@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Build output / caches
+dist/
+**/dist/
+ts-dist/
+**/ts-dist/
+build/
+**/build/
+.turbo/
+**/.turbo/
+.sst/
+**/.sst/
+sst-env.d.ts
+.direnv/
+
+# Rust build
+target/
+**/target/
+result
+/result
+
+# Tooling caches
+.serena/
+**/.serena/
+.omo/
+**/.omo/
+.scripts/
+.worktrees/
+
+# Docs / local generated
+.docx_build/
+projects/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+**/.env
+**/.env.local
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Local opencode config (project root only; keep theme opencode.json files)
+/opencode/opencode.json
+opencode-dev
+
+# Editor / OS
+.DS_Store
+**/.DS_Store
+.idea/
+.vscode/
+.codex/
+*~
+Session.vim
+
+# Logs / test output
+*.log
+test-results/
+playwright-report/
+
+# Misc
+tmp/
+playground/
+a.out

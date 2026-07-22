@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>New Game</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #05030f; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; }
+  #hud {
+    position: fixed; top: 10px; left: 12px; color: #ffffff;
+    font: 14px ui-monospace, monospace; text-shadow: 0 0 6px rgba(255,255,255,.4);
+  }
+  body.caliber-edit canvas { cursor: crosshair; }
+  #edit-badge {
+    display: none; position: fixed; top: 10px; right: 12px; color: #000; background: #fff;
+    font: 11px ui-monospace, monospace; letter-spacing: .15em; padding: 3px 8px; border-radius: 4px;
+  }
+  body.caliber-edit #edit-badge { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="edit-badge">EDIT</div>
+<script>
+// Caliber protocol: telemetry, click-to-edit, and scripted playtests.
+let playtestSink = null
+const caliber = (msg) => {
+  if (playtestSink && (msg.type === "game_event" || msg.type === "runtime_error")) playtestSink.push(msg)
+  parent.postMessage({ source: "caliber-game", ...msg }, "*")
+}
+addEventListener("error", (e) => caliber({ type: "runtime_error", message: e.message }))
+
+// Editable config — loaded from config.json, editable live from the Arcade.
+let cfg = {
+  background: { color: "#05030f" },
+  ship: { color: "#ffffff", size: 18, speed: 0.6 },
+  stars: { color: "#d6d6d6", count: 12, speed: 0.12 },
+}
+
+const canvas = document.getElementById("c")
+const ctx = canvas.getContext("2d")
+let w, h
+const resize = () => { w = canvas.width = innerWidth; h = canvas.height = innerHeight }
+addEventListener("resize", resize); resize()
+
+const ship = { x: 0.5 }
+let stars = []
+function makeStars() {
+  stars = Array.from({ length: cfg.stars.count }, () => ({ x: Math.random(), y: Math.random() * -1, s: 0.4 + Math.random() }))
+}
+let score = 0
+const keys = {}
+addEventListener("keydown", (e) => keys[e.code] = true)
+addEventListener("keyup", (e) => keys[e.code] = false)
+
+// ---- edit mode ----
+let editMode = false
+addEventListener("message", (e) => {
+  const d = e.data
+  if (!d || typeof d !== "object") return
+  if (d.type === "caliber:edit-mode") {
+    editMode = !!d.on
+    document.body.classList.toggle("caliber-edit", editMode)
+  }
+  if (d.type === "caliber:set-prop" && cfg[d.entity]) {
+    cfg[d.entity][d.key] = d.value
+    if (d.entity === "stars" && d.key === "count") makeStars()
+  }
+  if (d.type === "caliber:get-config") caliber({ type: "edit_config", config: cfg })
+  if (d.type === "caliber:playtest") runPlaytest(d)
+  if (d.type === "caliber:record") runRecording(d)
+})
+
+canvas.addEventListener("pointerdown", (e) => {
+  if (!editMode) return
+  const px = e.clientX, py = e.clientY
+  const sx = ship.x * w
+  if (py > h - 60 && Math.abs(px - sx) < cfg.ship.size * 2.2) {
+    return caliber({ type: "edit_pick", entity: "ship", props: cfg.ship })
+  }
+  for (const st of stars) {
+    if (Math.hypot(st.x * w - px, st.y * h - py) < 16) {
+      return caliber({ type: "edit_pick", entity: "stars", props: cfg.stars })
+    }
+  }
+  caliber({ type: "edit_pick", entity: "background", props: cfg.background })
+})
+
+// ---- game frame (steppable: the normal loop and playtests both use it) ----
+function frame(dt) {
+  if (keys.ArrowLeft || keys.KeyA) ship.x -= dt * cfg.ship.speed
+  if (keys.ArrowRight || keys.KeyD) ship.x += dt * cfg.ship.speed
+  ship.x = Math.max(0.05, Math.min(0.95, ship.x))
+
+  ctx.fillStyle = cfg.background.color; ctx.fillRect(0, 0, w, h)
+  for (const st of stars) {
+    st.y += dt * cfg.stars.speed * st.s
+    if (st.y > 1) { st.y = -0.05; st.x = Math.random() }
+    const sx = st.x * w, sy = st.y * h
+    if (!editMode && sy > h - 60 && Math.abs(sx - ship.x * w) < 30) {
+      score++; st.y = -0.05; st.x = Math.random()
+      caliber({ type: "game_event", name: "score:" + score })
+    }
+    ctx.fillStyle = cfg.stars.color
+    ctx.beginPath(); ctx.arc(sx, sy, 3 + st.s * 2, 0, 7); ctx.fill()
+  }
+  const s = cfg.ship.size
+  ctx.fillStyle = cfg.ship.color
+  ctx.beginPath()
+  ctx.moveTo(ship.x * w, h - 28 - s); ctx.lineTo(ship.x * w - s, h - 14); ctx.lineTo(ship.x * w + s, h - 14)
+  ctx.closePath(); ctx.fill()
+  document.getElementById("hud").textContent = "New Game — SCORE " + score + " — arrows / AD to move"
+}
+
+/**
+ * Scripted playtest: { type:"caliber:playtest", durationMs, inputs:[{code, atMs, forMs}] }
+ * Runs the game loop synchronously with the scripted keys and replies
+ * { type:"playtest_result", events, frames, durationMs, finalScore }.
+ */
+function runPlaytest(req) {
+  const duration = Math.min(60000, req.durationMs || 5000)
+  const inputs = Array.isArray(req.inputs) ? req.inputs : []
+  const events = []
+  playtestSink = events
+  const stepMs = 16
+  let frames = 0
+  for (let t = 0; t < duration; t += stepMs) {
+    for (const inp of inputs) {
+      const start = inp.atMs || 0
+      const end = start + (inp.forMs || 500)
+      keys[inp.code] = t >= start && t < end
+    }
+    frame(stepMs / 1000)
+    frames++
+  }
+  for (const inp of inputs) keys[inp.code] = false
+  playtestSink = null
+  caliber({ type: "playtest_result", events, frames, durationMs: duration, finalScore: score })
+}
+
+/**
+ * Record live animation: { type:"caliber:record", durationMs, fps }
+ * Captures downscaled JPEG frames from the canvas while the game runs, then
+ * replies { type:"record_result", frames:[dataURL], fps, durationMs }.
+ */
+function runRecording(req) {
+  const duration = Math.min(10000, req.durationMs || 3000)
+  const fps = Math.min(10, req.fps || 6)
+  const scale = Math.min(1, 480 / w)
+  const off = document.createElement("canvas")
+  off.width = Math.round(w * scale)
+  off.height = Math.round(h * scale)
+  const octx = off.getContext("2d")
+  const frames = []
+  const grab = () => {
+    // If the live loop is stalled (hidden tab), step the game ourselves so
+    // the recording still shows real animation.
+    if (performance.now() - lastLoopTick > 150) frame(1 / fps)
+    octx.drawImage(canvas, 0, 0, off.width, off.height)
+    frames.push(off.toDataURL("image/jpeg", 0.7))
+  }
+  grab()
+  const timer = setInterval(grab, 1000 / fps)
+  setTimeout(() => {
+    clearInterval(timer)
+    caliber({ type: "record_result", frames, fps, durationMs: duration })
+  }, duration)
+}
+
+let last = performance.now(), fFrames = 0, fpsAt = last
+let lastLoopTick = 0
+function loop(now) {
+  lastLoopTick = performance.now()
+  const dt = Math.min(0.05, (now - last) / 1000); last = now
+  fFrames++
+  if (now - fpsAt > 1000) { caliber({ type: "fps", value: fFrames * 1000 / (now - fpsAt) }); fFrames = 0; fpsAt = now }
+  frame(dt)
+  requestAnimationFrame(loop)
+}
+
+fetch("./config.json").then((r) => r.ok ? r.json() : null).then((loaded) => {
+  if (loaded) cfg = { ...cfg, ...loaded }
+}).catch(() => {}).finally(() => {
+  makeStars()
+  requestAnimationFrame(loop)
+  caliber({ type: "ready" })
+})
+</script>
+</body>
+</html>

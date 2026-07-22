@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Caliber Studio UI Concept</title>
+  <style>
+    :root {
+      --ink: #071018;
+      --shell: #0a141e;
+      --panel: #0d1924;
+      --panel-2: #101f2c;
+      --line: #203443;
+      --line-soft: #172a37;
+      --text: #eef5f6;
+      --muted: #8195a2;
+      --muted-2: #546a77;
+      --cyan: #22d3c5;
+      --cyan-2: #7ff5ea;
+      --blue: #5fa8ff;
+      --amber: #e5aa47;
+      --red: #f16f67;
+      --green: #7bd88f;
+      --shadow: rgba(0, 0, 0, .32);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; }
+    body {
+      background: #050b10;
+      color: var(--text);
+      font-family: "Avenir Next", "Helvetica Neue", sans-serif;
+      font-size: 14px;
+      letter-spacing: .01em;
+    }
+
+    .app {
+      width: 100vw;
+      height: 100vh;
+      display: grid;
+      grid-template-rows: 64px 1fr 34px;
+      background:
+        radial-gradient(circle at 73% 30%, rgba(30, 92, 109, .12), transparent 34%),
+        var(--shell);
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 424px 1fr 430px;
+      align-items: center;
+      border-bottom: 1px solid var(--line);
+      background: rgba(8, 18, 27, .96);
+      box-shadow: 0 10px 30px var(--shadow);
+      z-index: 20;
+    }
+
+    .brand {
+      height: 100%;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 0 22px;
+      border-right: 1px solid var(--line);
+    }
+
+    .mark {
+      width: 28px;
+      height: 28px;
+      position: relative;
+      transform: rotate(45deg);
+      border: 1px solid var(--cyan);
+      box-shadow: inset 0 0 0 5px rgba(34, 211, 197, .08), 0 0 20px rgba(34, 211, 197, .12);
+    }
+    .mark::after {
+      content: "";
+      position: absolute;
+      inset: 7px;
+      background: var(--cyan);
+    }
+    .brand-name {
+      font-size: 16px;
+      font-weight: 800;
+      letter-spacing: .13em;
+    }
+    .brand-version {
+      color: var(--muted-2);
+      font-family: "SFMono-Regular", Menlo, monospace;
+      font-size: 10px;
+      margin-left: 2px;
+    }
+
+    .project {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 0 22px;
+      min-width: 0;
+    }
+    .crumb { color: var(--muted); font-size: 12px; }
+    .project-title { font-weight: 650; }
+    .branch {
+      color: var(--cyan-2);
+      background: rgba(34, 211, 197, .08);
+      border: 1px solid rgba(34, 211, 197, .2);
+      padding: 4px 8px;
+      border-radius: 3px;
+      font-family: "SFMono-Regular", Menlo, monospace;
+      font-size: 10px;
+    }
+    .saved { color: var(--muted-2); font-size: 11px; }
+
+    .top-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 16px;
+      padding-right: 18px;
+    }
+    .modes {
+      display: flex;
+      padding: 3px;
+      background: #07111a;
+      border: 1px solid var(--line);
+      border-radius: 4px;
+    }
+    .mode { padding: 7px 16px; color: var(--muted); font-size: 11px; font-weight: 700; }
+    .mode.active { color: var(--ink); background: var(--cyan); border-radius: 2px; }
+    .metric { display: flex; flex-direction: column; align-items: flex-end; line-height: 1.15; }
+    .metric strong { color: var(--green); font: 700 12px "SFMono-Regular", Menlo, monospace; }
+    .metric span { color: var(--muted-2); font-size: 9px; text-transform: uppercase; letter-spacing: .12em; }
+    .play-button {
+      display: grid;
+      place-items: center;
+      width: 34px;
+      height: 34px;
+      background: var(--cyan);
+      color: var(--ink);
+      clip-path: polygon(0 0, 100% 0, 100% 76%, 76% 100%, 0 100%);
+      font-size: 13px;
+      font-weight: 900;
+    }
+
+    .workspace {
+      min-height: 0;
+      display: grid;
+      grid-template-columns: 712px 7px 1fr;
+    }
+
+    .left {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: 66px 1fr;
+      background: var(--panel);
+      border-right: 1px solid #050b10;
+    }
+
+    .rail {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 4px;
+      padding: 12px 7px;
+      background: #07111a;
+      border-right: 1px solid var(--line);
+    }
+    .rail-item {
+      width: 52px;
+      min-height: 54px;
+      display: grid;
+      place-items: center;
+      align-content: center;
+      gap: 5px;
+      color: var(--muted-2);
+      border-left: 2px solid transparent;
+      font-size: 8px;
+      font-weight: 750;
+      letter-spacing: .07em;
+    }
+    .rail-item .glyph {
+      width: 20px;
+      height: 20px;
+      display: grid;
+      place-items: center;
+      border: 1px solid currentColor;
+      font: 700 9px "SFMono-Regular", Menlo, monospace;
+    }
+    .rail-item.active {
+      color: var(--cyan-2);
+      background: linear-gradient(90deg, rgba(34, 211, 197, .11), transparent);
+      border-left-color: var(--cyan);
+    }
+    .rail-spacer { flex: 1; }
+
+    .left-body {
+      min-height: 0;
+      display: grid;
+      grid-template-rows: 55px 1fr;
+    }
+    .pane-heading {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 17px 0 20px;
+      border-bottom: 1px solid var(--line);
+      background: #0b1721;
+    }
+    .pane-heading h1 { margin: 0; font-size: 13px; letter-spacing: .16em; }
+    .context-pill { color: var(--muted); font: 10px "SFMono-Regular", Menlo, monospace; }
+    .context-pill b { color: var(--cyan-2); font-weight: 600; }
+
+    .left-scroll {
+      min-height: 0;
+      padding: 16px 16px 18px;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 13px;
+      overflow: hidden;
+      background:
+        linear-gradient(rgba(255,255,255,.018) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.012) 1px, transparent 1px);
+      background-size: 24px 24px;
+    }
+
+    .label-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 8px;
+      color: var(--muted);
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .13em;
+    }
+    .label-row span:last-child { color: var(--muted-2); font-family: "SFMono-Regular", Menlo, monospace; letter-spacing: 0; }
+
+    .prompt-card {
+      border: 1px solid #315060;
+      background: linear-gradient(150deg, rgba(20, 40, 53, .96), rgba(12, 26, 36, .96));
+      box-shadow: 0 14px 28px rgba(0,0,0,.19);
+    }
+    .prompt-text {
+      padding: 16px 17px 15px;
+      color: #e9f2f3;
+      font-size: 14px;
+      line-height: 1.48;
+    }
+    .prompt-text .at { color: var(--cyan-2); }
+    .prompt-meta {
+      min-height: 42px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 10px 0 16px;
+      border-top: 1px solid var(--line);
+      background: rgba(5, 14, 21, .44);
+    }
+    .scope { display: flex; gap: 7px; }
+    .tag { color: var(--muted); border: 1px solid var(--line); padding: 4px 7px; font: 9px "SFMono-Regular", Menlo, monospace; }
+    .run { background: var(--cyan); color: var(--ink); padding: 7px 13px; font-size: 10px; font-weight: 850; letter-spacing: .09em; }
+
+    .agents { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+    .agent {
+      min-width: 0;
+      padding: 11px 10px;
+      border: 1px solid var(--line);
+      background: rgba(10, 24, 34, .86);
+      position: relative;
+      overflow: hidden;
+    }
+    .agent::after { content: ""; position: absolute; bottom: 0; left: 0; height: 2px; width: var(--progress); background: var(--agent); }
+    .agent-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .agent-name { font-size: 10px; font-weight: 750; white-space: nowrap; }
+    .agent-state { color: var(--agent); font: 9px "SFMono-Regular", Menlo, monospace; }
+    .agent-task { margin-top: 8px; color: var(--muted); font-size: 9px; line-height: 1.35; }
+
+    .code {
+      min-height: 0;
+      border: 1px solid var(--line);
+      background: #07121a;
+      display: grid;
+      grid-template-rows: 36px 1fr;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,.02);
+    }
+    .code-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0 12px;
+      border-bottom: 1px solid var(--line);
+      color: var(--muted);
+      font: 10px "SFMono-Regular", Menlo, monospace;
+    }
+    .code-head .diff-count { color: var(--green); }
+    .code-body {
+      padding: 11px 0;
+      font: 11px/1.62 "SFMono-Regular", Menlo, monospace;
+      color: #a5b7c0;
+      overflow: hidden;
+    }
+    .line { display: grid; grid-template-columns: 34px 18px 1fr; padding: 0 12px 0 0; }
+    .ln { color: #38505d; text-align: right; padding-right: 10px; user-select: none; }
+    .plus { color: var(--green); }
+    .minus { color: var(--red); }
+    .added { background: rgba(57, 138, 84, .09); color: #bde6c7; }
+    .removed { background: rgba(171, 66, 61, .08); color: #e3b5b1; }
+    .kw { color: #77b7ff; }
+    .str { color: #e2bd78; }
+
+    .changeset {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 16px;
+      align-items: center;
+      padding: 11px 12px;
+      border: 1px solid rgba(229, 170, 71, .34);
+      border-left: 3px solid var(--amber);
+      background: rgba(229, 170, 71, .06);
+    }
+    .change-title { font-size: 11px; font-weight: 750; }
+    .change-sub { margin-top: 3px; color: var(--muted); font-size: 9px; }
+    .review-button { color: #1d1508; background: var(--amber); padding: 7px 11px; font-size: 9px; font-weight: 850; letter-spacing: .08em; }
+
+    .divider {
+      position: relative;
+      background: #050b10;
+      border-left: 1px solid #182a35;
+      border-right: 1px solid #182a35;
+    }
+    .divider::after {
+      content: "";
+      position: absolute;
+      top: 50%; left: 2px;
+      width: 1px; height: 54px;
+      transform: translateY(-50%);
+      background: #38515e;
+      box-shadow: 3px 0 #38515e;
+    }
+
+    .right {
+      min-width: 0;
+      min-height: 0;
+      position: relative;
+      background: #071019;
+      overflow: hidden;
+    }
+    .viewport-head {
+      position: absolute;
+      z-index: 8;
+      top: 0; left: 0; right: 0;
+      height: 47px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 18px;
+      border-bottom: 1px solid rgba(113, 144, 158, .25);
+      background: linear-gradient(180deg, rgba(5, 13, 20, .94), rgba(5, 13, 20, .68));
+      backdrop-filter: blur(14px);
+    }
+    .live-label { display: flex; align-items: center; gap: 10px; font-size: 11px; font-weight: 800; letter-spacing: .13em; }
+    .live-dot { width: 6px; height: 6px; background: var(--cyan); box-shadow: 0 0 12px var(--cyan); }
+    .scene-meta { display: flex; gap: 17px; color: var(--muted); font: 9px "SFMono-Regular", Menlo, monospace; }
+    .scene-meta b { color: #c6d4d8; font-weight: 500; }
+
+    .world { position: absolute; inset: 0; }
+    .world svg { width: 100%; height: 100%; display: block; }
+    .vignette { position: absolute; inset: 0; pointer-events: none; box-shadow: inset 0 0 130px rgba(0,0,0,.5); }
+
+    .hierarchy, .inspector {
+      position: absolute;
+      z-index: 7;
+      top: 64px;
+      background: rgba(7, 18, 27, .88);
+      border: 1px solid rgba(84, 117, 132, .4);
+      box-shadow: 0 18px 48px rgba(0,0,0,.28);
+      backdrop-filter: blur(14px);
+    }
+    .hierarchy { left: 16px; width: 205px; }
+    .inspector { right: 16px; width: 270px; }
+    .float-head {
+      height: 37px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 11px;
+      border-bottom: 1px solid var(--line);
+      color: #dce7e9;
+      font-size: 9px;
+      font-weight: 800;
+      letter-spacing: .12em;
+    }
+    .float-head span:last-child { color: var(--muted-2); font: 12px "SFMono-Regular", Menlo, monospace; }
+
+    .tree { padding: 8px 0 10px; font-size: 10px; }
+    .tree-row { display: flex; align-items: center; gap: 7px; height: 27px; padding: 0 10px; color: var(--muted); }
+    .tree-row.child { padding-left: 24px; }
+    .tree-row.child-2 { padding-left: 39px; }
+    .tree-row.active { color: var(--cyan-2); background: rgba(34,211,197,.1); border-left: 2px solid var(--cyan); padding-left: 37px; }
+    .tri { color: var(--muted-2); font-size: 8px; }
+    .cube { width: 8px; height: 8px; border: 1px solid currentColor; transform: rotate(45deg); opacity: .7; }
+
+    .object-name { padding: 13px 12px 11px; border-bottom: 1px solid var(--line-soft); }
+    .object-name strong { display: block; font-size: 13px; }
+    .object-name span { color: var(--cyan); font: 9px "SFMono-Regular", Menlo, monospace; }
+    .section { border-bottom: 1px solid var(--line-soft); padding: 10px 12px 12px; }
+    .section-title { color: var(--muted); font-size: 9px; font-weight: 800; letter-spacing: .12em; margin-bottom: 9px; }
+    .field-grid { display: grid; grid-template-columns: 48px 1fr; gap: 6px 8px; align-items: center; font-size: 9px; }
+    .field-label { color: var(--muted-2); }
+    .xyz { display: grid; grid-template-columns: repeat(3, 1fr); gap: 4px; }
+    .input { min-width: 0; padding: 5px 5px; color: #b9c8cd; background: #07121a; border: 1px solid var(--line); font: 8px "SFMono-Regular", Menlo, monospace; }
+    .asset-ref { display: flex; align-items: center; justify-content: space-between; padding: 7px 8px; background: #07121a; border: 1px solid var(--line); color: #c3d0d4; font-size: 9px; }
+    .lock { color: var(--cyan); font-size: 8px; }
+
+    .foundry {
+      position: absolute;
+      z-index: 9;
+      left: 236px;
+      right: 301px;
+      bottom: 16px;
+      height: 137px;
+      border: 1px solid rgba(82, 115, 130, .48);
+      background: rgba(7, 18, 27, .91);
+      backdrop-filter: blur(16px);
+      box-shadow: 0 20px 55px rgba(0,0,0,.38);
+      display: grid;
+      grid-template-rows: 36px 1fr;
+    }
+    .foundry-head { display: flex; align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid var(--line); }
+    .foundry-title { font-size: 9px; font-weight: 850; letter-spacing: .13em; }
+    .foundry-state { color: var(--green); font: 9px "SFMono-Regular", Menlo, monospace; }
+    .candidates { padding: 10px; display: grid; grid-template-columns: repeat(3, 1fr) 1.15fr; gap: 8px; min-width: 0; }
+    .candidate { min-width: 0; position: relative; overflow: hidden; border: 1px solid var(--line); background: #10232e; }
+    .candidate.selected { border-color: var(--cyan); box-shadow: inset 0 0 0 1px var(--cyan); }
+    .candidate svg { width: 100%; height: 100%; }
+    .candidate-label { position: absolute; left: 6px; right: 6px; bottom: 5px; display: flex; justify-content: space-between; font-size: 8px; color: #dce8ea; text-shadow: 0 1px 3px #000; }
+    .candidate-label b { color: var(--green); }
+    .validation { padding: 9px 10px; display: grid; grid-template-rows: auto 1fr; background: #0a1822; }
+    .validation strong { font-size: 9px; letter-spacing: .09em; }
+    .checks { margin-top: 7px; display: grid; grid-template-columns: 1fr 1fr; gap: 5px 9px; color: var(--muted); font-size: 8px; }
+    .checks span::before { content: "✓"; color: var(--green); margin-right: 5px; }
+
+    .statusbar {
+      display: grid;
+      grid-template-columns: 712px 7px 1fr;
+      background: #061018;
+      border-top: 1px solid var(--line);
+      color: var(--muted-2);
+      font: 9px "SFMono-Regular", Menlo, monospace;
+    }
+    .left-status, .right-status { display: flex; align-items: center; gap: 18px; padding: 0 15px; }
+    .right-status { justify-content: flex-end; }
+    .status-ok { color: var(--green); }
+    .status-warn { color: var(--amber); }
+    .key { color: #a9b9c0; padding: 2px 5px; border: 1px solid var(--line); background: #0a1720; }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true"></div>
+        <div class="brand-name">CALIBER STUDIO</div>
+        <div class="brand-version">ALPHA / 01</div>
+      </div>
+      <div class="project">
+        <span class="crumb">PROJECT /</span>
+        <span class="project-title">Atlas Observatory</span>
+        <span class="branch">vertical-slice</span>
+        <span class="saved">Saved 4s ago</span>
+      </div>
+      <div class="top-actions">
+        <div class="modes" aria-label="Editor modes">
+          <span class="mode active">Edit</span><span class="mode">Play</span><span class="mode">Review</span>
+        </div>
+        <div class="metric"><strong>60.0 FPS</strong><span>target met</span></div>
+        <div class="play-button">▶</div>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <aside class="left">
+        <nav class="rail" aria-label="Primary navigation">
+          <div class="rail-item active"><span class="glyph">+</span><span>CREATE</span></div>
+          <div class="rail-item"><span class="glyph">{ }</span><span>CODE</span></div>
+          <div class="rail-item"><span class="glyph">✓</span><span>TASKS</span></div>
+          <div class="rail-item"><span class="glyph">A</span><span>AGENTS</span></div>
+          <div class="rail-item"><span class="glyph">±</span><span>CHANGES</span></div>
+          <div class="rail-item"><span class="glyph">◇</span><span>CONTENT</span></div>
+          <div class="rail-item"><span class="glyph">V</span><span>VERIFY</span></div>
+          <div class="rail-item"><span class="glyph">↑</span><span>SHIP</span></div>
+          <div class="rail-spacer"></div>
+          <div class="rail-item"><span class="glyph">?</span><span>HELP</span></div>
+        </nav>
+
+        <div class="left-body">
+          <div class="pane-heading">
+            <h1>CREATE</h1>
+            <div class="context-pill">CONTEXT <b>87%</b></div>
+          </div>
+          <div class="left-scroll">
+            <section>
+              <div class="label-row"><span>Direction</span><span>PRJ / scene-03</span></div>
+              <div class="prompt-card">
+                <div class="prompt-text">Make the east access door feel heavier and more ceremonial. Keep my transform, use the active Style Pack, and <span class="at">@verify</span> the interaction before proposing the change.</div>
+                <div class="prompt-meta">
+                  <div class="scope"><span class="tag">door-east</span><span class="tag">material</span><span class="tag">interaction</span></div>
+                  <div class="run">DELEGATE ↗</div>
+                </div>
+              </div>
+            </section>
+
+            <section>
+              <div class="label-row"><span>Active work</span><span>3 agents / disjoint scopes</span></div>
+              <div class="agents">
+                <div class="agent" style="--agent:var(--cyan);--progress:72%">
+                  <div class="agent-top"><span class="agent-name">Scene Agent</span><span class="agent-state">RUNNING</span></div>
+                  <div class="agent-task">Door timing + material binding</div>
+                </div>
+                <div class="agent" style="--agent:var(--blue);--progress:91%">
+                  <div class="agent-top"><span class="agent-name">Asset Agent</span><span class="agent-state">3 READY</span></div>
+                  <div class="agent-task">Ceremonial door candidates</div>
+                </div>
+                <div class="agent" style="--agent:var(--green);--progress:100%">
+                  <div class="agent-top"><span class="agent-name">Test Agent</span><span class="agent-state">PASSED</span></div>
+                  <div class="agent-task">Interaction smoke path</div>
+                </div>
+              </div>
+            </section>
+
+            <section class="code">
+              <div class="code-head"><span>src/interaction/door-controller.ts</span><span class="diff-count">+8 −2</span></div>
+              <div class="code-body">
+                <div class="line"><span class="ln">41</span><span> </span><span><span class="kw">const</span> duration = style.motion.door;</span></div>
+                <div class="line removed"><span class="ln">42</span><span class="minus">−</span><span>tween.to(open, <span class="str">0.48</span>);</span></div>
+                <div class="line added"><span class="ln">42</span><span class="plus">+</span><span><span class="kw">const</span> weight = inspector.massClass;</span></div>
+                <div class="line added"><span class="ln">43</span><span class="plus">+</span><span>tween.to(open, duration * weight);</span></div>
+                <div class="line added"><span class="ln">44</span><span class="plus">+</span><span>audio.emit(<span class="str">"door.ceremonial"</span>);</span></div>
+                <div class="line"><span class="ln">45</span><span> </span><span>evidence.capture(<span class="str">"door-open"</span>);</span></div>
+                <div class="line"><span class="ln">46</span><span> </span><span><span class="kw">return</span> changeset.commit();</span></div>
+              </div>
+            </section>
+
+            <section class="changeset">
+              <div><div class="change-title">CHG-018 · Ceremonial door response</div><div class="change-sub">2 files · 1 scene binding · evidence attached · no conflicts</div></div>
+              <div class="review-button">READY FOR REVIEW</div>
+            </section>
+          </div>
+        </div>
+      </aside>
+
+      <div class="divider" aria-hidden="true"></div>
+
+      <section class="right">
+        <div class="viewport-head">
+          <div class="live-label"><span class="live-dot"></span><span>LIVE WORLD</span></div>
+          <div class="scene-meta"><span>SCENE <b>observatory_north</b></span><span>REV <b>018</b></span><span>WEBGPU <b>ACTIVE</b></span></div>
+        </div>
+
+        <div class="world" aria-label="Editable stylized observatory game world">
+          <svg viewBox="0 0 1200 900" preserveAspectRatio="xMidYMid slice" role="img" aria-label="Stylized sci-fi observatory with selected east access door">
+            <defs>
+              <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#071621"/><stop offset=".5" stop-color="#173545"/><stop offset="1" stop-color="#1b3741"/>
+              </linearGradient>
+              <radialGradient id="moon" cx="70%" cy="17%" r="28%">
+                <stop offset="0" stop-color="#d9fbf4" stop-opacity=".42"/><stop offset=".22" stop-color="#8ce8de" stop-opacity=".12"/><stop offset="1" stop-color="#6ed9cf" stop-opacity="0"/>
+              </radialGradient>
+              <linearGradient id="mountain" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#274c5a"/><stop offset="1" stop-color="#102732"/>
+              </linearGradient>
+              <linearGradient id="floor" x1=".5" y1="0" x2=".5" y2="1">
+                <stop offset="0" stop-color="#294d58"/><stop offset="1" stop-color="#0b202a"/>
+              </linearGradient>
+              <linearGradient id="metal" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#587684"/><stop offset=".45" stop-color="#293f4c"/><stop offset="1" stop-color="#132834"/>
+              </linearGradient>
+              <linearGradient id="glass" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0" stop-color="#8de6e1" stop-opacity=".7"/><stop offset="1" stop-color="#2f7281" stop-opacity=".2"/>
+              </linearGradient>
+              <filter id="glow"><feGaussianBlur stdDeviation="4" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+              <filter id="soft"><feGaussianBlur stdDeviation="18"/></filter>
+              <pattern id="grid" width="55" height="55" patternUnits="userSpaceOnUse"><path d="M55 0H0V55" fill="none" stroke="#9cd8d5" stroke-opacity=".08" stroke-width="1"/></pattern>
+            </defs>
+            <rect width="1200" height="900" fill="url(#sky)"/>
+            <rect width="1200" height="900" fill="url(#moon)"/>
+            <g fill="#c4f6ee" opacity=".6">
+              <circle cx="280" cy="108" r="1.6"/><circle cx="386" cy="150" r="1"/><circle cx="548" cy="104" r="1.3"/><circle cx="790" cy="90" r="1.1"/><circle cx="1005" cy="172" r="1.4"/><circle cx="1090" cy="118" r="1"/><circle cx="636" cy="188" r=".8"/><circle cx="186" cy="202" r=".9"/>
+            </g>
+            <circle cx="880" cy="168" r="48" fill="#9be3de" opacity=".22" filter="url(#soft)"/>
+            <circle cx="880" cy="168" r="25" fill="#d7f7f3" opacity=".74"/>
+            <path d="M0 440L190 255L325 391L475 226L646 407L830 276L1010 425L1200 274V520H0Z" fill="url(#mountain)" opacity=".82"/>
+            <path d="M0 493L142 373L261 462L388 333L535 477L700 348L845 468L982 365L1200 501V603H0Z" fill="#112c37" opacity=".9"/>
+            <path d="M0 650L1200 610V900H0Z" fill="url(#floor)"/>
+            <path d="M0 650L1200 610V900H0Z" fill="url(#grid)" opacity=".7"/>
+            <path d="M375 900L525 542H735L911 900Z" fill="#091b24" opacity=".68"/>
+            <path d="M552 900L590 543H668L711 900Z" fill="#5d7e83" opacity=".25"/>
+
+            <g id="observatory">
+              <path d="M414 622L461 447H757L808 622Z" fill="#0d2733" stroke="#63818c" stroke-opacity=".5"/>
+              <path d="M455 454L505 394H713L758 454Z" fill="url(#metal)"/>
+              <rect x="493" y="320" width="230" height="84" fill="#263f4d"/>
+              <path d="M516 320A91 91 0 0 1 700 320Z" fill="url(#metal)" stroke="#7ca4ad" stroke-opacity=".6" stroke-width="2"/>
+              <path d="M541 319A66 66 0 0 1 675 319Z" fill="url(#glass)" opacity=".82"/>
+              <path d="M608 218V320" stroke="#8ab3b8" stroke-width="7"/>
+              <path d="M608 221L668 190" stroke="#9dcbc9" stroke-width="6"/>
+              <circle cx="670" cy="188" r="9" fill="#a8e4dc"/>
+              <path d="M466 448H756" stroke="#9bbdc2" stroke-opacity=".55" stroke-width="3"/>
+              <path d="M480 456L438 621M733 456L782 620" stroke="#89a5ad" stroke-width="4" opacity=".6"/>
+              <rect x="486" y="486" width="248" height="133" fill="#162f3a"/>
+              <g fill="#77cbc4" opacity=".44">
+                <rect x="507" y="507" width="44" height="31"/><rect x="565" y="507" width="44" height="31"/><rect x="623" y="507" width="44" height="31"/><rect x="681" y="507" width="31" height="31"/>
+              </g>
+              <path d="M435 620H811L859 659H385Z" fill="#162e38" stroke="#597985" stroke-opacity=".5"/>
+              <path d="M401 659H842" stroke="#86a8b0" stroke-opacity=".42"/>
+              <g opacity=".75">
+                <rect x="349" y="530" width="93" height="92" fill="#102832"/><path d="M349 530L395 489L442 530Z" fill="#344d58"/>
+                <rect x="780" y="520" width="96" height="103" fill="#102832"/><path d="M780 520L828 477L876 520Z" fill="#344d58"/>
+              </g>
+              <g id="selected-door" filter="url(#glow)">
+                <rect x="670" y="537" width="57" height="82" fill="#172832" stroke="#22d3c5" stroke-width="3"/>
+                <path d="M680 608V548H716V608" fill="#2c4550" stroke="#83f5e9" stroke-opacity=".6"/>
+                <circle cx="709" cy="579" r="3" fill="#e6b257"/>
+                <rect x="663" y="530" width="71" height="96" fill="none" stroke="#22d3c5" stroke-width="1" stroke-dasharray="5 4" opacity=".9"/>
+              </g>
+            </g>
+
+            <g transform="translate(700 576)" filter="url(#glow)">
+              <circle r="12" fill="none" stroke="#f0f8f7" stroke-width="2"/>
+              <path d="M0 0V-69" stroke="#22d3c5" stroke-width="3"/><path d="M0-69l-7 12h14Z" fill="#22d3c5"/>
+              <path d="M0 0H63" stroke="#f16f67" stroke-width="3"/><path d="M63 0L51-7V7Z" fill="#f16f67"/>
+              <path d="M0 0L-38 42" stroke="#5fa8ff" stroke-width="3"/><path d="M-38 42l4-13 10 9Z" fill="#5fa8ff"/>
+            </g>
+
+            <g opacity=".78">
+              <path d="M300 736H907" stroke="#69afa9" stroke-opacity=".28" stroke-width="2"/>
+              <circle cx="277" cy="744" r="3" fill="#22d3c5"/><circle cx="936" cy="717" r="3" fill="#22d3c5"/>
+              <path d="M277 744V695M936 717V675" stroke="#4f928d" stroke-width="2"/>
+            </g>
+          </svg>
+          <div class="vignette"></div>
+        </div>
+
+        <aside class="hierarchy">
+          <div class="float-head"><span>HIERARCHY</span><span>⌕</span></div>
+          <div class="tree">
+            <div class="tree-row"><span class="tri">▼</span><span class="cube"></span><span>observatory_north</span></div>
+            <div class="tree-row child"><span class="tri">▼</span><span class="cube"></span><span>architecture</span></div>
+            <div class="tree-row child-2"><span class="cube"></span><span>dome_array</span></div>
+            <div class="tree-row child-2 active"><span class="cube"></span><span>door_east</span></div>
+            <div class="tree-row child-2"><span class="cube"></span><span>platform_main</span></div>
+            <div class="tree-row child"><span class="tri">›</span><span class="cube"></span><span>lighting</span></div>
+            <div class="tree-row child"><span class="tri">›</span><span class="cube"></span><span>audio_zones</span></div>
+          </div>
+        </aside>
+
+        <aside class="inspector">
+          <div class="float-head"><span>INSPECTOR</span><span>⋯</span></div>
+          <div class="object-name"><strong>East Access Door</strong><span>CAL-OBJ-018 / user priority</span></div>
+          <div class="section">
+            <div class="section-title">TRANSFORM</div>
+            <div class="field-grid">
+              <span class="field-label">Position</span><div class="xyz"><span class="input">12.0</span><span class="input">0.0</span><span class="input">−4.0</span></div>
+              <span class="field-label">Rotation</span><div class="xyz"><span class="input">0°</span><span class="input">90°</span><span class="input">0°</span></div>
+              <span class="field-label">Scale</span><div class="xyz"><span class="input">1.0</span><span class="input">1.0</span><span class="input">1.0</span></div>
+            </div>
+          </div>
+          <div class="section">
+            <div class="section-title">MATERIAL</div>
+            <div class="asset-ref"><span>ceremonial_alloy / v04</span><span class="lock">STYLE</span></div>
+          </div>
+          <div class="section">
+            <div class="section-title">INTERACTION</div>
+            <div class="field-grid"><span class="field-label">Motion</span><span class="input">weighted_open</span><span class="field-label">Audio</span><span class="input">door.ceremonial</span></div>
+          </div>
+        </aside>
+
+        <section class="foundry">
+          <div class="foundry-head"><span class="foundry-title">ASSET FOUNDRY / DOOR CANDIDATES</span><span class="foundry-state">3 PROCESSED · VALIDATION PASSED</span></div>
+          <div class="candidates">
+            <div class="candidate selected">
+              <svg viewBox="0 0 130 70"><rect width="130" height="70" fill="#18313c"/><path d="M40 64V10H90V64" fill="#334f59" stroke="#8fcbc5"/><path d="M48 59V18H82V59" fill="#1d323c"/><circle cx="76" cy="40" r="3" fill="#e3ad4a"/></svg>
+              <div class="candidate-label"><span>V04 · alloy</span><b>SELECTED</b></div>
+            </div>
+            <div class="candidate">
+              <svg viewBox="0 0 130 70"><rect width="130" height="70" fill="#192b38"/><path d="M37 64L43 12H87L94 64" fill="#41535d" stroke="#769fa3"/><path d="M51 60V24H80V60" fill="#243842"/></svg>
+              <div class="candidate-label"><span>V02 · basalt</span><span>92%</span></div>
+            </div>
+            <div class="candidate">
+              <svg viewBox="0 0 130 70"><rect width="130" height="70" fill="#182e39"/><path d="M40 64V16L65 8L90 16V64" fill="#375461" stroke="#88b5b2"/><path d="M52 59V25H78V59" fill="#1f3540"/></svg>
+              <div class="candidate-label"><span>V07 · prism</span><span>88%</span></div>
+            </div>
+            <div class="validation"><strong>PRODUCTION CHECKS</strong><div class="checks"><span>scale + pivot</span><span>material slots</span><span>collision</span><span>LOD budget</span><span>license data</span><span>lineage</span></div></div>
+          </div>
+        </section>
+      </section>
+    </section>
+
+    <footer class="statusbar">
+      <div class="left-status"><span class="status-ok">● CORE CONNECTED</span><span>OpenCode worker 01</span><span class="status-warn">1 approval waiting</span><span>rev 018</span></div>
+      <div></div>
+      <div class="right-status"><span>draw 184</span><span>tri 1.28m</span><span>frame 16.6ms</span><span><span class="key">⌘ S</span> save</span><span><span class="key">F6</span> play</span></div>
+    </footer>
+  </main>
+</body>
+</html>

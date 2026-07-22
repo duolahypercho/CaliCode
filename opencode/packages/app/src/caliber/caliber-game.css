@@ -1,0 +1,388 @@
+/* Caliber Arcade — the gaming pane. Deliberately its own visual system:
+   CRT bezel, neon accents, scanlines. Does not use OpenCode UI primitives. */
+
+.caliber-arcade {
+  --ca-bg: #050505;
+  --ca-bezel: #161616;
+  --ca-bezel-edge: #2e2e2e;
+  --ca-neon: #ffffff;
+  --ca-neon-2: #d9d9d9;
+  --ca-amber: #f0f0f0;
+  --ca-text: #d6d6d6;
+  --ca-text-dim: #818181;
+  --ca-danger: #ffffff;
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-width: 0;
+  background:
+    radial-gradient(120% 90% at 50% 0%, #161616 0%, var(--ca-bg) 55%),
+    var(--ca-bg);
+  border-left: 1px solid var(--ca-bezel-edge);
+  color: var(--ca-text);
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  user-select: none;
+}
+
+/* ---------- header ---------- */
+
+.caliber-arcade__header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 12px;
+  background: linear-gradient(180deg, #1c1c1c, #101010);
+  border-bottom: 1px solid var(--ca-bezel-edge);
+  flex-shrink: 0;
+}
+
+.caliber-arcade__title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.28em;
+  color: var(--ca-neon);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--ca-neon) 60%, transparent);
+  white-space: nowrap;
+}
+
+.caliber-arcade__title em {
+  font-style: normal;
+  color: var(--ca-neon-2);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--ca-neon-2) 60%, transparent);
+}
+
+.caliber-arcade__led {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #3a3a3a;
+  box-shadow: none;
+  transition: background 200ms, box-shadow 200ms;
+}
+.caliber-arcade__led[data-state="live"] {
+  background: var(--ca-neon);
+  box-shadow: 0 0 6px var(--ca-neon), 0 0 14px color-mix(in srgb, var(--ca-neon) 50%, transparent);
+}
+.caliber-arcade__led[data-state="error"] {
+  background: var(--ca-danger);
+  box-shadow: 0 0 6px var(--ca-danger);
+}
+
+.caliber-arcade__spacer { flex: 1; }
+
+/* ---------- buttons ---------- */
+
+.caliber-arcade button {
+  appearance: none;
+  border: 1px solid var(--ca-bezel-edge);
+  background: linear-gradient(180deg, #202020, #121212);
+  color: var(--ca-text);
+  font: inherit;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 5px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: border-color 140ms, color 140ms, box-shadow 140ms, transform 80ms;
+}
+.caliber-arcade button:hover {
+  border-color: var(--ca-neon);
+  color: var(--ca-neon);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--ca-neon) 30%, transparent);
+}
+.caliber-arcade button:active { transform: translateY(1px); }
+.caliber-arcade button[data-accent="magenta"]:hover {
+  border-color: var(--ca-neon-2);
+  color: var(--ca-neon-2);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--ca-neon-2) 30%, transparent);
+}
+.caliber-arcade button[data-on="true"] {
+  border-color: var(--ca-neon);
+  color: var(--ca-neon);
+}
+
+/* ---------- deck (url bar) ---------- */
+
+.caliber-arcade__deck {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--ca-bezel-edge);
+  flex-shrink: 0;
+}
+
+.caliber-arcade__url {
+  flex: 1;
+  min-width: 0;
+  background: #0e0e0e;
+  border: 1px solid var(--ca-bezel-edge);
+  border-radius: 6px;
+  color: var(--ca-neon);
+  font: inherit;
+  font-size: 11px;
+  padding: 6px 9px;
+  outline: none;
+}
+.caliber-arcade__url:focus {
+  border-color: var(--ca-neon);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--ca-neon) 40%, transparent);
+}
+
+/* ---------- screen ---------- */
+
+.caliber-arcade__stage {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  padding: 12px;
+  display: flex;
+}
+
+.caliber-arcade__crt {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  border-radius: 14px;
+  background: #000;
+  border: 1px solid var(--ca-bezel-edge);
+  box-shadow:
+    inset 0 0 0 6px var(--ca-bezel),
+    inset 0 0 0 7px #050409,
+    0 0 24px rgb(0 0 0 / 0.6),
+    0 0 18px color-mix(in srgb, var(--ca-neon) 8%, transparent);
+  overflow: hidden;
+}
+
+.caliber-arcade__crt iframe {
+  position: absolute;
+  inset: 7px;
+  width: calc(100% - 14px);
+  height: calc(100% - 14px);
+  border: none;
+  border-radius: 8px;
+  background: #000;
+}
+
+.caliber-arcade__scanlines {
+  position: absolute;
+  inset: 7px;
+  border-radius: 8px;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    0deg,
+    rgb(255 255 255 / 0.015) 0px,
+    rgb(255 255 255 / 0.015) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  mix-blend-mode: overlay;
+}
+
+.caliber-arcade__idle {
+  position: absolute;
+  inset: 7px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  text-align: center;
+  padding: 0 24px;
+}
+.caliber-arcade__idle-mark {
+  font-size: 26px;
+  letter-spacing: 0.5em;
+  padding-left: 0.5em;
+  color: var(--ca-neon-2);
+  text-shadow:
+    0 0 10px color-mix(in srgb, var(--ca-neon-2) 70%, transparent),
+    0 0 30px color-mix(in srgb, var(--ca-neon-2) 40%, transparent);
+  animation: caliber-flicker 4s infinite;
+}
+.caliber-arcade__idle-copy {
+  font-size: 11px;
+  line-height: 1.7;
+  color: var(--ca-text-dim);
+  max-width: 34ch;
+}
+
+@keyframes caliber-flicker {
+  0%, 92%, 96%, 100% { opacity: 1; }
+  94% { opacity: 0.55; }
+}
+
+/* ---------- readouts ---------- */
+
+.caliber-arcade__readouts {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 7px 14px;
+  border-top: 1px solid var(--ca-bezel-edge);
+  background: #101010;
+  flex-shrink: 0;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--ca-text-dim);
+}
+.caliber-arcade__readouts b {
+  font-weight: 400;
+  color: var(--ca-amber);
+  text-shadow: 0 0 6px color-mix(in srgb, var(--ca-amber) 40%, transparent);
+}
+
+/* ---------- console drawer ---------- */
+
+.caliber-arcade__console {
+  max-height: 130px;
+  overflow-y: auto;
+  border-top: 1px solid var(--ca-bezel-edge);
+  background: #0e0e0e;
+  padding: 6px 12px;
+  flex-shrink: 0;
+  font-size: 10.5px;
+  line-height: 1.6;
+  user-select: text;
+}
+.caliber-arcade__console div { color: var(--ca-text-dim); }
+.caliber-arcade__console div[data-kind="event"] { color: var(--ca-neon); }
+.caliber-arcade__console div[data-kind="error"] {
+  color: var(--ca-danger);
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+/* ---------- resize + toggle ---------- */
+
+.caliber-arcade__grip {
+  position: absolute;
+  left: -3px;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: col-resize;
+  z-index: 5;
+}
+.caliber-arcade__grip:hover { background: color-mix(in srgb, var(--ca-neon) 30%, transparent); }
+
+.caliber-arcade-toggle {
+  position: fixed;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 40;
+  writing-mode: vertical-rl;
+  appearance: none;
+  border: 1px solid #2e2e2e;
+  border-right: none;
+  border-radius: 8px 0 0 8px;
+  background: linear-gradient(180deg, #1c1c1c, #101010);
+  color: #ffffff;
+  font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 10px;
+  letter-spacing: 0.3em;
+  padding: 14px 6px;
+  cursor: pointer;
+  text-shadow: 0 0 8px rgb(255 255 255 / 0.4);
+  transition: color 140ms, box-shadow 140ms;
+}
+.caliber-arcade-toggle:hover {
+  color: #ffffff;
+  box-shadow: 0 0 14px rgb(255 255 255 / 0.25);
+  text-shadow: 0 0 8px rgb(255 255 255 / 0.5);
+}
+
+/* ---------- edit inspector ---------- */
+
+.caliber-arcade__inspector {
+  border-top: 1px solid var(--ca-bezel-edge);
+  background: #0e0e0e;
+  padding: 8px 14px 10px;
+  flex-shrink: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  align-items: center;
+}
+.caliber-arcade__inspector-title {
+  width: 100%;
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  color: var(--ca-neon);
+}
+.caliber-arcade__prop {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ca-text-dim);
+  text-transform: uppercase;
+}
+.caliber-arcade__prop input[type="number"] {
+  width: 64px;
+  background: #050505;
+  border: 1px solid var(--ca-bezel-edge);
+  border-radius: 4px;
+  color: var(--ca-text);
+  font: inherit;
+  padding: 3px 6px;
+}
+.caliber-arcade__prop input[type="color"] {
+  width: 30px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--ca-bezel-edge);
+  border-radius: 4px;
+  background: none;
+}
+
+/* ---------- cartridge library ---------- */
+
+.caliber-arcade__library {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  max-width: 44ch;
+}
+.caliber-arcade__library button {
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  padding: 7px 14px;
+}
+
+/* ---------- live agents rail ---------- */
+
+.caliber-arcade__agents {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 14px;
+  border-top: 1px solid var(--ca-bezel-edge);
+  background: #0b0b0b;
+  flex-shrink: 0;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.caliber-arcade__agents-title {
+  color: var(--ca-neon);
+  letter-spacing: 0.22em;
+  flex-shrink: 0;
+}
+.caliber-arcade__agent-chip {
+  border: 1px solid var(--ca-bezel-edge);
+  border-radius: 999px;
+  padding: 2px 9px;
+  color: var(--ca-text-dim);
+}
+.caliber-arcade__agent-chip b {
+  font-weight: 700;
+  color: var(--ca-text);
+}
+.caliber-arcade__agent-chip[data-actor="you"] b { color: #ffffff; }

@@ -1,0 +1,27 @@
+[package]
+name = "caliber-core"
+version = "0.1.0"
+edition = "2021"
+description = "Caliber's Rust core: game project scaffolding, dev-server discovery, and game serving for the Caliber Arcade."
+license = "MIT"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "fs"] }
+tower-http = { version = "0.6", features = ["cors"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+tao = "0.34"
+wry = "0.53"
+
+[[bin]]
+name = "caliber-core"
+path = "src/main.rs"
+
+[[bin]]
+name = "caliber-app"
+path = "src/bin/app.rs"
+
+[profile.release]
+lto = true

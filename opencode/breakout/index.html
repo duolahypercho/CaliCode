@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Breakout</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0a0a1a; overflow: hidden; }
+  canvas { width: 100%; height: 100%; display: block; }
+  #hud {
+    position: fixed; top: 10px; left: 12px; color: #fff;
+    font: 14px ui-monospace, monospace; text-shadow: 0 0 6px rgba(255,255,255,.3);
+    pointer-events: none;
+  }
+  #win-overlay {
+    display: none; position: fixed; inset: 0;
+    background: rgba(0,0,0,.7); color: #fff;
+    font: 48px ui-monospace, monospace; text-align: center;
+    place-items: center; cursor: pointer;
+  }
+  #win-overlay span { margin-top: 20vh; display: block; }
+  #win-overlay small { font-size: 18px; opacity: .6; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<div id="win-overlay"><span>YOU WIN!<br><small>click to restart</small></span></div>
+<script>
+const caliber = (msg) => parent.postMessage({ source: "caliber-game", ...msg }, "*")
+addEventListener("error", (e) => caliber({ type: "runtime_error", message: e.message }))
+
+const canvas = document.getElementById("c")
+const ctx = canvas.getContext("2d")
+let w, h
+const resize = () => { w = canvas.width = innerWidth; h = canvas.height = innerHeight }
+addEventListener("resize", resize); resize()
+
+const PADDLE_W = 0.15
+const PADDLE_H = 14
+const BALL_R = 7
+const BRICK_ROWS = 3
+const BRICK_COLS = 8
+const BRICK_GAP = 4
+const BRICK_TOP = 60
+const BRICK_H = 20
+const SPEED_INIT = 480
+const SPEED_INC = 20
+
+const paddle = { x: 0.5 }
+const ball = { x: 0.5, y: 0, dx: 1, dy: -1, speed: SPEED_INIT, live: false }
+let score = 0
+let won = false
+let bricks = []
+
+function setupBricks() {
+  bricks = []
+  const bw = (w - BRICK_GAP) / BRICK_COLS - BRICK_GAP
+  const colors = ["#ff4466", "#ff8844", "#44ddff"]
+  for (let r = 0; r < BRICK_ROWS; r++) {
+    for (let c = 0; c < BRICK_COLS; c++) {
+      bricks.push({
+        x: BRICK_GAP + c * (bw + BRICK_GAP),
+        y: BRICK_TOP + r * (BRICK_H + BRICK_GAP),
+        w: bw, h: BRICK_H,
+        alive: true,
+        color: colors[r],
+      })
+    }
+  }
+}
+
+function resetBall() {
+  ball.x = paddle.x
+  ball.y = 1 - 50 / h
+  ball.dx = (Math.random() - 0.5) * 0.8
+  ball.dy = -1
+  ball.speed = SPEED_INIT
+  ball.live = false
+}
+
+function resetGame() {
+  score = 0
+  won = false
+  document.getElementById("win-overlay").style.display = "none"
+  setupBricks()
+  resetBall()
+}
+
+const keys = {}
+addEventListener("keydown", (e) => { keys[e.code] = true; if (!ball.live && e.code === "Space") launch() })
+addEventListener("keyup", (e) => keys[e.code] = false)
+canvas.addEventListener("mousemove", (e) => { paddle.x = e.clientX / w })
+canvas.addEventListener("click", () => { if (!ball.live) launch() })
+
+function launch() {
+  if (won) { resetGame(); return }
+  ball.live = true
+  const len = Math.hypot(ball.dx, ball.dy)
+  ball.dx /= len; ball.dy /= len
+}
+
+addEventListener("message", (e) => {
+  const d = e.data
+  if (!d || typeof d !== "object") return
+  if (d.type === "caliber:get-config") caliber({ type: "edit_config", config: {} })
+})
+
+function rect(x, y, w, h) { return { left: x, top: y, right: x + w, bottom: y + h } }
+function overlap(a, b) { return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top }
+
+let last = performance.now(), frames = 0, fpsAt = last
+function tick(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now
+  frames++
+  if (now - fpsAt > 1000) { caliber({ type: "fps", value: Math.round(frames * 1000 / (now - fpsAt)) }); frames = 0; fpsAt = now }
+
+  if (keys.ArrowLeft || keys.KeyA) paddle.x = Math.max(0, paddle.x - dt * 1.2)
+  if (keys.ArrowRight || keys.KeyD) paddle.x = Math.min(1, paddle.x + dt * 1.2)
+
+  if (!ball.live) {
+    ball.x = paddle.x
+    ball.y = 1 - 50 / h
+  } else {
+    const px = ball.x * w + ball.dx * ball.speed * dt
+    const py = ball.y * h + ball.dy * ball.speed * dt
+
+    if (px < BALL_R) { ball.dx = -ball.dx; ball.x = BALL_R / w }
+    else if (px > w - BALL_R) { ball.dx = -ball.dx; ball.x = (w - BALL_R) / w }
+    else ball.x = px / w
+
+    if (py < BALL_R) { ball.dy = -ball.dy; ball.y = BALL_R / h }
+    else ball.y = py / h
+
+    if (ball.y > 1 + BALL_R / h) {
+      caliber({ type: "game_event", name: "death" })
+      resetBall()
+    }
+
+    const br = rect(ball.x * w - BALL_R, ball.y * h - BALL_R, BALL_R * 2, BALL_R * 2)
+    const pr = rect((paddle.x - PADDLE_W / 2) * w, h - PADDLE_H - 10, PADDLE_W * w, PADDLE_H)
+    if (overlap(br, pr) && ball.dy > 0) {
+      ball.dy = -ball.dy
+      ball.y = (h - PADDLE_H - 10 - BALL_R) / h
+      const hit = (ball.x - paddle.x) / (PADDLE_W / 2)
+      ball.dx = Math.max(-1, Math.min(1, ball.dx + hit * 0.3))
+      const len = Math.hypot(ball.dx, ball.dy)
+      ball.dx /= len; ball.dy /= len
+    }
+
+    for (const brick of bricks) {
+      if (!brick.alive) continue
+      const br2 = rect(brick.x, brick.y, brick.w, brick.h)
+      if (!overlap(br, br2)) continue
+      brick.alive = false
+      score++
+      ball.speed += SPEED_INC
+      caliber({ type: "game_event", name: "score:" + score })
+      const bx = ball.x * w, by = ball.y * h
+      const penX = Math.min(bx - br2.left, br2.right - bx)
+      const penY = Math.min(by - br2.top, br2.bottom - by)
+      if (penX < penY) ball.dx = -ball.dx
+      else ball.dy = -ball.dy
+      break
+    }
+
+    if (bricks.every((b) => !b.alive) && !won) {
+      won = true
+      document.getElementById("win-overlay").style.display = "grid"
+      caliber({ type: "game_event", name: "win" })
+    }
+  }
+
+  ctx.fillStyle = "#0a0a1a"; ctx.fillRect(0, 0, w, h)
+
+  const paddleW = PADDLE_W * w
+  ctx.fillStyle = "#ffffff"
+  ctx.beginPath()
+  ctx.roundRect((paddle.x - PADDLE_W / 2) * w, h - PADDLE_H - 10, paddleW, PADDLE_H, 4)
+  ctx.fill()
+
+  ctx.fillStyle = ball.live ? "#ffffff" : "rgba(255,255,255,.4)"
+  ctx.beginPath(); ctx.arc(ball.x * w, ball.y * h, BALL_R, 0, 7); ctx.fill()
+
+  for (const brick of bricks) {
+    if (!brick.alive) continue
+    ctx.fillStyle = brick.color
+    ctx.beginPath(); ctx.roundRect(brick.x, brick.y, brick.w, brick.h, 3); ctx.fill()
+  }
+
+  document.getElementById("hud").textContent = "BREAKOUT  —  SCORE " + score + " / " + (BRICK_ROWS * BRICK_COLS) + "  " + (!ball.live ? (won ? "click to replay" : "click or space to launch") : "")
+
+  requestAnimationFrame(tick)
+}
+
+setupBricks()
+resetBall()
+requestAnimationFrame(tick)
+caliber({ type: "ready" })
+</script>
+</body>
+</html>

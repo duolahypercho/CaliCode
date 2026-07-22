@@ -1,0 +1,5 @@
+{
+  "background": { "color": "#05030f" },
+  "ship": { "color": "#ffffff", "size": 18, "speed": 0.6 },
+  "stars": { "color": "#d6d6d6", "count": 12, "speed": 0.12 }
+}

@@ -1,0 +1,26 @@
+/* Caliber hero — the home / new-session intro. */
+
+.caliber-hero {
+  background:
+    radial-gradient(90% 70% at 50% 42%, rgb(255 255 255 / 0.035), transparent 60%),
+    radial-gradient(140% 100% at 50% 120%, rgb(255 255 255 / 0.02), transparent 55%),
+    var(--v2-background-bg-deep, #0a0a0a);
+}
+
+.caliber-hero-mark {
+  font-family: "Didot", "Bodoni 72", "Playfair Display", Georgia, "Times New Roman", serif;
+  font-size: clamp(64px, 9vw, 132px);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0.08em;
+  color: #e9e9e9;
+  text-shadow: 0 2px 60px rgb(255 255 255 / 0.1);
+  user-select: none;
+}
+
+.caliber-hero-tag {
+  margin-top: 14px;
+  font-size: 14px;
+  color: #818181;
+  letter-spacing: 0.01em;
+}
