@@ -117,13 +117,13 @@ fn default_opencode_dir() -> Option<std::path::PathBuf> {
         starts.push(cwd);
     }
     for start in starts {
-        let mut dir = start.as_path();
-        while let Some(parent) = dir.parent() {
-            let candidate = parent.join("packages").join("opencode");
+        let mut dir = Some(start.as_path());
+        while let Some(d) = dir {
+            let candidate = d.join("packages").join("opencode");
             if candidate.join("src").join("index.ts").is_file() {
                 return Some(candidate);
             }
-            dir = parent;
+            dir = d.parent();
         }
     }
     None
