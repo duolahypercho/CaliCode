@@ -25,16 +25,21 @@ use tao::{
 use wry::WebViewBuilder;
 
 fn main() -> wry::Result<()> {
-    // Prefer the studio bundled into Caliber.app/Contents/Resources/studio.
+    // Prefer a studio bundled next to the executable. Layouts per platform:
+    // macOS: Caliber.app/Contents/MacOS/<exe> -> ../Resources/studio
+    // Windows/Linux: <exe dir>/studio
     if std::env::var("CALIBER_STUDIO_DIST").is_err() {
         if let Ok(exe) = std::env::current_exe() {
-            if let Some(bundled) = exe
-                .parent()
-                .and_then(|p| p.parent())
-                .map(|p| p.join("Resources/studio"))
-            {
+            let candidates = [
+                exe.parent().map(|p| p.join("studio")),
+                exe.parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("Resources/studio")),
+            ];
+            for bundled in candidates.into_iter().flatten() {
                 if bundled.join("index.html").is_file() {
                     std::env::set_var("CALIBER_STUDIO_DIST", &bundled);
+                    break;
                 }
             }
         }
@@ -89,12 +94,37 @@ fn spawn_backend() -> Option<Child> {
     if TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok() {
         return None;
     }
-    let dir = std::env::var("CALIBER_OPENCODE_DIR").unwrap_or_else(|_| {
-        "/Users/ziwenxu/Code/caliber-studio/opencode/packages/opencode".to_string()
-    });
+    let dir = std::env::var("CALIBER_OPENCODE_DIR")
+        .map(std::path::PathBuf::from)
+        .ok()
+        .or_else(default_opencode_dir)?;
     Command::new("bun")
         .args(["run", "--conditions=browser", "src/index.ts", "serve", "--port", "4096"])
         .current_dir(dir)
         .spawn()
         .ok()
+}
+
+/// Locate packages/opencode by walking up from the executable and the working
+/// directory — works from a dev build (caliber-core/target/{debug,release})
+/// and from a checkout root on any OS, with no hardcoded developer path.
+fn default_opencode_dir() -> Option<std::path::PathBuf> {
+    let mut starts: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        starts.push(exe);
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        starts.push(cwd);
+    }
+    for start in starts {
+        let mut dir = start.as_path();
+        while let Some(parent) = dir.parent() {
+            let candidate = parent.join("packages").join("opencode");
+            if candidate.join("src").join("index.ts").is_file() {
+                return Some(candidate);
+            }
+            dir = parent;
+        }
+    }
+    None
 }
