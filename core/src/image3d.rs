@@ -18,8 +18,7 @@ pub const PASS_ORDER: [&str; 8] = [
 ];
 
 pub fn ingest(root: &Path, slug: &str, name: &str, image_base64: &str) -> Result<Value> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(image_base64)
+    let bytes = crate::baselines::decode_image_base64(image_base64)
         .context("invalid image base64")?;
     let img = image::load_from_memory(&bytes).context("unable to decode reference image")?;
     let hash = crate::assets::sha256_bytes(&bytes);
@@ -178,8 +177,7 @@ pub async fn review(
         .and_then(|arr| arr.iter().find(|a| a["id"] == asset_id))
         .context("asset not found")?;
     let source_bytes = locate_source_image(root, slug, asset_id)?;
-    let screenshot = base64::engine::general_purpose::STANDARD
-        .decode(screenshot_base64)
+    let screenshot = crate::baselines::decode_image_base64(screenshot_base64)
         .context("invalid screenshot base64")?;
     let dhash = dhash_distance(&source_bytes, &screenshot)?;
     let threshold = 28u32;

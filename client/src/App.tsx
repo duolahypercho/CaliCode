@@ -380,8 +380,24 @@ export default function App() {
           width: ingest.width,
           height: ingest.height,
         });
-        await rpc("image3d_generate", { slug: project.slug, spec });
-        pushLog(`image-to-3D spec generated for ${file.name}`);
+        const generated = await rpc<{ assetId: string }>("image3d_generate", { slug: project.slug, spec });
+        const caliFile = await rpc<{ content: string }>("file_read", {
+          slug: project.slug,
+          path: `assets/${generated.assetId}.cali.json`,
+        });
+        const loadedWithCali = await rpc<Project>("project_open", { slug: project.slug });
+        const withCali: Project = {
+          ...loadedWithCali,
+          assets: loadedWithCali.assets.map((asset) =>
+            asset.id === generated.assetId
+              ? { ...asset, metadata: { ...(asset.metadata ?? {}), cali: JSON.parse(caliFile.content) } }
+              : asset,
+          ),
+        };
+        await rpc("project_save", { project: withCali });
+        setProject(withCali);
+        pushLog(`imported ${file.name} and generated image-to-3D spec`);
+        return;
       }
       const loaded = await rpc<Project>("project_open", { slug: project.slug });
       setProject(loaded);

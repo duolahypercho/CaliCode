@@ -54,6 +54,7 @@ rpc '{"jsonrpc":"2.0","id":1,"method":"model_switch","params":{"provider":"codex
 - `image3d_ingest`, `image3d_assess`, `image3d_spec`, `image3d_validate`, `image3d_generate`, `image3d_review`
 - `tool_register`, `tool_list`
 - `agent_chat`, `agent_tool_result`, `agent_approval_response`, `agent_sessions`
+- `subagent_spawn` (core agent tool for focused planner/coder/tester/visual-critic agents)
 
 ## Browser Agent Tools
 
@@ -61,3 +62,15 @@ rpc '{"jsonrpc":"2.0","id":1,"method":"model_switch","params":{"provider":"codex
 `editor_update_transform`, `editor_script_write`, `editor_run_pie`,
 `editor_capture_frame`, `editor_run_tests`, `editor_asset_generate`,
 `editor_asset_preview`, `editor_promote_asset`.
+
+## Live Loop Checks
+
+```bash
+node scripts/agent-tool-client.mjs
+node scripts/agent-subagent-client.mjs
+node scripts/agent-vision-client.mjs
+```
+
+`agent-vision-client.mjs` proves PIE, frame capture, and screenshot baselines
+through the live agent loop. `agent-subagent-client.mjs` proves native subagent
+spawning with a browser tool roundtrip.

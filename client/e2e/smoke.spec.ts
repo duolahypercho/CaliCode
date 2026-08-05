@@ -9,9 +9,11 @@ test("editor loads and renders", async ({ page }) => {
 
 test("PIE captures frames", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: /Play/i }).click();
+  const play = page.getByRole("button", { name: "Play", exact: true });
+  await expect(play).toBeEnabled({ timeout: 10_000 });
+  await play.click();
   await page.waitForTimeout(1200);
-  await page.getByRole("button", { name: /Stop/i }).click();
+  await page.getByRole("button", { name: "Stop", exact: true }).click();
   await page.getByRole("tab", { name: "Filmstrip" }).click();
   await expect(page.locator("figure").first()).toBeVisible();
 });

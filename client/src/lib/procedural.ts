@@ -109,8 +109,47 @@ export function buildObject(kind: string, materialParams: GeneratorParams = {}):
 }
 
 export function assetObject(asset: Asset): THREE.Object3D {
+  if (asset.type === "cali" && asset.metadata?.cali) {
+    return caliObjectFromSpec(asset.metadata.cali as Record<string, unknown>);
+  }
   const kind = asset.source.replace("procedural:", "") || "box";
   return buildObject(kind, (asset.metadata as GeneratorParams) ?? {});
+}
+
+export function caliObjectFromSpec(spec: Record<string, unknown>): THREE.Group {
+  const root = new THREE.Group();
+  const components = (spec.componentTree as Array<Record<string, unknown>>) ?? [];
+  const materials = (spec.materials as Array<Record<string, unknown>>) ?? [];
+  const byId = new Map<string, THREE.Object3D>();
+  for (const component of components) {
+    const id = String(component.id ?? `node-${byId.size}`);
+    const dimensions = (component.dimensions as Record<string, number>) ?? {};
+    const geometry = createGeometry(String(component.primitive ?? "box"), dimensions);
+    const materialId = component.materialId as string | undefined;
+    const pbr = (materials.find((material) => material.id === materialId)?.pbr as
+      | Record<string, unknown>
+      | undefined) ?? {};
+    const material = new THREE.MeshStandardMaterial({
+      color: new THREE.Color(String(pbr.baseColor ?? "#9ca3af")),
+      metalness: Number(pbr.metalness ?? 0.1),
+      roughness: Number(pbr.roughness ?? 0.7),
+    });
+    const mesh = new THREE.Mesh(geometry, material);
+    mesh.name = String(component.name ?? id);
+    const transform = (component.transform as Record<string, number[]>) ?? {};
+    mesh.position.set(...(((transform.position as number[]) ?? [0, 0, 0]) as [number, number, number]));
+    mesh.rotation.set(...(((transform.rotation as number[]) ?? [0, 0, 0]) as [number, number, number]));
+    mesh.scale.set(...(((transform.scale as number[]) ?? [1, 1, 1]) as [number, number, number]));
+    byId.set(id, mesh);
+  }
+  for (const component of components) {
+    const id = String(component.id);
+    const object = byId.get(id);
+    if (!object) continue;
+    const parent = component.parent ? byId.get(String(component.parent)) : root;
+    (parent ?? root).add(object);
+  }
+  return root;
 }
 
 export function entityObject(entity: Entity): THREE.Object3D {
@@ -130,7 +169,17 @@ export function entityObject(entity: Entity): THREE.Object3D {
 export function buildScene(project: Project): THREE.Group {
   const group = new THREE.Group();
   for (const entity of project.entities) {
-    const object = entityObject(entity);
+    const asset = entity.assetId ? project.assets.find((item) => item.id === entity.assetId) : undefined;
+    let object: THREE.Object3D;
+    if (entity.kind === "light" || entity.kind === "camera") {
+      object = entityObject(entity);
+    } else if (asset?.type === "cali" && asset.metadata?.cali) {
+      object = caliObjectFromSpec(asset.metadata.cali as Record<string, unknown>);
+    } else if (asset) {
+      object = assetObject(asset);
+    } else {
+      object = entityObject(entity);
+    }
     object.name = entity.name;
     const [px, py, pz] = entity.transform.position;
     const [rx, ry, rz] = entity.transform.rotation;

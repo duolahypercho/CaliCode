@@ -6,9 +6,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 
 pub fn save_baseline(root: &Path, slug: &str, name: &str, image_base64: &str) -> Result<Value> {
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(image_base64)
-        .context("invalid base64")?;
+    let bytes = decode_image_base64(image_base64)?;
     let dir = crate::store::project_dir(root, slug)?.join("baselines");
     std::fs::create_dir_all(&dir)?;
     let file_name = format!("{}.png", sanitize_name(name));
@@ -28,9 +26,7 @@ pub fn compare_baseline(
     if !path.exists() {
         anyhow::bail!("baseline {} not found", name);
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(image_base64)
-        .context("invalid base64")?;
+    let bytes = decode_image_base64(image_base64)?;
     let left = gray_hash(&std::fs::read(&path)?)?;
     let right = gray_hash(&bytes)?;
     let distance = hamming_distance(&left, &right);
@@ -65,6 +61,13 @@ fn sanitize_name(name: &str) -> String {
     name.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
         .collect()
+}
+
+pub(crate) fn decode_image_base64(value: &str) -> Result<Vec<u8>> {
+    let clean = value.split(',').last().unwrap_or(value).trim();
+    base64::engine::general_purpose::STANDARD
+        .decode(clean)
+        .context("invalid base64")
 }
 
 #[cfg(test)]

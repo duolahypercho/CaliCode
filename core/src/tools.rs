@@ -121,6 +121,21 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             parameters: json!({"type":"object","properties":{"provider":{"type":"string"},"model":{"type":"string"}},"required":["provider","model"]}),
             kind: ToolKind::Core,
         },
+        ToolDef {
+            name: "subagent_spawn".into(),
+            description: "Spawn a Cali subagent to complete a focused task; it can use the same scene, asset, PIE, and test tools.".to_string(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "role":{"type":"string","description":"Subagent role, e.g. planner, coder, tester, visual-critic"},
+                    "instructions":{"type":"string"},
+                    "maxTurns":{"type":"number"},
+                    "projectSlug":{"type":"string"}
+                },
+                "required":["role","instructions"]
+            }),
+            kind: ToolKind::Core,
+        },
     ]
 }
 
@@ -211,6 +226,44 @@ pub async fn execute_core_tool(
             model_switch(&mut config, required_str(args, "provider")?, required_str(args, "model")?)
                 .map_err(anyhow::Error::msg)
         }
+        "subagent_spawn" => {
+            drop(config);
+            let registered = state.tools.read().await.clone();
+            let role = required_str(args, "role")?;
+            let instructions = required_str(args, "instructions")?;
+            let max_turns = args["maxTurns"].as_u64().unwrap_or(6) as usize;
+            let slug = args
+                .get("projectSlug")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let system = format!(
+                "You are a {} subagent inside Cali, an AI game engine harness. \
+                 You have full access to the scene, asset workbench, PIE runtime, and test tools. \
+                 Work independently, call tools when they help, and finish with a concise report.",
+                role
+            );
+            let options = crate::agent::AgentOptions {
+                permission_mode: "full-access".into(),
+                max_turns,
+                system: Some(system),
+                project_slug: slug,
+            };
+            let result = Box::pin(state.agents.chat(
+                state,
+                &registered,
+                None,
+                &[json!({ "role": "user", "content": instructions })],
+                options,
+            ))
+            .await?;
+            Ok(json!({
+                "role": role,
+                "sessionId": result["sessionId"],
+                "reply": result["reply"],
+                "toolCalls": result["toolCalls"],
+                "turns": result["turns"]
+            }))
+        }
         _ => anyhow::bail!("unknown core tool {}", tool.name),
     }
 }
@@ -245,4 +298,70 @@ pub fn required_str<'a>(value: &'a Value, key: &'a str) -> Result<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing required string {}", key))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::AgentManager;
+    use crate::config::{AppConfig, ModelConfig};
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use axum::Router;
+    use std::collections::HashMap;
+    use std::convert::Infallible;
+
+    async fn final_provider() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        Sse::new(futures::stream::iter(vec![
+            Ok(Event::default().data(r#"{"choices":[{"delta":{"role":"assistant","content":"subagent done"}}]}"#)),
+            Ok(Event::default().data("[DONE]")),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn subagent_spawn_runs_focused_agent() {
+        let app = Router::new().route("/v1/chat/completions", post(final_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = AppConfig {
+            model: ModelConfig {
+                default: "mock".into(),
+                provider: "mock".into(),
+                base_url: format!("http://{}/v1", addr),
+                api_key_env: "CALI_MOCK_KEY".into(),
+                temperature: 0.0,
+                max_tokens: Some(64),
+            },
+            providers: vec![],
+            projects_dir: None,
+        };
+        let (bus, _) = tokio::sync::broadcast::channel(32);
+        let agents = AgentManager::new(bus.clone());
+        let state = crate::AppState {
+            config: std::sync::Arc::new(tokio::sync::RwLock::new(config)),
+            projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+            agents: agents.clone(),
+            bus: bus.clone(),
+            tools: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        };
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "subagent_spawn")
+            .unwrap();
+        let result = execute_core_tool(
+            &def,
+            &json!({ "role": "tester", "instructions": "Run the scene tests.", "maxTurns": 3, "projectSlug": "starter" }),
+            &state,
+            &state.projects_root,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["role"], "tester");
+        assert!(result["reply"].as_str().unwrap().contains("subagent done"));
+        assert!(result["sessionId"].as_str().unwrap().starts_with("session-"));
+    }
 }

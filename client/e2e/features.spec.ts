@@ -55,6 +55,23 @@ test("image import triggers image-to-3D and lands in the library", async ({ page
   await expect(page.locator("aside").getByText("asset.png").first()).toBeVisible();
 });
 
+test("generated cali asset promotes into the scene", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Workbench" }).click();
+  await page.getByRole("tab", { name: "Import" }).click();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "cali.png",
+    mimeType: "image/png",
+    buffer: Buffer.from(PNG_1PX, "base64"),
+  });
+  await page.getByRole("tab", { name: "Console" }).click();
+  await expect(page.getByText(/generated image-to-3D spec/i)).toBeVisible({ timeout: 20_000 });
+  await page.getByRole("tab", { name: "Assets", exact: true }).first().click();
+  await page.getByRole("button", { name: "Promote cali.png" }).first().click();
+  await page.getByRole("tab", { name: "Scene", exact: true }).first().click();
+  await expect(page.locator("aside").getByRole("button", { name: /cali\.png/i })).toBeVisible();
+});
+
 test("save, checkpoint, and tests report in console", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("button", { name: "Save" }).click();

@@ -38,9 +38,7 @@ pub fn import_file(
     mime: &str,
     tags: Vec<String>,
 ) -> Result<Value> {
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(data_base64)
-        .context("invalid base64")?;
+    let data = crate::baselines::decode_image_base64(data_base64).context("invalid base64")?;
     let hash = sha256_bytes(&data);
     let ext = extension_for(mime);
     let id = format!("asset-{}", short_id());
