@@ -51,9 +51,9 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
         void (async () => {
           try {
             const result = tool ? await tool.handler((event.arguments as Record<string, unknown>) ?? {}) : { error: `unknown tool ${event.tool}` };
-            await rpc("agent.tool_result", { sessionId: event.sessionId, requestId: event.requestId, result });
+            await rpc("agent_tool_result", { sessionId: event.sessionId, requestId: event.requestId, result });
           } catch (error) {
-            await rpc("agent.tool_result", {
+            await rpc("agent_tool_result", {
               sessionId: event.sessionId,
               requestId: event.requestId,
               result: { error: error instanceof Error ? error.message : String(error) },
@@ -85,7 +85,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     setBusy(true);
     try {
       const history = messages.map((message) => ({ role: message.role, content: message.content }));
-      const result = (await rpc("agent.chat", {
+      const result = (await rpc("agent_chat", {
         sessionId,
         projectSlug,
         permissionMode,
@@ -115,7 +115,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     const raw = parts[1];
     const [provider, model] = raw.includes(":") ? raw.split(":") : [modelList?.active.provider ?? "openai", raw];
     try {
-      await rpc("model.switch", { provider, model });
+      await rpc("model_switch", { provider, model });
       onModelChange();
       setMessages((current) => [...current, { role: "assistant", content: `Switched to ${provider} / ${model}.` }]);
     } catch (error) {
@@ -126,7 +126,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
   const respondToApproval = async (approved: boolean) => {
     if (!approval || !sessionId) return;
     try {
-      await rpc("agent.approval_response", { sessionId, requestId: approval.requestId, approved });
+      await rpc("agent_approval_response", { sessionId, requestId: approval.requestId, approved });
       setMessages((current) => [
         ...current,
         { role: "tool", content: approved ? `Approved ${approval.tool}` : `Denied ${approval.tool}`, tool: approval.tool },
@@ -233,11 +233,10 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
 
   async function switchModel(provider: string, model: string) {
     try {
-      await rpc("model.switch", { provider, model });
+      await rpc("model_switch", { provider, model });
       onModelChange();
     } catch (error) {
       onLog(`model switch failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 }
-

@@ -1,8 +1,9 @@
 import { useMemo, useState } from "react";
-import { Copy, Search, Trash2 } from "lucide-react";
+import { Copy, Download, Search, Trash2 } from "lucide-react";
 import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import type { Asset, Entity } from "../../lib/types";
 
 interface AssetLibraryProps {
@@ -68,13 +69,23 @@ export function AssetLibrary({ assets, entities, onPromote, onRemove, onDedupe, 
                   ))}
                 </div>
               </div>
-              <div className="flex flex-col gap-1">
-                <Button variant="secondary" size="sm" onClick={() => onPromote(asset)}>
-                  Promote
-                </Button>
-                <Button variant="ghost" size="icon" aria-label={`Remove ${asset.name}`} onClick={() => onRemove(asset.id)}>
-                  <Trash2 className="h-3.5 w-3.5" />
-                </Button>
+              <div className="flex shrink-0 flex-col gap-1">
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="secondary" size="icon" aria-label={`Promote ${asset.name}`} onClick={() => onPromote(asset)}>
+                      <Download className="h-3.5 w-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Promote to scene</TooltipContent>
+                </Tooltip>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button variant="ghost" size="icon" aria-label={`Remove ${asset.name}`} onClick={() => onRemove(asset.id)}>
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Remove asset</TooltipContent>
+                </Tooltip>
               </div>
             </div>
           ))
@@ -83,4 +94,3 @@ export function AssetLibrary({ assets, entities, onPromote, onRemove, onDedupe, 
     </div>
   );
 }
-

@@ -57,14 +57,14 @@ export default function App() {
   useEffect(() => {
     void (async () => {
       try {
-        const loaded = (await rpc("project.open", { slug: "starter" })) as Project;
+        const loaded = (await rpc("project_open", { slug: "starter" })) as Project;
         setProject(loaded);
         setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
       } catch {
         pushLog("core unavailable; using local starter project", "error");
       }
       try {
-        setModelList(await rpc("model.list", {}));
+        setModelList(await rpc("model_list", {}));
       } catch (error) {
         pushLog(`model list failed: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -305,14 +305,14 @@ export default function App() {
   );
 
   useEffect(() => {
-    void rpc("tool.register", {
+    void rpc("tool_register", {
       tools: browserTools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
     }).catch((error) => pushLog(`tool registration failed: ${error instanceof Error ? error.message : String(error)}`));
   }, [browserTools, pushLog]);
 
   const saveProject = async () => {
     try {
-      await rpc("project.save", { project });
+      await rpc("project_save", { project });
       pushLog(`saved ${project.slug}`);
     } catch (error) {
       pushLog(`save failed: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -321,7 +321,7 @@ export default function App() {
 
   const checkpointProject = async () => {
     try {
-      const result = await rpc<{ id: string }>("project.checkpoint", { slug: project.slug });
+      const result = await rpc<{ id: string }>("project_checkpoint", { slug: project.slug });
       pushLog(`checkpoint ${result.id}`);
     } catch (error) {
       pushLog(`checkpoint failed: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -332,7 +332,7 @@ export default function App() {
     if (!runtime) return;
     const results = await runTests(project, runtime, project.tests, pushLog, async (name, dataUrl, threshold = 8) => {
       try {
-        const result = await rpc<{ pass: boolean; distance: number; threshold: number }>("test.baseline.compare", {
+        const result = await rpc<{ pass: boolean; distance: number; threshold: number }>("test_baseline_compare", {
           slug: project.slug,
           name,
           image: dataUrl.split(",")[1] ?? "",
@@ -367,23 +367,23 @@ export default function App() {
     const data = await readFileBase64(file);
     const mime = file.type || "application/octet-stream";
     try {
-      await rpc("asset.import_file", { slug: project.slug, name: file.name, data, mime, tags: ["imported"] });
+      await rpc("asset_import_file", { slug: project.slug, name: file.name, data, mime, tags: ["imported"] });
       if (mime.startsWith("image/")) {
-        const ingest = await rpc<{ sourceHash: string; width: number; height: number }>("image3d.ingest", {
+        const ingest = await rpc<{ sourceHash: string; width: number; height: number }>("image3d_ingest", {
           slug: project.slug,
           name: file.name,
           image: data,
         });
-        const spec = await rpc("image3d.spec", {
+        const spec = await rpc("image3d_spec", {
           name: file.name,
           sourceHash: ingest.sourceHash,
           width: ingest.width,
           height: ingest.height,
         });
-        await rpc("image3d.generate", { slug: project.slug, spec });
+        await rpc("image3d_generate", { slug: project.slug, spec });
         pushLog(`image-to-3D spec generated for ${file.name}`);
       }
-      const loaded = await rpc<Project>("project.open", { slug: project.slug });
+      const loaded = await rpc<Project>("project_open", { slug: project.slug });
       setProject(loaded);
       pushLog(`imported ${file.name}`);
     } catch (error) {
@@ -393,7 +393,7 @@ export default function App() {
 
   const handleDedupe = async () => {
     try {
-      const result = await rpc<{ sha256: string; files: string[] }[]>("asset.hash_dedupe", { slug: project.slug });
+      const result = await rpc<{ sha256: string; files: string[] }[]>("asset_hash_dedupe", { slug: project.slug });
       pushLog(result.length === 0 ? "no duplicate assets" : `found ${result.length} duplicate groups`);
     } catch (error) {
       pushLog(`dedupe failed: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -544,7 +544,7 @@ export default function App() {
                 modelList={modelList}
                 browserTools={browserTools}
                 onModelChange={() =>
-                  void rpc<ModelList>("model.list", {}).then((list) => setModelList(list)).catch(() => undefined)
+                  void rpc<ModelList>("model_list", {}).then((list) => setModelList(list)).catch(() => undefined)
                 }
                 onLog={pushLog}
               />

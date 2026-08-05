@@ -32,19 +32,28 @@ model:
   api_key_env: CALI_OPENAI_API_KEY
 ```
 
-Provider presets: `openai`, `openrouter`, `local`. Switch from the agent panel
-or with `/model provider:model`.
+Provider presets: `openai`, `codex-router`, `openrouter`, `local`. Switch from
+the agent panel or with `/model provider:model`.
+
+`codex-router` points at the local Codex Router gateway
+(`http://127.0.0.1:4100/v1`) and reuses the router's managed provider
+credentials, so DeepSeek and other router-enabled models work without a second
+API key:
+
+```bash
+rpc '{"jsonrpc":"2.0","id":1,"method":"model_switch","params":{"provider":"codex-router","model":"deepseek-v4-flash"}}'
+```
 
 ## Main RPC Methods
 
-- `project.create`, `project.list`, `project.open`, `project.save`, `project.checkpoint`, `project.revert`
-- `model.list`, `model.switch`
-- `file.read`, `file.write`
-- `asset.import_file`, `asset.hash_dedupe`, `asset.usage`, `asset.export_gltf`
-- `test.baseline.save`, `test.baseline.compare`
-- `image3d.ingest`, `image3d.assess`, `image3d.spec`, `image3d.validate`, `image3d.generate`, `image3d.review`
-- `tool.register`, `tool.list`
-- `agent.chat`, `agent.tool_result`, `agent.approval_response`, `agent.sessions`
+- `project_create`, `project_list`, `project_open`, `project_save`, `project_checkpoint`, `project_revert`
+- `model_list`, `model_switch`
+- `file_read`, `file_write`
+- `asset_import_file`, `asset_hash_dedupe`, `asset_usage`, `asset_export_gltf`
+- `test_baseline_save`, `test_baseline_compare`
+- `image3d_ingest`, `image3d_assess`, `image3d_spec`, `image3d_validate`, `image3d_generate`, `image3d_review`
+- `tool_register`, `tool_list`
+- `agent_chat`, `agent_tool_result`, `agent_approval_response`, `agent_sessions`
 
 ## Browser Agent Tools
 
@@ -52,4 +61,3 @@ or with `/model provider:model`.
 `editor.update_transform`, `editor.script_write`, `editor.run_pie`,
 `editor.capture_frame`, `editor.run_tests`, `editor.asset_generate`,
 `editor.asset_preview`, `editor.promote_asset`.
-

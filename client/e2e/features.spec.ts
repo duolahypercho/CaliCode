@@ -1,0 +1,56 @@
+import { expect, test } from "@playwright/test";
+
+const PNG_1PX =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+test("workbench generates, promotes, and library shows usage", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Workbench" }).click();
+  await page.getByRole("button", { name: /Add to library/i }).click();
+  await page.getByRole("tab", { name: "Assets", exact: true }).first().click();
+  await expect(page.locator("aside").getByText("Box Asset").first()).toBeVisible();
+  await page.getByRole("button", { name: "Promote Box Asset" }).click();
+  await page.getByRole("tab", { name: "Scene", exact: true }).first().click();
+  await expect(page.locator("aside").getByRole("button", { name: /Box Asset/i })).toBeVisible();
+});
+
+test("scene graph selects and inspector renames an entity", async ({ page }) => {
+  await page.goto("/");
+  await page.getByText("Hero Cube").click();
+  await page.getByLabel("Name").fill("Renamed Hero");
+  await page.getByRole("button", { name: "Apply" }).click();
+  await expect(page.getByText("Renamed Hero").first()).toBeVisible();
+});
+
+test("script editor saves edits", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Scripts" }).click();
+  await page.getByLabel("spin source").fill("function update(e) { return e; }");
+  await page.getByRole("button", { name: "Save script" }).click();
+  await expect(page.getByLabel("spin source")).toHaveValue("function update(e) { return e; }");
+});
+
+test("theme toggles between light and dark", async ({ page }) => {
+  await page.goto("/");
+  const html = page.locator("html");
+  const initial = await html.getAttribute("class");
+  await page.getByRole("button", { name: "Toggle theme" }).click();
+  await expect
+    .poll(async () => html.getAttribute("class"))
+    .not.toBe(initial);
+});
+
+test("image import triggers image-to-3D and lands in the library", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Workbench" }).click();
+  await page.getByRole("tab", { name: "Import" }).click();
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "asset.png",
+    mimeType: "image/png",
+    buffer: Buffer.from(PNG_1PX, "base64"),
+  });
+  await page.getByRole("tab", { name: "Console" }).click();
+  await expect(page.getByText(/imported asset\.png/i)).toBeVisible();
+  await page.getByRole("tab", { name: "Assets", exact: true }).first().click();
+  await expect(page.locator("aside").getByText("asset.png").first()).toBeVisible();
+});

@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 pub const DEFAULT_CONFIG_PATH: &str = "~/.cali/config.yaml";
+pub const CODEX_ROUTER_PROVIDER_ID: &str = "codex-router";
+pub const CODEX_ROUTER_BASE_URL: &str = "http://127.0.0.1:4100/v1";
+const CODEX_ROUTER_KEY_ENV: &str = "CALI_CODEX_ROUTER_KEY";
+const CODEX_ROUTER_STATE_KEY: &str = "~/.codex/codex-router/internal-secret";
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -78,6 +82,12 @@ pub fn default_providers() -> Vec<ProviderPreset> {
             api_key_env: "CALI_OPENAI_API_KEY".into(),
         },
         ProviderPreset {
+            id: CODEX_ROUTER_PROVIDER_ID.into(),
+            label: "Codex Router".into(),
+            base_url: CODEX_ROUTER_BASE_URL.into(),
+            api_key_env: CODEX_ROUTER_KEY_ENV.into(),
+        },
+        ProviderPreset {
             id: "openrouter".into(),
             label: "OpenRouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
@@ -103,6 +113,12 @@ pub fn load() -> Result<AppConfig> {
     };
     if config.providers.is_empty() {
         config.providers = default_providers();
+    } else {
+        for preset in default_providers() {
+            if !config.providers.iter().any(|existing| existing.id == preset.id) {
+                config.providers.push(preset);
+            }
+        }
     }
     Ok(config)
 }
@@ -132,7 +148,21 @@ pub fn api_key(config: &AppConfig) -> String {
         .find(|p| p.id == config.model.provider)
         .map(|p| p.api_key_env.clone())
         .unwrap_or_else(|| config.model.api_key_env.clone());
-    std::env::var(&key).unwrap_or_default()
+    std::env::var(&key).unwrap_or_default().trim().to_string()
+}
+
+/// The router keeps its loopback service key in protected state, so Cali can
+/// reuse the router's configured providers without duplicating credentials.
+pub fn router_key() -> String {
+    if let Some(key) = std::env::var(CODEX_ROUTER_KEY_ENV).ok().map(|value| value.trim().to_string()) {
+        if !key.is_empty() {
+            return key;
+        }
+    }
+    std::fs::read_to_string(expand_tilde(CODEX_ROUTER_STATE_KEY))
+        .ok()
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -157,5 +187,25 @@ mod tests {
     fn tilde_expands() {
         let p = expand_tilde("~/cali");
         assert!(p.is_absolute());
+    }
+
+    #[test]
+    fn default_providers_include_codex_router() {
+        let providers = default_providers();
+        let preset = providers
+            .iter()
+            .find(|p| p.id == crate::config::CODEX_ROUTER_PROVIDER_ID)
+            .expect("codex-router preset should exist");
+        assert_eq!(preset.base_url, crate::config::CODEX_ROUTER_BASE_URL);
+    }
+
+    #[test]
+    fn api_key_prefers_the_presets_env_var() {
+        let mut config = AppConfig::default();
+        config.providers = default_providers();
+        config.model.provider = crate::config::CODEX_ROUTER_PROVIDER_ID.into();
+        std::env::set_var("CALI_CODEX_ROUTER_KEY", "env-key");
+        assert_eq!(api_key(&config), "env-key");
+        std::env::remove_var("CALI_CODEX_ROUTER_KEY");
     }
 }

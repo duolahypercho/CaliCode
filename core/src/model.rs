@@ -23,7 +23,11 @@ pub async fn chat(
     tools: Option<&[Value]>,
     delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
 ) -> Result<ChatResult> {
-    let key = api_key(config);
+    let key = if config.model.provider == crate::config::CODEX_ROUTER_PROVIDER_ID {
+        crate::config::router_key()
+    } else {
+        api_key(config)
+    };
     if key.is_empty() && !config.model.base_url.contains("127.0.0.1") {
         anyhow::bail!(
             "model key is not configured; set {} and restart core",
@@ -160,13 +164,13 @@ mod tests {
                     "tool_calls": [{
                         "index": 0,
                         "id": "call-1",
-                        "function": { "name": "project.list", "arguments": "{}" }
+                        "function": { "name": "project_list", "arguments": "{}" }
                     }]
                 }
             }]
         });
         let delta = payload["choices"][0]["delta"].clone();
-        assert_eq!(delta["tool_calls"][0]["function"]["name"], "project.list");
+        assert_eq!(delta["tool_calls"][0]["function"]["name"], "project_list");
     }
 
     #[tokio::test]

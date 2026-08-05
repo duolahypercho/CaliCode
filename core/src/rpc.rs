@@ -39,11 +39,11 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             let config = state.config.read().await;
             Ok(serde_json::to_value(&*config)?)
         }
-        "model.list" => {
+        "model_list" => {
             let config = state.config.read().await;
             Ok(model_list(&*config)?)
         }
-        "model.switch" => {
+        "model_switch" => {
             let mut config = state.config.write().await;
             Ok(model_switch(
                 &mut config,
@@ -51,36 +51,36 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 str_param(&params, "model")?,
             )?)
         }
-        "project.create" => {
+        "project_create" => {
             let slug = str_param(&params, "slug")?;
             let title = params.get("title").and_then(|v| v.as_str()).unwrap_or(slug);
             Ok(store::create_project(&state.projects_root, slug, title)?)
         }
-        "project.list" => Ok(store::list_projects(&state.projects_root)?),
-        "project.open" => Ok(store::read_project(&state.projects_root, str_param(&params, "slug")?)?),
-        "project.save" => {
+        "project_list" => Ok(store::list_projects(&state.projects_root)?),
+        "project_open" => Ok(store::read_project(&state.projects_root, str_param(&params, "slug")?)?),
+        "project_save" => {
             let project = params.get("project").context("project missing")?;
             let slug = str_param(project, "slug")?;
             store::write_project(&state.projects_root, slug, project)?;
             Ok(json!({ "saved": true, "slug": slug }))
         }
-        "project.checkpoint" => Ok(store::checkpoint_project(
+        "project_checkpoint" => Ok(store::checkpoint_project(
             &state.projects_root,
             str_param(&params, "slug")?,
         )?),
-        "project.revert" => Ok(store::revert_checkpoint(
+        "project_revert" => Ok(store::revert_checkpoint(
             &state.projects_root,
             str_param(&params, "slug")?,
             str_param(&params, "checkpointId")?,
         )?),
-        "project.starter" => Ok(serde_json::from_str(store::SAMPLE_PROJECT)?),
-        "file.read" => {
+        "project_starter" => Ok(serde_json::from_str(store::SAMPLE_PROJECT)?),
+        "file_read" => {
             let slug = str_param(&params, "slug")?;
             let path = store::safe_join(&store::project_dir(&state.projects_root, slug)?, str_param(&params, "path")?)?;
             let content = std::fs::read_to_string(&path)?;
             Ok(json!({ "path": params["path"], "content": content }))
         }
-        "file.write" => {
+        "file_write" => {
             let slug = str_param(&params, "slug")?;
             let path = store::safe_join(&store::project_dir(&state.projects_root, slug)?, str_param(&params, "path")?)?;
             if let Some(parent) = path.parent() {
@@ -89,7 +89,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             std::fs::write(&path, str_param(&params, "content")?)?;
             Ok(json!({ "path": params["path"], "written": true }))
         }
-        "asset.import_file" => {
+        "asset_import_file" => {
             let tags = params["tags"]
                 .as_array()
                 .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
@@ -103,51 +103,51 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 tags,
             )?)
         }
-        "asset.list" => {
+        "asset_list" => {
             let project = store::read_project(&state.projects_root, str_param(&params, "slug")?)?;
             Ok(project["assets"].clone())
         }
-        "asset.files" => Ok(assets::list_files(&state.projects_root, str_param(&params, "slug")?)?),
-        "asset.hash_dedupe" => Ok(assets::dedupe(&state.projects_root, str_param(&params, "slug")?)?),
-        "asset.usage" => Ok(assets::usage(&state.projects_root, str_param(&params, "slug")?)?),
-        "asset.export_gltf" => Ok(assets::export_gltf(
+        "asset_files" => Ok(assets::list_files(&state.projects_root, str_param(&params, "slug")?)?),
+        "asset_hash_dedupe" => Ok(assets::dedupe(&state.projects_root, str_param(&params, "slug")?)?),
+        "asset_usage" => Ok(assets::usage(&state.projects_root, str_param(&params, "slug")?)?),
+        "asset_export_gltf" => Ok(assets::export_gltf(
             &state.projects_root,
             str_param(&params, "slug")?,
             str_param(&params, "assetId")?,
         )?),
-        "test.baseline.save" => Ok(baselines::save_baseline(
+        "test_baseline_save" => Ok(baselines::save_baseline(
             &state.projects_root,
             str_param(&params, "slug")?,
             str_param(&params, "name")?,
             str_param(&params, "image")?,
         )?),
-        "test.baseline.compare" => Ok(baselines::compare_baseline(
+        "test_baseline_compare" => Ok(baselines::compare_baseline(
             &state.projects_root,
             str_param(&params, "slug")?,
             str_param(&params, "name")?,
             str_param(&params, "image")?,
             params.get("threshold").and_then(|v| v.as_u64()).unwrap_or(8) as u32,
         )?),
-        "image3d.ingest" => Ok(image3d::ingest(
+        "image3d_ingest" => Ok(image3d::ingest(
             &state.projects_root,
             str_param(&params, "slug")?,
             str_param(&params, "name")?,
             str_param(&params, "image")?,
         )?),
-        "image3d.assess" => Ok(image3d::assess(
+        "image3d_assess" => Ok(image3d::assess(
             str_param(&params, "name")?,
             str_param(&params, "sourceHash")?,
             params.get("width").and_then(|v| v.as_u64()).unwrap_or(512) as u32,
             params.get("height").and_then(|v| v.as_u64()).unwrap_or(512) as u32,
         )),
-        "image3d.spec" => Ok(image3d::spec(
+        "image3d_spec" => Ok(image3d::spec(
             str_param(&params, "name")?,
             str_param(&params, "sourceHash")?,
             params.get("width").and_then(|v| v.as_u64()).unwrap_or(512) as u32,
             params.get("height").and_then(|v| v.as_u64()).unwrap_or(512) as u32,
         )),
-        "image3d.validate" => Ok(image3d::validate_spec(&params["spec"])?),
-        "image3d.generate" => {
+        "image3d_validate" => Ok(image3d::validate_spec(&params["spec"])?),
+        "image3d_generate" => {
             let mut spec = params.get("spec").cloned().unwrap_or_else(|| json!({}));
             if spec.get("assessment").is_none() {
                 spec["assessment"] = image3d::assess(
@@ -162,14 +162,14 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             }
             Ok(image3d::generate(&state.projects_root, str_param(&params, "slug")?, spec)?)
         }
-        "image3d.review" => Ok(image3d::review(
+        "image3d_review" => Ok(image3d::review(
             &state.projects_root,
             str_param(&params, "slug")?,
             str_param(&params, "assetId")?,
             str_param(&params, "image")?,
             str_param(&params, "passId")?,
         )?),
-        "tool.register" => {
+        "tool_register" => {
             let mut tools = state.tools.write().await;
             if let Some(list) = params["tools"].as_array() {
                 for item in list {
@@ -184,7 +184,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             }
             Ok(json!({ "registered": tools.len() }))
         }
-        "tool.list" => {
+        "tool_list" => {
             let tools = state.tools.read().await;
             let list: Vec<Value> = tools
                 .values()
@@ -192,7 +192,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 .collect();
             Ok(json!(list))
         }
-        "agent.chat" => {
+        "agent_chat" => {
             let messages = params.get("messages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
             let registered = state.tools.read().await.clone();
             let system = params
@@ -211,17 +211,17 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             let session_id = params.get("sessionId").and_then(|v| v.as_str());
             Ok(state.agents.chat(state, &registered, session_id, &messages, options).await?)
         }
-        "agent.tool_result" => Ok(state.agents.submit_tool_result(
+        "agent_tool_result" => Ok(state.agents.submit_tool_result(
             str_param(&params, "sessionId")?,
             str_param(&params, "requestId")?,
             params.get("result").cloned().unwrap_or(Value::Null),
         ).await?),
-        "agent.approval_response" => Ok(state.agents.submit_approval(
+        "agent_approval_response" => Ok(state.agents.submit_approval(
             str_param(&params, "sessionId")?,
             str_param(&params, "requestId")?,
             params.get("approved").and_then(|v| v.as_bool()).unwrap_or(false),
         ).await?),
-        "agent.sessions" => Ok(json!(state.agents.sessions().await)),
+        "agent_sessions" => Ok(json!(state.agents.sessions().await)),
         _ => anyhow::bail!("unknown method {}", method),
     }
 }

@@ -26,97 +26,97 @@ pub enum ToolKind {
 pub fn core_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
-            name: "project.list".into(),
+            name: "project_list".into(),
             description: "List saved Cali projects.".into(),
             parameters: json!({"type":"object","properties":{}}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "project.open".into(),
+            name: "project_open".into(),
             description: "Open a project by slug and return its full JSON state.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "project.checkpoint".into(),
+            name: "project_checkpoint".into(),
             description: "Snapshot a project before a risky edit so it can be reverted.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "project.revert".into(),
+            name: "project_revert".into(),
             description: "Revert a project to a previous checkpoint.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"checkpointId":{"type":"string"}},"required":["slug","checkpointId"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "file.read".into(),
+            name: "file_read".into(),
             description: "Read a UTF-8 text file inside the active project.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"path":{"type":"string"}},"required":["slug","path"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "file.write".into(),
+            name: "file_write".into(),
             description: "Write UTF-8 text inside the active project (scripts, tests, docs).".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["slug","path","content"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "asset.import_file".into(),
+            name: "asset_import_file".into(),
             description: "Import a file into the asset library as base64 data.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"data":{"type":"string"},"mime":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}},"required":["slug","name","data","mime"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "asset.hash_dedupe".into(),
+            name: "asset_hash_dedupe".into(),
             description: "Find duplicate asset files by SHA-256.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "asset.usage".into(),
+            name: "asset_usage".into(),
             description: "Count entity references per asset.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "asset.export_gltf".into(),
+            name: "asset_export_gltf".into(),
             description: "Export an asset entry to a minimal glTF 2.0 file.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"assetId":{"type":"string"}},"required":["slug","assetId"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "test.baseline.save".into(),
+            name: "test_baseline_save".into(),
             description: "Save a screenshot baseline for a named test.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"image":{"type":"string"}},"required":["slug","name","image"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "test.baseline.compare".into(),
+            name: "test_baseline_compare".into(),
             description: "Compare a screenshot to a saved baseline with perceptual hashing.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"image":{"type":"string"},"threshold":{"type":"number"}},"required":["slug","name","image"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "image3d.ingest".into(),
+            name: "image3d_ingest".into(),
             description: "Admit a reference image into the Rust image-to-3D pipeline.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"image":{"type":"string"}},"required":["slug","name","image"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "image3d.validate".into(),
+            name: "image3d_validate".into(),
             description: "Strictly validate an image3d spec before generation.".into(),
             parameters: json!({"type":"object","properties":{"spec":{"type":"object"}},"required":["spec"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "model.list".into(),
+            name: "model_list".into(),
             description: "List configured model providers and the active model.".into(),
             parameters: json!({"type":"object","properties":{}}),
             kind: ToolKind::Core,
         },
         ToolDef {
-            name: "model.switch".into(),
+            name: "model_switch".into(),
             description: "Switch the active provider and model.".into(),
             parameters: json!({"type":"object","properties":{"provider":{"type":"string"},"model":{"type":"string"}},"required":["provider","model"]}),
             kind: ToolKind::Core,
@@ -144,20 +144,20 @@ pub async fn execute_core_tool(
     let root = projects_root;
     let config = state.config.read().await;
     match tool.name.as_str() {
-        "project.list" => Ok(store::list_projects(root)?),
-        "project.open" => Ok(store::read_project(root, required_str(args, "slug")?)?),
-        "project.checkpoint" => Ok(store::checkpoint_project(root, required_str(args, "slug")?)?),
-        "project.revert" => Ok(store::revert_checkpoint(
+        "project_list" => Ok(store::list_projects(root)?),
+        "project_open" => Ok(store::read_project(root, required_str(args, "slug")?)?),
+        "project_checkpoint" => Ok(store::checkpoint_project(root, required_str(args, "slug")?)?),
+        "project_revert" => Ok(store::revert_checkpoint(
             root,
             required_str(args, "slug")?,
             required_str(args, "checkpointId")?,
         )?),
-        "file.read" => {
+        "file_read" => {
             let path = store::safe_join(&store::project_dir(root, required_str(args, "slug")?)?, required_str(args, "path")?)?;
             let text = std::fs::read_to_string(&path)?;
             Ok(json!({ "path": args["path"], "content": text }))
         }
-        "file.write" => {
+        "file_write" => {
             let dir = store::project_dir(root, required_str(args, "slug")?)?;
             let path = store::safe_join(&dir, required_str(args, "path")?)?;
             if let Some(parent) = path.parent() {
@@ -166,7 +166,7 @@ pub async fn execute_core_tool(
             std::fs::write(&path, required_str(args, "content")?)?;
             Ok(json!({ "path": args["path"], "written": true }))
         }
-        "asset.import_file" => {
+        "asset_import_file" => {
             let tags = args["tags"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
             Ok(crate::assets::import_file(
                 root,
@@ -177,35 +177,35 @@ pub async fn execute_core_tool(
                 tags,
             )?)
         }
-        "asset.hash_dedupe" => Ok(crate::assets::dedupe(root, required_str(args, "slug")?)?),
-        "asset.usage" => Ok(crate::assets::usage(root, required_str(args, "slug")?)?),
-        "asset.export_gltf" => Ok(crate::assets::export_gltf(
+        "asset_hash_dedupe" => Ok(crate::assets::dedupe(root, required_str(args, "slug")?)?),
+        "asset_usage" => Ok(crate::assets::usage(root, required_str(args, "slug")?)?),
+        "asset_export_gltf" => Ok(crate::assets::export_gltf(
             root,
             required_str(args, "slug")?,
             required_str(args, "assetId")?,
         )?),
-        "test.baseline.save" => Ok(baselines::save_baseline(
+        "test_baseline_save" => Ok(baselines::save_baseline(
             root,
             required_str(args, "slug")?,
             required_str(args, "name")?,
             required_str(args, "image")?,
         )?),
-        "test.baseline.compare" => Ok(baselines::compare_baseline(
+        "test_baseline_compare" => Ok(baselines::compare_baseline(
             root,
             required_str(args, "slug")?,
             required_str(args, "name")?,
             required_str(args, "image")?,
             args["threshold"].as_u64().unwrap_or(8) as u32,
         )?),
-        "image3d.ingest" => Ok(image3d::ingest(
+        "image3d_ingest" => Ok(image3d::ingest(
             root,
             required_str(args, "slug")?,
             required_str(args, "name")?,
             required_str(args, "image")?,
         )?),
-        "image3d.validate" => Ok(image3d::validate_spec(&args["spec"])?),
-        "model.list" => Ok(model_list(&*config)?),
-        "model.switch" => {
+        "image3d_validate" => Ok(image3d::validate_spec(&args["spec"])?),
+        "model_list" => Ok(model_list(&*config)?),
+        "model_switch" => {
             drop(config);
             let mut config = state.config.write().await;
             model_switch(&mut config, required_str(args, "provider")?, required_str(args, "model")?)

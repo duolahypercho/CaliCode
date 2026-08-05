@@ -45,20 +45,25 @@ impl AgentManager {
         options: AgentOptions,
     ) -> Result<Value> {
         let session = self.get_or_create(session_id).await?;
-        let sid = session.lock().await.id.clone();
-        let mut guard = session.lock().await;
-        if options.system.is_some() && guard.messages.is_empty() {
-            guard.messages.push(json!({
-                "role": "system",
-                "content": options.system.clone().unwrap_or_default()
-            }));
-        }
-        for message in messages {
-            guard.messages.push(message.clone());
+        let current_session_id = {
+            let guard = session.lock().await;
+            guard.id.clone()
+        };
+        {
+            let mut guard = session.lock().await;
+            if options.system.is_some() && guard.messages.is_empty() {
+                guard.messages.push(json!({
+                    "role": "system",
+                    "content": options.system.clone().unwrap_or_default()
+                }));
+            }
+            for message in messages {
+                guard.messages.push(message.clone());
+            }
         }
         let mut turns = 0usize;
         let max_turns = options.max_turns.clamp(1, 30);
-        let tool_calls_log: Vec<Value> = Vec::new();
+        let mut tool_calls_log: Vec<Value> = Vec::new();
 
         loop {
             if turns >= max_turns {
@@ -69,7 +74,7 @@ impl AgentManager {
             let schemas: Vec<Value> = defs.iter().map(to_openai_schema).collect();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let bus = self.events.clone();
-            let sid_for_delta = sid.clone();
+            let sid_for_delta = current_session_id.clone();
             tokio::spawn(async move {
                 while let Some(delta) = rx.recv().await {
                     let _ = bus.send(json!({
@@ -80,38 +85,50 @@ impl AgentManager {
                 }
             });
             let config = state.config.read().await;
-            let result = model::chat(&*config, &guard.messages, Some(&schemas), Some(&tx)).await?;
+            let snapshot = {
+                let guard = session.lock().await;
+                guard.messages.clone()
+            };
+            let result = model::chat(&*config, &snapshot, Some(&schemas), Some(&tx)).await?;
             drop(config);
             drop(tx);
             if result.content.is_empty() && result.tool_calls.is_empty() {
-                guard
-                    .messages
-                    .push(json!({ "role": "assistant", "content": "I could not produce a response." }));
+                let mut guard = session.lock().await;
+                guard.messages.push(json!({ "role": "assistant", "content": "I could not produce a response." }));
                 break;
             }
 
             if result.tool_calls.is_empty() {
-                guard
-                    .messages
-                    .push(json!({ "role": "assistant", "content": result.content }));
+                {
+                    let mut guard = session.lock().await;
+                    guard.messages.push(json!({ "role": "assistant", "content": result.content.clone() }));
+                }
                 return Ok(json!({
-                    "sessionId": sid,
+                    "sessionId": current_session_id,
                     "reply": result.content,
                     "toolCalls": tool_calls_log,
                     "turns": turns
                 }));
             }
 
-            guard.messages.push(json!({
-                "role": "assistant",
-                "content": result.content,
-                "tool_calls": result.tool_calls.iter().map(assistant_tool_call).collect::<Vec<_>>()
-            }));
+            {
+                let mut guard = session.lock().await;
+                guard.messages.push(json!({
+                    "role": "assistant",
+                    "content": result.content,
+                    "tool_calls": result.tool_calls.iter().map(assistant_tool_call).collect::<Vec<_>>()
+                }));
+            }
 
             for call in &result.tool_calls {
+                tool_calls_log.push(json!({
+                    "name": call.name,
+                    "arguments": call.arguments,
+                    "id": call.id
+                }));
                 let _ = self.events.send(json!({
                     "type": "agent.tool_started",
-                    "sessionId": sid,
+                    "sessionId": current_session_id,
                     "tool": call.name,
                     "arguments": call.arguments
                 }));
@@ -119,8 +136,8 @@ impl AgentManager {
                     .execute_tool_call(
                         state,
                         registered_tools,
-                        &mut guard,
-                        &sid,
+                        &session,
+                        &current_session_id,
                         call,
                         &options,
                     )
@@ -129,27 +146,32 @@ impl AgentManager {
                     Ok(value) => value,
                     Err(error) => json!({ "error": error.to_string() }),
                 };
-                guard
-                    .messages
-                    .push(json!({ "role": "tool", "tool_call_id": call.id, "content": outcome.to_string() }));
+                {
+                    let mut guard = session.lock().await;
+                    guard.messages.push(json!({ "role": "tool", "tool_call_id": call.id, "content": outcome.to_string() }));
+                }
                 let _ = self.events.send(json!({
                     "type": "agent.tool_finished",
-                    "sessionId": sid,
+                    "sessionId": current_session_id,
                     "tool": call.name,
                     "result": outcome
                 }));
             }
         }
 
-        let last = guard
-            .messages
-            .iter()
-            .rev()
-            .find(|m| m["role"] == "assistant")
-            .and_then(|m| m["content"].as_str())
-            .unwrap_or("Turn limit reached");
+        let last = {
+            let guard = session.lock().await;
+            guard
+                .messages
+                .iter()
+                .rev()
+                .find(|m| m["role"] == "assistant")
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or("Turn limit reached")
+                .to_string()
+        };
         Ok(json!({
-            "sessionId": sid,
+            "sessionId": current_session_id,
             "reply": last,
             "toolCalls": tool_calls_log,
             "turns": turns
@@ -232,7 +254,7 @@ impl AgentManager {
         &self,
         state: &AppState,
         registered: &HashMap<String, ToolDef>,
-        session: &mut AgentSession,
+        session: &Arc<Mutex<AgentSession>>,
         sid: &str,
         call: &ToolCall,
         options: &AgentOptions,
@@ -247,7 +269,10 @@ impl AgentManager {
         if requires_approval(&options.permission_mode, &def.name) {
             let request_id = format!("approval-{}", Uuid::new_v4().simple());
             let (tx, rx) = oneshot::channel();
-            session.pending.insert(request_id.clone(), tx);
+            {
+                let mut guard = session.lock().await;
+                guard.pending.insert(request_id.clone(), tx);
+            }
             let _ = self.events.send(json!({
                 "type": "agent.approval_request",
                 "sessionId": sid,
@@ -270,7 +295,10 @@ impl AgentManager {
 
         let request_id = format!("tool-{}", Uuid::new_v4().simple());
         let (tx, rx) = oneshot::channel();
-        session.pending.insert(request_id.clone(), tx);
+        {
+            let mut guard = session.lock().await;
+            guard.pending.insert(request_id.clone(), tx);
+        }
         let _ = self.events.send(json!({
             "type": "agent.tool_request",
             "sessionId": sid,
@@ -299,7 +327,214 @@ fn assistant_tool_call(call: &ToolCall) -> Value {
 fn requires_approval(mode: &str, tool: &str) -> bool {
     match mode {
         "supervised" => true,
-        "auto-accept-edits" => tool == "project.revert" || tool.starts_with("image3d."),
+        "auto-accept-edits" => tool == "project_revert" || tool.starts_with("image3d_"),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{AppConfig, ModelConfig};
+    use axum::extract::State;
+    use axum::response::sse::{Event, Sse};
+    use axum::routing::post;
+    use axum::Router;
+    use std::convert::Infallible;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn mock_chat_stream(has_tool_result: bool) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let events = if has_tool_result {
+            vec![
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"role":"assistant","content":"Echo: "}}]}"#)),
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"content":"hello-agent"}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        } else {
+            vec![
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"editor_echo","arguments":"{\"message\":\"hello-agent\"}"}}]}}]}"#)),
+                Ok(Event::default().data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
+    async fn mock_provider(
+        State(calls): State<Arc<AtomicUsize>>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let has_tool_result = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|messages| messages.iter().any(|m| m["role"] == "tool"))
+            .unwrap_or(false);
+        calls.fetch_add(1, Ordering::SeqCst);
+        mock_chat_stream(has_tool_result)
+    }
+
+    #[tokio::test]
+    async fn browser_tool_loop_completes() {
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_provider))
+            .with_state(Arc::new(AtomicUsize::new(0)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = AppConfig {
+            model: ModelConfig {
+                default: "mock".into(),
+                provider: "mock".into(),
+                base_url: format!("http://{}/v1", addr),
+                api_key_env: "CALI_MOCK_KEY".into(),
+                temperature: 0.0,
+                max_tokens: Some(128),
+            },
+            providers: vec![],
+            projects_dir: None,
+        };
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = crate::AppState {
+            config: std::sync::Arc::new(tokio::sync::RwLock::new(config)),
+            projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+            agents: agents.clone(),
+            bus: bus.clone(),
+            tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
+        };
+
+        let responder_agents = agents.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                if event["type"] == "agent.tool_request" {
+                    let session_id = event["sessionId"].as_str().unwrap().to_string();
+                    let request_id = event["requestId"].as_str().unwrap().to_string();
+                    responder_agents
+                        .submit_tool_result(&session_id, &request_id, json!({ "message": "hello-agent" }))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let options = AgentOptions {
+            permission_mode: "full-access".into(),
+            max_turns: 5,
+            system: None,
+            project_slug: None,
+        };
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "call editor_echo" })],
+                options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["toolCalls"].as_array().unwrap().len(), 1);
+        assert!(result["reply"].as_str().unwrap().contains("hello-agent"));
+        responder.abort();
+    }
+
+    #[tokio::test]
+    async fn supervised_approval_flow_completes() {
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_provider))
+            .with_state(Arc::new(AtomicUsize::new(0)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let config = AppConfig {
+            model: ModelConfig {
+                default: "mock".into(),
+                provider: "mock".into(),
+                base_url: format!("http://{}/v1", addr),
+                api_key_env: "CALI_MOCK_KEY".into(),
+                temperature: 0.0,
+                max_tokens: Some(128),
+            },
+            providers: vec![],
+            projects_dir: None,
+        };
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = crate::AppState {
+            config: std::sync::Arc::new(tokio::sync::RwLock::new(config)),
+            projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+            agents: agents.clone(),
+            bus: bus.clone(),
+            tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
+        };
+
+        let responder_agents = agents.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                if event["type"] == "agent.approval_request" {
+                    let session_id = event["sessionId"].as_str().unwrap().to_string();
+                    let request_id = event["requestId"].as_str().unwrap().to_string();
+                    responder_agents
+                        .submit_approval(&session_id, &request_id, true)
+                        .await
+                        .unwrap();
+                }
+                if event["type"] == "agent.tool_request" {
+                    let session_id = event["sessionId"].as_str().unwrap().to_string();
+                    let request_id = event["requestId"].as_str().unwrap().to_string();
+                    responder_agents
+                        .submit_tool_result(&session_id, &request_id, json!({ "message": "hello-agent" }))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let options = AgentOptions {
+            permission_mode: "supervised".into(),
+            max_turns: 5,
+            system: None,
+            project_slug: None,
+        };
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "call editor_echo" })],
+                options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["toolCalls"].as_array().unwrap().len(), 1);
+        assert!(result["reply"].as_str().unwrap().contains("hello-agent"));
+        responder.abort();
     }
 }
