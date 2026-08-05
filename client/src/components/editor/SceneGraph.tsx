@@ -25,35 +25,35 @@ export function SceneGraph({ entities, selectedId, onSelect, onAdd, onRemove }: 
           <p className="px-2 py-3 text-xs text-muted-foreground">No entities yet. Add one to start building.</p>
         ) : (
           entities.map((entity) => (
-            <button
+            <div
               key={entity.id}
               className={cn(
                 "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent",
                 selectedId === entity.id && "bg-accent text-foreground",
               )}
-              onClick={() => onSelect(entity.id)}
             >
-              {entity.kind === "light" ? (
-                <Lightbulb className="h-3.5 w-3.5 text-muted-foreground" />
-              ) : (
-                <Box className="h-3.5 w-3.5 text-muted-foreground" />
-              )}
-              <span className="min-w-0 flex-1 truncate">{entity.name}</span>
+              <button
+                className="flex min-w-0 flex-1 items-center gap-2 text-left"
+                onClick={() => onSelect(entity.id)}
+              >
+                {entity.kind === "light" ? (
+                  <Lightbulb className="h-3.5 w-3.5 text-muted-foreground" />
+                ) : (
+                  <Box className="h-3.5 w-3.5 text-muted-foreground" />
+                )}
+                <span className="min-w-0 flex-1 truncate">{entity.name}</span>
+              </button>
               <button
                 className="hidden rounded p-0.5 text-muted-foreground hover:bg-border group-hover:block"
                 aria-label={`Remove ${entity.name}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  onRemove(entity.id);
-                }}
+                onClick={() => onRemove(entity.id)}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
-            </button>
+            </div>
           ))
         )}
       </div>
     </div>
   );
 }
-
