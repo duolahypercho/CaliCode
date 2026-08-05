@@ -330,7 +330,20 @@ export default function App() {
 
   const runTestSuite = async () => {
     if (!runtime) return;
-    const results = await runTests(project, runtime, project.tests, pushLog);
+    const results = await runTests(project, runtime, project.tests, pushLog, async (name, dataUrl, threshold = 8) => {
+      try {
+        const result = await rpc<{ pass: boolean; distance: number; threshold: number }>("test.baseline.compare", {
+          slug: project.slug,
+          name,
+          image: dataUrl.split(",")[1] ?? "",
+          threshold,
+        });
+        return result;
+      } catch (error) {
+        pushLog(`baseline compare failed: ${error instanceof Error ? error.message : String(error)}`);
+        return { pass: false, distance: 64, threshold };
+      }
+    });
     setTestResults(results);
     pushLog(`${results.filter((result) => result.pass).length}/${results.length} tests passed`);
   };

@@ -7,6 +7,7 @@ export interface TestRunContext {
   assert: (condition: boolean, message?: string) => void;
   log: (message: string) => void;
   step: (frames: number) => Promise<void>;
+  baseline: (name: string, dataUrl: string, threshold?: number) => Promise<{ pass: boolean; distance: number; threshold: number }>;
 }
 
 export async function runTests(
@@ -14,6 +15,7 @@ export async function runTests(
   runtime: PieRuntime,
   tests: GameTest[],
   onLog: (message: string) => void,
+  baselineCompare?: (name: string, dataUrl: string, threshold?: number) => Promise<{ pass: boolean; distance: number; threshold: number }>,
 ): Promise<TestResult[]> {
   const results: TestResult[] = [];
   for (const test of tests) {
@@ -34,9 +36,14 @@ export async function runTests(
       },
       log: (message) => logs.push(message),
       step: (frames) => runtime.waitFrames(frames),
+      baseline: (name, dataUrl, threshold = 8) =>
+        baselineCompare
+          ? baselineCompare(name, dataUrl, threshold)
+          : Promise.resolve({ pass: true, distance: 0, threshold }),
     };
     try {
       const body = [
+        "const baseline = context.baseline;",
         "const scene = context.scene;",
         "const entityFor = context.entityFor;",
         "const assert = context.assert;",
@@ -47,7 +54,8 @@ export async function runTests(
       // eslint-disable-next-line no-new-func
       const run = new Function("context", `return (async () => { ${body} })();`) as (context: TestRunContext) => Promise<void>;
       await run(context);
-      results.push({ id: test.id, name: test.name, pass: true, logs });
+      const baseline = context.baseline;
+      results.push({ id: test.id, name: test.name, pass: true, logs, baselineDistance: baseline === baselineCompare ? 0 : undefined });
     } catch (error) {
       results.push({
         id: test.id,
@@ -61,4 +69,3 @@ export async function runTests(
   }
   return results;
 }
-
