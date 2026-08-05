@@ -54,3 +54,31 @@ test("image import triggers image-to-3D and lands in the library", async ({ page
   await page.getByRole("tab", { name: "Assets", exact: true }).first().click();
   await expect(page.locator("aside").getByText("asset.png").first()).toBeVisible();
 });
+
+test("save, checkpoint, and tests report in console", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Save" }).click();
+  await page.getByRole("button", { name: "Checkpoint" }).click();
+  await page.getByRole("button", { name: "Run tests" }).click();
+  await page.getByRole("tab", { name: "Console" }).click();
+  await expect(page.getByText(/saved starter/i)).toBeVisible();
+  await expect(page.getByText(/checkpoint cp-/i)).toBeVisible();
+  await page.getByRole("tab", { name: "Tests" }).click();
+  await expect(page.getByText(/2 \/ 2 passed/i)).toBeVisible();
+});
+
+test("agent panel shows the active model", async ({ page }) => {
+  await page.goto("/");
+  await expect(page.getByRole("tab", { name: "Agent" })).toBeVisible();
+  await expect(page.getByText("Cali Agent")).toBeVisible();
+  await expect(page.getByLabel("Model provider")).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "Model", exact: true })).toBeVisible();
+});
+
+test("agent panel sends commands and surfaces errors", async ({ page }) => {
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Agent" }).click();
+  await page.getByLabel("Agent prompt").fill("/model missing-provider:test");
+  await page.keyboard.press("Enter");
+  await expect(page.getByText(/unknown provider missing-provider/i)).toBeVisible();
+});

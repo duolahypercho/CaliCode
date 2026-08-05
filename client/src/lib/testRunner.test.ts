@@ -32,5 +32,24 @@ describe("test runner", () => {
     expect(results[0].pass).toBe(false);
     expect(results[0].error).toContain("nope");
   });
-});
 
+  it("runs baseline comparisons in tests", async () => {
+    const project = starterProject();
+    project.tests = [
+      {
+        id: "baseline",
+        name: "Visual",
+        script:
+          "const result = await baseline('shot', 'data:image/png;base64,abc', 8); assert(result.pass, 'baseline failed');",
+      },
+    ];
+    const results = await runTests(
+      project,
+      new FakeRuntime() as never,
+      project.tests,
+      () => undefined,
+      async () => ({ pass: true, distance: 2, threshold: 8 }),
+    );
+    expect(results[0].pass).toBe(true);
+  });
+});
