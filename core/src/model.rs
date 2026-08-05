@@ -146,6 +146,11 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ModelConfig;
+    use axum::routing::post;
+    use axum::Router;
+    use axum::response::sse::{Event, Sse};
+    use std::convert::Infallible;
 
     #[test]
     fn tool_call_parse() {
@@ -162,5 +167,46 @@ mod tests {
         });
         let delta = payload["choices"][0]["delta"].clone();
         assert_eq!(delta["tool_calls"][0]["function"]["name"], "project.list");
+    }
+
+    #[tokio::test]
+    async fn chat_streams_from_mock_provider() {
+        let app = Router::new().route("/v1/chat/completions", post(mock_chat));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let config = AppConfig {
+            model: ModelConfig {
+                default: "mock-model".into(),
+                provider: "mock".into(),
+                base_url: format!("http://{}/v1", addr),
+                api_key_env: "CALI_MOCK_KEY".into(),
+                temperature: 0.0,
+                max_tokens: Some(32),
+            },
+            providers: vec![],
+            projects_dir: None,
+        };
+        let result = chat(
+            &config,
+            &[json!({ "role": "user", "content": "hello" })],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.content.contains("Hello from Cali"));
+        assert!(result.tool_calls.is_empty());
+    }
+
+    async fn mock_chat() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let events = vec![
+            Ok(Event::default().data(r#"{"choices":[{"delta":{"role":"assistant","content":"Hello "}}]}"#)),
+            Ok(Event::default().data(r#"{"choices":[{"delta":{"content":"from Cali"}}]}"#)),
+            Ok(Event::default().data("[DONE]")),
+        ];
+        Sse::new(futures::stream::iter(events))
     }
 }
