@@ -56,6 +56,7 @@ export interface ProviderPreset {
   label: string;
   base_url: string;
   api_key_env: string;
+  models?: string[];
 }
 
 export interface ModelList {
@@ -91,3 +92,10 @@ export interface BrowserTool {
   handler: (args: Record<string, unknown>) => Promise<unknown>;
 }
 
+export interface SubagentResult {
+  role: string;
+  sessionId: string;
+  reply: string;
+  toolCalls: unknown[];
+  turns: number;
+}

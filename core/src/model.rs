@@ -201,14 +201,14 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(result.content.contains("Hello from Cali"));
+        assert!(result.content.contains("Hello from Caliber"));
         assert!(result.tool_calls.is_empty());
     }
 
     async fn mock_chat() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
         let events = vec![
             Ok(Event::default().data(r#"{"choices":[{"delta":{"role":"assistant","content":"Hello "}}]}"#)),
-            Ok(Event::default().data(r#"{"choices":[{"delta":{"content":"from Cali"}}]}"#)),
+            Ok(Event::default().data(r#"{"choices":[{"delta":{"content":"from Caliber"}}]}"#)),
             Ok(Event::default().data("[DONE]")),
         ];
         Sse::new(futures::stream::iter(events))

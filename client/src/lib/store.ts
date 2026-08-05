@@ -55,7 +55,7 @@ export function starterProject(): Project {
     assets: [
       {
         id: "asset-cube",
-        name: "Cali Cube",
+        name: "Caliber Cube",
         type: "procedural",
         source: "procedural:box",
         tags: ["prop", "starter"],
@@ -155,4 +155,3 @@ export function addTest(project: Project, test: Partial<GameTest>): Project {
 export function clampVec3(value: Vec3): Vec3 {
   return value.map((v) => (Number.isFinite(v) ? v : 0)) as Vec3;
 }
-

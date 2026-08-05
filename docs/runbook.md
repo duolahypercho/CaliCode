@@ -1,4 +1,4 @@
-# Cali Runbook
+# Caliber Runbook
 
 ## Start
 
@@ -7,7 +7,7 @@
 ```
 
 - Editor: `http://127.0.0.1:5199`
-- Rust core: `http://127.0.0.1:8765`
+- Caliber core: `http://127.0.0.1:8765`
 - JSON-RPC: `POST /rpc`
 - Agent events: `GET /events` (SSE)
 
@@ -22,7 +22,7 @@ cd client && pnpm test:e2e
 
 ## Configuration
 
-`~/.cali/config.yaml` mirrors the Hermes model shape:
+`~/.cali/config.yaml` stores the Caliber model shape:
 
 ```yaml
 model:
@@ -54,7 +54,7 @@ rpc '{"jsonrpc":"2.0","id":1,"method":"model_switch","params":{"provider":"codex
 - `image3d_ingest`, `image3d_assess`, `image3d_spec`, `image3d_validate`, `image3d_generate`, `image3d_review`
 - `tool_register`, `tool_list`
 - `agent_chat`, `agent_tool_result`, `agent_approval_response`, `agent_sessions`
-- `subagent_spawn` (core agent tool for focused planner/coder/tester/visual-critic agents)
+- `subagent_spawn` (RPC and core agent tool for focused planner/coder/tester/visual-critic agents)
 
 ## Browser Agent Tools
 

@@ -27,7 +27,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "project_list".into(),
-            description: "List saved Cali projects.".into(),
+            description: "List saved Caliber projects.".into(),
             parameters: json!({"type":"object","properties":{}}),
             kind: ToolKind::Core,
         },
@@ -123,7 +123,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "subagent_spawn".into(),
-            description: "Spawn a Cali subagent to complete a focused task; it can use the same scene, asset, PIE, and test tools.".to_string(),
+            description: "Spawn a Caliber subagent to complete a focused task; it can use the same scene, asset, PIE, and test tools.".to_string(),
             parameters: json!({
                 "type":"object",
                 "properties":{
@@ -226,46 +226,47 @@ pub async fn execute_core_tool(
             model_switch(&mut config, required_str(args, "provider")?, required_str(args, "model")?)
                 .map_err(anyhow::Error::msg)
         }
-        "subagent_spawn" => {
-            drop(config);
-            let registered = state.tools.read().await.clone();
-            let role = required_str(args, "role")?;
-            let instructions = required_str(args, "instructions")?;
-            let max_turns = args["maxTurns"].as_u64().unwrap_or(6) as usize;
-            let slug = args
-                .get("projectSlug")
-                .and_then(|v| v.as_str())
-                .map(String::from);
-            let system = format!(
-                "You are a {} subagent inside Cali, an AI game engine harness. \
-                 You have full access to the scene, asset workbench, PIE runtime, and test tools. \
-                 Work independently, call tools when they help, and finish with a concise report.",
-                role
-            );
-            let options = crate::agent::AgentOptions {
-                permission_mode: "full-access".into(),
-                max_turns,
-                system: Some(system),
-                project_slug: slug,
-            };
-            let result = Box::pin(state.agents.chat(
-                state,
-                &registered,
-                None,
-                &[json!({ "role": "user", "content": instructions })],
-                options,
-            ))
-            .await?;
-            Ok(json!({
-                "role": role,
-                "sessionId": result["sessionId"],
-                "reply": result["reply"],
-                "toolCalls": result["toolCalls"],
-                "turns": result["turns"]
-            }))
-        }
+        "subagent_spawn" => spawn_subagent(state, args).await,
         _ => anyhow::bail!("unknown core tool {}", tool.name),
     }
+}
+
+pub async fn spawn_subagent(state: &AppState, args: &Value) -> Result<Value> {
+    let registered = state.tools.read().await.clone();
+    let role = required_str(args, "role")?;
+    let instructions = required_str(args, "instructions")?;
+    let max_turns = args["maxTurns"].as_u64().unwrap_or(6) as usize;
+    let slug = args
+        .get("projectSlug")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let system = format!(
+        "You are a {} subagent inside Caliber, an AI game engine harness. \
+         You have full access to the scene, asset workbench, PIE runtime, and test tools. \
+         Work independently, call tools when they help, and finish with a concise report.",
+        role
+    );
+    let options = crate::agent::AgentOptions {
+        permission_mode: "full-access".into(),
+        max_turns,
+        system: Some(system),
+        project_slug: slug,
+    };
+    let result = Box::pin(state.agents.chat(
+        state,
+        &registered,
+        None,
+        &[json!({ "role": "user", "content": instructions })],
+        options,
+    ))
+    .await?;
+    Ok(json!({
+        "role": role,
+        "sessionId": result["sessionId"],
+        "reply": result["reply"],
+        "toolCalls": result["toolCalls"],
+        "turns": result["turns"]
+    }))
 }
 
 pub fn model_list(config: &crate::config::AppConfig) -> Result<Value> {

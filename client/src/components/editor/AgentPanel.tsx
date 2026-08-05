@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { Bot, Send, ShieldCheck, ShieldOff } from "lucide-react";
+import { ArrowRightLeft, Bot, Send, ShieldCheck, ShieldOff, Workflow } from "lucide-react";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import { Textarea } from "../ui/textarea";
+import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import { connectEvents, rpc, type AgentEvent } from "../../lib/rpc";
-import type { AgentMessage, BrowserTool, ModelList } from "../../lib/types";
+import type { AgentMessage, BrowserTool, ModelList, SubagentResult } from "../../lib/types";
 
 interface ApprovalRequest {
   requestId: string;
@@ -29,9 +30,18 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [eventSessionId, setEventSessionId] = useState<string | null>(null);
   const [permissionMode, setPermissionMode] = useState("full-access");
+  const [providerTarget, setProviderTarget] = useState("openai");
+  const [modelInput, setModelInput] = useState("");
+  const [subagentRole, setSubagentRole] = useState("planner");
+  const [subagentTask, setSubagentTask] = useState("");
   const transcriptRef = useRef<HTMLDivElement>(null);
   const toolsRef = useRef(browserTools);
   toolsRef.current = browserTools;
+
+  useEffect(() => {
+    setProviderTarget(modelList?.active.provider ?? "openai");
+    setModelInput(modelList?.active.model ?? "");
+  }, [modelList]);
 
   useEffect(() => {
     const disconnect = connectEvents((event: AgentEvent) => {
@@ -66,6 +76,18 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
       if (event.type === "agent.approval_request" && event.requestId && event.tool) {
         setEventSessionId(event.sessionId ?? null);
         setApproval({ requestId: event.requestId, tool: event.tool, arguments: event.arguments });
+      }
+      if (event.type === "agent.tool_started" && event.tool) {
+        setMessages((current) => [...current, { role: "tool", content: `${event.tool} started`, tool: event.tool }]);
+      }
+      if (event.type === "agent.tool_finished" && event.tool) {
+        const summary =
+          typeof event.result === "string"
+            ? event.result.slice(0, 140)
+            : event.result && typeof event.result === "object"
+              ? JSON.stringify(event.result).slice(0, 140)
+              : "finished";
+        setMessages((current) => [...current, { role: "tool", content: `${event.tool}: ${summary}`, tool: event.tool }]);
       }
     });
     return disconnect;
@@ -147,17 +169,42 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     }
   };
 
+  const spawnSubagent = async () => {
+    const task = subagentTask.trim();
+    if (!task || busy) return;
+    setBusy(true);
+    try {
+      const result = await rpc<SubagentResult>("subagent_spawn", {
+        role: subagentRole,
+        instructions: task,
+        projectSlug,
+        maxTurns: 8,
+      });
+      setMessages((current) => [
+        ...current,
+        { role: "tool", content: `${result.role} subagent: ${result.reply}`, tool: result.role },
+      ]);
+      onLog(`${result.role} subagent finished in ${result.turns} turns`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      setMessages((current) => [...current, { role: "tool", content: `subagent error: ${message}`, tool: subagentRole }]);
+      onLog(`subagent error: ${message}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
         <Bot className="h-4 w-4" />
-        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">Cali Agent</span>
+        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">Caliber Agent</span>
         <span className="text-[10px] tracking-[0.12em] text-[#616161]">{busy ? "working" : "ready"}</span>
       </div>
       <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-        <Select value={modelList?.active.provider ?? ""} onValueChange={() => undefined}>
+        <Select value={providerTarget} onValueChange={setProviderTarget}>
           <SelectTrigger className="h-7 w-28" aria-label="Model provider">
-            <SelectValue placeholder="Provider" />
+            <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {modelList?.providers.map((provider) => (
@@ -167,14 +214,35 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
             ))}
           </SelectContent>
         </Select>
-        <Select value={modelList?.active.model ?? ""} onValueChange={(model) => void switchModel(modelList?.active.provider ?? "openai", model)}>
-          <SelectTrigger className="h-7 min-w-0 flex-1" aria-label="Model">
-            <SelectValue placeholder="Model" />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value={modelList?.active.model ?? ""}>{modelList?.active.model ?? "No model"}</SelectItem>
-          </SelectContent>
-        </Select>
+        <Input
+          className="h-7 min-w-0 flex-1"
+          value={modelInput}
+          onChange={(event) => setModelInput(event.target.value)}
+          list="caliber-models"
+          aria-label="Target model"
+        />
+        <datalist id="caliber-models">
+          {modelList?.providers.flatMap((provider) => provider.models ?? []).map((model) => (
+            <option key={model} value={model} />
+          ))}
+        </datalist>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="h-7 w-7 shrink-0 px-0"
+              aria-label="Switch model"
+              disabled={busy || !modelInput.trim()}
+              onClick={() => void switchModel(providerTarget, modelInput.trim())}
+            >
+              <ArrowRightLeft className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Switch model</TooltipContent>
+        </Tooltip>
+      </div>
+      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
         <Select value={permissionMode} onValueChange={setPermissionMode}>
           <SelectTrigger className="h-7 w-32" aria-label="Permission mode">
             <SelectValue />
@@ -186,6 +254,42 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
             <SelectItem value="supervised">Supervised</SelectItem>
           </SelectContent>
         </Select>
+        <div className="flex-1" />
+        <Select value={subagentRole} onValueChange={setSubagentRole}>
+          <SelectTrigger className="h-7 w-24" aria-label="Subagent role">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="planner">Planner</SelectItem>
+            <SelectItem value="coder">Coder</SelectItem>
+            <SelectItem value="tester">Tester</SelectItem>
+            <SelectItem value="visual-critic">Critic</SelectItem>
+          </SelectContent>
+        </Select>
+      </div>
+      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
+        <Input
+          className="h-7 min-w-0 flex-1"
+          value={subagentTask}
+          onChange={(event) => setSubagentTask(event.target.value)}
+          placeholder="Subagent task"
+          aria-label="Subagent task"
+        />
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              size="sm"
+              variant="secondary"
+              className="h-7 w-7 shrink-0 px-0"
+              aria-label="Spawn subagent"
+              disabled={busy || !subagentTask.trim()}
+              onClick={() => void spawnSubagent()}
+            >
+              <Workflow className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Spawn subagent</TooltipContent>
+        </Tooltip>
       </div>
       <div ref={transcriptRef} className="min-h-0 flex-1 overflow-y-auto p-2">
         {messages.length === 0 && (

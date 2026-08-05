@@ -51,6 +51,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 str_param(&params, "model")?,
             )?)
         }
+        "subagent_spawn" => crate::tools::spawn_subagent(state, &params).await,
         "project_create" => {
             let slug = str_param(&params, "slug")?;
             let title = params.get("title").and_then(|v| v.as_str()).unwrap_or(slug);
@@ -233,10 +234,10 @@ fn default_system_prompt(projects_root: &std::path::Path, slug: &str) -> String 
     let project = store::read_project(projects_root, slug).ok();
     let context = project.unwrap_or_else(|| json!({ "entities": [], "assets": [], "tests": [] }));
     format!(
-        "You are Cali, an AI game engine harness for a three.js editor.\n\
-         You can inspect and edit the project, import and export assets, manage test baselines, \
-         run the image-to-3D pipeline, and switch models. When the project needs a scene, asset, \
-         PIE, or visual change, call the browser tool and wait for its result.\n\
+        "You are Caliber, an AI game engine harness for a three.js editor.\n\
+         You can inspect and edit the project, save and checkpoint work, import and export assets, \
+         manage test baselines, run the image-to-3D pipeline, and switch models. When the project \
+         needs a scene, asset, PIE, or visual change, call the browser tool and wait for its result.\n\
          Project context:\n{}",
         serde_json::to_string_pretty(&context).unwrap_or_default()
     )

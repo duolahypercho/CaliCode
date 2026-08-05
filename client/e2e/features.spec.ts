@@ -87,9 +87,11 @@ test("save, checkpoint, and tests report in console", async ({ page }) => {
 test("agent panel shows the active model", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("tab", { name: "Agent" })).toBeVisible();
-  await expect(page.getByText("Cali Agent")).toBeVisible();
+  await expect(page.getByText("Caliber Agent")).toBeVisible();
   await expect(page.getByLabel("Model provider")).toBeVisible();
-  await expect(page.getByRole("combobox", { name: "Model", exact: true })).toBeVisible();
+  await expect(page.getByLabel("Target model")).toBeVisible();
+  await expect(page.getByLabel("Switch model")).toBeVisible();
+  await expect(page.getByLabel("Spawn subagent")).toBeVisible();
 });
 
 test("agent panel sends commands and surfaces errors", async ({ page }) => {

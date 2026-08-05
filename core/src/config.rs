@@ -46,6 +46,8 @@ pub struct ProviderPreset {
     pub label: String,
     pub base_url: String,
     pub api_key_env: String,
+    #[serde(default)]
+    pub models: Vec<String>,
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -80,24 +82,48 @@ pub fn default_providers() -> Vec<ProviderPreset> {
             label: "OpenAI".into(),
             base_url: "https://api.openai.com/v1".into(),
             api_key_env: "CALI_OPENAI_API_KEY".into(),
+            models: vec![
+                "gpt-4.1-mini".into(),
+                "gpt-4.1".into(),
+                "gpt-4o".into(),
+                "o3-mini".into(),
+            ],
         },
         ProviderPreset {
             id: CODEX_ROUTER_PROVIDER_ID.into(),
             label: "Codex Router".into(),
             base_url: CODEX_ROUTER_BASE_URL.into(),
             api_key_env: CODEX_ROUTER_KEY_ENV.into(),
+            models: vec![
+                "deepseek-v4-flash".into(),
+                "deepseek-v3.2".into(),
+                "gpt-4.1-mini".into(),
+                "gpt-4.1".into(),
+                "claude-sonnet-4-5".into(),
+                "gemini-2.5-pro".into(),
+            ],
         },
         ProviderPreset {
             id: "openrouter".into(),
             label: "OpenRouter".into(),
             base_url: "https://openrouter.ai/api/v1".into(),
             api_key_env: "CALI_OPENROUTER_API_KEY".into(),
+            models: vec![
+                "deepseek/deepseek-chat".into(),
+                "openai/gpt-4o".into(),
+                "anthropic/claude-sonnet-4-5".into(),
+            ],
         },
         ProviderPreset {
             id: "local".into(),
             label: "Local".into(),
             base_url: "http://127.0.0.1:11434/v1".into(),
             api_key_env: "CALI_LOCAL_API_KEY".into(),
+            models: vec![
+                "llama3.2".into(),
+                "qwen2.5-coder:7b".into(),
+                "deepseek-r1:7b".into(),
+            ],
         },
     ]
 }
@@ -114,9 +140,17 @@ pub fn load() -> Result<AppConfig> {
     if config.providers.is_empty() {
         config.providers = default_providers();
     } else {
+        let defaults = default_providers();
         for preset in default_providers() {
             if !config.providers.iter().any(|existing| existing.id == preset.id) {
                 config.providers.push(preset);
+            }
+        }
+        for preset in &mut config.providers {
+            if preset.models.is_empty() {
+                if let Some(default) = defaults.iter().find(|candidate| candidate.id == preset.id) {
+                    preset.models = default.models.clone();
+                }
             }
         }
     }
@@ -151,7 +185,7 @@ pub fn api_key(config: &AppConfig) -> String {
     std::env::var(&key).unwrap_or_default().trim().to_string()
 }
 
-/// The router keeps its loopback service key in protected state, so Cali can
+/// The router keeps its loopback service key in protected state, so Caliber can
 /// reuse the router's configured providers without duplicating credentials.
 pub fn router_key() -> String {
     if let Some(key) = std::env::var(CODEX_ROUTER_KEY_ENV).ok().map(|value| value.trim().to_string()) {
@@ -197,6 +231,7 @@ mod tests {
             .find(|p| p.id == crate::config::CODEX_ROUTER_PROVIDER_ID)
             .expect("codex-router preset should exist");
         assert_eq!(preset.base_url, crate::config::CODEX_ROUTER_BASE_URL);
+        assert!(!preset.models.is_empty());
     }
 
     #[test]

@@ -303,6 +303,113 @@ export default function App() {
           return entity;
         },
       },
+      {
+        name: "editor_project_save",
+        description: "Persist the current scene, assets, scripts, and tests to the Caliber project store.",
+        parameters: { type: "object", properties: {} },
+        handler: async () => {
+          await rpc("project_save", { project });
+          return { saved: true, slug: project.slug };
+        },
+      },
+      {
+        name: "editor_project_checkpoint",
+        description: "Create a revertible checkpoint of the current project.",
+        parameters: { type: "object", properties: {} },
+        handler: async () => {
+          const result = await rpc<{ id: string }>("project_checkpoint", { slug: project.slug });
+          return result;
+        },
+      },
+      {
+        name: "editor_model_switch",
+        description: "Switch the Caliber harness provider and model.",
+        parameters: {
+          type: "object",
+          properties: {
+            provider: { type: "string" },
+            model: { type: "string" },
+          },
+          required: ["provider", "model"],
+        },
+        handler: async (args) => {
+          const list = await rpc<ModelList>("model_switch", {
+            provider: String(args.provider),
+            model: String(args.model),
+          });
+          setModelList(list);
+          return { switched: true, provider: args.provider, model: args.model };
+        },
+      },
+      {
+        name: "editor_console_log",
+        description: "Write a line to the editor console.",
+        parameters: {
+          type: "object",
+          properties: {
+            message: { type: "string" },
+            level: { type: "string", enum: ["info", "error"] },
+          },
+          required: ["message"],
+        },
+        handler: async (args) => {
+          pushLog(String(args.message), args.level === "error" ? "error" : "info");
+          return { logged: true };
+        },
+      },
+      {
+        name: "editor_select_entity",
+        description: "Select or deselect an entity in the scene graph.",
+        parameters: { type: "object", properties: { id: { type: "string" } } },
+        handler: async (args) => {
+          const id = args.id ? String(args.id) : null;
+          setSelectedEntityId(id);
+          return { selected: id };
+        },
+      },
+      {
+        name: "editor_test_add",
+        description: "Add a scripted game test to the project.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string" },
+            script: { type: "string" },
+          },
+          required: ["name", "script"],
+        },
+        handler: async (args) => {
+          const test = { id: uid("test"), name: String(args.name), script: String(args.script ?? "") };
+          setProject((current) => ({ ...current, tests: [...current.tests, test] }));
+          return test;
+        },
+      },
+      {
+        name: "editor_asset_import_file",
+        description: "Import a base64-encoded image or 3D file into the asset library.",
+        parameters: {
+          type: "object",
+          properties: {
+            name: { type: "string" },
+            data: { type: "string" },
+            mime: { type: "string" },
+            tags: { type: "array", items: { type: "string" } },
+          },
+          required: ["name", "data", "mime"],
+        },
+        handler: async (args) => {
+          const result = await rpc("asset_import_file", {
+            slug: project.slug,
+            name: String(args.name),
+            data: String(args.data),
+            mime: String(args.mime),
+            tags: Array.isArray(args.tags) ? args.tags : [],
+          });
+          const loaded = await rpc<Project>("project_open", { slug: project.slug });
+          setProject(loaded);
+          return result;
+        },
+      },
     ],
     [project, pushLog],
   );
@@ -427,10 +534,12 @@ export default function App() {
       <header className="flex h-11 shrink-0 items-center gap-3 border-b border-border bg-[#0c0c0c] px-4">
         <div className="flex items-center gap-3">
           <Gamepad2 className="h-4 w-4 text-[#828282]" />
-          <h1 className="font-display text-sm font-extrabold tracking-[0.32em] text-[#d6d6d6]">Cali</h1>
+          <h1 className="font-display text-sm font-extrabold tracking-[0.32em] text-[#d6d6d6]">Caliber</h1>
         </div>
-        <span className="text-[#3a3a3a]">/</span>
-        <span className="text-xs tracking-[0.12em] text-[#828282]">{project.title}</span>
+        <span className="hidden min-w-0 items-center gap-3 sm:flex">
+          <span className="text-[#3a3a3a]">/</span>
+          <span className="truncate text-xs tracking-[0.12em] text-[#828282]">{project.title}</span>
+        </span>
         <span className="ml-2 hidden rounded border border-white/10 px-2 py-0.5 text-[10px] tracking-[0.14em] text-[#616161] md:inline">
           {modelList?.active.provider ?? "OFFLINE"} · {modelList?.active.model ?? "NO MODEL"}
         </span>
