@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CaliAsset",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "assetId",
+    "name",
+    "sourceHash",
+    "seed",
+    "assessment",
+    "detailInventory",
+    "componentTree",
+    "materials",
+    "runtime",
+    "reviewHistory"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "assetId": { "type": "string" },
+    "name": { "type": "string" },
+    "sourceHash": { "type": "string" },
+    "seed": { "type": "integer" },
+    "assessment": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "detailInventory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "componentTree": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "materials": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "reviewHistory": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true
+      }
+    }
+  }
+}
+

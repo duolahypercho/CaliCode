@@ -1,0 +1,30 @@
+# Cali
+
+Cali is a native AI game engine harness for the web. It pairs a Rust control
+plane with a three.js editor, asset workbench, asset library, Play-In-Editor
+(PIE) runtime, deterministic frame capture, scripted tests, and a native agent
+panel. No MCP, no harness fork, and no generated Three.js code: image-to-3D
+reconstruction is a Rust pipeline that emits a data-driven `.cali` asset.
+
+## Layout
+
+- `core/` - Rust JSON-RPC service: model gateway, project store, checkpoints, assets, baselines, image-to-3D, agent loop.
+- `client/` - Vite + React + TypeScript three.js editor.
+
+## Run
+
+```bash
+./scripts/dev.sh
+```
+
+The Rust core listens on `http://127.0.0.1:8765`; Vite serves the editor on
+`http://localhost:5173` and proxies `/rpc` and `/events` to core.
+
+## Tests
+
+```bash
+cd core && cargo test
+cd client && pnpm test
+cd client && pnpm test:e2e
+```
+

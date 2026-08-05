@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CaliProject",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "slug", "title", "entities", "scripts", "assets", "tests", "settings"],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "slug": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+    "title": { "type": "string" },
+    "entities": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/entity" }
+    },
+    "scripts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/script" }
+    },
+    "assets": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/asset" }
+    },
+    "tests": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/test" }
+    },
+    "settings": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "$defs": {
+    "vec3": {
+      "type": "array",
+      "items": { "type": "number" },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "entity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "kind", "transform", "material", "light", "scriptIds", "assetId"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "kind": { "enum": ["box", "sphere", "cylinder", "plane", "terrain", "asset", "light", "camera"] },
+        "transform": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["position", "rotation", "scale"],
+          "properties": {
+            "position": { "$ref": "#/$defs/vec3" },
+            "rotation": { "$ref": "#/$defs/vec3" },
+            "scale": { "$ref": "#/$defs/vec3" }
+          }
+        },
+        "material": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "light": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "scriptIds": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "assetId": { "type": ["string", "null"] }
+      }
+    },
+    "script": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "code"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "code": { "type": "string" }
+      }
+    },
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "type", "source", "tags", "usage"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "type": { "enum": ["procedural", "image", "gltf", "obj", "cali"] },
+        "source": { "type": "string" },
+        "tags": { "type": "array", "items": { "type": "string" } },
+        "usage": { "type": "array", "items": { "type": "string" } },
+        "thumbnail": { "type": ["string", "null"] },
+        "metadata": { "type": "object", "additionalProperties": true }
+      }
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "name", "script"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "script": { "type": "string" }
+      }
+    }
+  }
+}
+
