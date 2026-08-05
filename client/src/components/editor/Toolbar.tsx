@@ -105,7 +105,7 @@ export function Toolbar({
         <TooltipTrigger asChild>
           <Button variant="secondary" size="sm" className="caliber-button" aria-label="Save" onClick={onSave}>
             <Save className="h-3.5 w-3.5" />
-            Save
+            <span className="hidden md:inline">Save</span>
           </Button>
         </TooltipTrigger>
         <TooltipContent>Save project to core</TooltipContent>

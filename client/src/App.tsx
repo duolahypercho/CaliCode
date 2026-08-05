@@ -431,7 +431,7 @@ export default function App() {
         </div>
         <span className="text-[#3a3a3a]">/</span>
         <span className="text-xs tracking-[0.12em] text-[#828282]">{project.title}</span>
-        <span className="ml-2 rounded border border-white/10 px-2 py-0.5 text-[10px] tracking-[0.14em] text-[#616161]">
+        <span className="ml-2 hidden rounded border border-white/10 px-2 py-0.5 text-[10px] tracking-[0.14em] text-[#616161] md:inline">
           {modelList?.active.provider ?? "OFFLINE"} · {modelList?.active.model ?? "NO MODEL"}
         </span>
         <div className="flex-1" />
@@ -448,14 +448,14 @@ export default function App() {
         </Button>
       </header>
       <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-52 shrink-0 border-r border-border bg-[#0b0b0b] md:block">
+        <aside className="hidden w-52 shrink-0 border-r border-border bg-[#0b0b0b] md:flex md:flex-col">
           <div className="px-3 pb-2 pt-3">
             <Button variant="secondary" size="sm" className="caliber-button w-full justify-center" onClick={handleAddEntity}>
               New Entity
             </Button>
           </div>
           <div className="caliber-label px-3 pb-2">Games</div>
-          <Tabs defaultValue="scene" className="flex h-full flex-col">
+          <Tabs defaultValue="scene" className="flex min-h-0 flex-1 flex-col">
             <TabsList className="border-b border-white/5 px-2">
               <TabsTrigger value="scene">Scene</TabsTrigger>
               <TabsTrigger value="assets">Assets</TabsTrigger>
@@ -563,7 +563,7 @@ export default function App() {
           </div>
           <section className="h-56 shrink-0 border-t border-border bg-[#0a0a0a]">
             <Tabs defaultValue="inspector" className="flex h-full flex-col">
-              <TabsList className="border-b border-white/5 px-2">
+              <TabsList className="max-w-full border-b border-white/5 px-2">
                 <TabsTrigger value="inspector">Inspector</TabsTrigger>
                 <TabsTrigger value="scripts">Scripts</TabsTrigger>
                 <TabsTrigger value="console">Console</TabsTrigger>

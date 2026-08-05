@@ -42,7 +42,12 @@ export function AssetWorkbench({ onAddAsset, onPromote, onImportImage }: AssetWo
         <SlidersHorizontal className="h-4 w-4 text-muted-foreground" />
       </div>
       <Tabs defaultValue="generate" className="flex min-h-0 flex-1 flex-col">
-        <TabsList className="px-2">
+        <TabsList
+          className="w-full max-w-full overflow-x-auto px-2"
+          onMouseEnter={(event) => event.currentTarget.scrollTo({ left: 0 })}
+          onFocus={(event) => event.currentTarget.scrollTo({ left: 0 })}
+          onPointerDown={(event) => event.currentTarget.scrollTo({ left: 0 })}
+        >
           <TabsTrigger value="generate">Generate</TabsTrigger>
           <TabsTrigger value="import">Import</TabsTrigger>
         </TabsList>
