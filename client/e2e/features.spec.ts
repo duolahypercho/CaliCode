@@ -82,3 +82,28 @@ test("agent panel sends commands and surfaces errors", async ({ page }) => {
   await page.keyboard.press("Enter");
   await expect(page.getByText(/unknown provider missing-provider/i)).toBeVisible();
 });
+
+test("agent panel runs a live model reply", async ({ page }) => {
+  test.setTimeout(45_000);
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Agent" }).click();
+  await page.getByLabel("Agent prompt").fill("Reply with exactly: live-ready");
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("live-ready")).toBeVisible({ timeout: 30_000 });
+});
+
+test("supervised agent tool approval completes live", async ({ page }) => {
+  test.setTimeout(90_000);
+  await page.goto("/");
+  await page.getByRole("tab", { name: "Agent" }).click();
+  const select = page.getByRole("combobox", { name: "Permission mode" });
+  await select.click();
+  await page.getByRole("option", { name: "Supervised" }).click();
+  await page.getByLabel("Agent prompt").fill(
+    "Call editor_scene_inspect. Then reply with the number of entities.",
+  );
+  await page.keyboard.press("Enter");
+  await page.getByText("Approve editor_scene_inspect?").waitFor({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Approve" }).click();
+  await expect(page.getByText(/3 entities/i)).toBeVisible({ timeout: 45_000 });
+});

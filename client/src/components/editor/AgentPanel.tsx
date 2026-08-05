@@ -27,6 +27,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [approval, setApproval] = useState<ApprovalRequest | null>(null);
+  const [eventSessionId, setEventSessionId] = useState<string | null>(null);
   const [permissionMode, setPermissionMode] = useState("full-access");
   const transcriptRef = useRef<HTMLDivElement>(null);
   const toolsRef = useRef(browserTools);
@@ -47,6 +48,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
         });
       }
       if (event.type === "agent.tool_request" && event.requestId && event.sessionId && event.tool) {
+        setEventSessionId(event.sessionId);
         const tool = toolsRef.current.find((candidate) => candidate.name === event.tool);
         void (async () => {
           try {
@@ -62,6 +64,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
         })();
       }
       if (event.type === "agent.approval_request" && event.requestId && event.tool) {
+        setEventSessionId(event.sessionId ?? null);
         setApproval({ requestId: event.requestId, tool: event.tool, arguments: event.arguments });
       }
     });
@@ -124,9 +127,11 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
   };
 
   const respondToApproval = async (approved: boolean) => {
-    if (!approval || !sessionId) return;
+    if (!approval) return;
+    const targetSession = eventSessionId ?? sessionId;
+    if (!targetSession) return;
     try {
-      await rpc("agent_approval_response", { sessionId, requestId: approval.requestId, approved });
+      await rpc("agent_approval_response", { sessionId: targetSession, requestId: approval.requestId, approved });
       setMessages((current) => [
         ...current,
         { role: "tool", content: approved ? `Approved ${approval.tool}` : `Denied ${approval.tool}`, tool: approval.tool },

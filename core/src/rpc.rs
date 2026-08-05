@@ -168,7 +168,8 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             str_param(&params, "assetId")?,
             str_param(&params, "image")?,
             str_param(&params, "passId")?,
-        )?),
+        )
+        .await?),
         "tool_register" => {
             let mut tools = state.tools.write().await;
             if let Some(list) = params["tools"].as_array() {
@@ -179,7 +180,9 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                         parameters: item.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"})),
                         kind: crate::tools::ToolKind::Browser,
                     };
-                    tools.insert(def.name.clone(), def);
+                    if !def.name.is_empty() && def.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                        tools.insert(def.name.clone(), def);
+                    }
                 }
             }
             Ok(json!({ "registered": tools.len() }))

@@ -57,7 +57,7 @@ rpc '{"jsonrpc":"2.0","id":1,"method":"model_switch","params":{"provider":"codex
 
 ## Browser Agent Tools
 
-`editor.scene_inspect`, `editor.object_add`, `editor.object_remove`,
-`editor.update_transform`, `editor.script_write`, `editor.run_pie`,
-`editor.capture_frame`, `editor.run_tests`, `editor.asset_generate`,
-`editor.asset_preview`, `editor.promote_asset`.
+`editor_scene_inspect`, `editor_object_add`, `editor_object_remove`,
+`editor_update_transform`, `editor_script_write`, `editor_run_pie`,
+`editor_capture_frame`, `editor_run_tests`, `editor_asset_generate`,
+`editor_asset_preview`, `editor_promote_asset`.

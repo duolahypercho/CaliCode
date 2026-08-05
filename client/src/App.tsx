@@ -74,7 +74,7 @@ export default function App() {
   const browserTools = useMemo<BrowserTool[]>(
     () => [
       {
-        name: "editor.scene_inspect",
+        name: "editor_scene_inspect",
         description: "Inspect the current scene graph, entities, scripts, assets, and tests.",
         parameters: { type: "object", properties: {} },
         handler: async () => ({
@@ -96,7 +96,7 @@ export default function App() {
         }),
       },
       {
-        name: "editor.object_add",
+        name: "editor_object_add",
         description: "Add an entity to the scene.",
         parameters: {
           type: "object",
@@ -128,7 +128,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.object_remove",
+        name: "editor_object_remove",
         description: "Remove an entity from the scene by id.",
         parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
         handler: async (args) => {
@@ -138,7 +138,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.update_transform",
+        name: "editor_update_transform",
         description: "Update an entity transform.",
         parameters: {
           type: "object",
@@ -171,7 +171,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.script_write",
+        name: "editor_script_write",
         description: "Create or update a game script.",
         parameters: {
           type: "object",
@@ -194,7 +194,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.run_pie",
+        name: "editor_run_pie",
         description: "Start PIE so scripts and game logic run.",
         parameters: { type: "object", properties: { frames: { type: "number" } } },
         handler: async (args) => {
@@ -208,7 +208,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.capture_frame",
+        name: "editor_capture_frame",
         description: "Capture the current frame as a screenshot.",
         parameters: { type: "object", properties: {} },
         handler: async () => {
@@ -218,7 +218,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.run_tests",
+        name: "editor_run_tests",
         description: "Run the project test suite and return pass/fail results.",
         parameters: { type: "object", properties: {} },
         handler: async () => {
@@ -230,7 +230,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.asset_generate",
+        name: "editor_asset_generate",
         description: "Generate a procedural asset in the workbench.",
         parameters: {
           type: "object",
@@ -264,7 +264,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.asset_preview",
+        name: "editor_asset_preview",
         description: "Render an asset thumbnail.",
         parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
         handler: async (args) => {
@@ -276,7 +276,7 @@ export default function App() {
         },
       },
       {
-        name: "editor.promote_asset",
+        name: "editor_promote_asset",
         description: "Add an asset to the scene as a new entity.",
         parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
         handler: async (args) => {
@@ -447,7 +447,7 @@ export default function App() {
                 search={assetSearch}
                 onSearch={setAssetSearch}
                 onPromote={(asset) => {
-                  const tool = browserTools.find((item) => item.name === "editor.promote_asset");
+                  const tool = browserTools.find((item) => item.name === "editor_promote_asset");
                   void tool?.handler({ id: asset.id });
                 }}
                 onRemove={(assetId) => {
@@ -567,7 +567,7 @@ export default function App() {
                   return next;
                 }}
                 onPromote={(assetId) => {
-                  const tool = browserTools.find((item) => item.name === "editor.promote_asset");
+                  const tool = browserTools.find((item) => item.name === "editor_promote_asset");
                   void tool?.handler({ id: assetId });
                 }}
                 onImportImage={(file) => void handleImportImage(file)}
