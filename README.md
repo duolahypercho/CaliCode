@@ -6,6 +6,10 @@ plane with a three.js editor, asset workbench, asset library, Play-In-Editor
 panel. No MCP, no harness fork, and no generated Three.js code: image-to-3D
 reconstruction is a Rust pipeline that emits a data-driven `.cali` asset.
 
+The editor UI follows the Caliber design language: a dark monochrome console
+with Syne branding, Space Mono body type, a games sidebar, an agent chat
+column, and a play/code/art/scene/test workspace.
+
 ## Layout
 
 - `core/` - Rust JSON-RPC service: model gateway, project store, checkpoints, assets, baselines, image-to-3D, agent loop.
@@ -27,4 +31,3 @@ cd core && cargo test
 cd client && pnpm test
 cd client && pnpm test:e2e
 ```
-

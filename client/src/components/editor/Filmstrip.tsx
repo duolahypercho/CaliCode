@@ -4,10 +4,10 @@ import type { CapturedFrame } from "../../lib/types";
 export function Filmstrip({ frames }: { frames: CapturedFrame[] }) {
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
         <Film className="h-4 w-4 text-muted-foreground" />
-        <span className="text-sm font-medium">Filmstrip</span>
-        <span className="text-xs text-muted-foreground">{frames.length} frames</span>
+        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">Filmstrip</span>
+        <span className="text-xs text-[#616161]">{frames.length} frames</span>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-2">
         {frames.length === 0 ? (
@@ -28,4 +28,3 @@ export function Filmstrip({ frames }: { frames: CapturedFrame[] }) {
     </div>
   );
 }
-

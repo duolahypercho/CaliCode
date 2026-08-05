@@ -33,7 +33,10 @@ export default function App() {
   const [modelList, setModelList] = useState<ModelList | null>(null);
   const [captureEvery, setCaptureEvery] = useState(3);
   const [assetSearch, setAssetSearch] = useState("");
-  const [dark, setDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches ?? false);
+  const [dark, setDark] = useState(() => {
+    const saved = localStorage.getItem("cali-theme");
+    return saved ? saved === "dark" : true;
+  });
   const runtimeRef = useRef<PieRuntime | null>(null);
   runtimeRef.current = runtime;
 
@@ -421,13 +424,20 @@ export default function App() {
 
   return (
     <div className="flex h-dvh flex-col">
-      <header className="flex h-10 items-center gap-3 border-b border-border bg-background px-3">
-        <div className="flex items-center gap-2">
-          <Gamepad2 className="h-4 w-4" />
-          <h1 className="text-base font-medium">Cali</h1>
+      <header className="flex h-11 shrink-0 items-center gap-3 border-b border-border bg-[#0c0c0c] px-4">
+        <div className="flex items-center gap-3">
+          <Gamepad2 className="h-4 w-4 text-[#828282]" />
+          <h1 className="font-display text-sm font-extrabold tracking-[0.32em] text-[#d6d6d6]">Cali</h1>
         </div>
-        <span className="text-sm text-muted-foreground">{project.title}</span>
+        <span className="text-[#3a3a3a]">/</span>
+        <span className="text-xs tracking-[0.12em] text-[#828282]">{project.title}</span>
+        <span className="ml-2 rounded border border-white/10 px-2 py-0.5 text-[10px] tracking-[0.14em] text-[#616161]">
+          {modelList?.active.provider ?? "OFFLINE"} · {modelList?.active.model ?? "NO MODEL"}
+        </span>
         <div className="flex-1" />
+        <span className="hidden text-[10px] tracking-[0.14em] text-[#4f4f4f] md:inline">
+          PIE · 60 HZ · CAPTURE {captureEvery}
+        </span>
         <Button
           variant="ghost"
           size="icon"
@@ -438,9 +448,15 @@ export default function App() {
         </Button>
       </header>
       <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-56 shrink-0 border-r border-border md:block">
+        <aside className="hidden w-52 shrink-0 border-r border-border bg-[#0b0b0b] md:block">
+          <div className="px-3 pb-2 pt-3">
+            <Button variant="secondary" size="sm" className="caliber-button w-full justify-center" onClick={handleAddEntity}>
+              New Entity
+            </Button>
+          </div>
+          <div className="caliber-label px-3 pb-2">Games</div>
           <Tabs defaultValue="scene" className="flex h-full flex-col">
-            <TabsList className="px-2">
+            <TabsList className="border-b border-white/5 px-2">
               <TabsTrigger value="scene">Scene</TabsTrigger>
               <TabsTrigger value="assets">Assets</TabsTrigger>
             </TabsList>
@@ -474,6 +490,49 @@ export default function App() {
             </TabsContent>
           </Tabs>
         </aside>
+        <aside className="hidden w-[380px] shrink-0 border-r border-border bg-[#0a0a0a] lg:block">
+          <Tabs defaultValue="agent" className="flex h-full flex-col">
+            <TabsList className="border-b border-white/5 px-2">
+              <TabsTrigger value="agent">Agent</TabsTrigger>
+              <TabsTrigger value="workbench">Workbench</TabsTrigger>
+            </TabsList>
+            <TabsContent value="agent" className="min-h-0 flex-1 pt-0">
+              <AgentPanel
+                projectSlug={project.slug}
+                modelList={modelList}
+                browserTools={browserTools}
+                onModelChange={() =>
+                  void rpc<ModelList>("model_list", {}).then((list) => setModelList(list)).catch(() => undefined)
+                }
+                onLog={pushLog}
+              />
+            </TabsContent>
+            <TabsContent value="workbench" className="min-h-0 flex-1 pt-0">
+              <AssetWorkbench
+                onAddAsset={(asset) => {
+                  const next: Asset = {
+                    id: uid("asset"),
+                    name: asset.name ?? "Asset",
+                    type: asset.type ?? "procedural",
+                    source: asset.source ?? "procedural:box",
+                    tags: asset.tags ?? [],
+                    usage: [],
+                    thumbnail: asset.thumbnail ?? null,
+                    metadata: asset.metadata ?? {},
+                  };
+                  setProject((current) => addAsset(current, next));
+                  pushLog(`generated ${next.name}`);
+                  return next;
+                }}
+                onPromote={(assetId) => {
+                  const tool = browserTools.find((item) => item.name === "editor_promote_asset");
+                  void tool?.handler({ id: assetId });
+                }}
+                onImportImage={(file) => void handleImportImage(file)}
+              />
+            </TabsContent>
+          </Tabs>
+        </aside>
         <main className="flex min-w-0 flex-1 flex-col">
           <Toolbar
             runtime={runtime}
@@ -502,9 +561,9 @@ export default function App() {
               onStateChange={setPieState}
             />
           </div>
-          <section className="h-56 shrink-0 border-t border-border bg-background">
+          <section className="h-56 shrink-0 border-t border-border bg-[#0a0a0a]">
             <Tabs defaultValue="inspector" className="flex h-full flex-col">
-              <TabsList className="px-2">
+              <TabsList className="border-b border-white/5 px-2">
                 <TabsTrigger value="inspector">Inspector</TabsTrigger>
                 <TabsTrigger value="scripts">Scripts</TabsTrigger>
                 <TabsTrigger value="console">Console</TabsTrigger>
@@ -548,49 +607,6 @@ export default function App() {
             </Tabs>
           </section>
         </main>
-        <aside className="hidden w-80 shrink-0 border-l border-border lg:block">
-          <Tabs defaultValue="agent" className="flex h-full flex-col">
-            <TabsList className="px-2">
-              <TabsTrigger value="agent">Agent</TabsTrigger>
-              <TabsTrigger value="workbench">Workbench</TabsTrigger>
-            </TabsList>
-            <TabsContent value="agent" className="min-h-0 flex-1 pt-0">
-              <AgentPanel
-                projectSlug={project.slug}
-                modelList={modelList}
-                browserTools={browserTools}
-                onModelChange={() =>
-                  void rpc<ModelList>("model_list", {}).then((list) => setModelList(list)).catch(() => undefined)
-                }
-                onLog={pushLog}
-              />
-            </TabsContent>
-            <TabsContent value="workbench" className="min-h-0 flex-1 pt-0">
-              <AssetWorkbench
-                onAddAsset={(asset) => {
-                  const next: Asset = {
-                    id: uid("asset"),
-                    name: asset.name ?? "Asset",
-                    type: asset.type ?? "procedural",
-                    source: asset.source ?? "procedural:box",
-                    tags: asset.tags ?? [],
-                    usage: [],
-                    thumbnail: asset.thumbnail ?? null,
-                    metadata: asset.metadata ?? {},
-                  };
-                  setProject((current) => addAsset(current, next));
-                  pushLog(`generated ${next.name}`);
-                  return next;
-                }}
-                onPromote={(assetId) => {
-                  const tool = browserTools.find((item) => item.name === "editor_promote_asset");
-                  void tool?.handler({ id: assetId });
-                }}
-                onImportImage={(file) => void handleImportImage(file)}
-              />
-            </TabsContent>
-          </Tabs>
-        </aside>
       </div>
     </div>
   );

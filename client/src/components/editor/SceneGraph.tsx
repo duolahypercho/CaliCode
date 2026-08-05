@@ -14,22 +14,22 @@ interface SceneGraphProps {
 export function SceneGraph({ entities, selectedId, onSelect, onAdd, onRemove }: SceneGraphProps) {
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center justify-between border-b border-border px-3 py-2">
-        <span className="text-sm font-medium">Scene Graph</span>
+      <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
+        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">Scene Graph</span>
         <Button variant="ghost" size="icon" aria-label="Add entity" onClick={onAdd}>
           <Plus className="h-4 w-4" />
         </Button>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-1">
         {entities.length === 0 ? (
-          <p className="px-2 py-3 text-xs text-muted-foreground">No entities yet. Add one to start building.</p>
+          <p className="px-2 py-3 text-xs text-[#616161]">No entities yet. Add one to start building.</p>
         ) : (
           entities.map((entity) => (
             <div
               key={entity.id}
               className={cn(
-                "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent",
-                selectedId === entity.id && "bg-accent text-foreground",
+                "group flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm hover:bg-[#171717]",
+                selectedId === entity.id && "bg-[#171717] text-[#e0e0e0]",
               )}
             >
               <button

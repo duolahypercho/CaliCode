@@ -28,7 +28,7 @@ export function Toolbar({
 }: ToolbarProps) {
   const running = pieState === "running";
   return (
-    <div className="flex h-10 items-center gap-1 border-b border-border bg-background px-2">
+    <div className="flex h-11 shrink-0 items-center gap-1 border-b border-white/5 bg-[#0b0b0b] px-2">
       <Tooltip>
         <TooltipTrigger asChild>
           <Button variant="ghost" size="icon" aria-label="Play" disabled={running || !runtime} onClick={() => runtime?.start()}>
@@ -64,7 +64,7 @@ export function Toolbar({
       <span className="mx-2 h-5 w-px bg-border" />
       <div className="flex items-center gap-1 text-xs text-muted-foreground">
         <Camera className="h-3.5 w-3.5" />
-        <span>Capture every</span>
+        <span className="text-[10px] tracking-[0.12em] text-[#616161]">Capture every</span>
         <Select value={String(captureEvery)} onValueChange={(value) => onCaptureEveryChange(Number(value))}>
           <SelectTrigger className="h-7 w-16">
             <SelectValue />
@@ -103,7 +103,7 @@ export function Toolbar({
       </Tooltip>
       <Tooltip>
         <TooltipTrigger asChild>
-          <Button variant="secondary" size="sm" aria-label="Save" onClick={onSave}>
+          <Button variant="secondary" size="sm" className="caliber-button" aria-label="Save" onClick={onSave}>
             <Save className="h-3.5 w-3.5" />
             Save
           </Button>
@@ -113,4 +113,3 @@ export function Toolbar({
     </div>
   );
 }
-

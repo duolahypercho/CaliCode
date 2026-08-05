@@ -54,12 +54,9 @@ export function AssetLibrary({ assets, entities, onPromote, onRemove, onDedupe, 
                 </div>
               )}
               <div className="min-w-0 flex-1">
-                <div className="flex items-center gap-2">
-                  <span className="truncate text-sm font-medium">{asset.name}</span>
-                  <Badge>{asset.type}</Badge>
-                </div>
+                <span className="block truncate text-sm font-medium">{asset.name}</span>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  Used by {usageCount.get(asset.id) ?? 0} entities
+                  {asset.type} · used by {usageCount.get(asset.id) ?? 0} entities
                 </p>
                 <div className="mt-1 flex flex-wrap gap-1">
                   {asset.tags.slice(0, 4).map((tag) => (

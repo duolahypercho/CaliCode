@@ -96,7 +96,13 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
         messages: [...history, userMessage],
       })) as { sessionId: string; reply: string; toolCalls: unknown[] };
       setSessionId(result.sessionId);
-      setMessages((current) => [...current, { role: "assistant", content: result.reply || "Done." }]);
+      setMessages((current) => {
+        const last = current[current.length - 1];
+        if (last?.role === "assistant" && last.content === (result.reply || "Done.")) {
+          return current;
+        }
+        return [...current, { role: "assistant", content: result.reply || "Done." }];
+      });
       if (result.toolCalls.length > 0) {
         onLog(`agent completed ${result.toolCalls.length} tool calls`);
       }
@@ -143,12 +149,12 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
 
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
         <Bot className="h-4 w-4" />
-        <span className="text-sm font-medium">Cali Agent</span>
-        <span className="text-xs text-muted-foreground">{busy ? "working" : "ready"}</span>
+        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">Cali Agent</span>
+        <span className="text-[10px] tracking-[0.12em] text-[#616161]">{busy ? "working" : "ready"}</span>
       </div>
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
         <Select value={modelList?.active.provider ?? ""} onValueChange={() => undefined}>
           <SelectTrigger className="h-7 w-28" aria-label="Model provider">
             <SelectValue placeholder="Provider" />

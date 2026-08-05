@@ -12,6 +12,7 @@ test("PIE captures frames", async ({ page }) => {
   const play = page.getByRole("button", { name: "Play", exact: true });
   await expect(play).toBeEnabled({ timeout: 10_000 });
   await play.click();
+  await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeEnabled({ timeout: 10_000 });
   await page.waitForTimeout(1200);
   await page.getByRole("button", { name: "Stop", exact: true }).click();
   await page.getByRole("tab", { name: "Filmstrip" }).click();

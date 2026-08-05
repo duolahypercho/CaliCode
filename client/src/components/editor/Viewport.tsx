@@ -35,8 +35,8 @@ export function Viewport({
   projectRef.current = project;
   const selectedRef = useRef(selectedEntityId);
   selectedRef.current = selectedEntityId;
-  const handlersRef = useRef({ onSelect, onCapture, onLog, onStateChange });
-  handlersRef.current = { onSelect, onCapture, onLog, onStateChange };
+  const handlersRef = useRef({ onSelect, onCapture, onLog, onStateChange, onRuntimeReady });
+  handlersRef.current = { onSelect, onCapture, onLog, onStateChange, onRuntimeReady };
   const rebuildRef = useRef<() => void>(() => undefined);
 
   useEffect(() => {
@@ -53,8 +53,8 @@ export function Viewport({
     rendererRef.current = renderer;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xf5f5f5);
-    scene.fog = new THREE.Fog(0xf5f5f5, 18, 42);
+    scene.background = new THREE.Color(0x080808);
+    scene.fog = new THREE.Fog(0x080808, 18, 42);
     sceneRef.current = scene;
     const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 100);
     camera.position.set(5, 4, 6);
@@ -71,7 +71,7 @@ export function Viewport({
     const key = new THREE.DirectionalLight(0xffffff, 2.4);
     key.position.set(5, 8, 5);
     scene.add(key);
-    const grid = new THREE.GridHelper(16, 16, 0xc7c7c7, 0xe2e2e2);
+    const grid = new THREE.GridHelper(16, 16, 0x3a3a3a, 0x1c1c1c);
     grid.position.y = -0.01;
     scene.add(grid);
 
@@ -94,7 +94,7 @@ export function Viewport({
       onStateChange: (state) => handlersRef.current.onStateChange(state),
     });
     runtimeRef.current = runtime;
-    onRuntimeReady(runtime);
+    handlersRef.current.onRuntimeReady(runtime);
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
@@ -132,11 +132,11 @@ export function Viewport({
       observer.disconnect();
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
       runtime.dispose();
-      onRuntimeReady(null);
+      handlersRef.current.onRuntimeReady(null);
       controls.dispose();
       renderer.dispose();
     };
-  }, [onRuntimeReady]);
+  }, []);
 
   useEffect(() => {
     if (!runtimeRef.current || runtimeRef.current.state === "running") return;

@@ -28,7 +28,7 @@ export function AssetPreview({ kind, params }: { kind: string; params: PreviewPa
     container.appendChild(renderer.domElement);
     rendererRef.current = renderer;
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xf5f5f5);
+    scene.background = new THREE.Color(0x111111);
     scene.add(new THREE.AmbientLight(0xffffff, 1.4));
     const key = new THREE.DirectionalLight(0xffffff, 2.4);
     key.position.set(3, 5, 4);
@@ -68,4 +68,3 @@ export function AssetPreview({ kind, params }: { kind: string; params: PreviewPa
 
   return <div ref={ref} className="h-full w-full" aria-label={`${kind} preview`} />;
 }
-
