@@ -4,8 +4,8 @@ target/
 .DS_Store
 .startup-kit/.backup/
 *.log
+*.tsbuildinfo
 .cali-runtime/
 client/playwright-report/
 client/test-results/
 client/coverage/
-

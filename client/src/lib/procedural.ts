@@ -1,0 +1,166 @@
+import * as THREE from "three";
+import type { Asset, Entity, Project } from "./types";
+
+export interface GeneratorParams {
+  width?: number;
+  height?: number;
+  depth?: number;
+  radius?: number;
+  segments?: number;
+  color?: string;
+  metalness?: number;
+  roughness?: number;
+  seed?: number;
+}
+
+export function createGeometry(kind: string, params: GeneratorParams = {}): THREE.BufferGeometry {
+  const w = params.width ?? 1;
+  const h = params.height ?? 1;
+  const d = params.depth ?? 1;
+  const r = params.radius ?? 0.5;
+  const s = Math.max(4, params.segments ?? 24);
+  switch (kind) {
+    case "box":
+      return new THREE.BoxGeometry(w, h, d);
+    case "sphere":
+      return new THREE.SphereGeometry(r, s, s);
+    case "cylinder":
+      return new THREE.CylinderGeometry(r, r, h, s);
+    case "cone":
+      return new THREE.ConeGeometry(r, h, s);
+    case "torus":
+      return new THREE.TorusGeometry(r, w * 0.5, 16, 48);
+    case "plane":
+      return new THREE.PlaneGeometry(w, h, 1, 1);
+    case "terrain":
+      return terrainGeometry(w, h, s, params.seed ?? 7);
+    default:
+      return new THREE.BoxGeometry(w, h, d);
+  }
+}
+
+export function terrainGeometry(width: number, depth: number, segments: number, seed: number): THREE.BufferGeometry {
+  const geometry = new THREE.PlaneGeometry(width, depth, segments, segments);
+  const positions = geometry.attributes.position as THREE.BufferAttribute;
+  const vector = new THREE.Vector3();
+  for (let i = 0; i < positions.count; i += 1) {
+    vector.fromBufferAttribute(positions, i);
+    const x = vector.x + seed;
+    const z = vector.y + seed;
+    vector.z =
+      Math.sin(x * 0.9 + seed) * 0.25 +
+      Math.sin(z * 1.3 + seed * 2) * 0.2 +
+      Math.sin((x + z) * 0.4) * 0.35;
+    positions.setXYZ(i, vector.x, vector.y, vector.z);
+  }
+  geometry.computeVertexNormals();
+  return geometry;
+}
+
+export function createMaterial(params: GeneratorParams = {}): THREE.MeshStandardMaterial {
+  const material = new THREE.MeshStandardMaterial({
+    color: new THREE.Color(params.color ?? "#6b7280"),
+    metalness: params.metalness ?? 0.1,
+    roughness: params.roughness ?? 0.7,
+  });
+  if (params.seed !== undefined) {
+    material.map = createNoiseTexture(params.seed);
+  }
+  return material;
+}
+
+export function createNoiseTexture(seed = 1, size = 256): THREE.CanvasTexture {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const context = canvas.getContext("2d");
+  if (!context) {
+    return new THREE.CanvasTexture(canvas);
+  }
+  const image = context.createImageData(size, size);
+  for (let y = 0; y < size; y += 1) {
+    for (let x = 0; x < size; x += 1) {
+      const value = Math.floor(
+        128 +
+          80 * Math.sin(x * 0.05 + seed) +
+          60 * Math.sin(y * 0.07 + seed * 2) +
+          30 * Math.sin((x + y) * 0.13 + seed * 3),
+      );
+      const index = (y * size + x) * 4;
+      image.data[index] = value;
+      image.data[index + 1] = value * 0.9;
+      image.data[index + 2] = value * 0.7;
+      image.data[index + 3] = 255;
+    }
+  }
+  context.putImageData(image, 0, 0);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return texture;
+}
+
+export function buildObject(kind: string, materialParams: GeneratorParams = {}): THREE.Object3D {
+  const group = new THREE.Group();
+  const geometry = createGeometry(kind, materialParams);
+  const material = createMaterial(materialParams);
+  const mesh = new THREE.Mesh(geometry, material);
+  group.add(mesh);
+  return group;
+}
+
+export function assetObject(asset: Asset): THREE.Object3D {
+  const kind = asset.source.replace("procedural:", "") || "box";
+  return buildObject(kind, (asset.metadata as GeneratorParams) ?? {});
+}
+
+export function entityObject(entity: Entity): THREE.Object3D {
+  if (entity.kind === "light") {
+    const light = new THREE.DirectionalLight(
+      new THREE.Color((entity.light.color as string) ?? "#ffffff"),
+      (entity.light.intensity as number) ?? 1,
+    );
+    return light;
+  }
+  if (entity.kind === "camera") {
+    return new THREE.PerspectiveCamera(50, 1, 0.1, 100);
+  }
+  return buildObject(entity.kind, entity.material as GeneratorParams);
+}
+
+export function buildScene(project: Project): THREE.Group {
+  const group = new THREE.Group();
+  for (const entity of project.entities) {
+    const object = entityObject(entity);
+    object.name = entity.name;
+    const [px, py, pz] = entity.transform.position;
+    const [rx, ry, rz] = entity.transform.rotation;
+    const [sx, sy, sz] = entity.transform.scale;
+    object.position.set(px, py, pz);
+    object.rotation.set(rx, ry, rz);
+    object.scale.set(sx, sy, sz);
+    object.userData.entityId = entity.id;
+    group.add(object);
+  }
+  return group;
+}
+
+export function renderThumbnail(object: THREE.Object3D, size = 128): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = size;
+  canvas.height = size;
+  const renderer = new THREE.WebGLRenderer({ canvas, preserveDrawingBuffer: true, antialias: true });
+  renderer.setSize(size, size, false);
+  const scene = new THREE.Scene();
+  scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+  const key = new THREE.DirectionalLight(0xffffff, 2);
+  key.position.set(3, 4, 5);
+  scene.add(key);
+  scene.add(object);
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 100);
+  camera.position.set(2.5, 2, 3);
+  camera.lookAt(0, 0, 0);
+  renderer.render(scene, camera);
+  const dataUrl = canvas.toDataURL("image/png");
+  renderer.dispose();
+  return dataUrl;
+}
