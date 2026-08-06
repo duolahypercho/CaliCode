@@ -48,7 +48,11 @@ export function Viewport({
       preserveDrawingBuffer: true,
     });
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setSize(container.clientWidth, container.clientHeight);
+    // updateStyle=false: the canvas is sized by CSS (h-full w-full). Letting
+    // three.js write inline width/height pins the canvas to whatever the
+    // container measured on the first layout pass — which is 0x0 inside a
+    // flex-1 parent, and inline styles then beat the classes permanently.
+    renderer.setSize(Math.max(container.clientWidth, 1), Math.max(container.clientHeight, 1), false);
     renderer.shadowMap.enabled = true;
     rendererRef.current = renderer;
 
@@ -112,6 +116,9 @@ export function Viewport({
     const onResize = () => {
       const width = container.clientWidth;
       const height = container.clientHeight;
+      // A hidden or not-yet-laid-out container reports 0, which would make
+      // camera.aspect NaN and blank the render target until a full remount.
+      if (width === 0 || height === 0) return;
       renderer.setSize(width, height, false);
       camera.aspect = width / height;
       camera.updateProjectionMatrix();

@@ -1,31 +1,38 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, FolderPlus, Moon, Sun, Gamepad2 } from "lucide-react";
-import { Toolbar } from "./components/editor/Toolbar";
 import { Viewport } from "./components/editor/Viewport";
 import { SceneGraph } from "./components/editor/SceneGraph";
 import { Inspector } from "./components/editor/Inspector";
 import { ScriptEditor } from "./components/editor/ScriptEditor";
-import { ConsolePanel, type LogEntry } from "./components/editor/ConsolePanel";
+import type { LogEntry } from "./components/editor/ConsolePanel";
 import { Filmstrip } from "./components/editor/Filmstrip";
 import { TestResults } from "./components/editor/TestResults";
 import { AssetWorkbench } from "./components/editor/AssetWorkbench";
 import { AssetLibrary } from "./components/editor/AssetLibrary";
 import { AgentPanel } from "./components/editor/AgentPanel";
+import { TitleBar } from "./components/workspace/TitleBar";
+import { GamesSidebar, type GameSession } from "./components/workspace/GamesSidebar";
+import { WorkspaceTabs, type WorkspaceTab } from "./components/workspace/WorkspaceTabs";
+import { PlayOverlay, type TweakPin } from "./components/workspace/PlayOverlay";
+import { TweakPanel, entityTweakControls, type TweakControl } from "./components/workspace/TweakPanel";
+import { LiveBar, type LiveStats } from "./components/workspace/LiveBar";
 import { Button } from "./components/ui/button";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from "./components/ui/dialog";
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { rpc } from "./lib/rpc";
-import { addAsset, addEntity, addScript, addTest, removeEntity, slugify, starterProject, uid, updateAsset, updateEntity, updateScript } from "./lib/store";
-import { assetObject, renderThumbnail } from "./lib/procedural";
+import { addAsset, removeEntity, slugify, starterProject, uid, updateEntity, updateScript } from "./lib/store";
 import { runTests } from "./lib/testRunner";
-import type { PieState } from "./lib/pie";
-import type { PieRuntime } from "./lib/pie";
-import type { Asset, BrowserTool, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
+import { useBrowserTools } from "./lib/useBrowserTools";
+import { useFrameStats } from "./lib/useFrameStats";
+import type { PieRuntime, PieState } from "./lib/pie";
+import type { Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
+
+const SESSIONS_KEY = "calicode-sessions";
+const PREVIEW_ORIGIN = "http://127.0.0.1:5199";
 
 export default function App() {
   const [project, setProject] = useState<Project>(starterProject);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
   const [selectedScriptId, setSelectedScriptId] = useState<string | null>("spin");
   const [runtime, setRuntime] = useState<PieRuntime | null>(null);
@@ -36,739 +43,352 @@ export default function App() {
   const [modelList, setModelList] = useState<ModelList | null>(null);
   const [captureEvery, setCaptureEvery] = useState(3);
   const [assetSearch, setAssetSearch] = useState("");
-  const [projects, setProjects] = useState<Project[]>([]);
+  const [tab, setTab] = useState<WorkspaceTab>("play");
+  const [activePin, setActivePin] = useState<string | null>(null);
+  const [buildMs, setBuildMs] = useState<number | null>(null);
+  const [exporting, setExporting] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
   const [newProjectBusy, setNewProjectBusy] = useState(false);
-  const [dark, setDark] = useState(() => {
-    const saved = localStorage.getItem("cali-theme");
-    return saved ? saved === "dark" : true;
-  });
+  const [sessions, setSessions] = useState<Record<string, GameSession[]>>(readSessions);
+  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+
   const runtimeRef = useRef<PieRuntime | null>(null);
   runtimeRef.current = runtime;
 
-  const pushLog = useCallback((message: string, level: "info" | "error" = "info") => {
+  const pushLog = useCallback((text: string, level: "info" | "error" = "info") => {
     setLogs((current) => [
       ...current.slice(-199),
-      {
-        id: uid("log"),
-        level,
-        message,
-        time: new Date().toLocaleTimeString(),
-      },
+      { id: uid("log"), level, message: text, time: new Date().toLocaleTimeString() },
     ]);
   }, []);
 
   useEffect(() => {
-    document.documentElement.classList.toggle("dark", dark);
-    localStorage.setItem("cali-theme", dark ? "dark" : "light");
-  }, [dark]);
+    document.documentElement.classList.add("dark");
+  }, []);
 
   useEffect(() => {
+    localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
+  }, [sessions]);
+
+  useEffect(() => {
+    const started = performance.now();
     void (async () => {
       try {
-        const loaded = (await rpc("project_open", { slug: "starter" })) as Project;
+        const loaded = await rpc<Project>("project_open", { slug: "starter" });
         setProject(loaded);
         setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
         setProjects(await rpc<Project[]>("project_list", {}));
+        setBuildMs(performance.now() - started);
       } catch {
         pushLog("core unavailable; using local starter project", "error");
       }
       try {
         setModelList(await rpc("model_list", {}));
       } catch (error) {
-        pushLog(`model list failed: ${error instanceof Error ? error.message : String(error)}`);
+        pushLog(`model list failed: ${reason(error)}`);
       }
     })();
   }, [pushLog]);
 
-  const browserTools = useMemo<BrowserTool[]>(
-    () => [
-      {
-        name: "editor_scene_inspect",
-        description: "Inspect the current scene graph, entities, scripts, assets, and tests.",
-        parameters: { type: "object", properties: {} },
-        handler: async () => ({
-          project: {
-            slug: project.slug,
-            entities: project.entities.map((entity) => ({
-              id: entity.id,
-              name: entity.name,
-              kind: entity.kind,
-              position: entity.transform.position,
-              rotation: entity.transform.rotation,
-              scale: entity.transform.scale,
-              assetId: entity.assetId,
-            })),
-            scripts: project.scripts.map((script) => ({ id: script.id, name: script.name })),
-            assets: project.assets.map((asset) => ({ id: asset.id, name: asset.name, type: asset.type, tags: asset.tags })),
-            tests: project.tests.map((test) => ({ id: test.id, name: test.name })),
-          },
-        }),
-      },
-      {
-        name: "editor_object_add",
-        description: "Add an entity to the scene.",
-        parameters: {
-          type: "object",
-          properties: {
-            name: { type: "string" },
-            kind: { type: "string", enum: ["box", "sphere", "cylinder", "cone", "torus", "terrain", "plane", "light"] },
-            position: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-            color: { type: "string" },
-          },
-          required: ["name", "kind"],
-        },
-        handler: async (args) => {
-          const entity: Entity = {
-            id: uid("entity"),
-            name: String(args.name ?? "New Entity"),
-            kind: String(args.kind ?? "box"),
-            transform: {
-              position: (args.position as [number, number, number]) ?? [0, 0.5, 0],
-              rotation: [0, 0, 0],
-              scale: [1, 1, 1],
-            },
-            material: { color: args.color ?? "#6b7280", metalness: 0.1, roughness: 0.7 },
-            light: args.kind === "light" ? { type: "directional", intensity: 2, color: args.color ?? "#ffffff" } : {},
-            scriptIds: [],
-            assetId: null,
-          };
-          setProject((current) => ({ ...current, entities: [...current.entities, entity] }));
-          return entity;
-        },
-      },
-      {
-        name: "editor_object_remove",
-        description: "Remove an entity from the scene by id.",
-        parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
-        handler: async (args) => {
-          const id = String(args.id);
-          setProject((current) => ({ ...current, entities: current.entities.filter((entity) => entity.id !== id) }));
-          return { removed: id };
-        },
-      },
-      {
-        name: "editor_update_transform",
-        description: "Update an entity transform.",
-        parameters: {
-          type: "object",
-          properties: {
-            id: { type: "string" },
-            position: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-            rotation: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-            scale: { type: "array", items: { type: "number" }, minItems: 3, maxItems: 3 },
-          },
-          required: ["id"],
-        },
-        handler: async (args) => {
-          const id = String(args.id);
-          setProject((current) => ({
-            ...current,
-            entities: current.entities.map((entity) =>
-              entity.id === id
-                ? {
-                    ...entity,
-                    transform: {
-                      position: (args.position as [number, number, number]) ?? entity.transform.position,
-                      rotation: (args.rotation as [number, number, number]) ?? entity.transform.rotation,
-                      scale: (args.scale as [number, number, number]) ?? entity.transform.scale,
-                    },
-                  }
-                : entity,
-            ),
-          }));
-          return { updated: id };
-        },
-      },
-      {
-        name: "editor_script_write",
-        description: "Create or update a game script.",
-        parameters: {
-          type: "object",
-          properties: {
-            id: { type: "string" },
-            name: { type: "string" },
-            code: { type: "string" },
-          },
-          required: ["name", "code"],
-        },
-        handler: async (args) => {
-          const script = { id: String(args.id ?? ""), name: String(args.name), code: String(args.code) };
-          setProject((current) => {
-            const existing = current.scripts.find((item) => item.id === script.id);
-            return existing
-              ? updateScript(current, existing.id, { name: script.name, code: script.code })
-              : addScript(current, { name: script.name, code: script.code });
-          });
-          return { saved: script.name };
-        },
-      },
-      {
-        name: "editor_run_pie",
-        description: "Start PIE so scripts and game logic run.",
-        parameters: { type: "object", properties: { frames: { type: "number" } } },
-        handler: async (args) => {
-          const target = runtimeRef.current;
-          if (!target) return { error: "runtime not ready" };
-          target.start();
-          const frames = Number(args.frames ?? 12);
-          await target.waitFrames(frames);
-          target.pause();
-          return { frames: target.frames, captures: target.frames };
-        },
-      },
-      {
-        name: "editor_capture_frame",
-        description: "Capture the current frame as a screenshot.",
-        parameters: { type: "object", properties: {} },
-        handler: async () => {
-          const target = runtimeRef.current;
-          if (!target) return { error: "runtime not ready" };
-          return { dataUrl: target.capture() };
-        },
-      },
-      {
-        name: "editor_run_tests",
-        description: "Run the project test suite and return pass/fail results.",
-        parameters: { type: "object", properties: {} },
-        handler: async () => {
-          const target = runtimeRef.current;
-          if (!target) return { error: "runtime not ready" };
-          const results = await runTests(project, target, project.tests, pushLog);
-          setTestResults(results);
-          return results;
-        },
-      },
-      {
-        name: "editor_asset_generate",
-        description: "Generate a procedural asset in the workbench.",
-        parameters: {
-          type: "object",
-          properties: {
-            name: { type: "string" },
-            kind: { type: "string", enum: ["box", "sphere", "cylinder", "cone", "torus", "terrain", "plane"] },
-            color: { type: "string" },
-            metalness: { type: "number" },
-            roughness: { type: "number" },
-          },
-          required: ["name", "kind"],
-        },
-        handler: async (args) => {
-          const asset: Asset = {
-            id: uid("asset"),
-            name: String(args.name),
-            type: "procedural",
-            source: `procedural:${args.kind}`,
-            tags: ["agent"],
-            usage: [],
-            thumbnail: null,
-            metadata: {
-              generator: args.kind,
-              color: args.color ?? "#f97316",
-              metalness: args.metalness ?? 0.2,
-              roughness: args.roughness ?? 0.45,
-            },
-          };
-          setProject((current) => addAsset(current, asset));
-          return asset;
-        },
-      },
-      {
-        name: "editor_asset_preview",
-        description: "Render an asset thumbnail.",
-        parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
-        handler: async (args) => {
-          const asset = project.assets.find((item) => item.id === args.id);
-          if (!asset) return { error: "asset not found" };
-          const thumbnail = renderThumbnail(assetObject(asset));
-          setProject((current) => updateAsset(current, asset.id, { thumbnail }));
-          return { thumbnail };
-        },
-      },
-      {
-        name: "editor_promote_asset",
-        description: "Add an asset to the scene as a new entity.",
-        parameters: { type: "object", properties: { id: { type: "string" } }, required: ["id"] },
-        handler: async (args) => {
-          const asset = project.assets.find((item) => item.id === args.id);
-          if (!asset) return { error: "asset not found" };
-          const entity: Entity = {
-            id: uid("entity"),
-            name: asset.name,
-            kind: String((asset.metadata?.generator as string) ?? "box"),
-            transform: { position: [0, 0.5, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
-            material: { color: (asset.metadata?.color as string) ?? "#6b7280", metalness: 0.2, roughness: 0.5 },
-            light: {},
-            scriptIds: [],
-            assetId: asset.id,
-          };
-          setProject((current) => ({
-            ...current,
-            entities: [...current.entities, entity],
-            assets: current.assets.map((item) => (item.id === asset.id ? { ...item, usage: [...item.usage, entity.id] } : item)),
-          }));
-          return entity;
-        },
-      },
-      {
-        name: "editor_project_save",
-        description: "Persist the current scene, assets, scripts, and tests to the CaliCode project store.",
-        parameters: { type: "object", properties: {} },
-        handler: async () => {
-          await rpc("project_save", { project });
-          return { saved: true, slug: project.slug };
-        },
-      },
-      {
-        name: "editor_project_checkpoint",
-        description: "Create a revertible checkpoint of the current project.",
-        parameters: { type: "object", properties: {} },
-        handler: async () => {
-          const result = await rpc<{ id: string }>("project_checkpoint", { slug: project.slug });
-          return result;
-        },
-      },
-      {
-        name: "editor_model_switch",
-        description: "Switch the CaliCode harness provider and model.",
-        parameters: {
-          type: "object",
-          properties: {
-            provider: { type: "string" },
-            model: { type: "string" },
-          },
-          required: ["provider", "model"],
-        },
-        handler: async (args) => {
-          const list = await rpc<ModelList>("model_switch", {
-            provider: String(args.provider),
-            model: String(args.model),
-          });
-          setModelList(list);
-          return { switched: true, provider: args.provider, model: args.model };
-        },
-      },
-      {
-        name: "editor_console_log",
-        description: "Write a line to the editor console.",
-        parameters: {
-          type: "object",
-          properties: {
-            message: { type: "string" },
-            level: { type: "string", enum: ["info", "error"] },
-          },
-          required: ["message"],
-        },
-        handler: async (args) => {
-          pushLog(String(args.message), args.level === "error" ? "error" : "info");
-          return { logged: true };
-        },
-      },
-      {
-        name: "editor_select_entity",
-        description: "Select or deselect an entity in the scene graph.",
-        parameters: { type: "object", properties: { id: { type: "string" } } },
-        handler: async (args) => {
-          const id = args.id ? String(args.id) : null;
-          setSelectedEntityId(id);
-          return { selected: id };
-        },
-      },
-      {
-        name: "editor_test_add",
-        description: "Add a scripted game test to the project.",
-        parameters: {
-          type: "object",
-          properties: {
-            name: { type: "string" },
-            script: { type: "string" },
-          },
-          required: ["name", "script"],
-        },
-        handler: async (args) => {
-          const test = { id: uid("test"), name: String(args.name), script: String(args.script ?? "") };
-          setProject((current) => ({ ...current, tests: [...current.tests, test] }));
-          return test;
-        },
-      },
-      {
-        name: "editor_asset_import_file",
-        description: "Import a base64-encoded image or 3D file into the asset library.",
-        parameters: {
-          type: "object",
-          properties: {
-            name: { type: "string" },
-            data: { type: "string" },
-            mime: { type: "string" },
-            tags: { type: "array", items: { type: "string" } },
-          },
-          required: ["name", "data", "mime"],
-        },
-        handler: async (args) => {
-          const result = await rpc("asset_import_file", {
-            slug: project.slug,
-            name: String(args.name),
-            data: String(args.data),
-            mime: String(args.mime),
-            tags: Array.isArray(args.tags) ? args.tags : [],
-          });
-          const loaded = await rpc<Project>("project_open", { slug: project.slug });
-          setProject(loaded);
-          return result;
-        },
-      },
-    ],
-    [project, pushLog],
-  );
+  const browserTools = useBrowserTools({
+    project,
+    setProject,
+    runtimeRef,
+    setModelList,
+    setTestResults,
+    setSelectedEntityId,
+    pushLog,
+  });
 
   useEffect(() => {
     void rpc("tool_register", {
-      tools: browserTools.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters })),
-    }).catch((error) => pushLog(`tool registration failed: ${error instanceof Error ? error.message : String(error)}`));
+      tools: browserTools.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters,
+      })),
+    }).catch((error) => pushLog(`tool registration failed: ${reason(error)}`));
   }, [browserTools, pushLog]);
 
-  const saveProject = async () => {
+  const saveProject = useCallback(async () => {
+    setExporting(true);
     try {
       await rpc("project_save", { project });
       pushLog(`saved ${project.slug}`);
     } catch (error) {
-      pushLog(`save failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      pushLog(`save failed: ${reason(error)}`, "error");
+    } finally {
+      setExporting(false);
     }
-  };
+  }, [project, pushLog]);
 
-  const checkpointProject = async () => {
-    try {
-      const result = await rpc<{ id: string }>("project_checkpoint", { slug: project.slug });
-      pushLog(`checkpoint ${result.id}`);
-    } catch (error) {
-      pushLog(`checkpoint failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-    }
-  };
-
-  const openProject = async (slug: string) => {
-    try {
-      const loaded = await rpc<Project>("project_open", { slug });
-      setProject(loaded);
-      setSelectedEntityId(null);
-      setSelectedScriptId(loaded.scripts[0]?.id ?? null);
-      setFrames([]);
-      setTestResults([]);
-      setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
-      pushLog(`opened ${loaded.title}`);
-    } catch (error) {
-      pushLog(`open failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-    }
-  };
+  const openProject = useCallback(
+    async (slug: string) => {
+      try {
+        const loaded = await rpc<Project>("project_open", { slug });
+        setProject(loaded);
+        setSelectedEntityId(null);
+        setSelectedScriptId(loaded.scripts[0]?.id ?? null);
+        setFrames([]);
+        setTestResults([]);
+        setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
+        pushLog(`opened ${loaded.title}`);
+      } catch (error) {
+        pushLog(`open failed: ${reason(error)}`, "error");
+      }
+    },
+    [pushLog],
+  );
 
   const createProject = async () => {
     const title = newProjectName.trim();
     if (!title || newProjectBusy) return;
     const slug = slugify(title);
-    if (projects.some((project) => project.slug === slug)) {
+    if (projects.some((item) => item.slug === slug)) {
       pushLog(`project ${slug} already exists`, "error");
       return;
     }
     setNewProjectBusy(true);
     try {
       const created = await rpc<Project>("project_create", { slug, title });
-      setProjects((current) => [...current.filter((project) => project.slug !== slug), created]);
+      setProjects((current) => [...current.filter((item) => item.slug !== slug), created]);
       setProject(created);
       setSelectedEntityId(null);
       setSelectedScriptId(created.scripts[0]?.id ?? null);
       setFrames([]);
       setTestResults([]);
-      setCaptureEvery((created.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
       setNewProjectName("");
       setNewProjectOpen(false);
       pushLog(`created ${title}`);
     } catch (error) {
-      pushLog(`create failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      pushLog(`create failed: ${reason(error)}`, "error");
     } finally {
       setNewProjectBusy(false);
     }
   };
 
-  const runTestSuite = async () => {
+  const runTestSuite = useCallback(async () => {
     if (!runtime) return;
     const results = await runTests(project, runtime, project.tests, pushLog, async (name, dataUrl, threshold = 8) => {
       try {
-        const result = await rpc<{ pass: boolean; distance: number; threshold: number }>("test_baseline_compare", {
+        return await rpc<{ pass: boolean; distance: number; threshold: number }>("test_baseline_compare", {
           slug: project.slug,
           name,
           image: dataUrl.split(",")[1] ?? "",
           threshold,
         });
-        return result;
       } catch (error) {
-        pushLog(`baseline compare failed: ${error instanceof Error ? error.message : String(error)}`);
+        pushLog(`baseline compare failed: ${reason(error)}`);
         return { pass: false, distance: 64, threshold };
       }
     });
     setTestResults(results);
     pushLog(`${results.filter((result) => result.pass).length}/${results.length} tests passed`);
-  };
+  }, [project, pushLog, runtime]);
 
-  const handleAddEntity = () => {
-    const entity = {
+  const handleAddEntity = useCallback(() => {
+    const entity: Entity = {
       id: uid("entity"),
       name: "New Entity",
       kind: "box",
-      transform: { position: [0, 0.5, 0] as [number, number, number], rotation: [0, 0, 0] as [number, number, number], scale: [1, 1, 1] as [number, number, number] },
+      transform: { position: [0, 0.5, 0], rotation: [0, 0, 0], scale: [1, 1, 1] },
       material: { color: "#6b7280", metalness: 0.1, roughness: 0.7 },
       light: {},
-      scriptIds: [] as string[],
+      scriptIds: [],
       assetId: null,
     };
     setProject((current) => ({ ...current, entities: [...current.entities, entity] }));
     setSelectedEntityId(entity.id);
-  };
+  }, []);
 
   const handleImportImage = async (file: File) => {
     const data = await readFileBase64(file);
     const mime = file.type || "application/octet-stream";
     try {
       await rpc("asset_import_file", { slug: project.slug, name: file.name, data, mime, tags: ["imported"] });
-      if (mime.startsWith("image/")) {
-        const ingest = await rpc<{ sourceHash: string; width: number; height: number }>("image3d_ingest", {
-          slug: project.slug,
-          name: file.name,
-          image: data,
-        });
-        const spec = await rpc("image3d_spec", {
-          name: file.name,
-          sourceHash: ingest.sourceHash,
-          width: ingest.width,
-          height: ingest.height,
-        });
-        const generated = await rpc<{ assetId: string }>("image3d_generate", { slug: project.slug, spec });
-        const caliFile = await rpc<{ content: string }>("file_read", {
-          slug: project.slug,
-          path: `assets/${generated.assetId}.cali.json`,
-        });
-        const loadedWithCali = await rpc<Project>("project_open", { slug: project.slug });
-        const withCali: Project = {
-          ...loadedWithCali,
-          assets: loadedWithCali.assets.map((asset) =>
-            asset.id === generated.assetId
-              ? { ...asset, metadata: { ...(asset.metadata ?? {}), cali: JSON.parse(caliFile.content) } }
-              : asset,
-          ),
-        };
-        await rpc("project_save", { project: withCali });
-        setProject(withCali);
-        pushLog(`imported ${file.name} and generated image-to-3D spec`);
+      if (!mime.startsWith("image/")) {
+        setProject(await rpc<Project>("project_open", { slug: project.slug }));
+        pushLog(`imported ${file.name}`);
         return;
       }
+      const ingest = await rpc<{ sourceHash: string; width: number; height: number }>("image3d_ingest", {
+        slug: project.slug,
+        name: file.name,
+        image: data,
+      });
+      const spec = await rpc("image3d_spec", {
+        name: file.name,
+        sourceHash: ingest.sourceHash,
+        width: ingest.width,
+        height: ingest.height,
+      });
+      const generated = await rpc<{ assetId: string }>("image3d_generate", { slug: project.slug, spec });
+      const caliFile = await rpc<{ content: string }>("file_read", {
+        slug: project.slug,
+        path: `assets/${generated.assetId}.cali.json`,
+      });
       const loaded = await rpc<Project>("project_open", { slug: project.slug });
-      setProject(loaded);
-      pushLog(`imported ${file.name}`);
+      const withCali: Project = {
+        ...loaded,
+        assets: loaded.assets.map((asset) =>
+          asset.id === generated.assetId
+            ? { ...asset, metadata: { ...(asset.metadata ?? {}), cali: JSON.parse(caliFile.content) } }
+            : asset,
+        ),
+      };
+      await rpc("project_save", { project: withCali });
+      setProject(withCali);
+      pushLog(`imported ${file.name} and generated image-to-3D spec`);
     } catch (error) {
-      pushLog(`import failed: ${error instanceof Error ? error.message : String(error)}`, "error");
-    }
-  };
-
-  const handleDedupe = async () => {
-    try {
-      const result = await rpc<{ sha256: string; files: string[] }[]>("asset_hash_dedupe", { slug: project.slug });
-      pushLog(result.length === 0 ? "no duplicate assets" : `found ${result.length} duplicate groups`);
-    } catch (error) {
-      pushLog(`dedupe failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+      pushLog(`import failed: ${reason(error)}`, "error");
     }
   };
 
   const selectedEntity = project.entities.find((entity) => entity.id === selectedEntityId) ?? null;
-  const selectedAsset = useMemo(() => project.assets.find((asset) => asset.id === selectedEntity?.assetId) ?? null, [project.assets, selectedEntity?.assetId]);
+
+  const promoteAsset = (assetId: string) => {
+    void browserTools.find((tool) => tool.name === "editor_promote_asset")?.handler({ id: assetId });
+  };
+
+  const pins = useMemo<TweakPin[]>(
+    () => [
+      ...project.entities.slice(0, 3).map((entity) => ({ id: entity.id, label: entity.name.toUpperCase() })),
+      { id: "__runtime", label: "RUNTIME" },
+    ],
+    [project.entities],
+  );
+
+  const tweak = useMemo<{ title: string; controls: TweakControl[] } | null>(() => {
+    if (!activePin) return null;
+    if (activePin === "__runtime") {
+      return {
+        title: "RUNTIME",
+        controls: [
+          {
+            key: "capture",
+            label: "Capture every",
+            min: 1,
+            max: 30,
+            step: 1,
+            value: captureEvery,
+            display: `${captureEvery}f`,
+            onChange: (value) => {
+              setCaptureEvery(value);
+              runtime?.setCaptureEvery(value);
+            },
+          },
+        ],
+      };
+    }
+    const entity = project.entities.find((item) => item.id === activePin);
+    if (!entity) return null;
+    return {
+      title: entity.name.toUpperCase(),
+      controls: entityTweakControls(entity, (patch) => setProject((current) => updateEntity(current, entity.id, patch))),
+    };
+  }, [activePin, captureEvery, project.entities, runtime]);
+
+  const frameStats = useFrameStats(runtime, pieState === "running");
+  const stats: LiveStats = {
+    fps: frameStats.fps,
+    frameMs: frameStats.frameMs,
+    draws: project.entities.length,
+    entities: project.entities.length,
+    buildMs,
+  };
+
+  const failing = testResults.filter((result) => !result.pass).length;
 
   return (
     <div className="flex h-dvh flex-col">
-      <header className="flex h-11 shrink-0 items-center gap-3 border-b border-border bg-[#0c0c0c] px-4">
-        <div className="flex items-center gap-3">
-          <Gamepad2 className="h-4 w-4 text-[#828282]" />
-          <h1 className="font-display text-sm font-extrabold tracking-[0.32em] text-[#d6d6d6]">CaliCode</h1>
-        </div>
-        <span className="hidden min-w-0 items-center gap-3 sm:flex">
-          <span className="text-[#3a3a3a]">/</span>
-          <span className="truncate text-xs tracking-[0.12em] text-[#828282]">{project.title}</span>
-        </span>
-        <span className="ml-2 hidden rounded border border-white/10 px-2 py-0.5 text-[10px] tracking-[0.14em] text-[#616161] md:inline">
-          {modelList?.active.provider ?? "OFFLINE"} · {modelList?.active.model ?? "NO MODEL"}
-        </span>
-        <div className="flex-1" />
-        <span className="hidden text-[10px] tracking-[0.14em] text-[#4f4f4f] md:inline">
-          PIE · 60 HZ · CAPTURE {captureEvery}
-        </span>
-        <Button
-          variant="ghost"
-          size="icon"
-          aria-label="Toggle theme"
-          onClick={() => setDark((current) => !current)}
-        >
-          {dark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-        </Button>
-      </header>
+      <TitleBar projectTitle={project.title} modelList={modelList} />
+
       <div className="flex min-h-0 flex-1">
-        <aside className="hidden w-52 shrink-0 border-r border-border bg-[#0b0b0b] md:flex md:flex-col">
-          <div className="px-3 pb-2 pt-3">
-            <Button variant="secondary" size="sm" className="calicode-button w-full justify-center" onClick={handleAddEntity}>
-              New Entity
-            </Button>
-          </div>
-          <div className="flex items-center justify-between px-3 pb-2">
-            <span className="calicode-label">Games</span>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-6 w-6"
-              aria-label="New project"
-              onClick={() => setNewProjectOpen(true)}
-            >
-              <FolderPlus className="h-3.5 w-3.5" />
-            </Button>
-          </div>
-          <div className="max-h-24 overflow-y-auto border-b border-white/5 px-2 pb-1">
-            {projects.length === 0 ? (
-              <p className="px-2 py-1 text-xs text-[#616161]">No saved projects.</p>
-            ) : (
-              projects.map((item) => (
-                <button
-                  key={item.slug}
-                  onClick={() => void openProject(item.slug)}
-                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs ${
-                    item.slug === project.slug ? "bg-[#171717] text-[#e0e0e0]" : "text-[#8a8a8a] hover:bg-[#141414]"
-                  }`}
-                >
-                  <span className="truncate">{item.title}</span>
-                  <span className="ml-auto shrink-0 text-[9px] tracking-[0.12em] text-[#4f4f4f]">{item.slug}</span>
-                </button>
-              ))
-            )}
-          </div>
-          <Tabs defaultValue="scene" className="flex min-h-0 flex-1 flex-col">
-            <TabsList className="border-b border-white/5 px-2">
-              <TabsTrigger value="scene">Scene</TabsTrigger>
-              <TabsTrigger value="assets">Assets</TabsTrigger>
-            </TabsList>
-            <TabsContent value="scene" className="min-h-0 flex-1 pt-0">
-              <SceneGraph
-                entities={project.entities}
-                selectedId={selectedEntityId}
-                onSelect={setSelectedEntityId}
-                onAdd={handleAddEntity}
-                onRemove={(id) => {
-                  setProject((current) => removeEntity(current, id));
-                  if (selectedEntityId === id) setSelectedEntityId(null);
-                }}
-              />
-            </TabsContent>
-            <TabsContent value="assets" className="min-h-0 flex-1 pt-0">
-              <AssetLibrary
-                assets={project.assets}
-                entities={project.entities}
-                search={assetSearch}
-                onSearch={setAssetSearch}
-                onPromote={(asset) => {
-                  const tool = browserTools.find((item) => item.name === "editor_promote_asset");
-                  void tool?.handler({ id: asset.id });
-                }}
-                onRemove={(assetId) => {
-                  setProject((current) => ({ ...current, assets: current.assets.filter((asset) => asset.id !== assetId) }));
-                }}
-                onDedupe={() => void handleDedupe()}
-              />
-            </TabsContent>
-          </Tabs>
-        </aside>
-        <aside className="hidden w-[380px] shrink-0 border-r border-border bg-[#0a0a0a] lg:block">
-          <Tabs defaultValue="agent" className="flex h-full flex-col">
-            <TabsList className="border-b border-white/5 px-2">
-              <TabsTrigger value="agent">Agent</TabsTrigger>
-              <TabsTrigger value="workbench">Workbench</TabsTrigger>
-            </TabsList>
-            <TabsContent value="agent" className="min-h-0 flex-1 pt-0">
-              <AgentPanel
-                projectSlug={project.slug}
-                modelList={modelList}
-                browserTools={browserTools}
-                onModelChange={() =>
-                  void rpc<ModelList>("model_list", {}).then((list) => setModelList(list)).catch(() => undefined)
-                }
-                onLog={pushLog}
-              />
-            </TabsContent>
-            <TabsContent value="workbench" className="min-h-0 flex-1 pt-0">
-              <AssetWorkbench
-                onAddAsset={(asset) => {
-                  const next: Asset = {
-                    id: uid("asset"),
-                    name: asset.name ?? "Asset",
-                    type: asset.type ?? "procedural",
-                    source: asset.source ?? "procedural:box",
-                    tags: asset.tags ?? [],
-                    usage: [],
-                    thumbnail: asset.thumbnail ?? null,
-                    metadata: asset.metadata ?? {},
-                  };
-                  setProject((current) => addAsset(current, next));
-                  pushLog(`generated ${next.name}`);
-                  return next;
-                }}
-                onPromote={(assetId) => {
-                  const tool = browserTools.find((item) => item.name === "editor_promote_asset");
-                  void tool?.handler({ id: assetId });
-                }}
-                onImportImage={(file) => void handleImportImage(file)}
-              />
-            </TabsContent>
-          </Tabs>
-        </aside>
-        <main className="flex min-w-0 flex-1 flex-col">
-          <Toolbar
-            runtime={runtime}
-            pieState={pieState}
-            captureEvery={captureEvery}
-            onCaptureEveryChange={(value) => {
-              setCaptureEvery(value);
-              runtime?.setCaptureEvery(value);
-            }}
-            onRunTests={() => void runTestSuite()}
-            onSave={() => void saveProject()}
-            onCheckpoint={() => void checkpointProject()}
-            onAddEntity={handleAddEntity}
+        <GamesSidebar
+          projects={projects.length > 0 ? projects : [project]}
+          activeSlug={project.slug}
+          sessions={sessions}
+          activeSessionId={activeSessionId}
+          onOpenProject={(slug) => void openProject(slug)}
+          onSelectSession={(slug, sessionId) => {
+            setActiveSessionId(sessionId);
+            if (slug !== project.slug) void openProject(slug);
+          }}
+          onNewSession={(slug) => {
+            const session: GameSession = { id: uid("session"), name: `Session ${(sessions[slug]?.length ?? 0) + 1}` };
+            setSessions((current) => ({ ...current, [slug]: [...(current[slug] ?? []), session] }));
+            setActiveSessionId(session.id);
+          }}
+          onNewGame={() => setNewProjectOpen(true)}
+        />
+
+        <aside className="hidden w-[384px] shrink-0 border-r border-white/[0.06] bg-[#0a0a0a] lg:block">
+          <AgentPanel
+            projectSlug={project.slug}
+            modelList={modelList}
+            browserTools={browserTools}
+            onModelChange={() =>
+              void rpc<ModelList>("model_list", {})
+                .then(setModelList)
+                .catch(() => undefined)
+            }
+            onLog={pushLog}
           />
+        </aside>
+
+        <main className="flex min-w-0 flex-1 flex-col bg-[#080808]">
+          <WorkspaceTabs
+            active={tab}
+            onChange={setTab}
+            badges={{ test: failing || undefined }}
+            previewUrl={`${PREVIEW_ORIGIN}/play/${project.slug}`}
+            onNewGame={() => setNewProjectOpen(true)}
+            onExport={() => void saveProject()}
+            exporting={exporting}
+          />
+
           <div className="relative min-h-0 flex-1">
-            <Viewport
-              project={project}
-              selectedEntityId={selectedEntityId}
-              onSelect={setSelectedEntityId}
-              onRuntimeReady={(next) => {
-                setRuntime(next);
-                if (next) next.setCaptureEvery(captureEvery);
-              }}
-              onCapture={(frame) => setFrames((current) => [...current.slice(-59), frame])}
-              onLog={pushLog}
-              onStateChange={setPieState}
-            />
-          </div>
-          <section className="h-56 shrink-0 border-t border-border bg-[#0a0a0a]">
-            <Tabs defaultValue="inspector" className="flex h-full flex-col">
-              <TabsList className="max-w-full border-b border-white/5 px-2">
-                <TabsTrigger value="inspector">Inspector</TabsTrigger>
-                <TabsTrigger value="scripts">Scripts</TabsTrigger>
-                <TabsTrigger value="console">Console</TabsTrigger>
-                <TabsTrigger value="filmstrip">Filmstrip</TabsTrigger>
-                <TabsTrigger value="tests">Tests</TabsTrigger>
-              </TabsList>
-              <TabsContent value="inspector" className="min-h-0 flex-1 overflow-y-auto pt-0">
-                <Inspector
-                  entity={selectedEntity}
-                  onSave={(entity) => {
-                    setProject((current) => updateEntity(current, entity.id, entity));
-                    pushLog(`updated ${entity.name}`);
-                  }}
-                />
-              </TabsContent>
-              <TabsContent value="scripts" className="min-h-0 flex-1 pt-0">
+            {/* The viewport stays mounted across tabs so PIE never loses its WebGL context. */}
+            <div
+              className={tab === "play" ? "absolute inset-0" : "pointer-events-none absolute inset-0 opacity-0"}
+              aria-hidden={tab !== "play"}
+            >
+              <Viewport
+                project={project}
+                selectedEntityId={selectedEntityId}
+                onSelect={setSelectedEntityId}
+                onRuntimeReady={(next) => {
+                  setRuntime(next);
+                  next?.setCaptureEvery(captureEvery);
+                }}
+                onCapture={(frame) => setFrames((current) => [...current.slice(-59), frame])}
+                onLog={pushLog}
+                onStateChange={setPieState}
+              />
+              {tab === "play" ? (
+                <>
+                  <PlayOverlay
+                    pieState={pieState}
+                    hint="CLICK TO SELECT"
+                    pins={pins}
+                    activePin={activePin}
+                    onTogglePin={(id) => setActivePin((current) => (current === id ? null : id))}
+                    onTogglePlay={() => (pieState === "running" ? runtime?.pause() : runtime?.start())}
+                    onReset={() => {
+                      runtime?.stop();
+                      setFrames([]);
+                    }}
+                  />
+                  {tweak ? (
+                    <TweakPanel title={tweak.title} controls={tweak.controls} onClose={() => setActivePin(null)} />
+                  ) : null}
+                </>
+              ) : null}
+            </div>
+
+            {tab === "code" ? (
+              <div className="absolute inset-0">
                 <ScriptEditor
                   scripts={project.scripts}
                   selectedId={selectedScriptId}
@@ -778,28 +398,129 @@ export default function App() {
                     pushLog(`saved script ${script.name}`);
                   }}
                   onAdd={() => {
-                    const script = { id: uid("script"), name: "script", code: "function update(entity, state, delta) {\n  return state;\n}" };
+                    const script = {
+                      id: uid("script"),
+                      name: "script",
+                      code: "function update(entity, state, delta) {\n  return state;\n}",
+                    };
                     setProject((current) => ({ ...current, scripts: [...current.scripts, script] }));
                     setSelectedScriptId(script.id);
                   }}
                 />
-              </TabsContent>
-              <TabsContent value="console" className="min-h-0 flex-1 pt-0">
-                <ConsolePanel logs={logs} />
-              </TabsContent>
-              <TabsContent value="filmstrip" className="min-h-0 flex-1 pt-0">
-                <Filmstrip frames={frames} />
-              </TabsContent>
-              <TabsContent value="tests" className="min-h-0 flex-1 pt-0">
-                <TestResults results={testResults} />
-              </TabsContent>
-            </Tabs>
-          </section>
+              </div>
+            ) : null}
+
+            {tab === "art" ? (
+              <div className="absolute inset-0 flex min-h-0">
+                <div className="min-h-0 w-[420px] shrink-0 overflow-y-auto border-r border-white/[0.06]">
+                  <AssetWorkbench
+                    onAddAsset={(asset) => {
+                      const next: Asset = {
+                        id: uid("asset"),
+                        name: asset.name ?? "Asset",
+                        type: asset.type ?? "procedural",
+                        source: asset.source ?? "procedural:box",
+                        tags: asset.tags ?? [],
+                        usage: [],
+                        thumbnail: asset.thumbnail ?? null,
+                        metadata: asset.metadata ?? {},
+                      };
+                      setProject((current) => addAsset(current, next));
+                      pushLog(`generated ${next.name}`);
+                      return next;
+                    }}
+                    onPromote={promoteAsset}
+                    onImportImage={(file) => void handleImportImage(file)}
+                  />
+                </div>
+                <div className="min-h-0 flex-1">
+                  <AssetLibrary
+                    assets={project.assets}
+                    entities={project.entities}
+                    search={assetSearch}
+                    onSearch={setAssetSearch}
+                    onPromote={(asset) => promoteAsset(asset.id)}
+                    onRemove={(assetId) =>
+                      setProject((current) => ({
+                        ...current,
+                        assets: current.assets.filter((asset) => asset.id !== assetId),
+                      }))
+                    }
+                    onDedupe={() =>
+                      void rpc<{ sha256: string; files: string[] }[]>("asset_hash_dedupe", { slug: project.slug })
+                        .then((result) =>
+                          pushLog(result.length === 0 ? "no duplicate assets" : `found ${result.length} duplicate groups`),
+                        )
+                        .catch((error) => pushLog(`dedupe failed: ${reason(error)}`, "error"))
+                    }
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            {tab === "scene" ? (
+              <div className="absolute inset-0 flex min-h-0">
+                <div className="min-h-0 w-[280px] shrink-0 border-r border-white/[0.06]">
+                  <SceneGraph
+                    entities={project.entities}
+                    selectedId={selectedEntityId}
+                    onSelect={setSelectedEntityId}
+                    onAdd={handleAddEntity}
+                    onRemove={(id) => {
+                      setProject((current) => removeEntity(current, id));
+                      if (selectedEntityId === id) setSelectedEntityId(null);
+                    }}
+                  />
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto">
+                  <Inspector
+                    entity={selectedEntity}
+                    onSave={(entity) => {
+                      setProject((current) => updateEntity(current, entity.id, entity));
+                      pushLog(`updated ${entity.name}`);
+                    }}
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            {tab === "test" ? (
+              <div className="absolute inset-0 flex min-h-0 flex-col">
+                <div className="flex shrink-0 items-center gap-3 border-b border-white/[0.06] px-5 py-3">
+                  <div>
+                    <div className="calicode-label">CaliCode Playtest</div>
+                    <p className="mt-1 text-[13px] text-[#c8c8c8]">
+                      {testResults.length === 0
+                        ? "No runs yet."
+                        : `${testResults.length - failing}/${testResults.length} passing · ${frames.length} frames captured.`}
+                    </p>
+                  </div>
+                  <Button
+                    size="sm"
+                    className="calicode-button ml-auto"
+                    disabled={!runtime}
+                    onClick={() => void runTestSuite()}
+                  >
+                    Run playtest
+                  </Button>
+                </div>
+                <div className="min-h-0 flex-1 overflow-y-auto">
+                  <TestResults results={testResults} />
+                </div>
+                <div className="h-32 shrink-0 border-t border-white/[0.06]">
+                  <Filmstrip frames={frames} />
+                </div>
+              </div>
+            ) : null}
+          </div>
+
+          <LiveBar stats={stats} pieState={pieState} logs={logs} />
         </main>
       </div>
+
       <Dialog open={newProjectOpen} onOpenChange={setNewProjectOpen}>
         <DialogContent className="max-w-sm">
-          <DialogTitle>New project</DialogTitle>
+          <DialogTitle>New game</DialogTitle>
           <DialogDescription>Create a CaliCode project in core and open it in the editor.</DialogDescription>
           <form
             className="mt-3"
@@ -834,9 +555,21 @@ export default function App() {
   );
 }
 
+function reason(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function readSessions(): Record<string, GameSession[]> {
+  try {
+    const raw = localStorage.getItem(SESSIONS_KEY);
+    return raw ? (JSON.parse(raw) as Record<string, GameSession[]>) : {};
+  } catch {
+    return {};
+  }
+}
+
 async function readFileBase64(file: File): Promise<string> {
-  const buffer = await file.arrayBuffer();
-  const bytes = new Uint8Array(buffer);
+  const bytes = new Uint8Array(await file.arrayBuffer());
   let binary = "";
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary);
