@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+#[allow(unused_imports)]
 use base64::Engine;
 use crate::config::AppConfig;
 use crate::model;

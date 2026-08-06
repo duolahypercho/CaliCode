@@ -10,7 +10,7 @@ mod tools;
 
 use agent::AgentManager;
 use axum::extract::State;
-use axum::http::header;
+use axum::http::{header, HeaderValue, Method};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::Router;
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Clone)]
@@ -57,9 +57,22 @@ async fn main() -> anyhow::Result<()> {
         tools: Arc::new(RwLock::new(HashMap::new())),
     };
 
+    // The RPC surface is unauthenticated and can create, overwrite, and revert
+    // projects, read files, and drive the agent loop against the user's API
+    // keys. `allow_origin(Any)` made all of that reachable from any website the
+    // user happened to have open, so origins are restricted to the loopback
+    // dev server and the core's own origin. Extra origins can be added via
+    // CALI_ALLOWED_ORIGINS (comma-separated) for non-default setups.
+    let mut origins: Vec<HeaderValue> = ["http://127.0.0.1:5199", "http://localhost:5199", "http://127.0.0.1:8765"]
+        .iter()
+        .filter_map(|origin| origin.parse().ok())
+        .collect();
+    if let Ok(extra) = std::env::var("CALI_ALLOWED_ORIGINS") {
+        origins.extend(extra.split(',').filter_map(|origin| origin.trim().parse().ok()));
+    }
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
         .allow_headers([header::CONTENT_TYPE]);
     let dist = std::env::var("CALI_DIST")
         .map(PathBuf::from)
