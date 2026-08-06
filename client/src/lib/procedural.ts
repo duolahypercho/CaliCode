@@ -176,7 +176,15 @@ export function buildScene(project: Project): THREE.Group {
     } else if (asset?.type === "cali" && asset.metadata?.cali) {
       object = caliObjectFromSpec(asset.metadata.cali as Record<string, unknown>);
     } else if (asset) {
-      object = assetObject(asset);
+      // The asset supplies the geometry; the entity still owns its material.
+      // Passing the asset alone discarded entity.material entirely, so the
+      // Inspector and the TWEAK LIVE colour/metalness/roughness sliders wrote
+      // to fields the renderer never read — the readout moved and the object
+      // stayed grey.
+      object = assetObject({
+        ...asset,
+        metadata: { ...(asset.metadata ?? {}), ...entityMaterialOverrides(entity) },
+      });
     } else {
       object = entityObject(entity);
     }
@@ -212,4 +220,18 @@ export function renderThumbnail(object: THREE.Object3D, size = 128): string {
   const dataUrl = canvas.toDataURL("image/png");
   renderer.dispose();
   return dataUrl;
+}
+
+/**
+ * Material fields the entity explicitly sets, for merging over an asset's own
+ * metadata. Only defined keys are returned so an entity that never set a
+ * colour keeps the asset's.
+ */
+function entityMaterialOverrides(entity: Entity): Record<string, unknown> {
+  const overrides: Record<string, unknown> = {};
+  for (const key of ["color", "metalness", "roughness"]) {
+    const value = entity.material?.[key];
+    if (value !== undefined && value !== null) overrides[key] = value;
+  }
+  return overrides;
 }

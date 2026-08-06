@@ -27,7 +27,14 @@ export function WorkspaceTabs({
 }: WorkspaceTabsProps) {
   return (
     <div className="flex h-[52px] shrink-0 items-center gap-3.5 border-b border-white/[0.06] bg-[#0b0b0b] px-3.5">
-      <div role="tablist" aria-label="Workspace" className="flex overflow-hidden rounded-md border border-white/[0.09]">
+      {/* shrink-0: NEW GAME and EXPORT were shrink-0 while the tablist was not,
+          so from ~1512px down the tab strip was clipped and TEST — the tab
+          carrying the failure badge — could not be seen or clicked. */}
+      <div
+        role="tablist"
+        aria-label="Workspace"
+        className="flex shrink-0 overflow-x-auto rounded-md border border-white/[0.09]"
+      >
         {WORKSPACE_TABS.map((tab) => {
           const selected = tab === active;
           const badge = badges[tab];
@@ -38,7 +45,7 @@ export function WorkspaceTabs({
               type="button"
               aria-selected={selected}
               onClick={() => onChange(tab)}
-              className={`border-r border-white/[0.08] px-[15px] py-2 text-[11px] font-bold uppercase tracking-[0.14em] last:border-r-0 ${
+              className={`shrink-0 border-r border-white/[0.08] px-[15px] py-2 text-[11px] font-bold uppercase tracking-[0.14em] last:border-r-0 ${
                 selected ? "bg-[#1c1c1c] text-[#e0e0e0]" : "text-[#767676] hover:text-[#b0b0b0]"
               }`}
             >

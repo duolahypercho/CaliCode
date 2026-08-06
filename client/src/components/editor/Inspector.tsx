@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useRef } from "react";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { z } from "zod";
@@ -33,10 +33,23 @@ interface InspectorProps {
 export function Inspector({ entity, onSave }: InspectorProps) {
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),
-    defaultValues: emptyValues(),
+    // Seed from the entity on the very first render. Starting empty and
+    // hydrating a tick later left a window in which anything typed was
+    // overwritten by the reset below — the field visibly reverted and Apply
+    // then saved the old value.
+    defaultValues: entity ? toValues(entity) : emptyValues(),
   });
+
+  // Reset only when the selection actually changes. `entity` is a fresh
+  // object on every project update (the store is immutable), so depending on
+  // its identity discarded in-progress edits on any unrelated scene change.
+  const loadedId = useRef(entity?.id ?? null);
   useEffect(() => {
-    if (entity) form.reset(toValues(entity));
+    if (entity && entity.id !== loadedId.current) {
+      loadedId.current = entity.id;
+      form.reset(toValues(entity));
+    }
+    if (!entity) loadedId.current = null;
   }, [entity, form]);
   if (!entity) {
     return <p className="px-3 py-3 text-xs text-muted-foreground">Select an entity to edit its transform and material.</p>;
