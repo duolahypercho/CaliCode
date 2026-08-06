@@ -73,6 +73,11 @@ export class PieRuntime {
     return this.frameIndex;
   }
 
+  /** Draw calls issued for the most recent frame, straight from the renderer. */
+  get drawCalls(): number {
+    return this.renderer.info.render.calls;
+  }
+
   setCaptureEvery(value: number): void {
     this.captureEvery = Math.max(1, value);
   }

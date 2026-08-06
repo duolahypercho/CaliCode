@@ -71,7 +71,7 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
               active ? "bg-[#171717] text-[#dcdcdc]" : "text-[#8f8f8f] hover:text-[#c6c6c6]"
             }`}
           >
-            <span aria-hidden className="w-2.5 shrink-0 text-[9px] text-[#565656]">
+            <span aria-hidden className="w-2.5 shrink-0 text-[9px] text-[#8f8f8f]">
               {node.kind === "dir" ? (open ? "▾" : "▸") : ""}
             </span>
             <span className="min-w-0 flex-1 truncate">{node.name}</span>
@@ -85,9 +85,9 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
     <div className="h-full overflow-y-auto py-2">
       <div className="calicode-label px-3 pb-2">Files</div>
       {loading ? (
-        <p className="px-3 text-xs text-[#565656]">Loading…</p>
+        <p className="px-3 text-xs text-[#8f8f8f]">Loading…</p>
       ) : roots.length === 0 ? (
-        <p className="px-3 text-xs text-[#565656]">Nothing to show.</p>
+        <p className="px-3 text-xs text-[#8f8f8f]">Nothing to show.</p>
       ) : (
         renderNodes(roots, 0)
       )}

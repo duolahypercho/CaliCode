@@ -44,7 +44,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
       <div className="flex min-h-0 w-[236px] shrink-0 flex-col border-r border-white/5 bg-[#0a0a0a]">
         <div className="calicode-label flex items-center px-3 pb-2.5 pt-3">
           Changed files
-          <span className="ml-auto text-[#767676]">{changed.length}</span>
+          <span className="ml-auto text-[#9c9c9c]">{changed.length}</span>
         </div>
         <div className="min-h-0 flex-1 overflow-y-auto px-2">
           {changes.map((entry) => {
@@ -63,10 +63,10 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
                 {dirty ? (
                   <>
                     <span className="shrink-0 text-[#8f8f8f]">+{entry.added}</span>
-                    <span className="shrink-0 text-[#565656]">−{entry.removed}</span>
+                    <span className="shrink-0 text-[#8f8f8f]">−{entry.removed}</span>
                   </>
                 ) : (
-                  <span className="shrink-0 text-[10px] text-[#454545]">clean</span>
+                  <span className="shrink-0 text-[10px] text-[#7d7d7d]">clean</span>
                 )}
               </button>
             );
@@ -94,7 +94,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
                 className={`rounded border px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] ${
                   mode === option
                     ? "border-white/25 bg-[#1c1c1c] text-[#dcdcdc]"
-                    : "border-white/10 text-[#767676] hover:text-[#b0b0b0]"
+                    : "border-white/10 text-[#9c9c9c] hover:text-[#b0b0b0]"
                 }`}
               >
                 {option}
@@ -104,7 +104,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
         </div>
 
         {!active ? (
-          <p className="p-4 text-xs text-[#565656]">No scripts in this project yet.</p>
+          <p className="p-4 text-xs text-[#8f8f8f]">No scripts in this project yet.</p>
         ) : mode === "edit" ? (
           <textarea
             value={active.script.code}
@@ -114,7 +114,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
             className="min-h-0 flex-1 resize-none bg-transparent px-4 py-3 font-mono text-[12.5px] leading-[1.75] text-[#c8c8c8] outline-none"
           />
         ) : rows.length === 0 ? (
-          <p className="p-4 text-xs text-[#565656]">
+          <p className="p-4 text-xs text-[#8f8f8f]">
             No changes in {active.script.name} since the project was loaded.
           </p>
         ) : (
@@ -126,7 +126,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
                   row.type === "added"
                     ? "bg-white/[0.05] text-[#e0e0e0]"
                     : row.type === "removed"
-                      ? "bg-white/[0.02] text-[#767676]"
+                      ? "bg-white/[0.02] text-[#9c9c9c]"
                       : "text-[#a6a6a6]"
                 }`}
               >

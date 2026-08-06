@@ -4,6 +4,8 @@ import type { PieRuntime } from "./pie";
 export interface FrameStats {
   fps: number;
   frameMs: number;
+  /** Real WebGL draw calls for the last frame; null when idle. */
+  drawCalls: number | null;
 }
 
 const SAMPLE_MS = 500;
@@ -14,11 +16,11 @@ const SAMPLE_MS = 500;
  * hardcoded 60 would hide exactly the stalls this readout exists to surface.
  */
 export function useFrameStats(runtime: PieRuntime | null, running: boolean): FrameStats {
-  const [stats, setStats] = useState<FrameStats>({ fps: 0, frameMs: 0 });
+  const [stats, setStats] = useState<FrameStats>({ fps: 0, frameMs: 0, drawCalls: null });
 
   useEffect(() => {
     if (!runtime || !running) {
-      setStats({ fps: 0, frameMs: 0 });
+      setStats({ fps: 0, frameMs: 0, drawCalls: null });
       return;
     }
 
@@ -34,7 +36,13 @@ export function useFrameStats(runtime: PieRuntime | null, running: boolean): Fra
 
       if (elapsed <= 0) return;
       const fps = (drawn * 1000) / elapsed;
-      setStats({ fps: Math.round(fps), frameMs: drawn > 0 ? elapsed / drawn : 0 });
+      setStats({
+        fps: Math.round(fps),
+        frameMs: drawn > 0 ? elapsed / drawn : 0,
+        // The DRAW readout used to be entities.length, which is not a draw
+        // call count and duplicated the ENTITIES cell beside it.
+        drawCalls: runtime.drawCalls,
+      });
     }, SAMPLE_MS);
 
     return () => window.clearInterval(timer);

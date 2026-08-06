@@ -5,7 +5,8 @@ import type { PieState } from "../../lib/pie";
 export interface LiveStats {
   fps: number;
   frameMs: number;
-  draws: number;
+  /** three.js render.info.render.calls, or null when the renderer is idle. */
+  drawCalls: number | null;
   entities: number;
   buildMs: number | null;
 }
@@ -32,7 +33,7 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
   const statCells = [
     { k: "FPS", v: String(stats.fps) },
     { k: "FRAME", v: `${stats.frameMs.toFixed(1)}ms` },
-    { k: "DRAW", v: String(stats.draws) },
+    { k: "DRAW", v: stats.drawCalls === null ? "—" : String(stats.drawCalls) },
     { k: "ENTITIES", v: String(stats.entities) },
   ];
 
@@ -64,17 +65,17 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
           <div className="flex shrink-0 flex-wrap gap-5">
             {statCells.map((cell) => (
               <span key={cell.k} className="inline-flex flex-col gap-[3px]">
-                <span className="text-[9px] tracking-[0.16em] text-[#4f4f4f]">{cell.k}</span>
+                <span className="text-[9px] tracking-[0.16em] text-[#8a8a8a]">{cell.k}</span>
                 <span className="text-sm text-[#c0c0c0]">{cell.v}</span>
               </span>
             ))}
           </div>
           <div className="min-w-0 flex-1 overflow-y-auto border-l border-white/[0.06] pl-5 text-[11px] leading-[1.7]">
             {logs.length === 0 ? (
-              <p className="text-[#4f4f4f]">No output yet.</p>
+              <p className="text-[#8a8a8a]">No output yet.</p>
             ) : (
               logs.slice(-40).reverse().map((log) => (
-                <div key={log.id} className={log.level === "error" ? "text-[#c98b8b]" : "text-[#616161]"}>
+                <div key={log.id} className={log.level === "error" ? "text-[#c98b8b]" : "text-[#949494]"}>
                   ▸ {log.message}
                 </div>
               ))

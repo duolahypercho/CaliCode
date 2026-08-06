@@ -214,11 +214,11 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center gap-2 border-b border-white/5 px-[18px] py-[15px]">
         <span className="font-display text-[15px] font-bold text-[#dadada]">{projectSlug}</span>
-        <span className="text-[10px] tracking-[0.12em] text-[#616161]">{busy ? "working" : "ready"}</span>
+        <span className="text-[10px] tracking-[0.12em] text-[#949494]">{busy ? "working" : "ready"}</span>
         <details className="relative ml-auto">
           <summary
             aria-label="Session settings"
-            className="cursor-pointer list-none px-1 text-[11px] tracking-[0.1em] text-[#4f4f4f] hover:text-[#a0a0a0]"
+            className="cursor-pointer list-none px-1 text-[11px] tracking-[0.1em] text-[#8a8a8a] hover:text-[#a0a0a0]"
           >
             · · ·
           </summary>
@@ -301,7 +301,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
         className="flex min-h-0 flex-1 flex-col gap-[18px] overflow-y-auto px-[18px] pb-2 pt-[18px]"
       >
         {messages.length === 0 && (
-          <p className="text-xs leading-relaxed text-[#565656]">
+          <p className="text-xs leading-relaxed text-[#8f8f8f]">
             Ask CaliCode to build or change the game, then verify the result in PIE.
           </p>
         )}
@@ -324,7 +324,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
             </div>
           ) : (
             <div key={index} data-role="assistant" className="max-w-[94%] self-start">
-              <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-[#4f4f4f]">CALICODE</div>
+              <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-[#8a8a8a]">CALICODE</div>
               <div className="text-[13px] leading-[1.6] text-[#c8c8c8]">
                 <AgentText content={message.content} />
               </div>
@@ -334,7 +334,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
 
         {busy && (
           <div className="self-start" aria-label="Agent is thinking">
-            <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-[#4f4f4f]">CALICODE</div>
+            <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-[#8a8a8a]">CALICODE</div>
             <div className="inline-flex gap-1">
               {[0, 1, 2].map((dot) => (
                 <span
@@ -350,7 +350,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
         {approval && (
           <div className="w-full self-start rounded-lg border border-white/[0.16] bg-[#0e0e0e] p-3">
             <p className="text-[13px] text-[#dadada]">Approve {approval.tool}?</p>
-            <pre className="mt-1.5 max-h-24 overflow-auto text-[11px] text-[#767676]">
+            <pre className="mt-1.5 max-h-24 overflow-auto text-[11px] text-[#9c9c9c]">
               {JSON.stringify(approval.arguments, null, 2)}
             </pre>
             <div className="mt-2.5 flex gap-2">

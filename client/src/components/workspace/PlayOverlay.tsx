@@ -36,11 +36,11 @@ export function PlayOverlay({
 
       <div className="absolute left-3.5 top-3.5 inline-flex items-center gap-2.5 rounded-md border border-white/10 bg-black/50 px-3 py-1.5 text-[10.5px] tracking-[0.14em] text-[#c0c0c0] backdrop-blur">
         <span
-          className={`h-1.5 w-1.5 ${running ? "animate-pulse bg-[#bdbdbd]" : "bg-[#4f4f4f]"}`}
+          className={`h-1.5 w-1.5 ${running ? "animate-pulse bg-[#bdbdbd]" : "bg-[#8a8a8a]"}`}
           aria-hidden
         />
         {pieState.toUpperCase()}
-        <span className="text-[#4f4f4f]">·</span>
+        <span className="text-[#8a8a8a]">·</span>
         <span className="text-[#828282]">{hint}</span>
       </div>
 
@@ -62,7 +62,7 @@ export function PlayOverlay({
       </div>
 
       <div className="absolute bottom-3.5 left-3.5 flex max-w-[70%] flex-wrap items-center gap-2">
-        <span className="text-[10px] tracking-[0.12em] text-[#4f4f4f]">TWEAK LIVE</span>
+        <span className="text-[10px] tracking-[0.12em] text-[#8a8a8a]">TWEAK LIVE</span>
         {pins.map((pin) => {
           const active = pin.id === activePin;
           return (
