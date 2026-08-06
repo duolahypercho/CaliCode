@@ -1,8 +1,8 @@
 use crate::agent::AgentOptions;
 use crate::assets;
 use crate::baselines;
-use crate::image3d;
 use crate::devserver;
+use crate::image3d;
 use crate::store;
 use crate::tools::{model_list, model_switch, ToolDef};
 use crate::workspace;
@@ -43,7 +43,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         }
         "model_list" => {
             let config = state.config.read().await;
-            Ok(model_list(&*config)?)
+            Ok(model_list(&config)?)
         }
         "model_switch" => {
             let mut config = state.config.write().await;
@@ -60,7 +60,10 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             Ok(store::create_project(&state.projects_root, slug, title)?)
         }
         "project_list" => Ok(store::list_projects(&state.projects_root)?),
-        "project_open" => Ok(store::read_project(&state.projects_root, str_param(&params, "slug")?)?),
+        "project_open" => Ok(store::read_project(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+        )?),
         "project_save" => {
             let project = params.get("project").context("project missing")?;
             store::validate_project(project)?;
@@ -107,8 +110,16 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             let registry = state.workspaces.read().await;
             let workspace = workspace::get(&registry, str_param(&params, "id")?)?;
             let depth = params.get("depth").and_then(Value::as_u64).unwrap_or(1) as u32;
-            let hidden = params.get("includeHidden").and_then(Value::as_bool).unwrap_or(false);
-            workspace::tree(workspace, params.get("path").and_then(Value::as_str).unwrap_or(""), depth, hidden)
+            let hidden = params
+                .get("includeHidden")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            workspace::tree(
+                workspace,
+                params.get("path").and_then(Value::as_str).unwrap_or(""),
+                depth,
+                hidden,
+            )
         }
         "workspace_file_read" => {
             let registry = state.workspaces.read().await;
@@ -129,7 +140,10 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             let registry = state.workspaces.read().await;
             let workspace = workspace::get(&registry, str_param(&params, "id")?)?.clone();
             drop(registry);
-            let script = params.get("script").and_then(Value::as_str).unwrap_or("dev");
+            let script = params
+                .get("script")
+                .and_then(Value::as_str)
+                .unwrap_or("dev");
             devserver::start(
                 &mut *state.dev_servers.write().await,
                 &workspace,
@@ -139,7 +153,11 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             .await
         }
         "devserver_stop" => {
-            devserver::stop(&mut *state.dev_servers.write().await, str_param(&params, "id")?).await
+            devserver::stop(
+                &mut *state.dev_servers.write().await,
+                str_param(&params, "id")?,
+            )
+            .await
         }
         "devserver_status" => Ok(devserver::status(
             &*state.dev_servers.read().await,
@@ -155,13 +173,19 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         }
         "file_read" => {
             let slug = str_param(&params, "slug")?;
-            let path = store::safe_join(&store::project_dir(&state.projects_root, slug)?, str_param(&params, "path")?)?;
+            let path = store::safe_join(
+                &store::project_dir(&state.projects_root, slug)?,
+                str_param(&params, "path")?,
+            )?;
             let content = std::fs::read_to_string(&path)?;
             Ok(json!({ "path": params["path"], "content": content }))
         }
         "file_write" => {
             let slug = str_param(&params, "slug")?;
-            let path = store::safe_join(&store::project_dir(&state.projects_root, slug)?, str_param(&params, "path")?)?;
+            let path = store::safe_join(
+                &store::project_dir(&state.projects_root, slug)?,
+                str_param(&params, "path")?,
+            )?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -171,7 +195,11 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         "asset_import_file" => {
             let tags = params["tags"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
                 .unwrap_or_default();
             Ok(assets::import_file(
                 &state.projects_root,
@@ -186,9 +214,18 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             let project = store::read_project(&state.projects_root, str_param(&params, "slug")?)?;
             Ok(project["assets"].clone())
         }
-        "asset_files" => Ok(assets::list_files(&state.projects_root, str_param(&params, "slug")?)?),
-        "asset_hash_dedupe" => Ok(assets::dedupe(&state.projects_root, str_param(&params, "slug")?)?),
-        "asset_usage" => Ok(assets::usage(&state.projects_root, str_param(&params, "slug")?)?),
+        "asset_files" => Ok(assets::list_files(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+        )?),
+        "asset_hash_dedupe" => Ok(assets::dedupe(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+        )?),
+        "asset_usage" => Ok(assets::usage(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+        )?),
         "asset_export_gltf" => Ok(assets::export_gltf(
             &state.projects_root,
             str_param(&params, "slug")?,
@@ -205,7 +242,10 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             str_param(&params, "slug")?,
             str_param(&params, "name")?,
             str_param(&params, "image")?,
-            params.get("threshold").and_then(|v| v.as_u64()).unwrap_or(8) as u32,
+            params
+                .get("threshold")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8) as u32,
         )?),
         "image3d_ingest" => Ok(image3d::ingest(
             &state.projects_root,
@@ -239,7 +279,11 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             if spec.get("seed").is_none() {
                 spec["seed"] = json!(0xCA11);
             }
-            Ok(image3d::generate(&state.projects_root, str_param(&params, "slug")?, spec)?)
+            Ok(image3d::generate(
+                &state.projects_root,
+                str_param(&params, "slug")?,
+                spec,
+            )?)
         }
         "image3d_review" => Ok(image3d::review(
             &state.projects_root,
@@ -265,7 +309,9 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 let name = item["name"].as_str().unwrap_or_default().to_string();
                 let valid = !name.is_empty()
                     && name.len() <= 64
-                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
                 // A browser tool shadowing a core tool emitted two functions
                 // with the same name in the provider's tools array, which
                 // 400s every agent_chat in every session until core restarts.
@@ -303,34 +349,60 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             Ok(json!(list))
         }
         "agent_chat" => {
-            let messages = params.get("messages").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+            let messages = params
+                .get("messages")
+                .and_then(|v| v.as_array())
+                .cloned()
+                .unwrap_or_default();
             let registered = state.tools.read().await.clone();
             let system = params
                 .get("system")
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| {
-                    params.get("projectSlug").and_then(|v| v.as_str()).map(|slug| default_system_prompt(&state.projects_root, slug))
+                    params
+                        .get("projectSlug")
+                        .and_then(|v| v.as_str())
+                        .map(|slug| default_system_prompt(&state.projects_root, slug))
                 });
             let options = AgentOptions {
-                permission_mode: params.get("permissionMode").and_then(|v| v.as_str()).unwrap_or("full-access").to_string(),
+                permission_mode: params
+                    .get("permissionMode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("full-access")
+                    .to_string(),
                 max_turns: params.get("maxTurns").and_then(|v| v.as_u64()).unwrap_or(8) as usize,
                 system,
-                project_slug: params.get("projectSlug").and_then(|v| v.as_str()).map(String::from),
+                project_slug: params
+                    .get("projectSlug")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
             };
             let session_id = params.get("sessionId").and_then(|v| v.as_str());
-            Ok(state.agents.chat(state, &registered, session_id, &messages, options).await?)
+            Ok(state
+                .agents
+                .chat(state, &registered, session_id, &messages, options)
+                .await?)
         }
-        "agent_tool_result" => Ok(state.agents.submit_tool_result(
-            str_param(&params, "sessionId")?,
-            str_param(&params, "requestId")?,
-            params.get("result").cloned().unwrap_or(Value::Null),
-        ).await?),
-        "agent_approval_response" => Ok(state.agents.submit_approval(
-            str_param(&params, "sessionId")?,
-            str_param(&params, "requestId")?,
-            params.get("approved").and_then(|v| v.as_bool()).unwrap_or(false),
-        ).await?),
+        "agent_tool_result" => Ok(state
+            .agents
+            .submit_tool_result(
+                str_param(&params, "sessionId")?,
+                str_param(&params, "requestId")?,
+                params.get("result").cloned().unwrap_or(Value::Null),
+            )
+            .await?),
+        "agent_approval_response" => Ok(state
+            .agents
+            .submit_approval(
+                str_param(&params, "sessionId")?,
+                str_param(&params, "requestId")?,
+                params
+                    .get("approved")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            )
+            .await?),
         "agent_sessions" => Ok(json!(state.agents.sessions().await)),
         _ => anyhow::bail!("unknown method {}", method),
     }

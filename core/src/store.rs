@@ -106,8 +106,8 @@ pub fn project_file(root: &Path, slug: &str) -> Result<PathBuf> {
 
 pub fn read_project(root: &Path, slug: &str) -> Result<Value> {
     let path = project_file(root, slug)?;
-    let text = std::fs::read_to_string(&path)
-        .with_context(|| format!("project {} not found", slug))?;
+    let text =
+        std::fs::read_to_string(&path).with_context(|| format!("project {} not found", slug))?;
     let value: Value = serde_json::from_str(&text)?;
     Ok(value)
 }
@@ -282,7 +282,14 @@ pub fn revert_checkpoint(root: &Path, slug: &str, checkpoint_id: &str) -> Result
     if src == dest {
         anyhow::bail!("invalid checkpoint id");
     }
-    for name in ["project.json", "scripts", "assets", "tests", "baselines", "thumbnails"] {
+    for name in [
+        "project.json",
+        "scripts",
+        "assets",
+        "tests",
+        "baselines",
+        "thumbnails",
+    ] {
         let from = src.join(name);
         let to = dest.join(name);
         if from.is_dir() && to.exists() {
@@ -292,7 +299,7 @@ pub fn revert_checkpoint(root: &Path, slug: &str, checkpoint_id: &str) -> Result
             copy_path(&from, &to)?;
         }
     }
-    Ok(read_project(root, &clean)?)
+    read_project(root, &clean)
 }
 
 pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
@@ -420,7 +427,10 @@ mod tests {
         }
 
         for name in ["scripts", "assets", "tests", "baselines", "thumbnails"] {
-            assert!(dir.join(name).is_dir(), "{name} must survive a rejected revert");
+            assert!(
+                dir.join(name).is_dir(),
+                "{name} must survive a rejected revert"
+            );
         }
         assert!(std::fs::metadata(dir.join("project.json")).unwrap().len() > 0);
     }
@@ -446,7 +456,10 @@ mod tests {
         write_project(root.path(), "demo", &saved).unwrap();
 
         assert!(create_project(root.path(), "demo", "Recreated").is_err());
-        assert_eq!(read_project(root.path(), "demo").unwrap()["title"], "User Work");
+        assert_eq!(
+            read_project(root.path(), "demo").unwrap()["title"],
+            "User Work"
+        );
     }
 
     #[test]
@@ -469,7 +482,9 @@ mod tests {
             let id = result["id"].as_str().unwrap().to_string();
             assert!(ids.insert(id.clone()), "duplicate checkpoint id {id}");
         }
-        let dir = project_dir(root.path(), "demo").unwrap().join("checkpoints");
+        let dir = project_dir(root.path(), "demo")
+            .unwrap()
+            .join("checkpoints");
         let on_disk = std::fs::read_dir(dir).unwrap().count();
         assert_eq!(on_disk, 12, "every returned id must exist on disk");
     }
@@ -479,7 +494,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         create_project(root.path(), "demo", "Demo").unwrap();
         let result = checkpoint_project(root.path(), "demo").unwrap();
-        assert!(result.get("path").is_none(), "absolute host path must not be returned");
+        assert!(
+            result.get("path").is_none(),
+            "absolute host path must not be returned"
+        );
     }
 
     #[test]
@@ -541,6 +559,9 @@ mod tests {
             .filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
             .collect();
-        assert!(leftovers.is_empty(), "temp files must be renamed, not left behind");
+        assert!(
+            leftovers.is_empty(),
+            "temp files must be renamed, not left behind"
+        );
     }
 }

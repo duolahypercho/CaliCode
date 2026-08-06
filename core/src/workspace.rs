@@ -43,7 +43,9 @@ const SKIP_DIRS: &[&str] = &[
 const SECRET_PATTERNS: &[&str] = &[".env", "id_rsa", "id_ed25519", ".pem", ".p12", ".keystore"];
 
 /// Roots that are never valid workspaces on their own.
-const FORBIDDEN_ROOTS: &[&str] = &["/", "/etc", "/System", "/Library", "/usr", "/bin", "/var", "/Volumes"];
+const FORBIDDEN_ROOTS: &[&str] = &[
+    "/", "/etc", "/System", "/Library", "/usr", "/bin", "/var", "/Volumes",
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Workspace {
@@ -74,14 +76,17 @@ pub fn open(registry: &mut Registry, path: &str, name: Option<&str>) -> Result<V
         anyhow::bail!("{} cannot be opened as a workspace", root.display());
     }
     if let Some(home) = std::env::var_os("HOME") {
-        if root == PathBuf::from(home) {
+        if root == home {
             anyhow::bail!("the home directory cannot be opened as a workspace");
         }
     }
     // A workspace should be a project, not an arbitrary folder. This keeps a
     // stray `workspace_open` from turning into a filesystem browser.
     if !root.join("package.json").exists() && !root.join(".git").exists() {
-        anyhow::bail!("{} has no package.json or .git; refusing to open", root.display());
+        anyhow::bail!(
+            "{} has no package.json or .git; refusing to open",
+            root.display()
+        );
     }
 
     let id = workspace_id(&root);
@@ -90,7 +95,11 @@ pub fn open(registry: &mut Registry, path: &str, name: Option<&str>) -> Result<V
         .or_else(|| root.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| id.clone());
 
-    let workspace = Workspace { id: id.clone(), name: label, root: root.clone() };
+    let workspace = Workspace {
+        id: id.clone(),
+        name: label,
+        root: root.clone(),
+    };
     registry.insert(id.clone(), workspace.clone());
     Ok(describe(&workspace))
 }
@@ -142,19 +151,29 @@ pub fn restore(registry: &mut Registry, paths: &[String]) -> Vec<String> {
 
 /// Absolute roots of every open workspace, for persisting to config.
 pub fn roots(registry: &Registry) -> Vec<String> {
-    let mut roots: Vec<String> = registry.values().map(|w| w.root.display().to_string()).collect();
+    let mut roots: Vec<String> = registry
+        .values()
+        .map(|w| w.root.display().to_string())
+        .collect();
     roots.sort();
     roots
 }
 
 pub fn list(registry: &Registry) -> Value {
     let mut items: Vec<Value> = registry.values().map(describe).collect();
-    items.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
+    items.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["name"].as_str().unwrap_or(""))
+    });
     json!(items)
 }
 
 pub fn get<'a>(registry: &'a Registry, id: &str) -> Result<&'a Workspace> {
-    registry.get(id).with_context(|| format!("workspace {id} is not open"))
+    registry
+        .get(id)
+        .with_context(|| format!("workspace {id} is not open"))
 }
 
 /// Resolves a workspace-relative path to a real path inside the root.
@@ -173,17 +192,24 @@ pub fn safe_resolve(root: &Path, rel: &str) -> Result<PathBuf> {
     for component in Path::new(trimmed).components() {
         match component {
             Component::ParentDir => anyhow::bail!("path escapes the workspace"),
-            Component::Prefix(_) | Component::RootDir => anyhow::bail!("path escapes the workspace"),
+            Component::Prefix(_) | Component::RootDir => {
+                anyhow::bail!("path escapes the workspace")
+            }
             _ => {}
         }
     }
 
     let lower = trimmed.to_ascii_lowercase();
-    if SECRET_PATTERNS.iter().any(|pattern| lower.contains(pattern)) {
+    if SECRET_PATTERNS
+        .iter()
+        .any(|pattern| lower.contains(pattern))
+    {
         anyhow::bail!("refusing to access {trimmed}");
     }
 
-    let root_real = root.canonicalize().context("workspace root is unavailable")?;
+    let root_real = root
+        .canonicalize()
+        .context("workspace root is unavailable")?;
     let candidate = root_real.join(trimmed);
 
     // The leaf may not exist yet on a write, so resolve the deepest existing
@@ -216,17 +242,11 @@ pub fn tree(workspace: &Workspace, rel: &str, depth: u32, include_hidden: bool) 
     } else {
         safe_resolve(&workspace.root, rel)?
     };
-    let entries = read_level(workspace, &base, rel, depth.min(3), include_hidden)?;
+    let entries = read_level(&base, rel, depth.min(3), include_hidden)?;
     Ok(json!({ "path": rel, "entries": entries }))
 }
 
-fn read_level(
-    workspace: &Workspace,
-    dir: &Path,
-    rel: &str,
-    depth: u32,
-    include_hidden: bool,
-) -> Result<Vec<Value>> {
+fn read_level(dir: &Path, rel: &str, depth: u32, include_hidden: bool) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     let mut listing: Vec<_> = std::fs::read_dir(dir)
         .with_context(|| format!("cannot list {rel}"))?
@@ -243,7 +263,11 @@ fn read_level(
 
     for entry in listing.into_iter().take(MAX_TREE_ENTRIES) {
         let name = entry.file_name().to_string_lossy().to_string();
-        let child_rel = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+        let child_rel = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir && is_skipped(&child_rel, &name) {
             continue;
@@ -259,8 +283,12 @@ fn read_level(
             "size": size,
         });
         if is_dir && depth > 1 {
-            node["children"] =
-                json!(read_level(workspace, &entry.path(), &child_rel, depth - 1, include_hidden)?);
+            node["children"] = json!(read_level(
+                &entry.path(),
+                &child_rel,
+                depth - 1,
+                include_hidden
+            )?);
         }
         out.push(node);
     }
@@ -271,7 +299,11 @@ pub fn read_file(workspace: &Workspace, rel: &str) -> Result<Value> {
     let path = safe_resolve(&workspace.root, rel)?;
     let bytes = std::fs::read(&path).with_context(|| format!("cannot read {rel}"))?;
     let truncated = bytes.len() > MAX_READ_BYTES;
-    let slice = if truncated { &bytes[..MAX_READ_BYTES] } else { &bytes[..] };
+    let slice = if truncated {
+        &bytes[..MAX_READ_BYTES]
+    } else {
+        &bytes[..]
+    };
 
     // A NUL in the first 8KiB means binary. The project-scoped `file_read`
     // hard-errors on these because it uses read_to_string; report honestly
@@ -295,7 +327,12 @@ pub fn read_file(workspace: &Workspace, rel: &str) -> Result<Value> {
     }))
 }
 
-pub fn write_file(workspace: &Workspace, rel: &str, content: &str, expected: Option<&str>) -> Result<Value> {
+pub fn write_file(
+    workspace: &Workspace,
+    rel: &str,
+    content: &str,
+    expected: Option<&str>,
+) -> Result<Value> {
     if content.len() > MAX_WRITE_BYTES {
         anyhow::bail!("refusing to write more than {MAX_WRITE_BYTES} bytes");
     }
@@ -343,12 +380,20 @@ mod tests {
 
     fn fixture() -> (tempfile::TempDir, Workspace) {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), r#"{"scripts":{"dev":"vite"}}"#).unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"dev":"vite"}}"#,
+        )
+        .unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/main.js"), "console.log('hi')").unwrap();
         std::fs::create_dir_all(dir.path().join("node_modules/pkg")).unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let workspace = Workspace { id: workspace_id(&root), name: "fixture".into(), root };
+        let workspace = Workspace {
+            id: workspace_id(&root),
+            name: "fixture".into(),
+            root,
+        };
         (dir, workspace)
     }
 
@@ -366,7 +411,10 @@ mod tests {
     fn open_refuses_system_roots() {
         let mut registry = Registry::new();
         for path in ["/", "/etc", "/System"] {
-            assert!(open(&mut registry, path, None).is_err(), "{path} must be refused");
+            assert!(
+                open(&mut registry, path, None).is_err(),
+                "{path} must be refused"
+            );
         }
     }
 
@@ -398,7 +446,10 @@ mod tests {
     fn safe_resolve_refuses_secret_files() {
         let (_dir, workspace) = fixture();
         for path in [".env", ".env.local", "keys/id_rsa", "certs/server.pem"] {
-            assert!(safe_resolve(&workspace.root, path).is_err(), "{path} must be refused");
+            assert!(
+                safe_resolve(&workspace.root, path).is_err(),
+                "{path} must be refused"
+            );
         }
     }
 
@@ -413,7 +464,10 @@ mod tests {
             .map(|e| e["name"].as_str().unwrap())
             .collect();
         assert!(names.contains(&"src"));
-        assert!(!names.contains(&"node_modules"), "node_modules must not be traversed");
+        assert!(
+            !names.contains(&"node_modules"),
+            "node_modules must not be traversed"
+        );
     }
 
     #[test]
@@ -427,11 +481,23 @@ mod tests {
 
         let listing = tree(&workspace, "", 1, false).unwrap();
         let entries = listing["entries"].as_array().unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
-        let kinds: Vec<&str> = entries.iter().map(|e| e["kind"].as_str().unwrap()).collect();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
+        let kinds: Vec<&str> = entries
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect();
 
-        assert!(!names.contains(&".qa-shot.png"), "dotfiles hidden by default");
-        let first_file = kinds.iter().position(|k| *k == "file").unwrap_or(kinds.len());
+        assert!(
+            !names.contains(&".qa-shot.png"),
+            "dotfiles hidden by default"
+        );
+        let first_file = kinds
+            .iter()
+            .position(|k| *k == "file")
+            .unwrap_or(kinds.len());
         assert!(
             kinds[..first_file].iter().all(|k| *k == "dir"),
             "directories must sort before files, got {names:?}"
@@ -439,8 +505,11 @@ mod tests {
 
         let with_hidden = tree(&workspace, "", 1, true).unwrap();
         let hidden_names: Vec<String> = with_hidden["entries"]
-            .as_array().unwrap().iter()
-            .map(|e| e["name"].as_str().unwrap().to_string()).collect();
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["name"].as_str().unwrap().to_string())
+            .collect();
         assert!(hidden_names.iter().any(|n| n == ".qa-shot.png"));
     }
 
@@ -451,7 +520,13 @@ mod tests {
         assert_eq!(read["encoding"], "utf8");
         let sha = read["sha256"].as_str().unwrap().to_string();
 
-        write_file(&workspace, "src/main.js", "console.log('edited')", Some(&sha)).unwrap();
+        write_file(
+            &workspace,
+            "src/main.js",
+            "console.log('edited')",
+            Some(&sha),
+        )
+        .unwrap();
         let after = read_file(&workspace, "src/main.js").unwrap();
         assert_eq!(after["content"], "console.log('edited')");
     }
@@ -460,7 +535,10 @@ mod tests {
     fn write_rejects_a_stale_hash() {
         let (_dir, workspace) = fixture();
         let result = write_file(&workspace, "src/main.js", "clobber", Some("deadbeef"));
-        assert!(result.is_err(), "a stale buffer must not overwrite newer content");
+        assert!(
+            result.is_err(),
+            "a stale buffer must not overwrite newer content"
+        );
         let after = read_file(&workspace, "src/main.js").unwrap();
         assert_eq!(after["content"], "console.log('hi')");
     }
@@ -481,10 +559,17 @@ mod tests {
         let root = workspace.root.display().to_string();
 
         let mut registry = Registry::new();
-        let opened = restore(&mut registry, &[root.clone(), "/nope/does/not/exist".into()]);
+        let opened = restore(
+            &mut registry,
+            &[root.clone(), "/nope/does/not/exist".into()],
+        );
 
         assert_eq!(opened, vec![root.clone()]);
-        assert_eq!(registry.len(), 1, "a missing path must not abort the restore");
+        assert_eq!(
+            registry.len(),
+            1,
+            "a missing path must not abort the restore"
+        );
         assert_eq!(roots(&registry), vec![root]);
     }
 

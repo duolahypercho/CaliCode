@@ -17,10 +17,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
 use axum::Router;
 use config::{load, AppConfig};
+use futures::Stream;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::convert::Infallible;
-use futures::Stream;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,12 +77,20 @@ async fn main() -> anyhow::Result<()> {
     // user happened to have open, so origins are restricted to the loopback
     // dev server and the core's own origin. Extra origins can be added via
     // CALI_ALLOWED_ORIGINS (comma-separated) for non-default setups.
-    let mut origins: Vec<HeaderValue> = ["http://127.0.0.1:5199", "http://localhost:5199", "http://127.0.0.1:8765"]
-        .iter()
-        .filter_map(|origin| origin.parse().ok())
-        .collect();
+    let mut origins: Vec<HeaderValue> = [
+        "http://127.0.0.1:5199",
+        "http://localhost:5199",
+        "http://127.0.0.1:8765",
+    ]
+    .iter()
+    .filter_map(|origin| origin.parse().ok())
+    .collect();
     if let Ok(extra) = std::env::var("CALI_ALLOWED_ORIGINS") {
-        origins.extend(extra.split(',').filter_map(|origin| origin.trim().parse().ok()));
+        origins.extend(
+            extra
+                .split(',')
+                .filter_map(|origin| origin.trim().parse().ok()),
+        );
     }
     let cors = CorsLayer::new()
         .allow_origin(origins)
@@ -96,8 +104,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/rpc", post(rpc::rpc_handler))
         .route("/events", get(events))
         .fallback_service(
-            ServeDir::new(&dist)
-                .not_found_service(ServeFile::new(dist.join("index.html"))),
+            ServeDir::new(&dist).not_found_service(ServeFile::new(dist.join("index.html"))),
         )
         .layer(cors)
         .layer(tower_http::trace::TraceLayer::new_for_http())
@@ -129,6 +136,9 @@ async fn events(
             }
         }
     });
-    Sse::new(stream)
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keepalive"))
+    Sse::new(stream).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    )
 }

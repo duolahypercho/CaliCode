@@ -22,7 +22,9 @@ pub fn compare_baseline(
     threshold: u32,
 ) -> Result<Value> {
     let file_name = format!("{}.png", sanitize_name(name)?);
-    let path = crate::store::project_dir(root, slug)?.join("baselines").join(&file_name);
+    let path = crate::store::project_dir(root, slug)?
+        .join("baselines")
+        .join(&file_name);
     if !path.exists() {
         anyhow::bail!("baseline {} not found", name);
     }
@@ -78,7 +80,12 @@ fn pixel_distance(baseline: &[u8], candidate: &[u8]) -> Result<(u32, u32)> {
 
 fn normalise(data: &[u8], size: u32) -> Result<RgbImage> {
     let img = image::load_from_memory(data).context("unable to decode image")?;
-    Ok(image::imageops::resize(&img.to_rgb8(), size, size, FilterType::Triangle))
+    Ok(image::imageops::resize(
+        &img.to_rgb8(),
+        size,
+        size,
+        FilterType::Triangle,
+    ))
 }
 
 /// Validates a baseline name.
@@ -100,7 +107,7 @@ fn sanitize_name(name: &str) -> Result<String> {
 }
 
 pub(crate) fn decode_image_base64(value: &str) -> Result<Vec<u8>> {
-    let clean = value.split(',').last().unwrap_or(value).trim();
+    let clean = value.split(',').next_back().unwrap_or(value).trim();
     base64::engine::general_purpose::STANDARD
         .decode(clean)
         .context("invalid base64")
@@ -120,7 +127,11 @@ mod tests {
                 "horizontal" => (y / 4) % 2 == 0,
                 _ => false,
             };
-            *p = if dark { Rgb([10, 20, 30]) } else { Rgb([220, 230, 240]) };
+            *p = if dark {
+                Rgb([10, 20, 30])
+            } else {
+                Rgb([220, 230, 240])
+            };
         }
         let mut cursor = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(img)
@@ -145,7 +156,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         create_project(root.path(), "demo", "Demo").unwrap();
         save_baseline(root.path(), "demo", "test", &png_base64("vertical")).unwrap();
-        let result = compare_baseline(root.path(), "demo", "test", &png_base64("horizontal"), 4).unwrap();
+        let result =
+            compare_baseline(root.path(), "demo", "test", &png_base64("horizontal"), 4).unwrap();
         assert_eq!(result["pass"], false);
     }
 
@@ -169,7 +181,8 @@ mod tests {
         create_project(root.path(), "demo", "Demo").unwrap();
         save_baseline(root.path(), "demo", "solid", &solid_png([255, 0, 0])).unwrap();
 
-        let result = compare_baseline(root.path(), "demo", "solid", &solid_png([0, 0, 255]), 0).unwrap();
+        let result =
+            compare_baseline(root.path(), "demo", "solid", &solid_png([0, 0, 255]), 0).unwrap();
         assert_eq!(result["pass"], false, "red vs blue must not pass");
         assert!(result["distance"].as_u64().unwrap() > 0);
         assert_eq!(result["changedPixelPercent"], 100);
@@ -183,7 +196,11 @@ mod tests {
 
         let mut img = RgbImage::new(32, 32);
         for (x, y, p) in img.enumerate_pixels_mut() {
-            *p = if x < 6 && y < 6 { Rgb([240, 240, 240]) } else { Rgb([20, 20, 20]) };
+            *p = if x < 6 && y < 6 {
+                Rgb([240, 240, 240])
+            } else {
+                Rgb([20, 20, 20])
+            };
         }
         let mut cursor = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(img)
@@ -192,7 +209,10 @@ mod tests {
         let candidate = base64::engine::general_purpose::STANDARD.encode(cursor.into_inner());
 
         let result = compare_baseline(root.path(), "demo", "spot", &candidate, 0).unwrap();
-        assert_eq!(result["pass"], false, "a moved/added object must be visible");
+        assert_eq!(
+            result["pass"], false,
+            "a moved/added object must be visible"
+        );
         assert!(result["changedPixelPercent"].as_u64().unwrap() >= 2);
     }
 

@@ -146,7 +146,11 @@ pub fn load() -> Result<AppConfig> {
     } else {
         let defaults = default_providers();
         for preset in default_providers() {
-            if !config.providers.iter().any(|existing| existing.id == preset.id) {
+            if !config
+                .providers
+                .iter()
+                .any(|existing| existing.id == preset.id)
+            {
                 config.providers.push(preset);
             }
         }
@@ -202,7 +206,10 @@ pub fn api_key(config: &AppConfig) -> String {
 /// The router keeps its loopback service key in protected state, so CaliCode can
 /// reuse the router's configured providers without duplicating credentials.
 pub fn router_key() -> String {
-    if let Some(key) = std::env::var(CODEX_ROUTER_KEY_ENV).ok().map(|value| value.trim().to_string()) {
+    if let Some(key) = std::env::var(CODEX_ROUTER_KEY_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+    {
         if !key.is_empty() {
             return key;
         }
@@ -227,7 +234,8 @@ mod tests {
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&path, yaml).unwrap();
-        let loaded: AppConfig = serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let loaded: AppConfig =
+            serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(loaded.model.default, "test-model");
     }
 
@@ -250,8 +258,10 @@ mod tests {
 
     #[test]
     fn api_key_prefers_the_presets_env_var() {
-        let mut config = AppConfig::default();
-        config.providers = default_providers();
+        let mut config = AppConfig {
+            providers: default_providers(),
+            ..Default::default()
+        };
         config.model.provider = crate::config::CODEX_ROUTER_PROVIDER_ID.into();
         std::env::set_var("CALI_CODEX_ROUTER_KEY", "env-key");
         assert_eq!(api_key(&config), "env-key");

@@ -58,7 +58,10 @@ pub fn import_file(
         "metadata": { "sha256": hash, "mime": mime, "bytes": data.len() }
     });
     let mut project = crate::store::read_project(root, slug)?;
-    project["assets"].as_array_mut().unwrap().push(asset.clone());
+    project["assets"]
+        .as_array_mut()
+        .unwrap()
+        .push(asset.clone());
     crate::store::write_project(root, slug, &project)?;
     Ok(asset)
 }

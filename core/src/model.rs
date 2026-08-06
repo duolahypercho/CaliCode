@@ -34,7 +34,10 @@ pub async fn chat(
             config.model.api_key_env
         );
     }
-    let url = format!("{}/chat/completions", config.model.base_url.trim_end_matches('/'));
+    let url = format!(
+        "{}/chat/completions",
+        config.model.base_url.trim_end_matches('/')
+    );
     let mut body = json!({
         "model": config.model.default,
         "messages": messages,
@@ -120,7 +123,11 @@ pub async fn chat(
         .into_iter()
         .filter(|t| !t.name.is_empty())
         .map(|t| ToolCall {
-            id: if t.id.is_empty() { format!("call-{}", t.arguments.len()) } else { t.id },
+            id: if t.id.is_empty() {
+                format!("call-{}", t.arguments.len())
+            } else {
+                t.id
+            },
             name: t.name,
             arguments: serde_json::from_str(&t.arguments).unwrap_or(Value::Null),
         })
@@ -151,9 +158,9 @@ fn truncate(text: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::config::ModelConfig;
+    use axum::response::sse::{Event, Sse};
     use axum::routing::post;
     use axum::Router;
-    use axum::response::sse::{Event, Sse};
     use std::convert::Infallible;
 
     #[test]
@@ -208,7 +215,8 @@ mod tests {
 
     async fn mock_chat() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
         let events = vec![
-            Ok(Event::default().data(r#"{"choices":[{"delta":{"role":"assistant","content":"Hello "}}]}"#)),
+            Ok(Event::default()
+                .data(r#"{"choices":[{"delta":{"role":"assistant","content":"Hello "}}]}"#)),
             Ok(Event::default().data(r#"{"choices":[{"delta":{"content":"from CaliCode"}}]}"#)),
             Ok(Event::default().data("[DONE]")),
         ];

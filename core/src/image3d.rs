@@ -1,8 +1,8 @@
+use crate::config::AppConfig;
+use crate::model;
 use anyhow::{Context, Result};
 #[allow(unused_imports)]
 use base64::Engine;
-use crate::config::AppConfig;
-use crate::model;
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -19,12 +19,14 @@ pub const PASS_ORDER: [&str; 8] = [
 ];
 
 pub fn ingest(root: &Path, slug: &str, name: &str, image_base64: &str) -> Result<Value> {
-    let bytes = crate::baselines::decode_image_base64(image_base64)
-        .context("invalid image base64")?;
+    let bytes =
+        crate::baselines::decode_image_base64(image_base64).context("invalid image base64")?;
     let img = image::load_from_memory(&bytes).context("unable to decode reference image")?;
     let hash = crate::assets::sha256_bytes(&bytes);
     let id = format!("cali-{}", short_id());
-    let dir = crate::store::project_dir(root, slug)?.join("assets").join("sources");
+    let dir = crate::store::project_dir(root, slug)?
+        .join("assets")
+        .join("sources");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join(format!("{}.png", id)), &bytes)?;
     Ok(json!({
@@ -39,7 +41,11 @@ pub fn ingest(root: &Path, slug: &str, name: &str, image_base64: &str) -> Result
 }
 
 pub fn assess(name: &str, source_hash: &str, width: u32, height: u32) -> Value {
-    let complexity = if width * height > 1_500_000 { "complex" } else { "moderate" };
+    let complexity = if width * height > 1_500_000 {
+        "complex"
+    } else {
+        "moderate"
+    };
     json!({
         "targetName": name,
         "sourceHash": source_hash,
@@ -99,13 +105,28 @@ pub fn spec(name: &str, source_hash: &str, width: u32, height: u32) -> Value {
 
 pub fn validate_spec(spec: &Value) -> Result<Value> {
     let mut errors: Vec<String> = Vec::new();
-    if spec.get("componentTree").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) == 0 {
+    if spec
+        .get("componentTree")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
+        == 0
+    {
         errors.push("componentTree must contain at least one component".into());
     }
-    if spec.get("materials").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) == 0 {
+    if spec
+        .get("materials")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
+        == 0
+    {
         errors.push("materials must contain at least one material".into());
     }
-    let components = spec["componentTree"].as_array().cloned().unwrap_or_default();
+    let components = spec["componentTree"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
     for component in components {
         let primitive = component["primitive"].as_str().unwrap_or("");
         let topology = component["topologyClass"].as_str().unwrap_or("");
@@ -116,7 +137,14 @@ pub fn validate_spec(spec: &Value) -> Result<Value> {
             ));
         }
     }
-    if spec.get("reviewHistory").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0) < 3 && false {
+    if spec
+        .get("reviewHistory")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0)
+        < 3
+        && false
+    {
         errors.push("reviewHistory is thin".into());
     }
     let strict_quality = errors.is_empty();
@@ -128,8 +156,14 @@ pub fn validate_spec(spec: &Value) -> Result<Value> {
 }
 
 pub fn generate(root: &Path, slug: &str, spec: Value) -> Result<Value> {
-    let asset_id = spec["assetId"].as_str().map(String::from).unwrap_or_else(|| format!("cali-{}", short_id()));
-    let name = spec["targetName"].as_str().unwrap_or("Cali Asset").to_string();
+    let asset_id = spec["assetId"]
+        .as_str()
+        .map(String::from)
+        .unwrap_or_else(|| format!("cali-{}", short_id()));
+    let name = spec["targetName"]
+        .as_str()
+        .unwrap_or("Cali Asset")
+        .to_string();
     let source_hash = spec["sourceHash"].as_str().unwrap_or("unknown").to_string();
     let seed = spec["seed"].as_u64().unwrap_or(0) as i64;
     let asset = json!({
@@ -187,12 +221,14 @@ pub async fn review(
         "dhashThreshold": threshold,
         "structureGate": dhash <= threshold
     });
-    let mut decision = if dhash <= threshold { "continue" } else { "refine-code" };
+    let mut decision = if dhash <= threshold {
+        "continue"
+    } else {
+        "refine-code"
+    };
     let mut vision: Option<Value> = None;
     if let Some(config) = app_config() {
-        let vision_prompt = format!(
-            "Review the reconstructed game asset against its reference. Reply with a single word: PASS or FAIL."
-        );
+        let vision_prompt = "Review the reconstructed game asset against its reference. Reply with a single word: PASS or FAIL.".to_string();
         let prompt = format!("{}\n\nVision review", vision_prompt);
         match model::chat(
             &config,
@@ -220,7 +256,10 @@ pub async fn review(
                 }
             }
             Err(error) => {
-                tracing::warn!("vision review unavailable, falling back to deterministic gate: {}", error);
+                tracing::warn!(
+                    "vision review unavailable, falling back to deterministic gate: {}",
+                    error
+                );
             }
         }
     }
@@ -239,10 +278,15 @@ pub async fn review(
         .join(format!("{}.cali.json", asset_id));
     if cali_path.exists() {
         let mut cali: Value = serde_json::from_str(&std::fs::read_to_string(&cali_path)?)?;
-        cali["reviewHistory"].as_array_mut().unwrap().push(review.clone());
+        cali["reviewHistory"]
+            .as_array_mut()
+            .unwrap()
+            .push(review.clone());
         std::fs::write(&cali_path, serde_json::to_string_pretty(&cali)?)?;
     }
-    Ok(json!({ "review": review, "next": if decision == "continue" { next_pass(pass_id) } else { pass_id.into() } }))
+    Ok(
+        json!({ "review": review, "next": if decision == "continue" { next_pass(pass_id) } else { pass_id } }),
+    )
 }
 
 fn locate_source_image(root: &Path, slug: &str, asset_id: &str) -> Result<Vec<u8>> {
@@ -283,7 +327,7 @@ fn locate_source_image(root: &Path, slug: &str, asset_id: &str) -> Result<Vec<u8
         }
     }
     let candidates_source = [
-        source_dir.join(&source_hash.to_string()),
+        source_dir.join(source_hash),
         source_dir.join(format!("{}.png", source_hash)),
     ];
     for candidate in candidates_source {
@@ -319,7 +363,10 @@ fn app_config() -> Option<AppConfig> {
 
 fn next_pass(pass_id: &str) -> &'static str {
     let index = PASS_ORDER.iter().position(|p| *p == pass_id).unwrap_or(0);
-    PASS_ORDER.get(index.saturating_add(1)).copied().unwrap_or("complete")
+    PASS_ORDER
+        .get(index.saturating_add(1))
+        .copied()
+        .unwrap_or("complete")
 }
 
 fn dhash_distance(left: &[u8], right: &[u8]) -> Result<u32> {
@@ -374,7 +421,10 @@ mod tests {
         let asset = generate(root.path(), "demo", spec).unwrap();
         assert_eq!(asset["schemaVersion"], 1);
         let asset_id = asset["assetId"].as_str().unwrap();
-        let path = crate::store::project_dir(root.path(), "demo").unwrap().join("assets").join(format!("{}.cali.json", asset_id));
+        let path = crate::store::project_dir(root.path(), "demo")
+            .unwrap()
+            .join("assets")
+            .join(format!("{}.cali.json", asset_id));
         assert!(path.exists());
     }
 
@@ -396,7 +446,8 @@ mod tests {
         let mut spec = spec("Vase", source_hash, 1, 1);
         spec["assetId"] = ingested["assetId"].clone();
         let asset = generate(root.path(), "demo", spec).unwrap();
-        let found = locate_source_image(root.path(), "demo", asset["assetId"].as_str().unwrap()).unwrap();
+        let found =
+            locate_source_image(root.path(), "demo", asset["assetId"].as_str().unwrap()).unwrap();
         assert!(!found.is_empty());
     }
 

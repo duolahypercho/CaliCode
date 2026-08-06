@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  core:
+    name: Rust core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Format
+        working-directory: core
+        run: cargo fmt --check
+
+      - name: Clippy
+        working-directory: core
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        working-directory: core
+        run: cargo test
+
+  client:
+    name: Client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: client/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: client
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        working-directory: client
+        run: pnpm tsc -b --pretty false
+
+      - name: Unit tests
+        working-directory: client
+        run: pnpm vitest run
+
+      - name: Build
+        working-directory: client
+        run: pnpm build
+
+  e2e:
+    name: End to end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      # Playwright starts core via `cargo run`; building first keeps that
+      # inside the webServer timeout on a cold cache.
+      - name: Build core
+        working-directory: core
+        run: cargo build
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: client/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: client
+        run: pnpm install --frozen-lockfile
+
+      - name: Install browsers
+        working-directory: client
+        run: pnpm exec playwright install --with-deps chromium
+
+      # Two specs are tagged @live because they need a configured model
+      # provider. CI has no API key, so they are excluded rather than left to
+      # fail and be ignored — a suite people learn to ignore is worse than a
+      # smaller one.
+      - name: E2E
+        working-directory: client
+        run: pnpm exec playwright test --grep-invert @live
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: client/test-results
+          retention-days: 7

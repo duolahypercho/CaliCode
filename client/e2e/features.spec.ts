@@ -147,7 +147,8 @@ test("agent panel sends commands and surfaces errors", async ({ page }) => {
   await expect(page.getByText(/unknown provider missing-provider/i)).toBeVisible();
 });
 
-test("agent panel runs a live model reply", async ({ page }) => {
+// @live — needs a configured model provider; CI runs with --grep-invert @live.
+test("agent panel runs a live model reply @live", async ({ page }) => {
   test.setTimeout(45_000);
   await page.goto("/");
   // The token must appear in an ASSISTANT message. Asserting on the page as a
@@ -163,7 +164,8 @@ test("agent panel runs a live model reply", async ({ page }) => {
   await expect(assistantReplies.last()).toContainText("live-ready", { timeout: 30_000 });
 });
 
-test("supervised agent tool approval completes live", async ({ page }) => {
+// @live — needs a configured model provider.
+test("supervised agent tool approval completes live @live", async ({ page }) => {
   test.setTimeout(90_000);
   await page.goto("/");
   const select = page.getByRole("combobox", { name: "Permission mode" });

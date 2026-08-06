@@ -164,14 +164,20 @@ pub async fn execute_core_tool(
     match tool.name.as_str() {
         "project_list" => Ok(store::list_projects(root)?),
         "project_open" => Ok(store::read_project(root, required_str(args, "slug")?)?),
-        "project_checkpoint" => Ok(store::checkpoint_project(root, required_str(args, "slug")?)?),
+        "project_checkpoint" => Ok(store::checkpoint_project(
+            root,
+            required_str(args, "slug")?,
+        )?),
         "project_revert" => Ok(store::revert_checkpoint(
             root,
             required_str(args, "slug")?,
             required_str(args, "checkpointId")?,
         )?),
         "file_read" => {
-            let path = store::safe_join(&store::project_dir(root, required_str(args, "slug")?)?, required_str(args, "path")?)?;
+            let path = store::safe_join(
+                &store::project_dir(root, required_str(args, "slug")?)?,
+                required_str(args, "path")?,
+            )?;
             let text = std::fs::read_to_string(&path)?;
             Ok(json!({ "path": args["path"], "content": text }))
         }
@@ -185,7 +191,14 @@ pub async fn execute_core_tool(
             Ok(json!({ "path": args["path"], "written": true }))
         }
         "asset_import_file" => {
-            let tags = args["tags"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>()).unwrap_or_default();
+            let tags = args["tags"]
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
             Ok(crate::assets::import_file(
                 root,
                 required_str(args, "slug")?,
@@ -226,8 +239,12 @@ pub async fn execute_core_tool(
         "model_switch" => {
             drop(config);
             let mut config = state.config.write().await;
-            model_switch(&mut config, required_str(args, "provider")?, required_str(args, "model")?)
-                .map_err(anyhow::Error::msg)
+            model_switch(
+                &mut config,
+                required_str(args, "provider")?,
+                required_str(args, "model")?,
+            )
+            .map_err(anyhow::Error::msg)
         }
         "subagent_spawn" => spawn_subagent(state, args).await,
         _ => anyhow::bail!("unknown core tool {}", tool.name),
@@ -317,7 +334,8 @@ mod tests {
 
     async fn final_provider() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
         Sse::new(futures::stream::iter(vec![
-            Ok(Event::default().data(r#"{"choices":[{"delta":{"role":"assistant","content":"subagent done"}}]}"#)),
+            Ok(Event::default()
+                .data(r#"{"choices":[{"delta":{"role":"assistant","content":"subagent done"}}]}"#)),
             Ok(Event::default().data("[DONE]")),
         ]))
     }
@@ -351,8 +369,12 @@ mod tests {
             projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
             agents: agents.clone(),
             bus: bus.clone(),
-            workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(crate::workspace::Registry::new())),
-            dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(crate::devserver::Servers::new())),
+            workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::workspace::Registry::new(),
+            )),
+            dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::devserver::Servers::new(),
+            )),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         };
         let def = core_tool_defs()
@@ -369,7 +391,10 @@ mod tests {
         .unwrap();
         assert_eq!(result["role"], "tester");
         assert!(result["reply"].as_str().unwrap().contains("subagent done"));
-        assert!(result["sessionId"].as_str().unwrap().starts_with("session-"));
+        assert!(result["sessionId"]
+            .as_str()
+            .unwrap()
+            .starts_with("session-"));
     }
 
     #[test]
@@ -379,9 +404,21 @@ mod tests {
         // agent_chat in every session until the core process restarts.
         let names: Vec<String> = core_tool_defs().into_iter().map(|t| t.name).collect();
         let unique: std::collections::HashSet<&String> = names.iter().collect();
-        assert_eq!(names.len(), unique.len(), "core tool names must be unique: {names:?}");
-        for reserved in ["file_write", "model_switch", "subagent_spawn", "project_revert"] {
-            assert!(names.iter().any(|n| n == reserved), "{reserved} must be a core tool");
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "core tool names must be unique: {names:?}"
+        );
+        for reserved in [
+            "file_write",
+            "model_switch",
+            "subagent_spawn",
+            "project_revert",
+        ] {
+            assert!(
+                names.iter().any(|n| n == reserved),
+                "{reserved} must be a core tool"
+            );
         }
     }
 }
