@@ -4,6 +4,19 @@ import type { CapturedFrame, Project } from "./types";
 
 export type PieState = "idle" | "running" | "paused";
 
+/** Name of the group the runtime owns. Everything else in the scene belongs
+ *  to the editor (lights, grid, gizmos) and must survive a rebuild. */
+export const PROJECT_GROUP = "__project__";
+
+type ScriptFn = (entity: THREE.Object3D, state: Record<string, unknown>, delta: number) => unknown;
+
+/** Cached compile plus the source it came from, so an edited script
+ *  recompiles instead of silently running the previous version. */
+interface CompiledScript {
+  code: string;
+  fn: ScriptFn;
+}
+
 export function shouldCaptureFrame(frameIndex: number, captureEvery: number): boolean {
   return frameIndex > 0 && frameIndex % Math.max(1, captureEvery) === 0;
 }
@@ -22,14 +35,17 @@ export class PieRuntime {
   private scene: THREE.Scene;
   private callbacks: PieCallbacks;
   private frameIndex = 0;
-  private elapsedMs = 0;
+  /** Monotonic simulation clock. Scripts read this as `state.time`. */
+  private simTimeMs = 0;
+  /** Fixed-step leftover. Never exposed — it only ever holds < one step. */
+  private accumulatorMs = 0;
   private lastTime = 0;
   private rafId = 0;
   private running = false;
   private captureEvery = 3;
   private fixedHz = 60;
-  private compiled = new Map<string, (entity: THREE.Object3D, state: Record<string, unknown>, delta: number) => unknown>();
-  private waiters: Array<{ target: number; resolve: () => void }> = [];
+  private compiled = new Map<string, CompiledScript>();
+  private waiters: Array<{ target: number; resolve: () => void; reject: (error: Error) => void }> = [];
 
   constructor(
     project: Project,
@@ -43,9 +59,12 @@ export class PieRuntime {
     this.scene = scene;
     this.camera = camera;
     this.callbacks = callbacks;
-    const settings = (project.settings.pie ?? {}) as { captureEvery?: number; fixedStepHz?: number };
+    const settings = (project.settings?.pie ?? {}) as { captureEvery?: number; fixedStepHz?: number };
     this.captureEvery = settings.captureEvery ?? 3;
     this.fixedHz = settings.fixedStepHz ?? 60;
+    // Own the project group from construction rather than depending on the
+    // caller having populated the scene first.
+    this.rebuild();
   }
 
   get state(): PieState {
@@ -62,7 +81,7 @@ export class PieRuntime {
 
   setProject(project: Project): void {
     this.project = project;
-    const settings = (project.settings.pie ?? {}) as { captureEvery?: number; fixedStepHz?: number };
+    const settings = (project.settings?.pie ?? {}) as { captureEvery?: number; fixedStepHz?: number };
     this.captureEvery = settings.captureEvery ?? this.captureEvery;
     this.fixedHz = settings.fixedStepHz ?? this.fixedHz;
   }
@@ -84,8 +103,12 @@ export class PieRuntime {
   stop(): void {
     this.pause();
     this.frameIndex = 0;
-    this.elapsedMs = 0;
-    this.waiters = [];
+    this.simTimeMs = 0;
+    this.accumulatorMs = 0;
+    // Discarding waiters without settling them left every in-flight
+    // waitFrames() permanently pending, so "Run tests" followed by Stop froze
+    // the results panel with no way back short of a reload.
+    this.rejectWaiters("PIE stopped before the requested frames elapsed");
     this.rebuild();
     this.renderer.render(this.scene, this.camera);
   }
@@ -94,9 +117,9 @@ export class PieRuntime {
     const delta = 1000 / this.fixedHz;
     this.step(delta);
     this.frameIndex += 1;
-    this.elapsedMs += delta;
+    this.simTimeMs += delta;
     this.resolveWaiters();
-    this.callbacks.onFrame(this.frameIndex, this.elapsedMs);
+    this.callbacks.onFrame(this.frameIndex, this.simTimeMs);
     if (shouldCaptureFrame(this.frameIndex, this.captureEvery)) {
       this.capture();
     }
@@ -112,15 +135,15 @@ export class PieRuntime {
       }
       return;
     }
-    await new Promise<void>((resolve) => {
-      this.waiters.push({ target, resolve });
+    await new Promise<void>((resolve, reject) => {
+      this.waiters.push({ target, resolve, reject });
     });
   }
 
   capture(): string {
     this.renderer.render(this.scene, this.camera);
     const dataUrl = this.renderer.domElement.toDataURL("image/png");
-    this.callbacks.onCapture({ frame: this.frameIndex, timeMs: this.elapsedMs, dataUrl });
+    this.callbacks.onCapture({ frame: this.frameIndex, timeMs: this.simTimeMs, dataUrl });
     return dataUrl;
   }
 
@@ -133,16 +156,17 @@ export class PieRuntime {
     const dt = Math.min(now - this.lastTime, 100);
     this.lastTime = now;
     const stepMs = 1000 / this.fixedHz;
-    this.elapsedMs += dt;
+    this.accumulatorMs += dt;
     let guard = 0;
-    while (this.elapsedMs >= stepMs && guard < 8) {
+    while (this.accumulatorMs >= stepMs && guard < 8) {
       this.step(stepMs);
-      this.elapsedMs -= stepMs;
+      this.accumulatorMs -= stepMs;
+      this.simTimeMs += stepMs;
       this.frameIndex += 1;
       guard += 1;
     }
     this.resolveWaiters();
-    this.callbacks.onFrame(this.frameIndex, this.elapsedMs);
+    this.callbacks.onFrame(this.frameIndex, this.simTimeMs);
     if (shouldCaptureFrame(this.frameIndex, this.captureEvery)) {
       this.capture();
     }
@@ -151,7 +175,10 @@ export class PieRuntime {
   };
 
   private step(delta: number): void {
-    const state: Record<string, unknown> = { time: this.elapsedMs / 1000, entities: this.scene.children };
+    // Reads the monotonic sim clock. This used to read the fixed-step
+    // accumulator, which never exceeds one step — so `state.time` sat at
+    // ~0.0167s forever and every time-driven script silently did nothing.
+    const state: Record<string, unknown> = { time: this.simTimeMs / 1000, entities: this.scene.children };
     for (const entity of this.project.entities) {
       const object = this.scene.getObjectByName(entity.name);
       if (!object) continue;
@@ -168,18 +195,21 @@ export class PieRuntime {
     }
   }
 
-  private compile(id: string, code: string): (entity: THREE.Object3D, state: Record<string, unknown>, delta: number) => unknown {
-    let fn = this.compiled.get(id);
-    if (!fn) {
-      // eslint-disable-next-line no-new-func
-      fn = new Function(
-        "entity",
-        "state",
-        "delta",
-        `${code}\nreturn typeof update === "function" ? update(entity, state, delta) : state;`,
-      ) as (entity: THREE.Object3D, state: Record<string, unknown>, delta: number) => unknown;
-      this.compiled.set(id, fn);
-    }
+  private compile(id: string, code: string): ScriptFn {
+    // The cache used to key on id alone and was never invalidated by
+    // setProject, so editing a script and pressing Play re-ran the previous
+    // build until a full page reload. Compare the source too.
+    const cached = this.compiled.get(id);
+    if (cached && cached.code === code) return cached.fn;
+
+    // eslint-disable-next-line no-new-func
+    const fn = new Function(
+      "entity",
+      "state",
+      "delta",
+      `${code}\nreturn typeof update === "function" ? update(entity, state, delta) : state;`,
+    ) as ScriptFn;
+    this.compiled.set(id, { code, fn });
     return fn;
   }
 
@@ -189,28 +219,60 @@ export class PieRuntime {
     for (const waiter of ready) waiter.resolve();
   }
 
+  private rejectWaiters(message: string): void {
+    const pending = this.waiters;
+    this.waiters = [];
+    for (const waiter of pending) waiter.reject(new Error(message));
+  }
+
+  /**
+   * Replaces the runtime-owned group in place.
+   *
+   * This used to clear every child of the scene, which took the editor's
+   * hemisphere light, key light and grid with it — they never came back, and
+   * because the `__project__` group went too, the next edit added a second
+   * copy of every entity alongside the first.
+   */
   private rebuild(): void {
-    while (this.scene.children.length > 0) {
-      const child = this.scene.children[0];
-      this.scene.remove(child);
-      if (child instanceof THREE.Object3D) {
-        child.traverse((node) => {
-          if (node instanceof THREE.Mesh) {
-            node.geometry.dispose();
-            const material = Array.isArray(node.material) ? node.material[0] : node.material;
-            material?.dispose();
-          }
-        });
-      }
+    const existing = this.scene.getObjectByName(PROJECT_GROUP);
+    if (existing) {
+      this.scene.remove(existing);
+      disposeTree(existing);
     }
     const group = buildScene(this.project);
-    while (group.children.length > 0) {
-      this.scene.add(group.children[0]);
-    }
+    group.name = PROJECT_GROUP;
+    this.scene.add(group);
   }
 
   dispose(): void {
-    this.stop();
+    // Deliberately not stop(): that rebuilds a whole fresh scene immediately
+    // before the renderer is torn down, allocating GPU resources that are
+    // then never freed.
+    this.pause();
+    this.rejectWaiters("PIE runtime disposed");
     this.compiled.clear();
+    const group = this.scene.getObjectByName(PROJECT_GROUP);
+    if (group) {
+      this.scene.remove(group);
+      disposeTree(group);
+    }
   }
+}
+
+/** Frees geometry, every material slot, and each material's textures. */
+export function disposeTree(root: THREE.Object3D): void {
+  root.traverse((node) => {
+    if (!(node instanceof THREE.Mesh)) return;
+    node.geometry?.dispose();
+    // Multi-material meshes only had slot 0 disposed, and textures were never
+    // touched at all — procedural noise maps are ~256KB each.
+    const materials: THREE.Material[] = Array.isArray(node.material) ? node.material : [node.material];
+    for (const material of materials) {
+      if (!material) continue;
+      for (const value of Object.values(material)) {
+        if (value instanceof THREE.Texture) value.dispose();
+      }
+      material.dispose();
+    }
+  });
 }

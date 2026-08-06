@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { buildScene } from "../../lib/procedural";
-import { PieRuntime, type PieState } from "../../lib/pie";
+import { PieRuntime, PROJECT_GROUP, disposeTree, type PieState } from "../../lib/pie";
 import type { CapturedFrame, Project } from "../../lib/types";
 
 interface ViewportProps {
@@ -79,13 +79,18 @@ export function Viewport({
     grid.position.y = -0.01;
     scene.add(grid);
 
+    // Same group name and disposal path the runtime uses, so editor rebuilds
+    // and PIE rebuilds never end up with two copies of the scene. Removing
+    // without disposing leaked geometry, materials and textures on every
+    // Inspector apply, script save, and agent tool call.
     const rebuild = () => {
-      const old = scene.getObjectByName("__project__");
-      if (old) scene.remove(old);
-      const group = new THREE.Group();
-      group.name = "__project__";
-      const built = buildScene(projectRef.current);
-      while (built.children.length > 0) group.add(built.children[0]);
+      const old = scene.getObjectByName(PROJECT_GROUP);
+      if (old) {
+        scene.remove(old);
+        disposeTree(old);
+      }
+      const group = buildScene(projectRef.current);
+      group.name = PROJECT_GROUP;
       scene.add(group);
     };
     rebuildRef.current = rebuild;
