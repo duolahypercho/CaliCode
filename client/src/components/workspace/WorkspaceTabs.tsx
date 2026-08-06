@@ -41,9 +41,24 @@ export function WorkspaceTabs({
           return (
             <button
               key={tab}
+              id={`workspace-tab-${tab}`}
               role="tab"
               type="button"
               aria-selected={selected}
+              aria-controls={`workspace-panel-${tab}`}
+              // Roving tabindex: the tablist is one stop, and arrows move
+              // within it. Every tab was tabIndex 0 with no key handling, so
+              // the role promised a pattern that was not implemented.
+              tabIndex={selected ? 0 : -1}
+              onKeyDown={(event) => {
+                const delta = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+                if (delta === 0) return;
+                event.preventDefault();
+                const index = WORKSPACE_TABS.indexOf(tab);
+                const next = WORKSPACE_TABS[(index + delta + WORKSPACE_TABS.length) % WORKSPACE_TABS.length];
+                onChange(next);
+                document.getElementById(`workspace-tab-${next}`)?.focus();
+              }}
               onClick={() => onChange(tab)}
               className={`shrink-0 border-r border-white/[0.08] px-[15px] py-2 text-[11px] font-bold uppercase tracking-[0.14em] last:border-r-0 ${
                 selected ? "bg-[#1c1c1c] text-[#e0e0e0]" : "text-[#9c9c9c] hover:text-[#b0b0b0]"

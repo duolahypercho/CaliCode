@@ -453,6 +453,7 @@ mod tests {
             },
             providers: vec![],
             projects_dir: None,
+            workspaces: Vec::new(),
         };
         let (bus, _) = tokio::sync::broadcast::channel(64);
         let agents = AgentManager::new(bus.clone());
@@ -533,6 +534,7 @@ mod tests {
             },
             providers: vec![],
             projects_dir: None,
+            workspaces: Vec::new(),
         };
         let (bus, _) = tokio::sync::broadcast::channel(64);
         let agents = AgentManager::new(bus.clone());

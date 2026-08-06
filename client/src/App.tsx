@@ -420,7 +420,7 @@ export default function App() {
             {/* A live workspace owns PLAY: its own dev server renders the real
                 game, rather than the scene document the editor manages. */}
             {tab === "play" && workspace ? (
-              <div className="absolute inset-0">
+              <div role="tabpanel" id="workspace-panel-play" aria-labelledby="workspace-tab-play" className="absolute inset-0">
                 <LivePreview
                   workspaceId={workspace.id}
                   workspaceName={workspace.name}
@@ -473,7 +473,7 @@ export default function App() {
             </div>
 
             {tab === "code" && workspace ? (
-              <div className="absolute inset-0 flex min-h-0">
+              <div role="tabpanel" id="workspace-panel-code" aria-labelledby="workspace-tab-code" className="absolute inset-0 flex min-h-0">
                 <div className="min-h-0 w-[260px] shrink-0 border-r border-white/[0.06]">
                   <FileTree
                     workspaceId={workspace.id}
@@ -494,7 +494,7 @@ export default function App() {
             ) : null}
 
             {tab === "code" && !workspace ? (
-              <div className="absolute inset-0">
+              <div role="tabpanel" id="workspace-panel-code" aria-labelledby="workspace-tab-code" className="absolute inset-0">
                 <CodeTab
                   scripts={project.scripts}
                   baseline={scriptBaseline}
@@ -515,7 +515,7 @@ export default function App() {
             ) : null}
 
             {tab === "art" ? (
-              <div className="absolute inset-0">
+              <div role="tabpanel" id="workspace-panel-art" aria-labelledby="workspace-tab-art" className="absolute inset-0">
                 <ArtTab
                   assets={project.assets}
                   entities={project.entities}
@@ -536,7 +536,7 @@ export default function App() {
             ) : null}
 
             {tab === "scene" ? (
-              <div className="absolute inset-0">
+              <div role="tabpanel" id="workspace-panel-scene" aria-labelledby="workspace-tab-scene" className="absolute inset-0">
                 <SceneGraphCanvas
                   project={project}
                   selectedEntityId={selectedEntityId}
@@ -552,7 +552,7 @@ export default function App() {
             ) : null}
 
             {tab === "test" ? (
-              <div className="absolute inset-0">
+              <div role="tabpanel" id="workspace-panel-test" aria-labelledby="workspace-tab-test" className="absolute inset-0">
                 <TestTab
                   results={testResults}
                   frames={frames}
