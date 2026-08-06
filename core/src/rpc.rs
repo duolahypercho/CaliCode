@@ -243,21 +243,49 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         )
         .await?),
         "tool_register" => {
-            let mut tools = state.tools.write().await;
-            if let Some(list) = params["tools"].as_array() {
-                for item in list {
-                    let def = ToolDef {
-                        name: item["name"].as_str().unwrap_or_default().to_string(),
-                        description: item["description"].as_str().unwrap_or_default().to_string(),
-                        parameters: item.get("parameters").cloned().unwrap_or_else(|| json!({"type":"object"})),
-                        kind: crate::tools::ToolKind::Browser,
-                    };
-                    if !def.name.is_empty() && def.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-                        tools.insert(def.name.clone(), def);
-                    }
+            // Registration replaces the browser tool set outright. It used to
+            // accumulate, so tools from a closed editor tab stayed advertised
+            // to the model forever and every call to one blocked for the full
+            // 300s tool timeout with nobody listening.
+            let reserved: std::collections::HashSet<String> = crate::tools::core_tool_defs()
+                .into_iter()
+                .map(|tool| tool.name)
+                .collect();
+
+            let mut next = std::collections::HashMap::new();
+            let mut rejected = Vec::new();
+            for item in params["tools"].as_array().into_iter().flatten() {
+                let name = item["name"].as_str().unwrap_or_default().to_string();
+                let valid = !name.is_empty()
+                    && name.len() <= 64
+                    && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+                // A browser tool shadowing a core tool emitted two functions
+                // with the same name in the provider's tools array, which
+                // 400s every agent_chat in every session until core restarts.
+                if !valid || reserved.contains(&name) {
+                    rejected.push(name);
+                    continue;
                 }
+                next.insert(
+                    name.clone(),
+                    ToolDef {
+                        name,
+                        description: item["description"].as_str().unwrap_or_default().to_string(),
+                        parameters: item
+                            .get("parameters")
+                            .cloned()
+                            .unwrap_or_else(|| json!({"type":"object"})),
+                        kind: crate::tools::ToolKind::Browser,
+                    },
+                );
             }
-            Ok(json!({ "registered": tools.len() }))
+
+            if !rejected.is_empty() {
+                tracing::warn!(?rejected, "rejected tool registrations");
+            }
+            let registered = next.len();
+            *state.tools.write().await = next;
+            Ok(json!({ "registered": registered, "rejected": rejected }))
         }
         "tool_list" => {
             let tools = state.tools.read().await;

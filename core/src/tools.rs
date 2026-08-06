@@ -157,7 +157,10 @@ pub async fn execute_core_tool(
     projects_root: &Path,
 ) -> Result<Value> {
     let root = projects_root;
-    let config = state.config.read().await;
+    // Cloned, not held: this guard used to span the whole match including
+    // spawn_subagent().await, which deadlocked against a concurrent
+    // model_switch writer.
+    let config = { state.config.read().await.clone() };
     match tool.name.as_str() {
         "project_list" => Ok(store::list_projects(root)?),
         "project_open" => Ok(store::read_project(root, required_str(args, "slug")?)?),
@@ -219,7 +222,7 @@ pub async fn execute_core_tool(
             required_str(args, "image")?,
         )?),
         "image3d_validate" => Ok(image3d::validate_spec(&args["spec"])?),
-        "model_list" => Ok(model_list(&*config)?),
+        "model_list" => Ok(model_list(&config)?),
         "model_switch" => {
             drop(config);
             let mut config = state.config.write().await;
@@ -366,5 +369,18 @@ mod tests {
         assert_eq!(result["role"], "tester");
         assert!(result["reply"].as_str().unwrap().contains("subagent done"));
         assert!(result["sessionId"].as_str().unwrap().starts_with("session-"));
+    }
+
+    #[test]
+    fn core_tool_names_are_reserved_and_unique() {
+        // A browser tool registered under a core name emitted two functions
+        // with the same name in the provider's tools array, which 400s every
+        // agent_chat in every session until the core process restarts.
+        let names: Vec<String> = core_tool_defs().into_iter().map(|t| t.name).collect();
+        let unique: std::collections::HashSet<&String> = names.iter().collect();
+        assert_eq!(names.len(), unique.len(), "core tool names must be unique: {names:?}");
+        for reserved in ["file_write", "model_switch", "subagent_spawn", "project_revert"] {
+            assert!(names.iter().any(|n| n == reserved), "{reserved} must be a core tool");
+        }
     }
 }

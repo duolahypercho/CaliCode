@@ -84,13 +84,16 @@ impl AgentManager {
                     }));
                 }
             });
-            let config = state.config.read().await;
+            // Clone rather than hold the guard across the streaming model
+            // call. Tokio's RwLock is fair, so a queued model_switch writer
+            // blocks every later reader — a switch during a subagent run was
+            // measured starving the whole harness for >270s.
+            let config = { state.config.read().await.clone() };
             let snapshot = {
                 let guard = session.lock().await;
                 guard.messages.clone()
             };
-            let result = model::chat(&*config, &snapshot, Some(&schemas), Some(&tx)).await?;
-            drop(config);
+            let result = model::chat(&config, &snapshot, Some(&schemas), Some(&tx)).await?;
             drop(tx);
             if result.content.is_empty() && result.tool_calls.is_empty() {
                 let mut guard = session.lock().await;
@@ -167,7 +170,8 @@ impl AgentManager {
                 .rev()
                 .find(|m| m["role"] == "assistant")
                 .and_then(|m| m["content"].as_str())
-                .unwrap_or("Turn limit reached")
+                .filter(|content| !content.trim().is_empty())
+                .unwrap_or("Turn limit reached before the agent finished.")
                 .to_string()
         };
         Ok(json!({
