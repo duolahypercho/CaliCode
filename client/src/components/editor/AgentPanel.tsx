@@ -222,7 +222,9 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
           aria-label="Target model"
         />
         <datalist id="calicode-models">
-          {modelList?.providers.flatMap((provider) => provider.models ?? []).map((model) => (
+          {/* Providers legitimately share model ids (gpt-4.1 via several routers),
+              so de-duplicate before rendering rather than emitting clashing keys. */}
+          {[...new Set(modelList?.providers.flatMap((provider) => provider.models ?? []) ?? [])].map((model) => (
             <option key={model} value={model} />
           ))}
         </datalist>
