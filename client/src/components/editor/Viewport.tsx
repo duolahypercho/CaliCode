@@ -25,7 +25,7 @@ export function Viewport({
   onStateChange,
 }: ViewportProps) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -42,11 +42,15 @@ export function Viewport({
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const renderer = new THREE.WebGLRenderer({
-      canvas: canvasRef.current ?? undefined,
-      antialias: true,
-      preserveDrawingBuffer: true,
-    });
+    // three.js owns the canvas rather than reusing a React-rendered one.
+    // Under StrictMode the effect mounts twice; the first renderer's
+    // dispose() releases the WebGL context, and constructing a second
+    // renderer over that same dead canvas threw during passive-effect flush.
+    // A fresh canvas per mount removes the shared mutable resource.
+    const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+    renderer.domElement.className = "block h-full w-full";
+    container.appendChild(renderer.domElement);
+    canvasRef.current = renderer.domElement;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     // updateStyle=false: the canvas is sized by CSS (h-full w-full). Letting
     // three.js write inline width/height pins the canvas to whatever the
@@ -146,7 +150,13 @@ export function Viewport({
       runtime.dispose();
       handlersRef.current.onRuntimeReady(null);
       controls.dispose();
+      // forceContextLoss releases the GPU context immediately; without it
+      // Chrome's ~16-context cap is reached after enough remounts and the
+      // live viewport's context gets evicted.
+      renderer.forceContextLoss();
       renderer.dispose();
+      renderer.domElement.remove();
+      if (canvasRef.current === renderer.domElement) canvasRef.current = null;
     };
   }, []);
 
@@ -158,7 +168,6 @@ export function Viewport({
 
   return (
     <div ref={containerRef} className="relative h-full w-full overflow-hidden" aria-label="3D viewport">
-      <canvas ref={canvasRef} className="block h-full w-full" />
       {selectedEntityId && (
         <div className="pointer-events-none absolute left-3 top-3 rounded-md border border-border bg-background/90 px-2 py-1 text-xs">
           {project.entities.find((entity) => entity.id === selectedEntityId)?.name ?? selectedEntityId}
