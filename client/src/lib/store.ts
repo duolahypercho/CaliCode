@@ -55,7 +55,7 @@ export function starterProject(): Project {
     assets: [
       {
         id: "asset-cube",
-        name: "Caliber Cube",
+        name: "CaliCode Cube",
         type: "procedural",
         source: "procedural:box",
         tags: ["prop", "starter"],

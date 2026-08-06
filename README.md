@@ -1,12 +1,12 @@
-# Caliber
+# CaliCode
 
-Caliber is a native AI game engine harness for the web. It pairs a Rust control
+CaliCode is a native AI game engine harness for the web. It pairs a Rust control
 plane with a three.js editor, asset workbench, asset library, Play-In-Editor
 (PIE) runtime, deterministic frame capture, scripted tests, and a native agent
 panel. No MCP, no harness fork, and no generated Three.js code: image-to-3D
 reconstruction is a Rust pipeline that emits a data-driven `.cali` asset.
 
-The editor UI follows the Caliber design language: a dark monochrome console
+The editor UI follows the CaliCode design language: a dark monochrome console
 with Syne branding, Space Mono body type, a games sidebar, an agent chat
 column, and a play/code/art/scene/test workspace.
 

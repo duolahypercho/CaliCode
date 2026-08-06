@@ -185,7 +185,7 @@ pub fn api_key(config: &AppConfig) -> String {
     std::env::var(&key).unwrap_or_default().trim().to_string()
 }
 
-/// The router keeps its loopback service key in protected state, so Caliber can
+/// The router keeps its loopback service key in protected state, so CaliCode can
 /// reuse the router's configured providers without duplicating credentials.
 pub fn router_key() -> String {
     if let Some(key) = std::env::var(CODEX_ROUTER_KEY_ENV).ok().map(|value| value.trim().to_string()) {

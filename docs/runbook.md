@@ -1,4 +1,4 @@
-# Caliber Runbook
+# CaliCode Runbook
 
 ## Start
 
@@ -7,7 +7,7 @@
 ```
 
 - Editor: `http://127.0.0.1:5199`
-- Caliber core: `http://127.0.0.1:8765`
+- CaliCode core: `http://127.0.0.1:8765`
 - JSON-RPC: `POST /rpc`
 - Agent events: `GET /events` (SSE)
 
@@ -22,7 +22,7 @@ cd client && pnpm test:e2e
 
 ## Configuration
 
-`~/.cali/config.yaml` stores the Caliber model shape:
+`~/.cali/config.yaml` stores the CaliCode model shape:
 
 ```yaml
 model:

@@ -27,7 +27,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "project_list".into(),
-            description: "List saved Caliber projects.".into(),
+            description: "List saved CaliCode projects.".into(),
             parameters: json!({"type":"object","properties":{}}),
             kind: ToolKind::Core,
         },
@@ -123,7 +123,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "subagent_spawn".into(),
-            description: "Spawn a Caliber subagent to complete a focused task; it can use the same scene, asset, PIE, and test tools.".to_string(),
+            description: "Spawn a CaliCode subagent to complete a focused task; it can use the same scene, asset, PIE, and test tools.".to_string(),
             parameters: json!({
                 "type":"object",
                 "properties":{
@@ -241,7 +241,7 @@ pub async fn spawn_subagent(state: &AppState, args: &Value) -> Result<Value> {
         .and_then(|v| v.as_str())
         .map(String::from);
     let system = format!(
-        "You are a {} subagent inside Caliber, an AI game engine harness. \
+        "You are a {} subagent inside CaliCode, an AI game engine harness. \
          You have full access to the scene, asset workbench, PIE runtime, and test tools. \
          Work independently, call tools when they help, and finish with a concise report.",
         role

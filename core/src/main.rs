@@ -78,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = "127.0.0.1:8765";
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Caliber core listening on http://{}", addr);
+    tracing::info!("CaliCode core listening on http://{}", addr);
     axum::serve(listener, app).await?;
     Ok(())
 }
