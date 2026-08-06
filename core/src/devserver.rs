@@ -74,7 +74,8 @@ fn free_port() -> Result<u16> {
 /// model arbitrary code execution.
 fn resolve_command(root: &Path, script: &str, port: u16) -> Result<Command> {
     let manifest: Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("package.json")).context("workspace has no package.json")?,
+        &std::fs::read_to_string(root.join("package.json"))
+            .context("workspace has no package.json")?,
     )?;
     manifest
         .get("scripts")
@@ -82,8 +83,14 @@ fn resolve_command(root: &Path, script: &str, port: u16) -> Result<Command> {
         .and_then(Value::as_str)
         .with_context(|| format!("package.json has no '{script}' script"))?;
 
-    let port_args = ["--host", "127.0.0.1", "--port", &port.to_string(), "--strictPort"]
-        .map(str::to_string);
+    let port_args = [
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+        "--strictPort",
+    ]
+    .map(str::to_string);
 
     let local_vite = root.join("node_modules/.bin/vite");
     let mut command = if local_vite.exists() {
@@ -159,10 +166,22 @@ pub async fn start(
     let status = Arc::new(Mutex::new(Status::Starting));
 
     if let Some(stdout) = child.stdout.take() {
-        drain(stdout, "stdout", &workspace.id, Arc::clone(&logs), bus.clone());
+        drain(
+            stdout,
+            "stdout",
+            &workspace.id,
+            Arc::clone(&logs),
+            bus.clone(),
+        );
     }
     if let Some(stderr) = child.stderr.take() {
-        drain(stderr, "stderr", &workspace.id, Arc::clone(&logs), bus.clone());
+        drain(
+            stderr,
+            "stderr",
+            &workspace.id,
+            Arc::clone(&logs),
+            bus.clone(),
+        );
     }
 
     // Poll for a real HTTP response. Vite prints "ready in NNms" before it can
@@ -173,7 +192,8 @@ pub async fn start(
         let id = workspace.id.clone();
         let url = format!("http://127.0.0.1:{port}/");
         tokio::spawn(async move {
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(READY_TIMEOUT_MS);
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(READY_TIMEOUT_MS);
             let client = reqwest::Client::new();
             loop {
                 if tokio::time::Instant::now() > deadline {
@@ -186,7 +206,13 @@ pub async fn start(
                     }));
                     return;
                 }
-                if client.get(&url).send().await.map(|r| r.status().is_success()).unwrap_or(false) {
+                if client
+                    .get(&url)
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+                {
                     if let Ok(mut slot) = status.lock() {
                         *slot = Status::Ready;
                     }
@@ -200,7 +226,13 @@ pub async fn start(
         });
     }
 
-    let server = DevServer { workspace_id: workspace.id.clone(), port, status, logs, child };
+    let server = DevServer {
+        workspace_id: workspace.id.clone(),
+        port,
+        status,
+        logs,
+        child,
+    };
     let response = json!({
         "workspaceId": workspace.id, "status": "starting", "port": port, "url": server.url(),
     });
@@ -236,9 +268,13 @@ pub fn status(servers: &Servers, id: &str) -> Value {
 pub fn logs(servers: &Servers, id: &str, limit: usize) -> Value {
     let lines: Vec<String> = servers
         .get(id)
-        .and_then(|server| server.logs.lock().ok().map(|buffer| {
-            buffer.iter().rev().take(limit).rev().cloned().collect()
-        }))
+        .and_then(|server| {
+            server
+                .logs
+                .lock()
+                .ok()
+                .map(|buffer| buffer.iter().rev().take(limit).rev().cloned().collect())
+        })
         .unwrap_or_default();
     json!({ "workspaceId": id, "lines": lines })
 }
@@ -251,7 +287,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("package.json"), scripts).unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let workspace = Workspace { id: "ws-test".into(), name: "test".into(), root };
+        let workspace = Workspace {
+            id: "ws-test".into(),
+            name: "test".into(),
+            root,
+        };
         (dir, workspace)
     }
 

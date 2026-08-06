@@ -100,14 +100,18 @@ impl AgentManager {
             drop(tx);
             if result.content.is_empty() && result.tool_calls.is_empty() {
                 let mut guard = session.lock().await;
-                guard.messages.push(json!({ "role": "assistant", "content": "I could not produce a response." }));
+                guard.messages.push(
+                    json!({ "role": "assistant", "content": "I could not produce a response." }),
+                );
                 break;
             }
 
             if result.tool_calls.is_empty() {
                 {
                     let mut guard = session.lock().await;
-                    guard.messages.push(json!({ "role": "assistant", "content": result.content.clone() }));
+                    guard
+                        .messages
+                        .push(json!({ "role": "assistant", "content": result.content.clone() }));
                 }
                 return Ok(json!({
                     "sessionId": current_session_id,
@@ -262,10 +266,7 @@ impl AgentManager {
 
     async fn session(&self, session_id: &str) -> Result<Arc<Mutex<AgentSession>>> {
         let guard = self.sessions.lock().await;
-        guard
-            .get(session_id)
-            .cloned()
-            .context("session not found")
+        guard.get(session_id).cloned().context("session not found")
     }
 
     fn build_tools(&self, registered: &HashMap<String, ToolDef>) -> Vec<ToolDef> {
@@ -287,7 +288,10 @@ impl AgentManager {
         let def = if let Some(def) = core_def {
             def
         } else {
-            registered.get(&call.name).cloned().context("tool not registered")?
+            registered
+                .get(&call.name)
+                .cloned()
+                .context("tool not registered")?
         };
 
         if requires_approval(&options.permission_mode, &def.name) {
@@ -307,14 +311,19 @@ impl AgentManager {
             // On timeout the receiver drops but the sender used to stay in
             // session.pending forever, so a late agent_tool_result answered
             // {"accepted": true} to nobody.
-            let response = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+            let response = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await
+            {
                 Ok(inner) => inner.context("approval channel closed")?,
                 Err(_) => {
                     session.lock().await.pending.remove(&request_id);
                     anyhow::bail!("approval timed out for {}", def.name);
                 }
             };
-            if response.get("approved").and_then(|v| v.as_bool()).unwrap_or(false) == false {
+            if !response
+                .get("approved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 anyhow::bail!("approval denied for {}", def.name);
             }
         }
@@ -362,7 +371,12 @@ fn assistant_tool_call(call: &ToolCall) -> Value {
 fn is_destructive(tool: &str) -> bool {
     matches!(
         tool,
-        "project_revert" | "project_save" | "project_create" | "file_write" | "model_switch" | "subagent_spawn"
+        "project_revert"
+            | "project_save"
+            | "project_create"
+            | "file_write"
+            | "model_switch"
+            | "subagent_spawn"
     ) || tool.starts_with("workspace_file_write")
         || tool.starts_with("devserver_")
 }
@@ -381,7 +395,10 @@ fn requires_approval(mode: &str, tool: &str) -> bool {
         // Scene edits flow; anything that writes outside the scene asks.
         "auto-accept-edits" => is_destructive(tool),
         // Ask only for the genuinely irreversible ones.
-        "auto" => matches!(tool, "project_revert" | "file_write") || tool.starts_with("workspace_file_write"),
+        "auto" => {
+            matches!(tool, "project_revert" | "file_write")
+                || tool.starts_with("workspace_file_write")
+        }
         // No prompts. Explicitly opted into.
         "full-access" => false,
         // Unknown modes fail closed rather than silently granting everything.
@@ -401,10 +418,13 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    fn mock_chat_stream(has_tool_result: bool) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    fn mock_chat_stream(
+        has_tool_result: bool,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
         let events = if has_tool_result {
             vec![
-                Ok(Event::default().data(r#"{"choices":[{"delta":{"role":"assistant","content":"Echo: "}}]}"#)),
+                Ok(Event::default()
+                    .data(r#"{"choices":[{"delta":{"role":"assistant","content":"Echo: "}}]}"#)),
                 Ok(Event::default().data(r#"{"choices":[{"delta":{"content":"hello-agent"}}]}"#)),
                 Ok(Event::default().data("[DONE]")),
             ]
@@ -471,8 +491,12 @@ mod tests {
             projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
             agents: agents.clone(),
             bus: bus.clone(),
-            workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(crate::workspace::Registry::new())),
-            dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(crate::devserver::Servers::new())),
+            workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::workspace::Registry::new(),
+            )),
+            dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::devserver::Servers::new(),
+            )),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
         };
 
@@ -484,7 +508,11 @@ mod tests {
                     let session_id = event["sessionId"].as_str().unwrap().to_string();
                     let request_id = event["requestId"].as_str().unwrap().to_string();
                     responder_agents
-                        .submit_tool_result(&session_id, &request_id, json!({ "message": "hello-agent" }))
+                        .submit_tool_result(
+                            &session_id,
+                            &request_id,
+                            json!({ "message": "hello-agent" }),
+                        )
                         .await
                         .unwrap();
                 }
@@ -552,8 +580,12 @@ mod tests {
             projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
             agents: agents.clone(),
             bus: bus.clone(),
-            workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(crate::workspace::Registry::new())),
-            dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(crate::devserver::Servers::new())),
+            workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::workspace::Registry::new(),
+            )),
+            dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::devserver::Servers::new(),
+            )),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
         };
 
@@ -573,7 +605,11 @@ mod tests {
                     let session_id = event["sessionId"].as_str().unwrap().to_string();
                     let request_id = event["requestId"].as_str().unwrap().to_string();
                     responder_agents
-                        .submit_tool_result(&session_id, &request_id, json!({ "message": "hello-agent" }))
+                        .submit_tool_result(
+                            &session_id,
+                            &request_id,
+                            json!({ "message": "hello-agent" }),
+                        )
                         .await
                         .unwrap();
                 }
@@ -609,10 +645,16 @@ mod tests {
         let counts: Vec<usize> = modes
             .iter()
             .map(|mode| {
-                ["project_revert", "file_write", "model_switch", "editor_object_add", "project_list"]
-                    .iter()
-                    .filter(|tool| requires_approval(mode, tool))
-                    .count()
+                [
+                    "project_revert",
+                    "file_write",
+                    "model_switch",
+                    "editor_object_add",
+                    "project_list",
+                ]
+                .iter()
+                .filter(|tool| requires_approval(mode, tool))
+                .count()
             })
             .collect();
 
@@ -630,7 +672,10 @@ mod tests {
         // every scene-mutating browser tool, and prompted only for revert and
         // image3d.
         assert!(!requires_approval("auto-accept-edits", "editor_object_add"));
-        assert!(!requires_approval("auto-accept-edits", "editor_update_transform"));
+        assert!(!requires_approval(
+            "auto-accept-edits",
+            "editor_update_transform"
+        ));
         assert!(requires_approval("auto-accept-edits", "file_write"));
         assert!(requires_approval("auto-accept-edits", "project_revert"));
         assert!(requires_approval("auto-accept-edits", "subagent_spawn"));
