@@ -1,19 +1,22 @@
 import { defineConfig } from "@playwright/test";
-import { rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+
+const PROJECTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), ".e2e-projects");
 
 /**
  * The suite writes real projects through core, so it gets its own projects
  * root. Pointed at the default `~/.cali/projects` it permanently mutated the
- * shared `starter` project on every run — accumulated drift had already
- * flipped a passing assertion to failing, which makes results depend on how
- * many times the suite had previously run on that machine.
+ * shared `starter` project on every run.
+ *
+ * The directory is wiped by the `pretest:e2e` npm script, not from here.
+ * Playwright evaluates this config once per process — the runner plus every
+ * worker — and starts `webServer` before globalSetup, so a wipe in either
+ * place deleted the project directory out from under the already-running
+ * core. Core seeds `starter` only at startup, so `project_open` then failed
+ * with "project starter not found" and the client silently fell back to its
+ * local starter project.
  */
-// ESM: no __dirname.
-const PROJECTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), ".e2e-projects");
-rmSync(PROJECTS_DIR, { recursive: true, force: true });
-
 export default defineConfig({
   testDir: "./e2e",
   timeout: 60_000,
