@@ -8,7 +8,8 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "pretest:e2e": "node -e \"require('node:fs').rmSync('.e2e-projects',{recursive:true,force:true})\""
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
