@@ -52,6 +52,14 @@ async fn main() -> anyhow::Result<()> {
         store::create_project(&projects_root, "starter", "Starter")?;
     }
 
+    // Re-attach folders opened in a previous session before the router is up,
+    // so the first workspace_list already reflects them.
+    let mut workspaces = workspace::Registry::new();
+    let restored = workspace::restore(&mut workspaces, &config.workspaces);
+    if !restored.is_empty() {
+        tracing::info!(count = restored.len(), "restored workspaces");
+    }
+
     let (bus, _) = broadcast::channel(256);
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
@@ -59,7 +67,7 @@ async fn main() -> anyhow::Result<()> {
         agents: AgentManager::new(bus.clone()),
         bus,
         tools: Arc::new(RwLock::new(HashMap::new())),
-        workspaces: Arc::new(RwLock::new(workspace::Registry::new())),
+        workspaces: Arc::new(RwLock::new(workspaces)),
         dev_servers: Arc::new(RwLock::new(devserver::Servers::new())),
     };
 

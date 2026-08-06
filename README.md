@@ -69,5 +69,12 @@ from an untrusted project cannot reach the RPC surface. Scripts see plain
 vectors and return a transform patch; they never touch three.js objects
 directly. A step that runs longer than 2s terminates the worker.
 
-**Known gap:** scripted *tests* (`testRunner.ts`) still evaluate with
-`new Function` on the main thread. Only run test suites you trust.
+Scripted tests run in their own sandboxed Worker. They genuinely need
+main-thread capabilities — stepping PIE, comparing baselines through core — so
+the worker calls back over a request/response channel rather than being handed
+those objects; it never holds a reference to anything real. `entityFor` stays
+synchronous, served from a scene snapshot refreshed on every host reply. A
+test that exceeds its timeout has its worker terminated.
+
+Workspaces you attach are recorded in `~/.cali/config.yaml` and re-opened at
+startup. Only the path is stored, so a custom label is not preserved.

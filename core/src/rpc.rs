@@ -83,17 +83,24 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         // workspace_open is the only method that accepts an absolute path.
         "workspace_open" => {
             let mut registry = state.workspaces.write().await;
-            workspace::open(
+            let described = workspace::open(
                 &mut registry,
                 str_param(&params, "path")?,
                 params.get("name").and_then(Value::as_str),
-            )
+            )?;
+            persist_workspaces(state, workspace::roots(&registry)).await;
+            Ok(described)
         }
         "workspace_list" => Ok(workspace::list(&*state.workspaces.read().await)),
         "workspace_close" => {
             let id = str_param(&params, "id")?.to_string();
             devserver::stop(&mut *state.dev_servers.write().await, &id).await?;
-            state.workspaces.write().await.remove(&id);
+            let roots = {
+                let mut registry = state.workspaces.write().await;
+                registry.remove(&id);
+                workspace::roots(&registry)
+            };
+            persist_workspaces(state, roots).await;
             Ok(json!({ "closed": true, "id": id }))
         }
         "workspace_tree" => {
@@ -347,4 +354,19 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing required string {}", key))
+}
+
+/// Mirrors the open-workspace set into the config file.
+///
+/// A failure here must not fail the RPC: losing the convenience of a restored
+/// workspace is not worth failing the open that just succeeded.
+async fn persist_workspaces(state: &AppState, roots: Vec<String>) {
+    let mut config = state.config.write().await;
+    if config.workspaces == roots {
+        return;
+    }
+    config.workspaces = roots;
+    if let Err(error) = crate::config::save(&config) {
+        tracing::warn!(%error, "could not persist workspaces");
+    }
 }

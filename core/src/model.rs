@@ -192,6 +192,7 @@ mod tests {
             },
             providers: vec![],
             projects_dir: None,
+            workspaces: Vec::new(),
         };
         let result = chat(
             &config,

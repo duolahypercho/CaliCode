@@ -123,6 +123,30 @@ pub fn describe(workspace: &Workspace) -> Value {
     })
 }
 
+/// Re-opens previously attached folders at startup.
+///
+/// The registry lives in memory, so without this every core restart silently
+/// dropped whatever folder the user had attached and the client came back
+/// with no workspace. Paths that no longer resolve are skipped rather than
+/// failing boot.
+pub fn restore(registry: &mut Registry, paths: &[String]) -> Vec<String> {
+    let mut opened = Vec::new();
+    for path in paths {
+        match open(registry, path, None) {
+            Ok(_) => opened.push(path.clone()),
+            Err(error) => tracing::warn!(%path, %error, "skipping unavailable workspace"),
+        }
+    }
+    opened
+}
+
+/// Absolute roots of every open workspace, for persisting to config.
+pub fn roots(registry: &Registry) -> Vec<String> {
+    let mut roots: Vec<String> = registry.values().map(|w| w.root.display().to_string()).collect();
+    roots.sort();
+    roots
+}
+
 pub fn list(registry: &Registry) -> Value {
     let mut items: Vec<Value> = registry.values().map(describe).collect();
     items.sort_by(|a, b| a["name"].as_str().unwrap_or("").cmp(b["name"].as_str().unwrap_or("")));
@@ -447,5 +471,35 @@ mod tests {
         std::fs::write(workspace.root.join("blob.bin"), [0u8, 1, 2, 3]).unwrap();
         let read = read_file(&workspace, "blob.bin").unwrap();
         assert_eq!(read["encoding"], "binary");
+    }
+
+    #[test]
+    fn restore_reopens_known_roots_and_skips_missing_ones() {
+        // The registry is in-memory, so without restore every core restart
+        // silently dropped the attached folder.
+        let (_dir, workspace) = fixture();
+        let root = workspace.root.display().to_string();
+
+        let mut registry = Registry::new();
+        let opened = restore(&mut registry, &[root.clone(), "/nope/does/not/exist".into()]);
+
+        assert_eq!(opened, vec![root.clone()]);
+        assert_eq!(registry.len(), 1, "a missing path must not abort the restore");
+        assert_eq!(roots(&registry), vec![root]);
+    }
+
+    #[test]
+    fn roots_are_stable_and_sorted() {
+        let (_a, first) = fixture();
+        let (_b, second) = fixture();
+        let mut registry = Registry::new();
+        open(&mut registry, first.root.to_str().unwrap(), None).unwrap();
+        open(&mut registry, second.root.to_str().unwrap(), None).unwrap();
+
+        let listed = roots(&registry);
+        assert_eq!(listed.len(), 2);
+        let mut sorted = listed.clone();
+        sorted.sort();
+        assert_eq!(listed, sorted);
     }
 }

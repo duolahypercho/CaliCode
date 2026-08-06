@@ -14,6 +14,10 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub providers: Vec<ProviderPreset>,
     pub projects_dir: Option<String>,
+    /// Absolute paths of folders opened as workspaces, so an attached project
+    /// survives a core restart instead of having to be re-opened by hand.
+    #[serde(default)]
+    pub workspaces: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
