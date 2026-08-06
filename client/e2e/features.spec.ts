@@ -126,9 +126,14 @@ test("games sidebar nests agent sessions under each game", async ({ page }) => {
   await expect(sidebar.getByRole("button", { name: /Session 1/ })).toBeVisible();
 });
 
-test("agent panel shows the active model", async ({ page }) => {
+test("agent panel exposes model and subagent controls", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByText("CaliCode Agent")).toBeVisible();
+  // The active model is shown inline on the composer; the switcher and
+  // subagent controls live behind the session menu.
+  await expect(page.getByLabel("Agent prompt")).toBeVisible();
+  await expect(page.getByLabel("Permission mode")).toBeVisible();
+
+  await page.getByLabel("Session settings").click();
   await expect(page.getByLabel("Model provider")).toBeVisible();
   await expect(page.getByLabel("Target model")).toBeVisible();
   await expect(page.getByLabel("Switch model")).toBeVisible();

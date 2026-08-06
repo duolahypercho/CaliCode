@@ -137,3 +137,15 @@ select {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Thinking-dot cadence from the design: each dot peaks in turn. */
+@keyframes cb-dot {
+  0%,
+  60%,
+  100% {
+    opacity: 0.25;
+  }
+  30% {
+    opacity: 1;
+  }
+}
