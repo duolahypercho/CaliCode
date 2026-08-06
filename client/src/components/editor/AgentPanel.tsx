@@ -109,7 +109,14 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     setMessages((current) => [...current, userMessage]);
     setBusy(true);
     try {
-      const history = messages.map((message) => ({ role: message.role, content: message.content }));
+      // Only real conversation turns. `messages` also holds synthetic
+      // role:"tool" entries pushed for the tool-call ticker; replaying those
+      // sends the provider a tool message with no preceding tool_calls, which
+      // is a protocol violation — every turn after the first hard-failed with
+      // a 502/422 and the panel was single-turn only in practice.
+      const history = messages
+        .filter((message) => message.role === "user" || message.role === "assistant")
+        .map((message) => ({ role: message.role, content: message.content }));
       const result = (await rpc("agent_chat", {
         sessionId,
         projectSlug,
