@@ -1,11 +1,14 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import type { Project } from "../../lib/types";
+import { EntityProperties } from "./EntityProperties";
+import type { Entity, Project } from "../../lib/types";
 
 interface SceneGraphCanvasProps {
   project: Project;
   selectedEntityId: string | null;
   onSelect: (id: string | null) => void;
   onAddEntity: () => void;
+  onPatchEntity: (id: string, patch: Partial<Entity>) => void;
+  onRemoveEntity: (id: string) => void;
 }
 
 interface GraphNode {
@@ -30,7 +33,14 @@ const ROW_GAP = 96;
  * edge means an actual `scriptIds` or `assetId` relationship rather than
  * decoration. Selecting an entity node selects it everywhere else too.
  */
-export function SceneGraphCanvas({ project, selectedEntityId, onSelect, onAddEntity }: SceneGraphCanvasProps) {
+export function SceneGraphCanvas({
+  project,
+  selectedEntityId,
+  onSelect,
+  onAddEntity,
+  onPatchEntity,
+  onRemoveEntity,
+}: SceneGraphCanvasProps) {
   const [offsets, setOffsets] = useState<Record<string, { dx: number; dy: number }>>({});
   const dragRef = useRef<{ id: string; startX: number; startY: number; baseX: number; baseY: number } | null>(null);
 
@@ -135,7 +145,7 @@ export function SceneGraphCanvas({ project, selectedEntityId, onSelect, onAddEnt
           >
             <span aria-hidden className="h-2 w-2 shrink-0 border border-[#6a6a6a]" />
             <span className="min-w-0 flex-1 truncate">{label}</span>
-            <span className="shrink-0 text-[10px] text-[#565656]">{count}</span>
+            <span className="shrink-0 text-[10px] text-[#8f8f8f]">{count}</span>
           </div>
         ))}
         <button
@@ -206,10 +216,18 @@ export function SceneGraphCanvas({ project, selectedEntityId, onSelect, onAddEnt
         })}
 
         {positioned.length === 0 ? (
-          <p className="absolute inset-0 flex items-center justify-center text-xs text-[#565656]">
+          <p className="absolute inset-0 flex items-center justify-center text-xs text-[#8f8f8f]">
             Nothing in this scene yet.
           </p>
         ) : null}
+      </div>
+
+      <div className="hidden min-h-0 w-[248px] shrink-0 border-l border-white/[0.06] bg-[#0a0a0a] xl:block">
+        <EntityProperties
+          entity={project.entities.find((entity) => entity.id === selectedEntityId) ?? null}
+          onChange={(patch) => selectedEntityId && onPatchEntity(selectedEntityId, patch)}
+          onRemove={onRemoveEntity}
+        />
       </div>
     </div>
   );

@@ -60,6 +60,11 @@ export default function App() {
   const [testing, setTesting] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [workspaceFile, setWorkspaceFile] = useState<string | null>(null);
+  // Below lg/md these panes leave the layout entirely; the toggles open them
+  // as overlays so the agent and the games list stay reachable on a narrow
+  // window rather than simply disappearing.
+  const [agentOpen, setAgentOpen] = useState(false);
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [openFolderOpen, setOpenFolderOpen] = useState(false);
   const [folderPath, setFolderPath] = useState("");
 
@@ -331,7 +336,7 @@ export default function App() {
   const stats: LiveStats = {
     fps: frameStats.fps,
     frameMs: frameStats.frameMs,
-    draws: project.entities.length,
+    drawCalls: frameStats.drawCalls,
     entities: project.entities.length,
     buildMs,
   };
@@ -340,7 +345,12 @@ export default function App() {
 
   return (
     <div className="flex h-dvh flex-col">
-      <TitleBar projectTitle={project.title} modelList={modelList} />
+      <TitleBar
+        projectTitle={project.title}
+        modelList={modelList}
+        onToggleSidebar={() => setSidebarOpen((open) => !open)}
+        onToggleAgent={() => setAgentOpen((open) => !open)}
+      />
 
       <div className="flex min-h-0 flex-1">
         <GamesSidebar
@@ -359,11 +369,29 @@ export default function App() {
             setActiveSessionId(session.id);
           }}
           onNewGame={() => setNewProjectOpen(true)}
+          overlay={sidebarOpen}
           workspace={workspace ? { name: workspace.name, root: workspace.root } : null}
           onOpenFolder={() => setOpenFolderOpen(true)}
         />
 
-        <aside className="hidden w-[384px] shrink-0 border-r border-white/[0.06] bg-[#0a0a0a] lg:block">
+        {/* Overlay backdrop for the narrow-window drawers. */}
+        {(agentOpen || sidebarOpen) && (
+          <button
+            type="button"
+            aria-label="Close panel"
+            onClick={() => {
+              setAgentOpen(false);
+              setSidebarOpen(false);
+            }}
+            className="fixed inset-0 z-30 bg-black/60 lg:hidden"
+          />
+        )}
+
+        <aside
+          className={`${
+            agentOpen ? "fixed inset-y-0 right-0 z-40 block w-[min(384px,92vw)] shadow-2xl" : "hidden"
+          } shrink-0 border-l border-white/[0.06] bg-[#0a0a0a] lg:static lg:block lg:w-[384px] lg:border-l-0 lg:border-r lg:shadow-none`}
+        >
           <AgentPanel
             projectSlug={project.slug}
             modelList={modelList}
@@ -514,6 +542,11 @@ export default function App() {
                   selectedEntityId={selectedEntityId}
                   onSelect={setSelectedEntityId}
                   onAddEntity={handleAddEntity}
+                  onPatchEntity={(id, patch) => setProject((current) => updateEntity(current, id, patch))}
+                  onRemoveEntity={(id) => {
+                    setProject((current) => removeEntity(current, id));
+                    if (selectedEntityId === id) setSelectedEntityId(null);
+                  }}
                 />
               </div>
             ) : null}

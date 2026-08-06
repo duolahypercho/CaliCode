@@ -99,9 +99,9 @@ test("generated cali asset promotes into the scene", async ({ page }) => {
   await expect(page.getByRole("button", { name: /cali\.png/i }).first()).toBeVisible();
 });
 
-test("export saves the project and the test tab runs the suite", async ({ page }) => {
+test("save persists the project and the test tab runs the suite", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "EXPORT" }).click();
+  await page.getByRole("button", { name: "SAVE", exact: true }).click();
   await page.getByRole("button", { name: /CONSOLE/ }).click();
   await expect(page.getByText(/saved starter/i)).toBeVisible();
 

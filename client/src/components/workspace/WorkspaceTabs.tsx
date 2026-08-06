@@ -46,7 +46,7 @@ export function WorkspaceTabs({
               aria-selected={selected}
               onClick={() => onChange(tab)}
               className={`shrink-0 border-r border-white/[0.08] px-[15px] py-2 text-[11px] font-bold uppercase tracking-[0.14em] last:border-r-0 ${
-                selected ? "bg-[#1c1c1c] text-[#e0e0e0]" : "text-[#767676] hover:text-[#b0b0b0]"
+                selected ? "bg-[#1c1c1c] text-[#e0e0e0]" : "text-[#9c9c9c] hover:text-[#b0b0b0]"
               }`}
             >
               {tab}
@@ -63,7 +63,7 @@ export function WorkspaceTabs({
           );
         })}
       </div>
-      <span className="ml-auto hidden truncate text-[11px] text-[#4f4f4f] xl:inline">{previewUrl}</span>
+      <span className="ml-auto hidden truncate text-[11px] text-[#8a8a8a] xl:inline">{previewUrl}</span>
       <button
         type="button"
         onClick={onNewGame}
@@ -77,7 +77,7 @@ export function WorkspaceTabs({
         disabled={exporting}
         className="shrink-0 rounded-md border border-white/[0.12] bg-[#2a2a2a] px-[15px] py-[7px] text-[11px] font-bold tracking-[0.12em] text-[#dcdcdc] hover:bg-[#333] disabled:opacity-50"
       >
-        {exporting ? "SAVING…" : "EXPORT"}
+        {exporting ? "SAVING…" : "SAVE"}
       </button>
     </div>
   );

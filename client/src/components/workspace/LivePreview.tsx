@@ -72,11 +72,11 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
               ? "animate-pulse bg-[#bdbdbd]"
               : status.status === "crashed"
                 ? "bg-[#c98b8b]"
-                : "bg-[#4f4f4f]"
+                : "bg-[#8a8a8a]"
           }`}
         />
         <span className="text-[10.5px] tracking-[0.14em] text-[#c0c0c0]">{status.status.toUpperCase()}</span>
-        <span className="min-w-0 truncate text-[11px] text-[#4f4f4f]">
+        <span className="min-w-0 truncate text-[11px] text-[#8a8a8a]">
           {status.url ?? `${workspaceName} · ${script}`}
         </span>
         <div className="ml-auto flex shrink-0 gap-1.5">
@@ -120,7 +120,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
             className="h-full w-full border-0"
           />
         ) : (
-          <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-[#565656]">
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-[#8f8f8f]">
             <span className="tracking-[0.14em]">
               {status.status === "starting"
                 ? "STARTING THE DEV SERVER…"

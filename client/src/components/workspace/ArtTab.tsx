@@ -74,7 +74,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
     <div className="flex h-full min-h-0 flex-col overflow-y-auto px-[22px] py-[18px]">
       <div className="mb-1.5 flex flex-wrap items-center gap-3">
         <span className="font-display text-[15px] font-bold text-[#dadada]">Sprite generator</span>
-        <span className="text-[11px] tracking-[0.06em] text-[#767676]">PROCEDURAL · SEEDED · MONOCHROME</span>
+        <span className="text-[11px] tracking-[0.06em] text-[#9c9c9c]">PROCEDURAL · SEEDED · MONOCHROME</span>
       </div>
 
       <div className="mb-[18px] mt-2.5 flex flex-wrap gap-2.5">
@@ -87,7 +87,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
             }}
             aria-label="Sprite prompt"
             placeholder="a hovering enemy drone with a glowing eye"
-            className="min-w-0 flex-1 bg-transparent text-[13px] text-[#d0d0d0] outline-none placeholder:text-[#565656]"
+            className="min-w-0 flex-1 bg-transparent text-[13px] text-[#d0d0d0] outline-none placeholder:text-[#8f8f8f]"
           />
         </div>
         <button
@@ -114,7 +114,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
       </div>
 
       <div className="mb-3 flex items-center gap-2 rounded-md border border-white/[0.07] bg-[#101010] px-2.5 py-[7px]">
-        <span aria-hidden className="text-[#454545]">
+        <span aria-hidden className="text-[#7d7d7d]">
           /
         </span>
         <input
@@ -122,13 +122,13 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
           onChange={(event) => setSearch(event.target.value)}
           aria-label="Search assets"
           placeholder="search assets"
-          className="min-w-0 flex-1 bg-transparent text-xs text-[#c6c6c6] outline-none placeholder:text-[#565656]"
+          className="min-w-0 flex-1 bg-transparent text-xs text-[#c6c6c6] outline-none placeholder:text-[#8f8f8f]"
         />
-        <span className="shrink-0 text-[10px] text-[#565656]">{visible.length}</span>
+        <span className="shrink-0 text-[10px] text-[#8f8f8f]">{visible.length}</span>
       </div>
 
       {visible.length === 0 ? (
-        <p className="text-xs text-[#565656]">
+        <p className="text-xs text-[#8f8f8f]">
           {assets.length === 0 ? "No assets yet — describe one above and generate." : "No assets match that search."}
         </p>
       ) : (
@@ -141,7 +141,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
                   {asset.thumbnail ? (
                     <img src={asset.thumbnail} alt="" className="h-full w-full object-contain" />
                   ) : (
-                    <span className="text-[10px] tracking-[0.1em] text-[#565656]">NO PREVIEW</span>
+                    <span className="text-[10px] tracking-[0.1em] text-[#8f8f8f]">NO PREVIEW</span>
                   )}
                 </div>
                 <div className="flex items-center gap-2 px-2.5 py-2">
@@ -150,7 +150,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
                   </span>
                   <span
                     className="shrink-0 text-[10px] tracking-[0.08em]"
-                    style={{ color: uses > 0 ? "#9a9a9a" : "#565656" }}
+                    style={{ color: uses > 0 ? "#9a9a9a" : "#8f8f8f" }}
                   >
                     {uses > 0 ? `IN USE ${uses}` : "READY"}
                   </span>
@@ -168,7 +168,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
                     type="button"
                     onClick={() => onRemove(asset.id)}
                     aria-label={`Remove ${asset.name}`}
-                    className="rounded border border-white/10 px-2 py-1 text-[10px] text-[#767676] hover:border-white/30 hover:text-[#c0c0c0]"
+                    className="rounded border border-white/10 px-2 py-1 text-[10px] text-[#9c9c9c] hover:border-white/30 hover:text-[#c0c0c0]"
                   >
                     ✕
                   </button>

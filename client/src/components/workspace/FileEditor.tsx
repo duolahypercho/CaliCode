@@ -69,7 +69,7 @@ export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorPr
 
   if (!path) {
     return (
-      <div className="flex h-full items-center justify-center text-xs text-[#565656]">
+      <div className="flex h-full items-center justify-center text-xs text-[#8f8f8f]">
         Select a file to edit.
       </div>
     );
@@ -77,7 +77,7 @@ export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorPr
 
   if (file?.encoding === "binary") {
     return (
-      <div className="flex h-full flex-col items-center justify-center gap-1 text-xs text-[#565656]">
+      <div className="flex h-full flex-col items-center justify-center gap-1 text-xs text-[#8f8f8f]">
         <span>{path}</span>
         <span>Binary file · {file.bytes.toLocaleString()} bytes</span>
       </div>

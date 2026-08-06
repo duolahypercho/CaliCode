@@ -22,7 +22,7 @@ export interface Issue {
 const SEVERITY_TINT: Record<Issue["severity"], string> = {
   HIGH: "#c8c8c8",
   MED: "#8f8f8f",
-  LOW: "#616161",
+  LOW: "#949494",
 };
 
 /**
@@ -60,7 +60,7 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
               >
                 ▶
               </button>
-              <span className="text-[11px] tracking-[0.06em] text-[#616161]">
+              <span className="text-[11px] tracking-[0.06em] text-[#949494]">
                 {running ? "RUNNING PLAYTEST…" : canRun ? "RUN A PLAYTEST" : "RUNTIME NOT READY"}
               </span>
             </div>
@@ -92,7 +92,7 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
         </div>
         <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto p-3.5">
           {issues.length === 0 ? (
-            <p className="text-xs text-[#565656]">
+            <p className="text-xs text-[#8f8f8f]">
               {results.length === 0 ? "Run a playtest to surface issues." : "All tests passed."}
             </p>
           ) : (
@@ -112,7 +112,7 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
                   <span className="min-w-0 flex-1 truncate text-[12.5px] font-bold text-[#dadada]">{issue.title}</span>
                 </div>
                 <p className="mb-2 whitespace-pre-wrap text-xs leading-[1.55] text-[#8f8f8f]">{issue.description}</p>
-                <p className="rounded-[5px] border border-white/[0.06] px-2.5 py-1.5 text-[11px] text-[#565656]">
+                <p className="rounded-[5px] border border-white/[0.06] px-2.5 py-1.5 text-[11px] text-[#8f8f8f]">
                   {issue.repro}
                 </p>
               </div>

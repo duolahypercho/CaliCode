@@ -34,7 +34,7 @@ export function TweakPanel({ title, controls, onClose }: TweakPanelProps) {
       </div>
       <div className="flex flex-col gap-3">
         {controls.length === 0 ? (
-          <p className="text-[11px] text-[#565656]">Nothing to tweak here yet.</p>
+          <p className="text-[11px] text-[#8f8f8f]">Nothing to tweak here yet.</p>
         ) : (
           controls.map((control) => (
             <div key={control.key}>
