@@ -17,6 +17,8 @@
  * internals anyway.
  */
 
+import { hardenWorkerScope } from "./hardenWorkerScope";
+
 export interface SandboxVec3 {
   x: number;
   y: number;
@@ -52,41 +54,11 @@ type ScriptFn = (entity: SandboxEntity, state: Record<string, unknown>, delta: n
 
 const compiled = new Map<string, { code: string; fn: ScriptFn }>();
 
-/**
- * Network capabilities removed from the worker's own global scope, before any
- * script is compiled.
- *
- * Shadowing them as function parameters alone is not enough: a script body can
- * reach the real global with `Function("return this")()` and read `fetch` off
- * it. This runs once at startup and the worker never needs them, so deleting
- * them closes that path rather than merely obscuring it.
- */
-function hardenGlobalScope(): void {
-  const scope = self as unknown as Record<string, unknown>;
-  for (const name of [
-    "fetch",
-    "XMLHttpRequest",
-    "WebSocket",
-    "importScripts",
-    "EventSource",
-    "Request",
-    "Response",
-    "indexedDB",
-    "caches",
-    "Worker",
-    "SharedWorker",
-    "BroadcastChannel",
-    "navigator",
-  ]) {
-    try {
-      Object.defineProperty(scope, name, { value: undefined, configurable: false, writable: false });
-    } catch {
-      /* already locked down, or not present in this runtime */
-    }
-  }
-}
-
-hardenGlobalScope();
+// Captured before hardening: the harness still needs to reply, and
+// postMessage is removed from the scope so a script body cannot use it to
+// exfiltrate.
+const reply = self.postMessage.bind(self);
+hardenWorkerScope(self);
 
 /**
  * Names shadowed as `undefined` parameters so a script body referencing them
@@ -158,5 +130,5 @@ self.onmessage = (event: MessageEvent<StepRequest>) => {
     })),
     logs,
   };
-  self.postMessage(response);
+  reply(response);
 };

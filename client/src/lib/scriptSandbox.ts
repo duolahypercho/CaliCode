@@ -25,14 +25,27 @@ class WorkerSandbox implements ScriptSandbox {
   private pending = new Map<number, { resolve: (value: StepOutcome) => void; timer: number }>();
 
   constructor() {
-    this.worker = new Worker(new URL("./scriptSandbox.worker.ts", import.meta.url), { type: "module" });
-    this.worker.onmessage = (event: MessageEvent<StepResponse>) => {
+    this.worker = this.spawn();
+  }
+
+  /**
+   * Builds a worker with its handler attached.
+   *
+   * restart() used to construct a bare worker and never re-attach onmessage,
+   * so the replacement was mute: after a single script timeout every later
+   * step timed out too, scripting was dead for the session, and each dead step
+   * spawned another abandoned worker.
+   */
+  private spawn(): Worker {
+    const worker = new Worker(new URL("./scriptSandbox.worker.ts", import.meta.url), { type: "module" });
+    worker.onmessage = (event: MessageEvent<StepResponse>) => {
       const entry = this.pending.get(event.data.seq);
       if (!entry) return;
       this.pending.delete(event.data.seq);
       window.clearTimeout(entry.timer);
       entry.resolve({ patches: event.data.patches, logs: event.data.logs });
     };
+    return worker;
   }
 
   step(request: Omit<StepRequest, "type" | "seq">): Promise<StepOutcome> {
@@ -58,7 +71,7 @@ class WorkerSandbox implements ScriptSandbox {
       entry.resolve({ patches: [], logs: ["sandbox restarted"] });
     }
     this.pending.clear();
-    this.worker = new Worker(new URL("./scriptSandbox.worker.ts", import.meta.url), { type: "module" });
+    this.worker = this.spawn();
   }
 
   dispose(): void {
