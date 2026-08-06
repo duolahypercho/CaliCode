@@ -61,6 +61,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         "project_open" => Ok(store::read_project(&state.projects_root, str_param(&params, "slug")?)?),
         "project_save" => {
             let project = params.get("project").context("project missing")?;
+            store::validate_project(project)?;
             let slug = str_param(project, "slug")?;
             store::write_project(&state.projects_root, slug, project)?;
             Ok(json!({ "saved": true, "slug": slug }))

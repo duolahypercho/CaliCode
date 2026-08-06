@@ -1,5 +1,6 @@
 use crate::store::project_dir;
 use anyhow::{Context, Result};
+#[allow(unused_imports)]
 use base64::Engine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
