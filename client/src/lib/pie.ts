@@ -1,5 +1,6 @@
 import * as THREE from "three";
 import { buildScene } from "./procedural";
+import { createScriptSandbox, toSandboxEntity, type ScriptSandbox } from "./scriptSandbox";
 import type { CapturedFrame, Project } from "./types";
 
 export type PieState = "idle" | "running" | "paused";
@@ -7,15 +8,6 @@ export type PieState = "idle" | "running" | "paused";
 /** Name of the group the runtime owns. Everything else in the scene belongs
  *  to the editor (lights, grid, gizmos) and must survive a rebuild. */
 export const PROJECT_GROUP = "__project__";
-
-type ScriptFn = (entity: THREE.Object3D, state: Record<string, unknown>, delta: number) => unknown;
-
-/** Cached compile plus the source it came from, so an edited script
- *  recompiles instead of silently running the previous version. */
-interface CompiledScript {
-  code: string;
-  fn: ScriptFn;
-}
 
 export function shouldCaptureFrame(frameIndex: number, captureEvery: number): boolean {
   return frameIndex > 0 && frameIndex % Math.max(1, captureEvery) === 0;
@@ -44,7 +36,13 @@ export class PieRuntime {
   private running = false;
   private captureEvery = 3;
   private fixedHz = 60;
-  private compiled = new Map<string, CompiledScript>();
+  private sandbox: ScriptSandbox = createScriptSandbox();
+  /** Set while a sandbox round trip is in flight, so a slow frame drops
+   *  rather than queueing an unbounded backlog of step requests. */
+  private stepping = false;
+  /** Steps are async now, so an in-flight one can outlive teardown. Every
+   *  post-await use of the renderer checks this first. */
+  private disposed = false;
   private waiters: Array<{ target: number; resolve: () => void; reject: (error: Error) => void }> = [];
 
   constructor(
@@ -113,9 +111,11 @@ export class PieRuntime {
     this.renderer.render(this.scene, this.camera);
   }
 
-  stepOnce(): void {
+  async stepOnce(): Promise<void> {
+    if (this.disposed) return;
     const delta = 1000 / this.fixedHz;
-    this.step(delta);
+    await this.step(delta);
+    if (this.disposed) return;
     this.frameIndex += 1;
     this.simTimeMs += delta;
     this.resolveWaiters();
@@ -131,7 +131,7 @@ export class PieRuntime {
     const target = this.frameIndex + count;
     if (!this.running) {
       for (let i = 0; i < count; i += 1) {
-        this.stepOnce();
+        await this.stepOnce();
       }
       return;
     }
@@ -141,6 +141,7 @@ export class PieRuntime {
   }
 
   capture(): string {
+    if (this.disposed) return "";
     this.renderer.render(this.scene, this.camera);
     const dataUrl = this.renderer.domElement.toDataURL("image/png");
     this.callbacks.onCapture({ frame: this.frameIndex, timeMs: this.simTimeMs, dataUrl });
@@ -157,60 +158,80 @@ export class PieRuntime {
     this.lastTime = now;
     const stepMs = 1000 / this.fixedHz;
     this.accumulatorMs += dt;
-    let guard = 0;
-    while (this.accumulatorMs >= stepMs && guard < 8) {
-      this.step(stepMs);
-      this.accumulatorMs -= stepMs;
-      this.simTimeMs += stepMs;
-      this.frameIndex += 1;
-      guard += 1;
+
+    // Scripts now run in a worker, so a step is asynchronous. Render and
+    // reschedule regardless; only the simulation waits on the sandbox.
+    if (!this.stepping && this.accumulatorMs >= stepMs) {
+      this.stepping = true;
+      const budget = Math.min(Math.floor(this.accumulatorMs / stepMs), 8);
+      void (async () => {
+        try {
+          for (let i = 0; i < budget && this.running && !this.disposed; i += 1) {
+            await this.step(stepMs);
+            if (this.disposed) return;
+            this.accumulatorMs -= stepMs;
+            this.simTimeMs += stepMs;
+            this.frameIndex += 1;
+          }
+        } finally {
+          this.stepping = false;
+        }
+        // The renderer may have been torn down while the sandbox round trip
+        // was in flight; capture() would then draw into a disposed context.
+        if (this.disposed) return;
+        this.resolveWaiters();
+        this.callbacks.onFrame(this.frameIndex, this.simTimeMs);
+        if (shouldCaptureFrame(this.frameIndex, this.captureEvery)) {
+          this.capture();
+        }
+      })();
     }
-    this.resolveWaiters();
-    this.callbacks.onFrame(this.frameIndex, this.simTimeMs);
-    if (shouldCaptureFrame(this.frameIndex, this.captureEvery)) {
-      this.capture();
-    }
+
     this.renderer.render(this.scene, this.camera);
     this.rafId = requestAnimationFrame(this.tick);
   };
 
-  private step(delta: number): void {
-    // Reads the monotonic sim clock. This used to read the fixed-step
-    // accumulator, which never exceeds one step — so `state.time` sat at
-    // ~0.0167s forever and every time-driven script silently did nothing.
-    const state: Record<string, unknown> = { time: this.simTimeMs / 1000, entities: this.scene.children };
-    for (const entity of this.project.entities) {
-      const object = this.scene.getObjectByName(entity.name);
+  /**
+   * Advances the simulation by one fixed step.
+   *
+   * Scripts execute in the sandbox, never here: they receive plain vectors
+   * and return a transform patch, which is applied to the live three.js
+   * objects on this side of the boundary.
+   */
+  private async step(delta: number): Promise<void> {
+    const scripted = this.project.entities
+      .filter((entity) => entity.scriptIds.length > 0)
+      .map((entity) => {
+        const object = this.scene.getObjectByName(entity.name);
+        return object ? toSandboxEntity(entity.id, entity.name, entity.scriptIds, object) : null;
+      })
+      .filter((entity): entity is NonNullable<typeof entity> => entity !== null);
+
+    if (scripted.length === 0) return;
+
+    const outcome = await this.sandbox.step({
+      delta: delta / 1000,
+      // The monotonic sim clock. This used to read the fixed-step
+      // accumulator, which never exceeds one step — so `state.time` sat at
+      // ~0.0167s forever and every time-driven script silently did nothing.
+      time: this.simTimeMs / 1000,
+      entities: scripted,
+      scripts: this.project.scripts.map((script) => ({
+        id: script.id,
+        name: script.name,
+        code: script.code,
+      })),
+    });
+
+    for (const patch of outcome.patches) {
+      const entity = this.project.entities.find((item) => item.id === patch.id);
+      const object = entity ? this.scene.getObjectByName(entity.name) : null;
       if (!object) continue;
-      for (const scriptId of entity.scriptIds) {
-        const script = this.project.scripts.find((s) => s.id === scriptId);
-        if (!script) continue;
-        try {
-          const fn = this.compile(script.id, script.code);
-          fn(object, state, delta / 1000);
-        } catch (error) {
-          this.callbacks.onLog(`script ${script.name}: ${String(error)}`);
-        }
-      }
+      object.position.set(patch.position.x, patch.position.y, patch.position.z);
+      object.rotation.set(patch.rotation.x, patch.rotation.y, patch.rotation.z);
+      object.scale.set(patch.scale.x, patch.scale.y, patch.scale.z);
     }
-  }
-
-  private compile(id: string, code: string): ScriptFn {
-    // The cache used to key on id alone and was never invalidated by
-    // setProject, so editing a script and pressing Play re-ran the previous
-    // build until a full page reload. Compare the source too.
-    const cached = this.compiled.get(id);
-    if (cached && cached.code === code) return cached.fn;
-
-    // eslint-disable-next-line no-new-func
-    const fn = new Function(
-      "entity",
-      "state",
-      "delta",
-      `${code}\nreturn typeof update === "function" ? update(entity, state, delta) : state;`,
-    ) as ScriptFn;
-    this.compiled.set(id, { code, fn });
-    return fn;
+    for (const line of outcome.logs) this.callbacks.onLog(line);
   }
 
   private resolveWaiters(): void {
@@ -248,9 +269,10 @@ export class PieRuntime {
     // Deliberately not stop(): that rebuilds a whole fresh scene immediately
     // before the renderer is torn down, allocating GPU resources that are
     // then never freed.
+    this.disposed = true;
     this.pause();
     this.rejectWaiters("PIE runtime disposed");
-    this.compiled.clear();
+    this.sandbox.dispose();
     const group = this.scene.getObjectByName(PROJECT_GROUP);
     if (group) {
       this.scene.remove(group);

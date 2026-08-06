@@ -69,48 +69,48 @@ describe("PieRuntime script compilation", () => {
     ({ runtime } = makeRuntime(scriptedProject("function update(entity){ entity.position.x += 1; }")));
   });
 
-  it("runs the script against the scene", () => {
-    runtime.stepOnce();
+  it("runs the script against the scene", async () => {
+    await runtime.stepOnce();
     expect(runtime.getObject("Probe")?.position.x).toBe(1);
   });
 
-  it("recompiles after the script source changes", () => {
+  it("recompiles after the script source changes", async () => {
     // The compile cache keyed on script id only and setProject never cleared
     // it, so an edited script kept running its previous build until reload —
     // the core write-script/see-it-run loop was broken.
-    runtime.stepOnce();
+    await runtime.stepOnce();
     expect(runtime.getObject("Probe")?.position.x).toBe(1);
 
     runtime.setProject(scriptedProject("function update(entity){ entity.position.x += 100; }"));
-    runtime.stepOnce();
+    await runtime.stepOnce();
 
     expect(runtime.getObject("Probe")?.position.x).toBe(101);
   });
 
-  it("reports script errors instead of throwing", () => {
+  it("reports script errors instead of throwing", async () => {
     const { runtime: broken, logs } = makeRuntime(scriptedProject("function update(){ throw new Error('boom'); }"));
-    expect(() => broken.stepOnce()).not.toThrow();
+    await expect(broken.stepOnce()).resolves.toBeUndefined();
     expect(logs.join("\n")).toContain("boom");
   });
 });
 
 describe("PieRuntime simulation clock", () => {
-  it("advances state.time across frames", () => {
+  it("advances state.time across frames", async () => {
     // state.time read the fixed-step accumulator, which never exceeds one
     // step, so it sat at ~0.0167s forever and `Math.sin(state.time)` scripts
     // never moved.
     const { runtime } = makeRuntime(scriptedProject("function update(entity, state){ entity.position.y = state.time; }"));
 
-    runtime.stepOnce();
+    await runtime.stepOnce();
     const first = runtime.getObject("Probe")!.position.y;
-    for (let i = 0; i < 30; i += 1) runtime.stepOnce();
+    for (let i = 0; i < 30; i += 1) await runtime.stepOnce();
     const later = runtime.getObject("Probe")!.position.y;
 
     expect(first).toBeCloseTo(0, 5);
     expect(later).toBeGreaterThan(0.4);
   });
 
-  it("reports monotonic capture timestamps", () => {
+  it("reports monotonic capture timestamps", async () => {
     const stamps: number[] = [];
     const scene = new THREE.Scene();
     const runtime = new PieRuntime(
@@ -126,7 +126,7 @@ describe("PieRuntime simulation clock", () => {
       },
     );
     runtime.setCaptureEvery(1);
-    for (let i = 0; i < 4; i += 1) runtime.stepOnce();
+    for (let i = 0; i < 4; i += 1) await runtime.stepOnce();
 
     expect(stamps.length).toBeGreaterThanOrEqual(3);
     // Previously every stamp was a sub-millisecond accumulator remainder.
@@ -136,7 +136,7 @@ describe("PieRuntime simulation clock", () => {
 });
 
 describe("PieRuntime scene ownership", () => {
-  it("keeps editor lights and grid across a stop", () => {
+  it("keeps editor lights and grid across a stop", async () => {
     // stop() used to clear every scene child, taking the editor's lights and
     // grid with it, and then re-add project entities flat.
     const { runtime, scene } = makeRuntime(scriptedProject("function update(){}"));
@@ -147,7 +147,7 @@ describe("PieRuntime scene ownership", () => {
     expect(scene.getObjectByName(PROJECT_GROUP)).toBeTruthy();
   });
 
-  it("does not duplicate entities across repeated rebuilds", () => {
+  it("does not duplicate entities across repeated rebuilds", async () => {
     // Losing the __project__ group made the next rebuild add a second copy of
     // every entity beside the first.
     const { runtime, scene } = makeRuntime(scriptedProject("function update(){}"));
