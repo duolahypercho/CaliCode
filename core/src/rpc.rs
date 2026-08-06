@@ -2,8 +2,10 @@ use crate::agent::AgentOptions;
 use crate::assets;
 use crate::baselines;
 use crate::image3d;
+use crate::devserver;
 use crate::store;
 use crate::tools::{model_list, model_switch, ToolDef};
+use crate::workspace;
 use crate::AppState;
 use anyhow::{Context, Result};
 use axum::extract::State;
@@ -76,6 +78,74 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             str_param(&params, "checkpointId")?,
         )?),
         "project_starter" => Ok(serde_json::from_str(store::SAMPLE_PROJECT)?),
+
+        // Workspaces: a real folder on disk that CaliCode edits in place.
+        // workspace_open is the only method that accepts an absolute path.
+        "workspace_open" => {
+            let mut registry = state.workspaces.write().await;
+            workspace::open(
+                &mut registry,
+                str_param(&params, "path")?,
+                params.get("name").and_then(Value::as_str),
+            )
+        }
+        "workspace_list" => Ok(workspace::list(&*state.workspaces.read().await)),
+        "workspace_close" => {
+            let id = str_param(&params, "id")?.to_string();
+            devserver::stop(&mut *state.dev_servers.write().await, &id).await?;
+            state.workspaces.write().await.remove(&id);
+            Ok(json!({ "closed": true, "id": id }))
+        }
+        "workspace_tree" => {
+            let registry = state.workspaces.read().await;
+            let workspace = workspace::get(&registry, str_param(&params, "id")?)?;
+            let depth = params.get("depth").and_then(Value::as_u64).unwrap_or(1) as u32;
+            let hidden = params.get("includeHidden").and_then(Value::as_bool).unwrap_or(false);
+            workspace::tree(workspace, params.get("path").and_then(Value::as_str).unwrap_or(""), depth, hidden)
+        }
+        "workspace_file_read" => {
+            let registry = state.workspaces.read().await;
+            let workspace = workspace::get(&registry, str_param(&params, "id")?)?;
+            workspace::read_file(workspace, str_param(&params, "path")?)
+        }
+        "workspace_file_write" => {
+            let registry = state.workspaces.read().await;
+            let workspace = workspace::get(&registry, str_param(&params, "id")?)?;
+            workspace::write_file(
+                workspace,
+                str_param(&params, "path")?,
+                str_param(&params, "content")?,
+                params.get("expectedSha256").and_then(Value::as_str),
+            )
+        }
+        "devserver_start" => {
+            let registry = state.workspaces.read().await;
+            let workspace = workspace::get(&registry, str_param(&params, "id")?)?.clone();
+            drop(registry);
+            let script = params.get("script").and_then(Value::as_str).unwrap_or("dev");
+            devserver::start(
+                &mut *state.dev_servers.write().await,
+                &workspace,
+                script,
+                state.bus.clone(),
+            )
+            .await
+        }
+        "devserver_stop" => {
+            devserver::stop(&mut *state.dev_servers.write().await, str_param(&params, "id")?).await
+        }
+        "devserver_status" => Ok(devserver::status(
+            &*state.dev_servers.read().await,
+            str_param(&params, "id")?,
+        )),
+        "devserver_logs" => {
+            let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+            Ok(devserver::logs(
+                &*state.dev_servers.read().await,
+                str_param(&params, "id")?,
+                limit.min(2000),
+            ))
+        }
         "file_read" => {
             let slug = str_param(&params, "slug")?;
             let path = store::safe_join(&store::project_dir(&state.projects_root, slug)?, str_param(&params, "path")?)?;

@@ -347,6 +347,8 @@ mod tests {
             projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
             agents: agents.clone(),
             bus: bus.clone(),
+            workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(crate::workspace::Registry::new())),
+            dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(crate::devserver::Servers::new())),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
         };
         let def = core_tool_defs()
