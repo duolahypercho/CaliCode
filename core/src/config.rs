@@ -167,7 +167,17 @@ pub fn save(config: &AppConfig) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Resolves where projects live.
+///
+/// `CALI_PROJECTS_DIR` wins over the config file so a test run can be pointed
+/// at a scratch directory. Without it the e2e suite writes to the user's real
+/// `~/.cali/projects`, permanently mutating the shared `starter` project on
+/// every run — enough accumulated drift had already turned a passing
+/// assertion into a failing one.
 pub fn projects_root(config: &AppConfig) -> PathBuf {
+    if let Some(override_dir) = std::env::var_os("CALI_PROJECTS_DIR") {
+        return expand_tilde(&override_dir.to_string_lossy());
+    }
     config
         .projects_dir
         .as_deref()

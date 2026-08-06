@@ -9,3 +9,6 @@ target/
 client/playwright-report/
 client/test-results/
 client/coverage/
+
+# e2e scratch projects root
+client/.e2e-projects/

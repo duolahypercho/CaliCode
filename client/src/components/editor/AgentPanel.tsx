@@ -307,7 +307,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
           </p>
         )}
         {messages.map((message, index) => (
-          <div key={index} className="mb-2 rounded-md border border-border bg-card p-2">
+          <div key={index} data-role={message.role} className="mb-2 rounded-md border border-border bg-card p-2">
             <span className="text-xs font-medium text-muted-foreground">{message.role}</span>
             {message.tool && <span className="ml-2 text-xs text-muted-foreground">tool: {message.tool}</span>}
             <p className="mt-1 whitespace-pre-wrap text-sm">{message.content}</p>

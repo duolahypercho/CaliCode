@@ -117,3 +117,23 @@ select {
   background: hsl(var(--border));
   border-radius: 4px;
 }
+
+/* Every hand-written component relied on the UA default focus ring — a blue
+   outline flush against the border, and invisible entirely on the two inputs
+   that set outline-none. One token, applied globally. */
+:where(a, button, input, textarea, select, [tabindex]):focus-visible {
+  outline: 2px solid #c6c6c6;
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Two indicator dots pulse indefinitely; honour the OS preference. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

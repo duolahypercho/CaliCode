@@ -161,7 +161,10 @@ export function Viewport({
   }, []);
 
   useEffect(() => {
-    if (!runtimeRef.current || runtimeRef.current.state === "running") return;
+    if (!runtimeRef.current) return;
+    // Rebuilding while running used to be skipped outright, which made
+    // "TWEAK LIVE" not tweak live: every slider was inert during PLAY and you
+    // had to pause to see any change.
     runtimeRef.current.setProject(project);
     rebuildRef.current();
   }, [project]);
