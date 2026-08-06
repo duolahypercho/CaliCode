@@ -100,6 +100,10 @@ async fn main() -> anyhow::Result<()> {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("../client/dist"));
 
+    // Cloned before `state` moves into the router, so shutdown can still
+    // reach the running dev servers.
+    let dev_servers = state.dev_servers.clone();
+
     let app = Router::new()
         .route("/rpc", post(rpc::rpc_handler))
         .route("/events", get(events))
@@ -113,8 +117,44 @@ async fn main() -> anyhow::Result<()> {
     let addr = "127.0.0.1:8765";
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("CaliCode core listening on http://{}", addr);
-    axum::serve(listener, app).await?;
+
+    // Dev-server children rely on Child::kill_on_drop, which only fires when
+    // the Servers map is dropped. A signalled process does not run
+    // destructors, so quitting core used to leave every vite child running.
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            tracing::info!("shutting down; stopping dev servers");
+            let ids: Vec<String> = dev_servers.read().await.keys().cloned().collect();
+            let mut servers = dev_servers.write().await;
+            for id in ids {
+                let _ = devserver::stop(&mut servers, &id).await;
+            }
+        })
+        .await?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => tracing::warn!(%error, "cannot listen for SIGTERM"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = interrupt => {}
+        _ = terminate => {}
+    }
 }
 
 async fn events(
