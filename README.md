@@ -63,7 +63,11 @@ resolver, refuses `.env` / key material, and never executes an arbitrary
 command — `devserver_start` takes a script *name* that must already exist in
 the target's `package.json`.
 
-**Known gap:** project scripts and tests are evaluated with `new Function` in
-the page realm, same origin as the RPC proxy, with no CSP. Only run projects
-you trust. Moving script execution into a sandboxed worker is tracked as the
-next hardening step.
+Project scripts run in a sandboxed Worker with `fetch`, `XMLHttpRequest`,
+`WebSocket` and friends removed from the worker's global scope, so a script
+from an untrusted project cannot reach the RPC surface. Scripts see plain
+vectors and return a transform patch; they never touch three.js objects
+directly. A step that runs longer than 2s terminates the worker.
+
+**Known gap:** scripted *tests* (`testRunner.ts`) still evaluate with
+`new Function` on the main thread. Only run test suites you trust.
