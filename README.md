@@ -1,23 +1,35 @@
 # CaliCode
 
-CaliCode is a native AI game engine harness for the web. It pairs a Rust control
-plane with a three.js editor, asset workbench, asset library, Play-In-Editor
-(PIE) runtime, deterministic frame capture, scripted tests, and a native agent
-panel. No MCP, no harness fork, and no generated Three.js code: image-to-3D
+CaliCode is a native AI game-coding harness for the web. A Rust control plane
+pairs with a three.js editor: asset workbench, asset library, Play-In-Editor
+(PIE) runtime, deterministic frame capture, scripted tests, and an agent panel
+that drives the editor through real tool calls.
+
+No MCP, no harness fork, and no generated Three.js code — image-to-3D
 reconstruction is a Rust pipeline that emits a data-driven `.cali` asset.
 
-The editor UI follows the CaliCode design language: a dark monochrome console
-with Syne branding, Space Mono body type, a games sidebar, an agent chat
-column, and a play/code/art/scene/test workspace.
+## Two ways to work
 
-The agent panel is the harness surface: switch provider/model directly or with
-`/model`, choose a permission mode, watch tool calls as they drive the editor,
-and spawn planner/coder/tester/critic subagents from the same panel.
+**Projects** are scene documents CaliCode owns end to end, stored under
+`~/.cali/projects/<slug>`. The PLAY tab runs them in the PIE viewport.
+
+**Workspaces** are folders on disk that CaliCode edits *in place* — your own
+repository, unchanged. CaliCode browses the file tree, reads and writes real
+files, and runs the project's own dev server in the PLAY tab. Open one with
+**OPEN FOLDER** in the sidebar; it needs a `package.json` or a `.git`.
+
+|                | Project              | Workspace                     |
+| -------------- | -------------------- | ----------------------------- |
+| Lives at       | `~/.cali/projects`   | anywhere                      |
+| Owned by       | CaliCode             | you                           |
+| Content        | scene JSON           | real source files             |
+| PLAY renders   | the PIE viewport     | the workspace's own dev server |
 
 ## Layout
 
-- `core/` - Rust JSON-RPC service: model gateway, project store, checkpoints, assets, baselines, image-to-3D, agent loop.
-- `client/` - Vite + React + TypeScript three.js editor.
+- `core/` — Rust JSON-RPC service: model gateway, project store, workspaces,
+  dev-server supervisor, checkpoints, assets, baselines, image-to-3D, agent loop.
+- `client/` — Vite + React + TypeScript three.js editor.
 
 ## Run
 
@@ -26,7 +38,8 @@ and spawn planner/coder/tester/critic subagents from the same panel.
 ```
 
 The Rust core listens on `http://127.0.0.1:8765`; Vite serves the editor on
-`http://127.0.0.1:5199` and proxies `/rpc` and `/events` to core.
+`http://127.0.0.1:5199` and proxies `/rpc` and `/events` to core. Workspace dev
+servers get a port in `5300–5399`.
 
 ## Tests
 
@@ -35,3 +48,22 @@ cd core && cargo test
 cd client && pnpm test
 cd client && pnpm test:e2e
 ```
+
+The e2e suite needs core running. Three specs exercise a live model provider
+and will fail without one configured.
+
+## Security notes
+
+The RPC surface is unauthenticated and loopback-only. CORS is restricted to the
+dev-server and core origins; extend it with `CALI_ALLOWED_ORIGINS` if you serve
+the client from somewhere else. Do not expose port 8765 beyond localhost.
+
+Workspace file access is confined to the workspace root by a canonicalizing
+resolver, refuses `.env` / key material, and never executes an arbitrary
+command — `devserver_start` takes a script *name* that must already exist in
+the target's `package.json`.
+
+**Known gap:** project scripts and tests are evaluated with `new Function` in
+the page realm, same origin as the RPC proxy, with no CSP. Only run projects
+you trust. Moving script execution into a sandboxed worker is tracked as the
+next hardening step.
