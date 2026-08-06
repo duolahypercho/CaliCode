@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Box, Moon, Sun, Gamepad2 } from "lucide-react";
+import { Box, FolderPlus, Moon, Sun, Gamepad2 } from "lucide-react";
 import { Toolbar } from "./components/editor/Toolbar";
 import { Viewport } from "./components/editor/Viewport";
 import { SceneGraph } from "./components/editor/SceneGraph";
@@ -12,9 +12,12 @@ import { AssetWorkbench } from "./components/editor/AssetWorkbench";
 import { AssetLibrary } from "./components/editor/AssetLibrary";
 import { AgentPanel } from "./components/editor/AgentPanel";
 import { Button } from "./components/ui/button";
+import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from "./components/ui/dialog";
+import { Input } from "./components/ui/input";
+import { Label } from "./components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { rpc } from "./lib/rpc";
-import { addAsset, addEntity, addScript, addTest, removeEntity, starterProject, uid, updateAsset, updateEntity, updateScript } from "./lib/store";
+import { addAsset, addEntity, addScript, addTest, removeEntity, slugify, starterProject, uid, updateAsset, updateEntity, updateScript } from "./lib/store";
 import { assetObject, renderThumbnail } from "./lib/procedural";
 import { runTests } from "./lib/testRunner";
 import type { PieState } from "./lib/pie";
@@ -33,6 +36,10 @@ export default function App() {
   const [modelList, setModelList] = useState<ModelList | null>(null);
   const [captureEvery, setCaptureEvery] = useState(3);
   const [assetSearch, setAssetSearch] = useState("");
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [newProjectOpen, setNewProjectOpen] = useState(false);
+  const [newProjectName, setNewProjectName] = useState("");
+  const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [dark, setDark] = useState(() => {
     const saved = localStorage.getItem("cali-theme");
     return saved ? saved === "dark" : true;
@@ -63,6 +70,7 @@ export default function App() {
         const loaded = (await rpc("project_open", { slug: "starter" })) as Project;
         setProject(loaded);
         setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
+        setProjects(await rpc<Project[]>("project_list", {}));
       } catch {
         pushLog("core unavailable; using local starter project", "error");
       }
@@ -438,6 +446,49 @@ export default function App() {
     }
   };
 
+  const openProject = async (slug: string) => {
+    try {
+      const loaded = await rpc<Project>("project_open", { slug });
+      setProject(loaded);
+      setSelectedEntityId(null);
+      setSelectedScriptId(loaded.scripts[0]?.id ?? null);
+      setFrames([]);
+      setTestResults([]);
+      setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
+      pushLog(`opened ${loaded.title}`);
+    } catch (error) {
+      pushLog(`open failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  };
+
+  const createProject = async () => {
+    const title = newProjectName.trim();
+    if (!title || newProjectBusy) return;
+    const slug = slugify(title);
+    if (projects.some((project) => project.slug === slug)) {
+      pushLog(`project ${slug} already exists`, "error");
+      return;
+    }
+    setNewProjectBusy(true);
+    try {
+      const created = await rpc<Project>("project_create", { slug, title });
+      setProjects((current) => [...current.filter((project) => project.slug !== slug), created]);
+      setProject(created);
+      setSelectedEntityId(null);
+      setSelectedScriptId(created.scripts[0]?.id ?? null);
+      setFrames([]);
+      setTestResults([]);
+      setCaptureEvery((created.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
+      setNewProjectName("");
+      setNewProjectOpen(false);
+      pushLog(`created ${title}`);
+    } catch (error) {
+      pushLog(`create failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    } finally {
+      setNewProjectBusy(false);
+    }
+  };
+
   const runTestSuite = async () => {
     if (!runtime) return;
     const results = await runTests(project, runtime, project.tests, pushLog, async (name, dataUrl, threshold = 8) => {
@@ -563,7 +614,36 @@ export default function App() {
               New Entity
             </Button>
           </div>
-          <div className="caliber-label px-3 pb-2">Games</div>
+          <div className="flex items-center justify-between px-3 pb-2">
+            <span className="caliber-label">Games</span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-6 w-6"
+              aria-label="New project"
+              onClick={() => setNewProjectOpen(true)}
+            >
+              <FolderPlus className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+          <div className="max-h-24 overflow-y-auto border-b border-white/5 px-2 pb-1">
+            {projects.length === 0 ? (
+              <p className="px-2 py-1 text-xs text-[#616161]">No saved projects.</p>
+            ) : (
+              projects.map((item) => (
+                <button
+                  key={item.slug}
+                  onClick={() => void openProject(item.slug)}
+                  className={`flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-xs ${
+                    item.slug === project.slug ? "bg-[#171717] text-[#e0e0e0]" : "text-[#8a8a8a] hover:bg-[#141414]"
+                  }`}
+                >
+                  <span className="truncate">{item.title}</span>
+                  <span className="ml-auto shrink-0 text-[9px] tracking-[0.12em] text-[#4f4f4f]">{item.slug}</span>
+                </button>
+              ))
+            )}
+          </div>
           <Tabs defaultValue="scene" className="flex min-h-0 flex-1 flex-col">
             <TabsList className="border-b border-white/5 px-2">
               <TabsTrigger value="scene">Scene</TabsTrigger>
@@ -717,6 +797,39 @@ export default function App() {
           </section>
         </main>
       </div>
+      <Dialog open={newProjectOpen} onOpenChange={setNewProjectOpen}>
+        <DialogContent className="max-w-sm">
+          <DialogTitle>New project</DialogTitle>
+          <DialogDescription>Create a Caliber project in core and open it in the editor.</DialogDescription>
+          <form
+            className="mt-3"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void createProject();
+            }}
+          >
+            <Label htmlFor="new-project-name">Name</Label>
+            <Input
+              id="new-project-name"
+              className="mt-1"
+              value={newProjectName}
+              onChange={(event) => setNewProjectName(event.target.value)}
+              autoFocus
+              placeholder="My Game"
+            />
+            <div className="mt-3 flex justify-end gap-2">
+              <DialogClose asChild>
+                <Button type="button" variant="ghost" size="sm">
+                  Cancel
+                </Button>
+              </DialogClose>
+              <Button type="submit" size="sm" disabled={newProjectBusy || !newProjectName.trim()}>
+                {newProjectBusy ? "Creating..." : "Create & open"}
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

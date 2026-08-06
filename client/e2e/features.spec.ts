@@ -14,6 +14,17 @@ test("workbench generates, promotes, and library shows usage", async ({ page }) 
   await expect(page.locator("aside").getByRole("button", { name: /Box Asset/i })).toBeVisible();
 });
 
+test("creates and opens a new project", async ({ page }) => {
+  const title = `E2E ${Date.now()}`;
+  await page.goto("/");
+  await page.getByLabel("New project").click();
+  await page.getByLabel("Name").fill(title);
+  await page.getByRole("button", { name: "Create & open" }).click();
+  await expect(page.locator("header").getByText(title, { exact: true })).toBeVisible();
+  await expect(page.locator("aside").getByText(title, { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /Caliber/i })).toBeVisible();
+});
+
 test("scene graph selects and inspector renames an entity", async ({ page }) => {
   await page.goto("/");
   await page.getByText("Hero Cube").click();
