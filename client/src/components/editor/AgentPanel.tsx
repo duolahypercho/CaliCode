@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowRightLeft, Bot, Send, ShieldCheck, ShieldOff, Workflow } from "lucide-react";
+import { ArrowRightLeft, Send, ShieldCheck, ShieldOff, Workflow } from "lucide-react";
+import { AgentText } from "./AgentText";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
@@ -201,166 +202,228 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     }
   };
 
+  const suggestions: Array<[string, string]> = [
+    ["Add a double jump", "Add a double jump to the player and rebuild the preview."],
+    ["Generate sprites", "Generate four enemy sprites and add them to the asset library."],
+    ["Playtest it", "Run the test suite and summarise any failures."],
+    ["Make it harder", "Increase the difficulty: faster scroll and tighter obstacle spacing."],
+    ["Show the diff", "List every file you changed and what changed in each."],
+  ];
+
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-        <Bot className="h-4 w-4" />
-        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">CaliCode Agent</span>
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex shrink-0 items-center gap-2 border-b border-white/5 px-[18px] py-[15px]">
+        <span className="font-display text-[15px] font-bold text-[#dadada]">{projectSlug}</span>
         <span className="text-[10px] tracking-[0.12em] text-[#616161]">{busy ? "working" : "ready"}</span>
+        <details className="relative ml-auto">
+          <summary
+            aria-label="Session settings"
+            className="cursor-pointer list-none px-1 text-[11px] tracking-[0.1em] text-[#4f4f4f] hover:text-[#a0a0a0]"
+          >
+            · · ·
+          </summary>
+          <div className="absolute right-0 z-20 mt-2 w-[264px] rounded-lg border border-white/[0.14] bg-[#0e0e0e] p-3 shadow-xl">
+            <div className="calicode-label mb-2">Model</div>
+            <div className="mb-3 flex items-center gap-1.5">
+              <Select value={providerTarget} onValueChange={setProviderTarget}>
+                <SelectTrigger className="h-7 min-w-0 flex-1" aria-label="Model provider">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {(modelList?.providers ?? []).map((provider) => (
+                    <SelectItem key={provider.id} value={provider.id}>
+                      {provider.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Input
+                className="h-7 min-w-0 flex-1"
+                value={modelInput}
+                onChange={(event) => setModelInput(event.target.value)}
+                list="calicode-models"
+                aria-label="Target model"
+              />
+              <datalist id="calicode-models">
+                {[...new Set(modelList?.providers.flatMap((provider) => provider.models ?? []) ?? [])].map((model) => (
+                  <option key={model} value={model} />
+                ))}
+              </datalist>
+              <Button
+                size="sm"
+                variant="secondary"
+                className="h-7 w-7 shrink-0 px-0"
+                aria-label="Switch model"
+                onClick={() => void handleModelCommand(`/model ${providerTarget}:${modelInput}`)}
+              >
+                <ArrowRightLeft className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+
+            <div className="calicode-label mb-2">Subagent</div>
+            <div className="flex items-center gap-1.5">
+              <Select value={subagentRole} onValueChange={setSubagentRole}>
+                <SelectTrigger className="h-7 w-24 shrink-0" aria-label="Subagent role">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {["planner", "coder", "tester", "critic"].map((role) => (
+                    <SelectItem key={role} value={role}>
+                      {role}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <Input
+                className="h-7 min-w-0 flex-1"
+                value={subagentTask}
+                onChange={(event) => setSubagentTask(event.target.value)}
+                placeholder="Subagent task"
+                aria-label="Subagent task"
+              />
+              <Button
+                size="sm"
+                variant="secondary"
+                className="h-7 w-7 shrink-0 px-0"
+                aria-label="Spawn subagent"
+                disabled={busy || !subagentTask.trim()}
+                onClick={() => void spawnSubagent()}
+              >
+                <Workflow className="h-3.5 w-3.5" />
+              </Button>
+            </div>
+          </div>
+        </details>
       </div>
-      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-        <Select value={providerTarget} onValueChange={setProviderTarget}>
-          <SelectTrigger className="h-7 w-28" aria-label="Model provider">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {modelList?.providers.map((provider) => (
-              <SelectItem key={provider.id} value={provider.id}>
-                {provider.label}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-        <Input
-          className="h-7 min-w-0 flex-1"
-          value={modelInput}
-          onChange={(event) => setModelInput(event.target.value)}
-          list="calicode-models"
-          aria-label="Target model"
-        />
-        <datalist id="calicode-models">
-          {/* Providers legitimately share model ids (gpt-4.1 via several routers),
-              so de-duplicate before rendering rather than emitting clashing keys. */}
-          {[...new Set(modelList?.providers.flatMap((provider) => provider.models ?? []) ?? [])].map((model) => (
-            <option key={model} value={model} />
-          ))}
-        </datalist>
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              size="sm"
-              variant="secondary"
-              className="h-7 w-7 shrink-0 px-0"
-              aria-label="Switch model"
-              disabled={busy || !modelInput.trim()}
-              onClick={() => void switchModel(providerTarget, modelInput.trim())}
-            >
-              <ArrowRightLeft className="h-3.5 w-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>Switch model</TooltipContent>
-        </Tooltip>
-      </div>
-      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-        <Select value={permissionMode} onValueChange={setPermissionMode}>
-          <SelectTrigger className="h-7 w-32" aria-label="Permission mode">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="full-access">Full access</SelectItem>
-            <SelectItem value="auto">Auto</SelectItem>
-            <SelectItem value="auto-accept-edits">Auto edits</SelectItem>
-            <SelectItem value="supervised">Supervised</SelectItem>
-          </SelectContent>
-        </Select>
-        <div className="flex-1" />
-        <Select value={subagentRole} onValueChange={setSubagentRole}>
-          <SelectTrigger className="h-7 w-24" aria-label="Subagent role">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="planner">Planner</SelectItem>
-            <SelectItem value="coder">Coder</SelectItem>
-            <SelectItem value="tester">Tester</SelectItem>
-            <SelectItem value="visual-critic">Critic</SelectItem>
-          </SelectContent>
-        </Select>
-      </div>
-      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
-        <Input
-          className="h-7 min-w-0 flex-1"
-          value={subagentTask}
-          onChange={(event) => setSubagentTask(event.target.value)}
-          placeholder="Subagent task"
-          aria-label="Subagent task"
-        />
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              size="sm"
-              variant="secondary"
-              className="h-7 w-7 shrink-0 px-0"
-              aria-label="Spawn subagent"
-              disabled={busy || !subagentTask.trim()}
-              onClick={() => void spawnSubagent()}
-            >
-              <Workflow className="h-3.5 w-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>Spawn subagent</TooltipContent>
-        </Tooltip>
-      </div>
-      <div ref={transcriptRef} className="min-h-0 flex-1 overflow-y-auto p-2">
+
+      <div
+        ref={transcriptRef}
+        className="flex min-h-0 flex-1 flex-col gap-[18px] overflow-y-auto px-[18px] pb-2 pt-[18px]"
+      >
         {messages.length === 0 && (
-          <p className="px-2 py-3 text-xs text-muted-foreground">
-            Ask the agent to build or change the game, then verify the result in PIE.
+          <p className="text-xs leading-relaxed text-[#565656]">
+            Ask CaliCode to build or change the game, then verify the result in PIE.
           </p>
         )}
-        {messages.map((message, index) => (
-          <div key={index} data-role={message.role} className="mb-2 rounded-md border border-border bg-card p-2">
-            <span className="text-xs font-medium text-muted-foreground">{message.role}</span>
-            {message.tool && <span className="ml-2 text-xs text-muted-foreground">tool: {message.tool}</span>}
-            <p className="mt-1 whitespace-pre-wrap text-sm">{message.content}</p>
+
+        {messages.map((message, index) =>
+          message.role === "user" ? (
+            <div
+              key={index}
+              data-role="user"
+              className="max-w-[88%] self-end rounded-[9px_9px_2px_9px] bg-[#262626] px-3.5 py-2.5 text-[13px] leading-[1.55] text-[#e0e0e0]"
+            >
+              {message.content}
+            </div>
+          ) : message.role === "tool" ? (
+            <div key={index} data-role="tool" className="self-start">
+              <div className="flex items-center gap-2.5 rounded-lg border border-white/[0.09] px-3 py-2.5 text-xs text-[#9a9a9a]">
+                <span aria-hidden className="h-3 w-3 shrink-0 border border-[#a0a0a0] bg-[#a0a0a0]" />
+                <span className="min-w-0">{message.content}</span>
+              </div>
+            </div>
+          ) : (
+            <div key={index} data-role="assistant" className="max-w-[94%] self-start">
+              <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-[#4f4f4f]">CALICODE</div>
+              <div className="text-[13px] leading-[1.6] text-[#c8c8c8]">
+                <AgentText content={message.content} />
+              </div>
+            </div>
+          ),
+        )}
+
+        {busy && (
+          <div className="self-start" aria-label="Agent is thinking">
+            <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-[#4f4f4f]">CALICODE</div>
+            <div className="inline-flex gap-1">
+              {[0, 1, 2].map((dot) => (
+                <span
+                  key={dot}
+                  className="h-1.5 w-1.5 bg-[#c6c6c6] [animation:cb-dot_1.2s_infinite]"
+                  style={{ animationDelay: `${dot * 0.15}s` }}
+                />
+              ))}
+            </div>
           </div>
-        ))}
+        )}
+
         {approval && (
-          <div className="mb-2 rounded-md border border-border bg-card p-2">
-            <p className="text-sm">Approve {approval.tool}?</p>
-            <pre className="mt-1 max-h-24 overflow-auto text-xs text-muted-foreground">{JSON.stringify(approval.arguments, null, 2)}</pre>
-            <div className="mt-2 flex gap-2">
-              <Button size="sm" variant="secondary" onClick={() => void respondToApproval(true)}>
-                <ShieldCheck className="h-3.5 w-3.5" />
-                Approve
+          <div className="w-full self-start rounded-lg border border-white/[0.16] bg-[#0e0e0e] p-3">
+            <p className="text-[13px] text-[#dadada]">Approve {approval.tool}?</p>
+            <pre className="mt-1.5 max-h-24 overflow-auto text-[11px] text-[#767676]">
+              {JSON.stringify(approval.arguments, null, 2)}
+            </pre>
+            <div className="mt-2.5 flex gap-2">
+              <Button size="sm" onClick={() => void respondToApproval(true)}>
+                <ShieldCheck className="mr-1 h-3.5 w-3.5" /> Approve
               </Button>
-              <Button size="sm" variant="ghost" onClick={() => void respondToApproval(false)}>
-                <ShieldOff className="h-3.5 w-3.5" />
-                Deny
+              <Button size="sm" variant="secondary" onClick={() => void respondToApproval(false)}>
+                <ShieldOff className="mr-1 h-3.5 w-3.5" /> Deny
               </Button>
             </div>
           </div>
         )}
       </div>
-      <div className="border-t border-border p-2">
-        <Textarea
-          value={input}
-          onChange={(event) => setInput(event.target.value)}
-          onKeyDown={(event) => {
-            if (event.key === "Enter" && !event.shiftKey) {
-              event.preventDefault();
-              void send();
-            }
-          }}
-          placeholder="Describe a scene, asset, or test..."
-          aria-label="Agent prompt"
-          className="min-h-14"
-        />
-        <div className="mt-2 flex items-center justify-between">
-          <span className="text-xs text-muted-foreground">Enter to send, Shift+Enter for a new line</span>
-          <Button size="sm" disabled={busy || !input.trim()} onClick={() => void send()}>
-            <Send className="h-3.5 w-3.5" />
-            Send
-          </Button>
+
+      <div className="shrink-0 border-t border-white/5 px-3.5 pb-3.5 pt-2.5">
+        <div className="mb-2.5 flex flex-wrap gap-[7px]">
+          {suggestions.map(([label, prompt]) => (
+            <button
+              key={label}
+              type="button"
+              disabled={busy}
+              onClick={() => setInput(prompt)}
+              className="rounded-[14px] border border-white/10 px-2.5 py-[5px] text-[11px] text-[#9a9a9a] hover:border-white/[0.28] hover:text-[#d0d0d0] disabled:opacity-40"
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <div className="rounded-[10px] border border-white/[0.11] bg-[#0d0d0d] px-3.5 pb-2.5 pt-3">
+          <Textarea
+            value={input}
+            onChange={(event) => setInput(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                void send();
+              }
+            }}
+            rows={2}
+            aria-label="Agent prompt"
+            placeholder="What do you want to build?"
+            className="min-h-0 resize-none border-0 bg-transparent p-0 text-[13px] text-[#d0d0d0] focus-visible:ring-0"
+          />
+          <div className="mt-2.5 flex items-center gap-3">
+            <span className="truncate text-[10.5px] tracking-[0.1em] text-[#828282]">
+              {(modelList?.active.model ?? "no model").toUpperCase()}
+            </span>
+            <Select value={permissionMode} onValueChange={setPermissionMode}>
+              <SelectTrigger
+                className="h-6 w-[116px] border-0 bg-transparent px-0 text-[10.5px] tracking-[0.1em] text-[#828282]"
+                aria-label="Permission mode"
+              >
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="full-access">Full access</SelectItem>
+                <SelectItem value="auto">Auto</SelectItem>
+                <SelectItem value="auto-accept-edits">Auto edits</SelectItem>
+                <SelectItem value="supervised">Supervised</SelectItem>
+              </SelectContent>
+            </Select>
+            <button
+              type="button"
+              onClick={() => void send()}
+              disabled={busy || !input.trim()}
+              className="ml-auto flex shrink-0 items-center gap-1.5 rounded-[5px] border border-white/[0.12] bg-[#2a2a2a] px-4 py-[7px] text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc] hover:bg-[#333] disabled:opacity-40"
+            >
+              <Send className="h-3 w-3" /> SEND
+            </button>
+          </div>
         </div>
       </div>
     </div>
   );
-
-  async function switchModel(provider: string, model: string) {
-    try {
-      await rpc("model_switch", { provider, model });
-      onModelChange();
-    } catch (error) {
-      onLog(`model switch failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
 }
