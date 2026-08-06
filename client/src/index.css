@@ -96,14 +96,14 @@ select {
   font-family: "Syne", "Space Mono", sans-serif;
 }
 
-.caliber-label {
+.calicode-label {
   font-size: 10px;
   letter-spacing: 0.24em;
   color: #4f4f4f;
   text-transform: uppercase;
 }
 
-.caliber-button {
+.calicode-button {
   text-transform: uppercase;
   letter-spacing: 0.12em;
 }

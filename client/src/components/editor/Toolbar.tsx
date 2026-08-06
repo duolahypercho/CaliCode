@@ -103,7 +103,7 @@ export function Toolbar({
       </Tooltip>
       <Tooltip>
         <TooltipTrigger asChild>
-          <Button variant="secondary" size="sm" className="caliber-button" aria-label="Save" onClick={onSave}>
+          <Button variant="secondary" size="sm" className="calicode-button" aria-label="Save" onClick={onSave}>
             <Save className="h-3.5 w-3.5" />
             <span className="hidden md:inline">Save</span>
           </Button>

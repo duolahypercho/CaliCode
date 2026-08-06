@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 pub const SAMPLE_PROJECT: &str = r##"{
   "schemaVersion": 1,
   "slug": "starter",
-  "title": "Caliber Starter",
+  "title": "CaliCode Starter",
   "entities": [
     {
       "id": "floor",
@@ -48,7 +48,7 @@ pub const SAMPLE_PROJECT: &str = r##"{
   "assets": [
     {
       "id": "asset-cube",
-      "name": "Caliber Cube",
+      "name": "CaliCode Cube",
       "type": "procedural",
       "source": "procedural:box",
       "tags": ["prop", "starter"],

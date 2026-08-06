@@ -1,4 +1,4 @@
-# Caliber Verification Matrix
+# CaliCode Verification Matrix
 
 Each feature below lists the authoritative evidence that it works.
 

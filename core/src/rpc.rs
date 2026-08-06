@@ -234,7 +234,7 @@ fn default_system_prompt(projects_root: &std::path::Path, slug: &str) -> String 
     let project = store::read_project(projects_root, slug).ok();
     let context = project.unwrap_or_else(|| json!({ "entities": [], "assets": [], "tests": [] }));
     format!(
-        "You are Caliber, an AI game engine harness for a three.js editor.\n\
+        "You are CaliCode, an AI game engine harness for a three.js editor.\n\
          You can inspect and edit the project, save and checkpoint work, import and export assets, \
          manage test baselines, run the image-to-3D pipeline, and switch models. When the project \
          needs a scene, asset, PIE, or visual change, call the browser tool and wait for its result.\n\

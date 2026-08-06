@@ -22,7 +22,7 @@ test("creates and opens a new project", async ({ page }) => {
   await page.getByRole("button", { name: "Create & open" }).click();
   await expect(page.locator("header").getByText(title, { exact: true })).toBeVisible();
   await expect(page.locator("aside").getByText(title, { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: /Caliber/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /CaliCode/i })).toBeVisible();
 });
 
 test("scene graph selects and inspector renames an entity", async ({ page }) => {
@@ -98,7 +98,7 @@ test("save, checkpoint, and tests report in console", async ({ page }) => {
 test("agent panel shows the active model", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("tab", { name: "Agent" })).toBeVisible();
-  await expect(page.getByText("Caliber Agent")).toBeVisible();
+  await expect(page.getByText("CaliCode Agent")).toBeVisible();
   await expect(page.getByLabel("Model provider")).toBeVisible();
   await expect(page.getByLabel("Target model")).toBeVisible();
   await expect(page.getByLabel("Switch model")).toBeVisible();

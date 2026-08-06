@@ -313,7 +313,7 @@ export default function App() {
       },
       {
         name: "editor_project_save",
-        description: "Persist the current scene, assets, scripts, and tests to the Caliber project store.",
+        description: "Persist the current scene, assets, scripts, and tests to the CaliCode project store.",
         parameters: { type: "object", properties: {} },
         handler: async () => {
           await rpc("project_save", { project });
@@ -331,7 +331,7 @@ export default function App() {
       },
       {
         name: "editor_model_switch",
-        description: "Switch the Caliber harness provider and model.",
+        description: "Switch the CaliCode harness provider and model.",
         parameters: {
           type: "object",
           properties: {
@@ -585,7 +585,7 @@ export default function App() {
       <header className="flex h-11 shrink-0 items-center gap-3 border-b border-border bg-[#0c0c0c] px-4">
         <div className="flex items-center gap-3">
           <Gamepad2 className="h-4 w-4 text-[#828282]" />
-          <h1 className="font-display text-sm font-extrabold tracking-[0.32em] text-[#d6d6d6]">Caliber</h1>
+          <h1 className="font-display text-sm font-extrabold tracking-[0.32em] text-[#d6d6d6]">CaliCode</h1>
         </div>
         <span className="hidden min-w-0 items-center gap-3 sm:flex">
           <span className="text-[#3a3a3a]">/</span>
@@ -610,12 +610,12 @@ export default function App() {
       <div className="flex min-h-0 flex-1">
         <aside className="hidden w-52 shrink-0 border-r border-border bg-[#0b0b0b] md:flex md:flex-col">
           <div className="px-3 pb-2 pt-3">
-            <Button variant="secondary" size="sm" className="caliber-button w-full justify-center" onClick={handleAddEntity}>
+            <Button variant="secondary" size="sm" className="calicode-button w-full justify-center" onClick={handleAddEntity}>
               New Entity
             </Button>
           </div>
           <div className="flex items-center justify-between px-3 pb-2">
-            <span className="caliber-label">Games</span>
+            <span className="calicode-label">Games</span>
             <Button
               variant="ghost"
               size="icon"
@@ -800,7 +800,7 @@ export default function App() {
       <Dialog open={newProjectOpen} onOpenChange={setNewProjectOpen}>
         <DialogContent className="max-w-sm">
           <DialogTitle>New project</DialogTitle>
-          <DialogDescription>Create a Caliber project in core and open it in the editor.</DialogDescription>
+          <DialogDescription>Create a CaliCode project in core and open it in the editor.</DialogDescription>
           <form
             className="mt-3"
             onSubmit={(event) => {

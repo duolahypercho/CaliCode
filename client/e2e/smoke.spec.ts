@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 test("editor loads and renders", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: /Caliber/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: /CaliCode/i })).toBeVisible();
   await expect(page.getByText("Scene Graph")).toBeVisible();
   await expect(page.locator("canvas").first()).toBeVisible();
 });

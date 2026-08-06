@@ -198,7 +198,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     <div className="flex h-full flex-col">
       <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
         <Bot className="h-4 w-4" />
-        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">Caliber Agent</span>
+        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">CaliCode Agent</span>
         <span className="text-[10px] tracking-[0.12em] text-[#616161]">{busy ? "working" : "ready"}</span>
       </div>
       <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
@@ -218,10 +218,10 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
           className="h-7 min-w-0 flex-1"
           value={modelInput}
           onChange={(event) => setModelInput(event.target.value)}
-          list="caliber-models"
+          list="calicode-models"
           aria-label="Target model"
         />
-        <datalist id="caliber-models">
+        <datalist id="calicode-models">
           {modelList?.providers.flatMap((provider) => provider.models ?? []).map((model) => (
             <option key={model} value={model} />
           ))}
