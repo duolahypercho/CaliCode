@@ -8,6 +8,9 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
 
+/// Idle sessions above this are evicted when a new one is created.
+const MAX_SESSIONS: usize = 32;
+
 #[derive(Clone)]
 pub struct AgentManager {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<AgentSession>>>>>,
@@ -230,6 +233,23 @@ impl AgentManager {
             }
             anyhow::bail!("session {} not found", id);
         }
+        // Sessions were never evicted - including ones created by a chat that
+        // failed on its first model call, since get_or_create runs before
+        // model::chat. A long-lived core accumulated them along with their
+        // full message history, base64 screenshots included.
+        if guard.len() >= MAX_SESSIONS {
+            let victims: Vec<String> = guard
+                .iter()
+                .filter(|(_, session)| session.try_lock().is_ok())
+                .map(|(id, _)| id.clone())
+                .take(guard.len() + 1 - MAX_SESSIONS)
+                .collect();
+            for id in victims {
+                guard.remove(&id);
+            }
+            tracing::debug!(sessions = guard.len(), "evicted idle agent sessions");
+        }
+
         let id = format!("session-{}", Uuid::new_v4().simple());
         let session = Arc::new(Mutex::new(AgentSession {
             id: id.clone(),
@@ -284,10 +304,16 @@ impl AgentManager {
                 "tool": def.name,
                 "arguments": call.arguments
             }));
-            let response = tokio::time::timeout(std::time::Duration::from_secs(300), rx)
-                .await
-                .context("approval timed out")?
-                .context("approval channel closed")?;
+            // On timeout the receiver drops but the sender used to stay in
+            // session.pending forever, so a late agent_tool_result answered
+            // {"accepted": true} to nobody.
+            let response = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+                Ok(inner) => inner.context("approval channel closed")?,
+                Err(_) => {
+                    session.lock().await.pending.remove(&request_id);
+                    anyhow::bail!("approval timed out for {}", def.name);
+                }
+            };
             if response.get("approved").and_then(|v| v.as_bool()).unwrap_or(false) == false {
                 anyhow::bail!("approval denied for {}", def.name);
             }
@@ -310,10 +336,13 @@ impl AgentManager {
             "tool": def.name,
             "arguments": call.arguments
         }));
-        tokio::time::timeout(std::time::Duration::from_secs(300), rx)
-            .await
-            .context("browser tool timed out")?
-            .context("browser tool channel closed")
+        match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
+            Ok(inner) => inner.context("browser tool channel closed"),
+            Err(_) => {
+                session.lock().await.pending.remove(&request_id);
+                anyhow::bail!("browser tool {} timed out", def.name)
+            }
+        }
     }
 }
 
@@ -328,11 +357,35 @@ fn assistant_tool_call(call: &ToolCall) -> Value {
     })
 }
 
+/// Tools that change something outside the current scene, or that cost money.
+/// These are what a permission mode is actually protecting.
+fn is_destructive(tool: &str) -> bool {
+    matches!(
+        tool,
+        "project_revert" | "project_save" | "project_create" | "file_write" | "model_switch" | "subagent_spawn"
+    ) || tool.starts_with("workspace_file_write")
+        || tool.starts_with("devserver_")
+}
+
+/// Whether a tool call needs the user to say yes first.
+///
+/// This used to be inverted and half-decorative. `auto-accept-edits`
+/// auto-accepted `file_write`, `project_checkpoint`, and every scene-mutating
+/// browser tool while prompting only for revert and image3d; and `auto` and
+/// `full-access` both fell through to the same `_ => false`, so the "Auto"
+/// entry in the UI dropdown changed nothing at all.
 fn requires_approval(mode: &str, tool: &str) -> bool {
     match mode {
+        // Ask before every tool call.
         "supervised" => true,
-        "auto-accept-edits" => tool == "project_revert" || tool.starts_with("image3d_"),
-        _ => false,
+        // Scene edits flow; anything that writes outside the scene asks.
+        "auto-accept-edits" => is_destructive(tool),
+        // Ask only for the genuinely irreversible ones.
+        "auto" => matches!(tool, "project_revert" | "file_write") || tool.starts_with("workspace_file_write"),
+        // No prompts. Explicitly opted into.
+        "full-access" => false,
+        // Unknown modes fail closed rather than silently granting everything.
+        _ => true,
     }
 }
 
@@ -544,5 +597,47 @@ mod tests {
         assert_eq!(result["toolCalls"].as_array().unwrap().len(), 1);
         assert!(result["reply"].as_str().unwrap().contains("hello-agent"));
         responder.abort();
+    }
+
+    #[test]
+    fn permission_modes_are_distinct_and_ordered() {
+        // "auto" and "full-access" both fell through to `_ => false`, so the
+        // Auto entry in the UI dropdown was pure decoration.
+        let modes = ["supervised", "auto-accept-edits", "auto", "full-access"];
+        let counts: Vec<usize> = modes
+            .iter()
+            .map(|mode| {
+                ["project_revert", "file_write", "model_switch", "editor_object_add", "project_list"]
+                    .iter()
+                    .filter(|tool| requires_approval(mode, tool))
+                    .count()
+            })
+            .collect();
+
+        // Strictly loosening as you move down the list.
+        assert!(
+            counts.windows(2).all(|pair| pair[0] > pair[1]),
+            "each mode must prompt for strictly fewer tools than the last: {counts:?}"
+        );
+        assert_eq!(*counts.last().unwrap(), 0, "full-access must never prompt");
+    }
+
+    #[test]
+    fn auto_accept_edits_lets_scene_edits_through_but_gates_writes() {
+        // The semantics used to be inverted: it auto-accepted file_write and
+        // every scene-mutating browser tool, and prompted only for revert and
+        // image3d.
+        assert!(!requires_approval("auto-accept-edits", "editor_object_add"));
+        assert!(!requires_approval("auto-accept-edits", "editor_update_transform"));
+        assert!(requires_approval("auto-accept-edits", "file_write"));
+        assert!(requires_approval("auto-accept-edits", "project_revert"));
+        assert!(requires_approval("auto-accept-edits", "subagent_spawn"));
+        assert!(requires_approval("auto-accept-edits", "devserver_start"));
+    }
+
+    #[test]
+    fn unknown_permission_modes_fail_closed() {
+        assert!(requires_approval("", "file_write"));
+        assert!(requires_approval("typo-mode", "editor_object_add"));
     }
 }
