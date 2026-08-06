@@ -15,6 +15,8 @@
  * anything real — only a call id.
  */
 
+import { hardenWorkerScope } from "./hardenWorkerScope";
+
 /** Live transform of one scene object, as scripts observe it. */
 export interface EntitySnapshot {
   position: { x: number; y: number; z: number };
@@ -72,22 +74,11 @@ const NETWORK_GLOBALS = [
   "navigator",
 ];
 
-/**
- * Removes network capability from the worker's own scope before any test is
- * compiled. Shadowing as parameters alone is escapable via
- * `Function("return this")()`.
- */
-for (const name of NETWORK_GLOBALS) {
-  try {
-    Object.defineProperty(self as unknown as Record<string, unknown>, name, {
-      value: undefined,
-      configurable: false,
-      writable: false,
-    });
-  } catch {
-    /* already locked down, or absent in this runtime */
-  }
-}
+// Captured before hardening: the harness still needs to reply, and
+// postMessage is removed from the scope so a test body cannot use it to
+// exfiltrate.
+const reply = self.postMessage.bind(self);
+hardenWorkerScope(self);
 
 /**
  * Latest known transforms.
@@ -104,7 +95,7 @@ let nextCallId = 1;
 const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
 
 function post(message: Outbound): void {
-  (self as unknown as { postMessage: (m: Outbound) => void }).postMessage(message);
+  reply(message);
 }
 
 /** Round-trips one capability call to the host. */
