@@ -2,11 +2,13 @@ mod agent;
 mod assets;
 mod baselines;
 mod config;
+mod devserver;
 mod image3d;
 mod model;
 mod rpc;
 mod store;
 mod tools;
+mod workspace;
 
 use agent::AgentManager;
 use axum::extract::State;
@@ -33,6 +35,8 @@ pub struct AppState {
     pub agents: AgentManager,
     pub bus: broadcast::Sender<Value>,
     pub tools: Arc<RwLock<HashMap<String, tools::ToolDef>>>,
+    pub workspaces: Arc<RwLock<workspace::Registry>>,
+    pub dev_servers: Arc<RwLock<devserver::Servers>>,
 }
 
 #[tokio::main]
@@ -55,6 +59,8 @@ async fn main() -> anyhow::Result<()> {
         agents: AgentManager::new(bus.clone()),
         bus,
         tools: Arc::new(RwLock::new(HashMap::new())),
+        workspaces: Arc::new(RwLock::new(workspace::Registry::new())),
+        dev_servers: Arc::new(RwLock::new(devserver::Servers::new())),
     };
 
     // The RPC surface is unauthenticated and can create, overwrite, and revert

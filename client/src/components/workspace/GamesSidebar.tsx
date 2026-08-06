@@ -15,6 +15,8 @@ interface GamesSidebarProps {
   onSelectSession: (slug: string, sessionId: string) => void;
   onNewSession: (slug: string) => void;
   onNewGame: () => void;
+  workspace: { name: string; root: string } | null;
+  onOpenFolder: () => void;
 }
 
 /**
@@ -30,6 +32,8 @@ export function GamesSidebar({
   onSelectSession,
   onNewSession,
   onNewGame,
+  workspace,
+  onOpenFolder,
 }: GamesSidebarProps) {
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<string | null>(activeSlug);
@@ -127,6 +131,27 @@ export function GamesSidebar({
             );
           })
         )}
+      </div>
+
+      {/* A workspace is a real folder on disk that CaliCode edits in place,
+          as opposed to a project it owns end to end. */}
+      <div className="mt-3 border-t border-white/5 pt-3">
+        <div className="calicode-label mx-1 mb-2">Workspace</div>
+        {workspace ? (
+          <div className="rounded-md border border-white/[0.07] bg-[#101010] px-2.5 py-2">
+            <div className="truncate text-[12px] text-[#dcdcdc]">{workspace.name}</div>
+            <div className="mt-0.5 truncate text-[10px] text-[#565656]" title={workspace.root}>
+              {workspace.root}
+            </div>
+          </div>
+        ) : null}
+        <button
+          type="button"
+          onClick={onOpenFolder}
+          className="mt-1.5 w-full rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] hover:border-white/25 hover:text-[#d0d0d0]"
+        >
+          {workspace ? "CHANGE FOLDER" : "OPEN FOLDER"}
+        </button>
       </div>
 
       <div className="mt-auto flex flex-col gap-[2px] border-t border-white/5 pt-3.5">

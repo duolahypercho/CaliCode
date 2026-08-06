@@ -24,6 +24,10 @@ import { addAsset, removeEntity, slugify, starterProject, uid, updateEntity, upd
 import { runTests } from "./lib/testRunner";
 import { useBrowserTools } from "./lib/useBrowserTools";
 import { useFrameStats } from "./lib/useFrameStats";
+import { FileTree } from "./components/workspace/FileTree";
+import { FileEditor } from "./components/workspace/FileEditor";
+import { LivePreview } from "./components/workspace/LivePreview";
+import { listWorkspaces, openWorkspace, type WorkspaceInfo } from "./lib/workspace";
 import type { PieRuntime, PieState } from "./lib/pie";
 import type { Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
 
@@ -52,6 +56,10 @@ export default function App() {
   const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [sessions, setSessions] = useState<Record<string, GameSession[]>>(readSessions);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
+  const [workspaceFile, setWorkspaceFile] = useState<string | null>(null);
+  const [openFolderOpen, setOpenFolderOpen] = useState(false);
+  const [folderPath, setFolderPath] = useState("");
 
   const runtimeRef = useRef<PieRuntime | null>(null);
   runtimeRef.current = runtime;
@@ -88,8 +96,30 @@ export default function App() {
       } catch (error) {
         pushLog(`model list failed: ${reason(error)}`);
       }
+      try {
+        // Workspaces survive a client reload because core owns the registry.
+        const open = await listWorkspaces();
+        if (open.length > 0) setWorkspace(open[0]);
+      } catch {
+        /* core may be offline; the scene editor still works */
+      }
     })();
   }, [pushLog]);
+
+  const attachFolder = async () => {
+    const path = folderPath.trim();
+    if (!path) return;
+    try {
+      const info = await openWorkspace(path);
+      setWorkspace(info);
+      setWorkspaceFile(null);
+      setOpenFolderOpen(false);
+      setFolderPath("");
+      pushLog(`opened workspace ${info.name} (${info.root})`);
+    } catch (error) {
+      pushLog(`open folder failed: ${reason(error)}`, "error");
+    }
+  };
 
   const browserTools = useBrowserTools({
     project,
@@ -321,6 +351,8 @@ export default function App() {
             setActiveSessionId(session.id);
           }}
           onNewGame={() => setNewProjectOpen(true)}
+          workspace={workspace ? { name: workspace.name, root: workspace.root } : null}
+          onOpenFolder={() => setOpenFolderOpen(true)}
         />
 
         <aside className="hidden w-[384px] shrink-0 border-r border-white/[0.06] bg-[#0a0a0a] lg:block">
@@ -342,17 +374,34 @@ export default function App() {
             active={tab}
             onChange={setTab}
             badges={{ test: failing || undefined }}
-            previewUrl={`${PREVIEW_ORIGIN}/play/${project.slug}`}
+            previewUrl={workspace ? workspace.root : `${PREVIEW_ORIGIN}/play/${project.slug}`}
             onNewGame={() => setNewProjectOpen(true)}
             onExport={() => void saveProject()}
             exporting={exporting}
           />
 
           <div className="relative min-h-0 flex-1">
+            {/* A live workspace owns PLAY: its own dev server renders the real
+                game, rather than the scene document the editor manages. */}
+            {tab === "play" && workspace ? (
+              <div className="absolute inset-0">
+                <LivePreview
+                  workspaceId={workspace.id}
+                  workspaceName={workspace.name}
+                  script={workspace.scripts.dev ? "dev" : Object.keys(workspace.scripts)[0] ?? "dev"}
+                  onError={(text) => pushLog(text, "error")}
+                />
+              </div>
+            ) : null}
+
             {/* The viewport stays mounted across tabs so PIE never loses its WebGL context. */}
             <div
-              className={tab === "play" ? "absolute inset-0" : "pointer-events-none absolute inset-0 opacity-0"}
-              aria-hidden={tab !== "play"}
+              className={
+                tab === "play" && !workspace
+                  ? "absolute inset-0"
+                  : "pointer-events-none absolute inset-0 opacity-0"
+              }
+              aria-hidden={tab !== "play" || Boolean(workspace)}
             >
               <Viewport
                 project={project}
@@ -366,7 +415,7 @@ export default function App() {
                 onLog={pushLog}
                 onStateChange={setPieState}
               />
-              {tab === "play" ? (
+              {tab === "play" && !workspace ? (
                 <>
                   <PlayOverlay
                     pieState={pieState}
@@ -387,7 +436,28 @@ export default function App() {
               ) : null}
             </div>
 
-            {tab === "code" ? (
+            {tab === "code" && workspace ? (
+              <div className="absolute inset-0 flex min-h-0">
+                <div className="min-h-0 w-[260px] shrink-0 border-r border-white/[0.06]">
+                  <FileTree
+                    workspaceId={workspace.id}
+                    activePath={workspaceFile}
+                    onOpenFile={setWorkspaceFile}
+                    onError={(text) => pushLog(text, "error")}
+                  />
+                </div>
+                <div className="min-h-0 flex-1">
+                  <FileEditor
+                    workspaceId={workspace.id}
+                    path={workspaceFile}
+                    onSaved={(path) => pushLog(`saved ${path}`)}
+                    onError={(text) => pushLog(text, "error")}
+                  />
+                </div>
+              </div>
+            ) : null}
+
+            {tab === "code" && !workspace ? (
               <div className="absolute inset-0">
                 <ScriptEditor
                   scripts={project.scripts}
@@ -517,6 +587,43 @@ export default function App() {
           <LiveBar stats={stats} pieState={pieState} logs={logs} />
         </main>
       </div>
+
+      <Dialog open={openFolderOpen} onOpenChange={setOpenFolderOpen}>
+        <DialogContent className="max-w-lg">
+          <DialogTitle>Open folder as a live project</DialogTitle>
+          <DialogDescription>
+            CaliCode edits this folder in place and runs its own dev server. It must contain a package.json or a
+            .git directory.
+          </DialogDescription>
+          <form
+            className="mt-3"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void attachFolder();
+            }}
+          >
+            <Label htmlFor="workspace-path">Absolute path</Label>
+            <Input
+              id="workspace-path"
+              className="mt-1"
+              value={folderPath}
+              onChange={(event) => setFolderPath(event.target.value)}
+              autoFocus
+              placeholder="/Users/you/code/my-game"
+            />
+            <div className="mt-3 flex justify-end gap-2">
+              <DialogClose asChild>
+                <Button type="button" variant="ghost" size="sm">
+                  Cancel
+                </Button>
+              </DialogClose>
+              <Button type="submit" size="sm" disabled={!folderPath.trim()}>
+                Open
+              </Button>
+            </div>
+          </form>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={newProjectOpen} onOpenChange={setNewProjectOpen}>
         <DialogContent className="max-w-sm">
