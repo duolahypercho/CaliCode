@@ -137,6 +137,27 @@ class InlineSandbox implements ScriptSandbox {
   }
 }
 
+/**
+ * Picks the transport.
+ *
+ * The Worker wins on a trade-off that is worth stating explicitly.
+ *
+ * A CSP-locked iframe (see `frameSandbox.ts`) is the only option that can
+ * close dynamic `import()`, because `import()` is syntax rather than a
+ * property and only a policy can refuse it. Measured: with the frame, both a
+ * `fetch` to `/rpc` and an `import()` of it are rejected.
+ *
+ * But a same-process iframe shares the main thread. A script containing
+ * `while (true) {}` blocks the parent's event loop too, so the step timeout
+ * never fires, the frame is never replaced, and the entire editor hangs —
+ * confirmed by a 60s test timeout. A Worker runs on its own thread, so the
+ * same script is contained and terminated in 2s.
+ *
+ * Hanging the whole application is a worse outcome than leaving a GET
+ * exfiltration channel open, so the Worker stays the default. Closing both
+ * properly means running a Worker *inside* the CSP frame, which is the next
+ * step rather than something to fake here.
+ */
 export function createScriptSandbox(): ScriptSandbox {
   if (typeof Worker !== "undefined") {
     try {

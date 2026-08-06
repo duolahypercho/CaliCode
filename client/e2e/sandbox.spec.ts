@@ -84,6 +84,91 @@ test.describe("script sandbox isolation", () => {
     expect(reached).not.toBe(1);
   });
 
+  test("a script cannot complete a fetch to /rpc", async ({ page }) => {
+    await page.goto("/");
+
+    // The substantive test: not whether the API exists, but whether a request
+    // completes and returns bytes.
+    const outcome = await page.evaluate(async () => {
+      const module = await import("/src/lib/scriptSandbox.ts");
+      const sandbox = module.createScriptSandbox();
+      const entity = () =>
+        module.toSandboxEntity("e1", "P", ["s1"], {
+          position: { x: 0, y: 0, z: 0 },
+          rotation: { x: 0, y: 0, z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        });
+      const code = `
+        function update(entity){
+          if (!self.__started) {
+            self.__started = 1; self.__fetch = 0; self.__import = 0;
+            try {
+              fetch("http://127.0.0.1:8765/rpc", { method: "POST", body: "{}" })
+                .then((r) => r.text()).then((t) => { self.__fetch = t.length; })
+                .catch(() => { self.__fetch = -1; });
+            } catch (e) { self.__fetch = -2; }
+            try {
+              import("http://127.0.0.1:8765/rpc")
+                .then(() => { self.__import = 1; }).catch(() => { self.__import = -1; });
+            } catch (e) { self.__import = -2; }
+          }
+          entity.position.x = self.__fetch || 0;
+          entity.position.y = self.__import || 0;
+        }`;
+      const step = () =>
+        sandbox.step({ delta: 0.016, time: 0, entities: [entity()], scripts: [{ id: "s1", name: "x", code }] });
+      try {
+        await step();
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        const result = await step();
+        return { fetch: result.patches[0].position.x, import: result.patches[0].position.y };
+      } finally {
+        sandbox.dispose();
+      }
+    });
+
+    // > 0 would mean bytes came back from /rpc.
+    expect(outcome.fetch, "fetch must not reach /rpc").toBeLessThanOrEqual(0);
+  });
+
+  // KNOWN GAP, deliberately left visible in the test output rather than
+  // deleted. `import()` is syntax, not a property, so worker hardening cannot
+  // refuse it — only a CSP can, and a CSP needs a document. The frame
+  // transport in frameSandbox.ts does block it (measured), but a same-process
+  // iframe shares the main thread, so `while (true) {}` hangs the whole
+  // editor. Closing both needs a Worker running inside the CSP frame.
+  test.fixme("dynamic import is refused", async ({ page }) => {
+    await page.goto("/");
+    const reached = await page.evaluate(async () => {
+      const module = await import("/src/lib/scriptSandbox.ts");
+      const sandbox = module.createScriptSandbox();
+      const entity = () =>
+        module.toSandboxEntity("e1", "P", ["s1"], {
+          position: { x: 0, y: 0, z: 0 },
+          rotation: { x: 0, y: 0, z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        });
+      const code = `
+        function update(entity){
+          if (!self.__i) { self.__i = 0;
+            try { import("http://127.0.0.1:8765/rpc").then(() => { self.__i = 1; }).catch(() => { self.__i = -1; }); }
+            catch (e) { self.__i = -2; }
+          }
+          entity.position.x = self.__i || 0;
+        }`;
+      const step = () =>
+        sandbox.step({ delta: 0.016, time: 0, entities: [entity()], scripts: [{ id: "s1", name: "i", code }] });
+      try {
+        await step();
+        await new Promise((resolve) => setTimeout(resolve, 1200));
+        return (await step()).patches[0].position.x;
+      } finally {
+        sandbox.dispose();
+      }
+    });
+    expect(reached, "dynamic import must be refused").toBeLessThanOrEqual(0);
+  });
+
   test("recovers after a script exceeds its time budget", async ({ page }) => {
     await page.goto("/");
 
