@@ -171,7 +171,14 @@ pub fn save(config: &AppConfig) -> Result<PathBuf> {
         std::fs::create_dir_all(parent)?;
     }
     let yaml = serde_yaml::to_string(config)?;
-    std::fs::write(&path, yaml)?;
+    // Temp file + rename, matching store::write_project. A crash mid-write
+    // would otherwise leave a truncated config, which load() silently falls
+    // back to defaults on — losing the provider, the projects dir and every
+    // attached workspace with no diagnostic. persist_workspaces now writes on
+    // every workspace open and close, so this window is hit often.
+    let temp = path.with_extension("yaml.tmp");
+    std::fs::write(&temp, yaml)?;
+    std::fs::rename(&temp, &path)?;
     Ok(path)
 }
 
