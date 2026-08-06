@@ -1,3 +1,4 @@
+import { FrameSandbox, canUseFrameSandbox } from "./frameSandbox";
 import type { SandboxEntity, StepRequest, StepResponse } from "./scriptSandbox.worker";
 
 export type { SandboxEntity, SandboxVec3 } from "./scriptSandbox.worker";
@@ -138,27 +139,26 @@ class InlineSandbox implements ScriptSandbox {
 }
 
 /**
- * Picks the transport.
+ * Picks the strongest available isolation.
  *
- * The Worker wins on a trade-off that is worth stating explicitly.
+ * A Worker inside a CSP-locked iframe is preferred because it is the only
+ * arrangement that gets both properties. A bare Worker has thread isolation
+ * but cannot carry a policy, so dynamic `import()` — syntax, not a property —
+ * stays open. A bare CSP iframe refuses `import()` but shares the main
+ * thread, so `while (true) {}` freezes the editor. Nesting the worker inside
+ * the frame inherits the policy and keeps the thread.
  *
- * A CSP-locked iframe (see `frameSandbox.ts`) is the only option that can
- * close dynamic `import()`, because `import()` is syntax rather than a
- * property and only a policy can refuse it. Measured: with the frame, both a
- * `fetch` to `/rpc` and an `import()` of it are rejected.
- *
- * But a same-process iframe shares the main thread. A script containing
- * `while (true) {}` blocks the parent's event loop too, so the step timeout
- * never fires, the frame is never replaced, and the entire editor hangs —
- * confirmed by a 60s test timeout. A Worker runs on its own thread, so the
- * same script is contained and terminated in 2s.
- *
- * Hanging the whole application is a worse outcome than leaving a GET
- * exfiltration channel open, so the Worker stays the default. Closing both
- * properly means running a Worker *inside* the CSP frame, which is the next
- * step rather than something to fake here.
+ * The bare Worker remains the fallback: it is the weaker of the two on
+ * exfiltration but never hangs the application.
  */
 export function createScriptSandbox(): ScriptSandbox {
+  if (canUseFrameSandbox()) {
+    try {
+      return new FrameSandbox();
+    } catch {
+      /* fall through to a bare worker */
+    }
+  }
   if (typeof Worker !== "undefined") {
     try {
       return new WorkerSandbox();

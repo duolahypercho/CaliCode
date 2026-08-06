@@ -131,13 +131,10 @@ test.describe("script sandbox isolation", () => {
     expect(outcome.fetch, "fetch must not reach /rpc").toBeLessThanOrEqual(0);
   });
 
-  // KNOWN GAP, deliberately left visible in the test output rather than
-  // deleted. `import()` is syntax, not a property, so worker hardening cannot
-  // refuse it — only a CSP can, and a CSP needs a document. The frame
-  // transport in frameSandbox.ts does block it (measured), but a same-process
-  // iframe shares the main thread, so `while (true) {}` hangs the whole
-  // editor. Closing both needs a Worker running inside the CSP frame.
-  test.fixme("dynamic import is refused", async ({ page }) => {
+  // `import()` is syntax, not a property, so no amount of global hardening
+  // refuses it — only a CSP does, and a CSP needs a document. This passes
+  // because the worker runs inside a CSP-locked frame and inherits its policy.
+  test("dynamic import is refused", async ({ page }) => {
     await page.goto("/");
     const reached = await page.evaluate(async () => {
       const module = await import("/src/lib/scriptSandbox.ts");
