@@ -6,15 +6,24 @@ const PNG_1PX =
 const openTab = (page: import("@playwright/test").Page, name: string) =>
   page.getByRole("tab", { name, exact: true }).click();
 
-test("art tab generates an asset and promotes it into the scene", async ({ page }) => {
+test("art tab generates a batch of real assets and promotes one", async ({ page }) => {
   await page.goto("/");
   await openTab(page, "art");
-  await page.getByRole("button", { name: /Add to library/i }).click();
-  await expect(page.getByText("Box Asset").first()).toBeVisible();
 
-  await page.getByRole("button", { name: "Promote Box Asset" }).first().click();
+  const cards = page.getByRole("button", { name: /^Promote / });
+  const before = await cards.count();
+  await page.getByLabel("Sprite prompt").fill("stone watchtower");
+  await page.getByRole("button", { name: /GENERATE 4/ }).click();
+  await expect(cards).toHaveCount(before + 4);
+
+  // Thumbnails are rendered through the real procedural pipeline, so a card
+  // must carry an actual image rather than the NO PREVIEW placeholder.
+  await expect(page.locator("img").first()).toBeVisible();
+
+  const promote = page.getByRole("button", { name: /^Promote stone-watchtower/ }).first();
+  await promote.click();
   await openTab(page, "scene");
-  await expect(page.getByRole("button", { name: /Box Asset/i }).first()).toBeVisible();
+  await expect(page.getByText(/stone-watchtower/).first()).toBeVisible();
 });
 
 test("new game creates a project and switches the workspace to it", async ({ page }) => {
@@ -27,27 +36,38 @@ test("new game creates a project and switches the workspace to it", async ({ pag
   await expect(page.locator("header").getByText(title, { exact: false })).toBeVisible();
 });
 
-test("scene tab renames an entity through the inspector", async ({ page }) => {
+test("scene tab graphs entities, scripts and their edges", async ({ page }) => {
   await page.goto("/");
   await openTab(page, "scene");
-  await page.getByText("Hero Cube").click();
-  await page.getByLabel("Name").fill("Renamed Hero");
-  await page.getByRole("button", { name: "Apply" }).click();
-  await expect(page.getByText("Renamed Hero").first()).toBeVisible();
+
+  await expect(page.getByText("Hero Cube").first()).toBeVisible();
+  await expect(page.getByText("spin").first()).toBeVisible();
+  // Hero Cube runs spin and draws from an asset, so the graph must draw
+  // edges. Exact count depends on the project, so assert it is non-empty.
+  await expect(page.locator("[data-scene-edges] path").first()).toBeAttached();
+
+  await page.getByRole("button", { name: "Hero Cube" }).first().click();
+  await openTab(page, "play");
+  await expect(page.getByRole("button", { name: "HERO CUBE" })).toHaveAttribute("aria-pressed", "false");
 });
 
-test("code tab edits and saves a script", async ({ page }) => {
+test("code tab edits a script and diffs it against the loaded project", async ({ page }) => {
   await page.goto("/");
   await openTab(page, "code");
+
+  await page.getByRole("button", { name: "edit", exact: true }).click();
   await page.getByLabel("spin source").fill("function update(e) { return e; }");
-  await page.getByRole("button", { name: "Save script" }).click();
   await expect(page.getByLabel("spin source")).toHaveValue("function update(e) { return e; }");
+
+  // The +/- counts must come from a real line diff, not a placeholder.
+  await page.getByRole("button", { name: "diff", exact: true }).click();
+  await expect(page.getByRole("button", { name: /spin.*\+\d/ })).toBeVisible();
+  await expect(page.getByText("function update(e) { return e; }")).toBeVisible();
 });
 
 test("importing an image reaches the asset library and the console", async ({ page }) => {
   await page.goto("/");
   await openTab(page, "art");
-  await page.getByRole("tab", { name: "Import" }).click();
   await page.locator('input[type="file"]').setInputFiles({
     name: "asset.png",
     mimeType: "image/png",
@@ -65,7 +85,6 @@ test("generated cali asset promotes into the scene", async ({ page }) => {
   test.setTimeout(60_000);
   await page.goto("/");
   await openTab(page, "art");
-  await page.getByRole("tab", { name: "Import" }).click();
   await page.locator('input[type="file"]').setInputFiles({
     name: "cali.png",
     mimeType: "image/png",
@@ -90,6 +109,8 @@ test("export saves the project and the test tab runs the suite", async ({ page }
   await page.getByRole("button", { name: "Run playtest" }).click();
   // "0/4 passing" also matches /passing/i, so assert a non-zero pass count.
   await expect(page.getByText(/[1-9]\d*\/\d+ passing/)).toBeVisible({ timeout: 30_000 });
+  // With everything green the panel must say so rather than listing issues.
+  await expect(page.getByRole("button", { name: "NOTHING TO FIX" })).toBeVisible();
 });
 
 test("games sidebar nests agent sessions under each game", async ({ page }) => {

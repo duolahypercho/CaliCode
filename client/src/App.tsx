@@ -1,13 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Viewport } from "./components/editor/Viewport";
-import { SceneGraph } from "./components/editor/SceneGraph";
-import { Inspector } from "./components/editor/Inspector";
-import { ScriptEditor } from "./components/editor/ScriptEditor";
 import type { LogEntry } from "./components/editor/ConsolePanel";
-import { Filmstrip } from "./components/editor/Filmstrip";
-import { TestResults } from "./components/editor/TestResults";
-import { AssetWorkbench } from "./components/editor/AssetWorkbench";
-import { AssetLibrary } from "./components/editor/AssetLibrary";
 import { AgentPanel } from "./components/editor/AgentPanel";
 import { TitleBar } from "./components/workspace/TitleBar";
 import { GamesSidebar, type GameSession } from "./components/workspace/GamesSidebar";
@@ -24,12 +17,18 @@ import { addAsset, removeEntity, slugify, starterProject, uid, updateEntity, upd
 import { runTests } from "./lib/testRunner";
 import { useBrowserTools } from "./lib/useBrowserTools";
 import { useFrameStats } from "./lib/useFrameStats";
+import { CodeTab } from "./components/workspace/CodeTab";
+import { ArtTab } from "./components/workspace/ArtTab";
+import { SceneGraphCanvas } from "./components/workspace/SceneGraphCanvas";
+import { TestTab, toIssues } from "./components/workspace/TestTab";
 import { FileTree } from "./components/workspace/FileTree";
 import { FileEditor } from "./components/workspace/FileEditor";
 import { LivePreview } from "./components/workspace/LivePreview";
 import { listWorkspaces, openWorkspace, type WorkspaceInfo } from "./lib/workspace";
 import type { PieRuntime, PieState } from "./lib/pie";
 import type { Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
+
+const snapshotScripts = (p: Project): Record<string, string> => Object.fromEntries(p.scripts.map((x) => [x.id, x.code]));
 
 const SESSIONS_KEY = "calicode-sessions";
 const PREVIEW_ORIGIN = "http://127.0.0.1:5199";
@@ -56,6 +55,9 @@ export default function App() {
   const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [sessions, setSessions] = useState<Record<string, GameSession[]>>(readSessions);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  // Scripts as of the last load or save, so CODE can show a real diff.
+  const [scriptBaseline, setScriptBaseline] = useState<Record<string, string>>({});
+  const [testing, setTesting] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [workspaceFile, setWorkspaceFile] = useState<string | null>(null);
   const [openFolderOpen, setOpenFolderOpen] = useState(false);
@@ -85,6 +87,7 @@ export default function App() {
       try {
         const loaded = await rpc<Project>("project_open", { slug: "starter" });
         setProject(loaded);
+        setScriptBaseline(snapshotScripts(loaded));
         setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
         setProjects(await rpc<Project[]>("project_list", {}));
         setBuildMs(performance.now() - started);
@@ -145,6 +148,7 @@ export default function App() {
     setExporting(true);
     try {
       await rpc("project_save", { project });
+      setScriptBaseline(snapshotScripts(project));
       pushLog(`saved ${project.slug}`);
     } catch (error) {
       pushLog(`save failed: ${reason(error)}`, "error");
@@ -158,6 +162,7 @@ export default function App() {
       try {
         const loaded = await rpc<Project>("project_open", { slug });
         setProject(loaded);
+        setScriptBaseline(snapshotScripts(loaded));
         setSelectedEntityId(null);
         setSelectedScriptId(loaded.scripts[0]?.id ?? null);
         setFrames([]);
@@ -184,6 +189,7 @@ export default function App() {
       const created = await rpc<Project>("project_create", { slug, title });
       setProjects((current) => [...current.filter((item) => item.slug !== slug), created]);
       setProject(created);
+      setScriptBaseline(snapshotScripts(created));
       setSelectedEntityId(null);
       setSelectedScriptId(created.scripts[0]?.id ?? null);
       setFrames([]);
@@ -200,6 +206,7 @@ export default function App() {
 
   const runTestSuite = useCallback(async () => {
     if (!runtime) return;
+    setTesting(true);
     const results = await runTests(project, runtime, project.tests, pushLog, async (name, dataUrl, threshold = 8) => {
       try {
         return await rpc<{ pass: boolean; distance: number; threshold: number }>("test_baseline_compare", {
@@ -214,6 +221,7 @@ export default function App() {
       }
     });
     setTestResults(results);
+    setTesting(false);
     pushLog(`${results.filter((result) => result.pass).length}/${results.length} tests passed`);
   }, [project, pushLog, runtime]);
 
@@ -459,14 +467,12 @@ export default function App() {
 
             {tab === "code" && !workspace ? (
               <div className="absolute inset-0">
-                <ScriptEditor
+                <CodeTab
                   scripts={project.scripts}
+                  baseline={scriptBaseline}
                   selectedId={selectedScriptId}
                   onSelect={setSelectedScriptId}
-                  onChange={(script) => {
-                    setProject((current) => updateScript(current, script.id, script));
-                    pushLog(`saved script ${script.name}`);
-                  }}
+                  onChange={(script) => setProject((current) => updateScript(current, script.id, script))}
                   onAdd={() => {
                     const script = {
                       id: uid("script"),
@@ -481,105 +487,63 @@ export default function App() {
             ) : null}
 
             {tab === "art" ? (
-              <div className="absolute inset-0 flex min-h-0">
-                <div className="min-h-0 w-[420px] shrink-0 overflow-y-auto border-r border-white/[0.06]">
-                  <AssetWorkbench
-                    onAddAsset={(asset) => {
-                      const next: Asset = {
-                        id: uid("asset"),
-                        name: asset.name ?? "Asset",
-                        type: asset.type ?? "procedural",
-                        source: asset.source ?? "procedural:box",
-                        tags: asset.tags ?? [],
-                        usage: [],
-                        thumbnail: asset.thumbnail ?? null,
-                        metadata: asset.metadata ?? {},
-                      };
-                      setProject((current) => addAsset(current, next));
-                      pushLog(`generated ${next.name}`);
-                      return next;
-                    }}
-                    onPromote={promoteAsset}
-                    onImportImage={(file) => void handleImportImage(file)}
-                  />
-                </div>
-                <div className="min-h-0 flex-1">
-                  <AssetLibrary
-                    assets={project.assets}
-                    entities={project.entities}
-                    search={assetSearch}
-                    onSearch={setAssetSearch}
-                    onPromote={(asset) => promoteAsset(asset.id)}
-                    onRemove={(assetId) =>
-                      setProject((current) => ({
-                        ...current,
-                        assets: current.assets.filter((asset) => asset.id !== assetId),
-                      }))
-                    }
-                    onDedupe={() =>
-                      void rpc<{ sha256: string; files: string[] }[]>("asset_hash_dedupe", { slug: project.slug })
-                        .then((result) =>
-                          pushLog(result.length === 0 ? "no duplicate assets" : `found ${result.length} duplicate groups`),
-                        )
-                        .catch((error) => pushLog(`dedupe failed: ${reason(error)}`, "error"))
-                    }
-                  />
-                </div>
+              <div className="absolute inset-0">
+                <ArtTab
+                  assets={project.assets}
+                  entities={project.entities}
+                  onGenerate={(created) =>
+                    setProject((current) => created.reduce((next, asset) => addAsset(next, asset), current))
+                  }
+                  onPromote={promoteAsset}
+                  onRemove={(assetId) =>
+                    setProject((current) => ({
+                      ...current,
+                      assets: current.assets.filter((asset) => asset.id !== assetId),
+                    }))
+                  }
+                  onImportImage={(file) => void handleImportImage(file)}
+                  onLog={pushLog}
+                />
               </div>
             ) : null}
 
             {tab === "scene" ? (
-              <div className="absolute inset-0 flex min-h-0">
-                <div className="min-h-0 w-[280px] shrink-0 border-r border-white/[0.06]">
-                  <SceneGraph
-                    entities={project.entities}
-                    selectedId={selectedEntityId}
-                    onSelect={setSelectedEntityId}
-                    onAdd={handleAddEntity}
-                    onRemove={(id) => {
-                      setProject((current) => removeEntity(current, id));
-                      if (selectedEntityId === id) setSelectedEntityId(null);
-                    }}
-                  />
-                </div>
-                <div className="min-h-0 flex-1 overflow-y-auto">
-                  <Inspector
-                    entity={selectedEntity}
-                    onSave={(entity) => {
-                      setProject((current) => updateEntity(current, entity.id, entity));
-                      pushLog(`updated ${entity.name}`);
-                    }}
-                  />
-                </div>
+              <div className="absolute inset-0">
+                <SceneGraphCanvas
+                  project={project}
+                  selectedEntityId={selectedEntityId}
+                  onSelect={setSelectedEntityId}
+                  onAddEntity={handleAddEntity}
+                />
               </div>
             ) : null}
 
             {tab === "test" ? (
-              <div className="absolute inset-0 flex min-h-0 flex-col">
-                <div className="flex shrink-0 items-center gap-3 border-b border-white/[0.06] px-5 py-3">
-                  <div>
-                    <div className="calicode-label">CaliCode Playtest</div>
-                    <p className="mt-1 text-[13px] text-[#c8c8c8]">
-                      {testResults.length === 0
-                        ? "No runs yet."
-                        : `${testResults.length - failing}/${testResults.length} passing · ${frames.length} frames captured.`}
-                    </p>
-                  </div>
-                  <Button
-                    size="sm"
-                    className="calicode-button ml-auto"
-                    disabled={!runtime}
-                    onClick={() => void runTestSuite()}
-                  >
-                    Run playtest
-                  </Button>
-                </div>
-                <div className="min-h-0 flex-1 overflow-y-auto">
-                  <TestResults results={testResults} />
-                </div>
-                <div className="h-32 shrink-0 border-t border-white/[0.06]">
-                  <Filmstrip frames={frames} />
-                </div>
+              <div className="absolute inset-0">
+                <TestTab
+                  results={testResults}
+                  frames={frames}
+                  running={testing}
+                  canRun={Boolean(runtime)}
+                  onRun={() => void runTestSuite()}
+                  onFixAll={(issues) => {
+                    setTab("play");
+                    pushLog(`asked the agent to fix ${issues.length} issue${issues.length === 1 ? "" : "s"}`);
+                    void rpc("agent_chat", {
+                      projectSlug: project.slug,
+                      permissionMode: "auto-accept-edits",
+                      maxTurns: 12,
+                      messages: [
+                        {
+                          role: "user",
+                          content: `The playtest found these issues. Fix them in the project:\n${issues
+                            .map((issue) => `- [${issue.severity}] ${issue.title}: ${issue.description}`)
+                            .join("\n")}`,
+                        },
+                      ],
+                    }).catch((error) => pushLog(`fix-all failed: ${reason(error)}`, "error"));
+                  }}
+                />
               </div>
             ) : null}
           </div>
