@@ -15,10 +15,10 @@ use axum::extract::State;
 use axum::http::{header, HeaderValue, Method};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Json, Router};
 use config::{load, AppConfig};
 use futures::Stream;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::path::PathBuf;
@@ -106,6 +106,10 @@ async fn main() -> anyhow::Result<()> {
 
     let app = Router::new()
         .route("/rpc", post(rpc::rpc_handler))
+        // A GET liveness probe. `/` serves the built client, which does not
+        // exist until `pnpm build` has run, so it is not a usable readiness
+        // signal for tooling — CI waited 180s on it and timed out.
+        .route("/health", get(health))
         .route("/events", get(events))
         .fallback_service(
             ServeDir::new(&dist).not_found_service(ServeFile::new(dist.join("index.html"))),
@@ -155,6 +159,10 @@ async fn shutdown_signal() {
         _ = interrupt => {}
         _ = terminate => {}
     }
+}
+
+async fn health() -> Json<Value> {
+    Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
 }
 
 async fn events(

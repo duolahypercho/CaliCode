@@ -26,7 +26,9 @@ export default defineConfig({
   webServer: [
     {
       command: "cd ../core && cargo run",
-      url: "http://127.0.0.1:8765/",
+      // /health, not /. The root serves the built client, which does not
+      // exist until `pnpm build` has run — CI waited the full 180s on it.
+      url: "http://127.0.0.1:8765/health",
       // Deliberately not reused: an already-running dev core would be using
       // the real projects directory, which is exactly what this isolates
       // against. Stop your dev core before running the suite.

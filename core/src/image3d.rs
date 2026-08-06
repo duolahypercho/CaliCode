@@ -484,12 +484,32 @@ mod tests {
     }
 
     #[test]
-    fn locate_source_image_resolves_existing_project_asset() {
-        let root = std::path::PathBuf::from("/Users/ziwenxu/.cali/projects");
-        let asset_id = "cali-18c8ce3e36d76a58";
-        match locate_source_image(&root, "audit", asset_id) {
-            Ok(bytes) => assert!(!bytes.is_empty()),
-            Err(error) => panic!("locate failed: {}", error),
+    fn locate_source_image_resolves_a_project_asset() {
+        // This previously hardcoded /Users/ziwenxu/.cali/projects and an asset
+        // id that only existed on one machine, so it passed locally and failed
+        // everywhere else — the first thing CI caught once it started running.
+        let root = tempfile::tempdir().unwrap();
+        create_project(root.path(), "demo", "Demo").unwrap();
+        let mut img = image::RgbImage::new(16, 16);
+        for (_, _, p) in img.enumerate_pixels_mut() {
+            *p = image::Rgb([200, 90, 40]);
         }
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut cursor, image::ImageFormat::Png)
+            .unwrap();
+        let png = base64::engine::general_purpose::STANDARD.encode(cursor.into_inner());
+
+        let ingested = ingest(root.path(), "demo", "Probe", &png).unwrap();
+        let mut spec = spec("Probe", ingested["sourceHash"].as_str().unwrap(), 16, 16);
+        spec["assetId"] = ingested["assetId"].clone();
+        let asset = generate(root.path(), "demo", spec).unwrap();
+
+        let found =
+            locate_source_image(root.path(), "demo", asset["assetId"].as_str().unwrap()).unwrap();
+        assert!(
+            !found.is_empty(),
+            "the ingested source image must be locatable"
+        );
     }
 }
