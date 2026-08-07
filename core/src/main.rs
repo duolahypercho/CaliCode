@@ -78,10 +78,11 @@ async fn main() -> anyhow::Result<()> {
     // user happened to have open, so origins are restricted to the loopback
     // dev server and the core's own origin. Extra origins can be added via
     // CALI_ALLOWED_ORIGINS (comma-separated) for non-default setups.
+    let client_port = std::env::var("CALI_CLIENT_PORT").unwrap_or_else(|_| "5199".to_string());
     let mut origins: Vec<HeaderValue> = [
-        "http://127.0.0.1:5199",
-        "http://localhost:5199",
-        "http://127.0.0.1:8765",
+        format!("http://127.0.0.1:{client_port}"),
+        format!("http://localhost:{client_port}"),
+        format!("http://127.0.0.1:{}", core_port()),
     ]
     .iter()
     .filter_map(|origin| origin.parse().ok())
@@ -128,8 +129,11 @@ async fn main() -> anyhow::Result<()> {
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = "127.0.0.1:8765";
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    // Both ports are configurable so two instances can coexist. They were
+    // hardcoded, so a second core died with "Address already in use" — which
+    // made concurrent work on this project genuinely painful.
+    let addr = format!("127.0.0.1:{}", core_port());
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("CaliCode core listening on http://{}", addr);
 
     // Dev-server children rely on Child::kill_on_drop, which only fires when
@@ -220,6 +224,14 @@ async fn require_loopback_host(
             .into_response();
     }
     next.run(request).await
+}
+
+/// The port core listens on. `CALI_PORT` overrides the 8765 default.
+fn core_port() -> u16 {
+    std::env::var("CALI_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8765)
 }
 
 async fn health() -> Json<Value> {

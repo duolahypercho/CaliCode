@@ -24,6 +24,9 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
   const [children, setChildren] = useState<Record<string, FileNode[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
+  // Per-node, so expanding one folder shows a spinner on that row instead of
+  // blanking the whole tree.
+  const [pending, setPending] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     let cancelled = false;
@@ -52,11 +55,18 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
       next.add(node.path);
       setExpanded(next);
       if (children[node.path]) return;
+      setPending((current) => new Set(current).add(node.path));
       try {
         const result = await readTree(workspaceId, node.path, 1);
         setChildren((current) => ({ ...current, [node.path]: result.entries }));
       } catch (error) {
         reportError.current(`cannot open ${node.path}: ${describe(error)}`);
+      } finally {
+        setPending((current) => {
+          const next = new Set(current);
+          next.delete(node.path);
+          return next;
+        });
       }
     },
     [children, expanded, workspaceId],
@@ -73,12 +83,13 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
             onClick={() => (node.kind === "dir" ? void toggle(node) : onOpenFile(node.path))}
             aria-expanded={node.kind === "dir" ? open : undefined}
             style={{ paddingLeft: `${depth * 12 + 8}px` }}
+            aria-busy={pending.has(node.path) || undefined}
             className={`flex w-full items-center gap-1.5 rounded py-[5px] pr-2 text-left text-[12px] ${
               active ? "bg-[#171717] text-[#dcdcdc]" : "text-[#8f8f8f] hover:text-[#c6c6c6]"
             }`}
           >
             <span aria-hidden className="w-2.5 shrink-0 text-[9px] text-[#8f8f8f]">
-              {node.kind === "dir" ? (open ? "▾" : "▸") : ""}
+              {node.kind === "dir" ? (pending.has(node.path) ? "◌" : open ? "▾" : "▸") : ""}
             </span>
             <span className="min-w-0 flex-1 truncate">{node.name}</span>
           </button>

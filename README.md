@@ -41,6 +41,14 @@ The Rust core listens on `http://127.0.0.1:8765`; Vite serves the editor on
 `http://127.0.0.1:5199` and proxies `/rpc` and `/events` to core. Workspace dev
 servers get a port in `5300–5399`.
 
+Both ports are configurable, so two instances can run side by side. Set the
+same values for core and the client, since core's CORS allowlist is built from
+them:
+
+```bash
+CALI_PORT=8799 CALI_CLIENT_PORT=5299 ./scripts/dev.sh
+```
+
 ## Tests
 
 ```bash

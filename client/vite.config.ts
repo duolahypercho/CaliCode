@@ -2,16 +2,22 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 
+/** Core's origin. CALI_PORT must match what core was launched with. */
+const CORE_ORIGIN = `http://127.0.0.1:${process.env.CALI_PORT ?? 8765}`;
+
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
     host: "127.0.0.1",
-    port: 5199,
+    // Configurable so two instances can coexist. CALI_CLIENT_PORT must match
+    // whatever core is told via CALI_CLIENT_PORT, so its CORS allowlist
+    // accepts this origin.
+    port: Number(process.env.CALI_CLIENT_PORT ?? 5199),
     strictPort: true,
     proxy: {
-      "/rpc": "http://127.0.0.1:8765",
+      "/rpc": CORE_ORIGIN,
       "/events": {
-        target: "http://127.0.0.1:8765",
+        target: CORE_ORIGIN,
         changeOrigin: true,
       },
     },
