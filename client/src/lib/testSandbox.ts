@@ -1,3 +1,5 @@
+import { canUseCspFrame } from "./cspFrameWorker";
+import { FrameTestSandbox } from "./frameTestSandbox";
 import type { EntitySnapshot, HostCall, HostResult, RunRequest, RunResult } from "./testSandbox.worker";
 
 /** Capabilities a test body may reach, answered on the main thread. */
@@ -156,7 +158,21 @@ class InlineTestSandbox implements TestSandbox {
   }
 }
 
+/**
+ * Picks the strongest available isolation.
+ *
+ * The CSP frame is preferred: a bare Worker cannot refuse dynamic `import()`,
+ * and an audit used exactly that to exfiltrate project data out of a scripted
+ * test and execute attacker code inside the worker.
+ */
 export function createTestSandbox(): TestSandbox {
+  if (canUseCspFrame()) {
+    try {
+      return new FrameTestSandbox();
+    } catch {
+      /* fall through to a bare worker */
+    }
+  }
   if (typeof Worker !== "undefined") {
     try {
       return new WorkerTestSandbox();

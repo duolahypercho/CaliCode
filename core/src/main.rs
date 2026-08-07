@@ -14,6 +14,7 @@ use agent::AgentManager;
 use axum::extract::State;
 use axum::http::{header, HeaderValue, Method};
 use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use config::{load, AppConfig};
@@ -104,6 +105,14 @@ async fn main() -> anyhow::Result<()> {
     // reach the running dev servers.
     let dev_servers = state.dev_servers.clone();
 
+    // CORS is not sufficient on its own. A DNS-rebinding attack sends a
+    // same-origin-looking request with NO Origin header and a foreign Host, so
+    // the origin allowlist never engages — an audit confirmed a request with
+    // `Host: evil.attacker.example` and no Origin was dispatched in full.
+    // Requiring a loopback Host closes that: after rebinding, the browser
+    // still sends the attacker's hostname.
+    let host_guard = axum::middleware::from_fn(require_loopback_host);
+
     let app = Router::new()
         .route("/rpc", post(rpc::rpc_handler))
         // A GET liveness probe. `/` serves the built client, which does not
@@ -115,6 +124,7 @@ async fn main() -> anyhow::Result<()> {
             ServeDir::new(&dist).not_found_service(ServeFile::new(dist.join("index.html"))),
         )
         .layer(cors)
+        .layer(host_guard)
         .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state);
 
@@ -159,6 +169,44 @@ async fn shutdown_signal() {
         _ = interrupt => {}
         _ = terminate => {}
     }
+}
+
+/// Rejects requests whose Host is not loopback.
+///
+/// Extra names can be allowed with CALI_ALLOWED_HOSTS (comma-separated) for
+/// setups that front core with a different local hostname.
+async fn require_loopback_host(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let host = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    // Strip the port; only the name matters.
+    let name = host.rsplit_once(':').map(|(n, _)| n).unwrap_or(&host);
+    let name = name.trim_start_matches('[').trim_end_matches(']');
+
+    let mut allowed = vec![
+        "127.0.0.1".to_string(),
+        "localhost".to_string(),
+        "::1".to_string(),
+    ];
+    if let Ok(extra) = std::env::var("CALI_ALLOWED_HOSTS") {
+        allowed.extend(extra.split(',').map(|value| value.trim().to_string()));
+    }
+
+    if !name.is_empty() && !allowed.iter().any(|candidate| candidate == name) {
+        tracing::warn!(%host, "rejected request with a non-loopback Host");
+        return (
+            axum::http::StatusCode::MISDIRECTED_REQUEST,
+            "CaliCode only serves loopback hosts",
+        )
+            .into_response();
+    }
+    next.run(request).await
 }
 
 async fn health() -> Json<Value> {
