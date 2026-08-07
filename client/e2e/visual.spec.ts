@@ -22,6 +22,9 @@ function unstable(page: Page) {
     page.locator("[data-live-stats]"),
     // Model name depends on whichever provider is configured.
     page.locator("[data-active-model]"),
+    // Other specs in this suite create projects with timestamped names, so
+    // the list contents vary run to run. The surrounding layout does not.
+    page.locator("[data-games-list]"),
   ];
 }
 
