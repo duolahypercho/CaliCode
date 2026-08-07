@@ -108,12 +108,13 @@ jobs:
         working-directory: client
         run: pnpm exec playwright install --with-deps chromium
 
-      # @live needs a model provider CI has no key for. @visual is excluded
-      # until the Linux baselines land — running a job that is knowingly red
-      # teaches people to ignore it.
+      # Only @live is excluded: it needs a model provider CI has no key for.
+      # Visual specs run here. Their Linux baselines were produced by the
+      # visual-baselines workflow running this same full suite on this same
+      # runner image, which is the only way they can match.
       - name: E2E
         working-directory: client
-        run: pnpm exec playwright test --grep-invert "@live|@visual"
+        run: pnpm exec playwright test --grep-invert @live
 
       - uses: actions/upload-artifact@v4
         if: failure()
