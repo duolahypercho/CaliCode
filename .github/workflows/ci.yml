@@ -118,7 +118,7 @@ jobs:
       # image — the only way they can match.
       - name: E2E
         working-directory: client
-        run: pnpm exec playwright test --grep-invert @live
+        run: pnpm exec playwright test --grep-invert "@live|@visual"
 
       - uses: actions/upload-artifact@v4
         if: failure()
