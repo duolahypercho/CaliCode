@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { readWorkspaceFile, writeWorkspaceFile, type FileContent } from "../../lib/workspace";
 
 interface FileEditorProps {
@@ -14,6 +14,10 @@ interface FileEditorProps {
  * tool produces a conflict rather than a silent overwrite.
  */
 export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorProps) {
+  // See FileTree: an inline onError in the dependency list turns any RPC
+  // failure into an unbounded request loop.
+  const reportError = useRef(onError);
+  reportError.current = onError;
   const [file, setFile] = useState<FileContent | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
@@ -33,11 +37,11 @@ export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorPr
         setFile(result);
         setDraft(result.content ?? "");
       })
-      .catch((error: unknown) => onError(`cannot read ${path}: ${describe(error)}`));
+      .catch((error: unknown) => reportError.current(`cannot read ${path}: ${describe(error)}`));
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, path, onError]);
+  }, [workspaceId, path]);
 
   const save = async () => {
     if (!file || !path || busy) return;
@@ -50,7 +54,7 @@ export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorPr
     } catch (error) {
       const message = describe(error);
       setConflict(message.includes("changed on disk"));
-      onError(`save failed: ${message}`);
+      reportError.current(`save failed: ${message}`);
     } finally {
       setBusy(false);
     }
@@ -64,7 +68,7 @@ export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorPr
         setDraft(result.content ?? "");
         setConflict(false);
       })
-      .catch((error: unknown) => onError(`cannot reload ${path}: ${describe(error)}`));
+      .catch((error: unknown) => reportError.current(`cannot reload ${path}: ${describe(error)}`));
   };
 
   if (!path) {

@@ -140,10 +140,23 @@ async fn main() -> anyhow::Result<()> {
             shutdown_signal().await;
             tracing::info!("shutting down; stopping dev servers");
             let ids: Vec<String> = dev_servers.read().await.keys().cloned().collect();
-            let mut servers = dev_servers.write().await;
-            for id in ids {
-                let _ = devserver::stop(&mut servers, &id).await;
+            {
+                let mut servers = dev_servers.write().await;
+                for id in ids {
+                    let _ = devserver::stop(&mut servers, &id).await;
+                }
             }
+
+            // axum's graceful shutdown waits for every in-flight response, and
+            // /events is a long-lived SSE stream that never completes on its
+            // own — so the process released the port but lingered forever,
+            // ignoring repeated SIGTERM and needing SIGKILL. Give connections
+            // a moment to drain, then exit for real.
+            tokio::spawn(async {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                tracing::info!("shutdown grace elapsed; exiting");
+                std::process::exit(0);
+            });
         })
         .await?;
     Ok(())
