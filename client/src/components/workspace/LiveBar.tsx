@@ -8,7 +8,8 @@ export interface LiveStats {
   /** three.js render.info.render.calls, or null when the renderer is idle. */
   drawCalls: number | null;
   entities: number;
-  buildMs: number | null;
+  /** Wall-clock duration of the initial project load RPC. Not a build. */
+  loadMs: number | null;
 }
 
 interface LiveBarProps {
@@ -25,7 +26,10 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
   const [open, setOpen] = useState(false);
 
   const chips = [
-    { k: "BUILD", v: stats.buildMs === null ? "pending" : `ok · ${(stats.buildMs / 1000).toFixed(1)}s` },
+    // Labelled LOAD, not BUILD. This is the duration of the initial
+    // project_open RPC — there is no build step, and calling it one implied a
+    // pipeline that does not exist.
+    { k: "LOAD", v: stats.loadMs === null ? "pending" : `${(stats.loadMs / 1000).toFixed(1)}s` },
     { k: "FPS", v: String(stats.fps) },
     { k: "SIG", v: pieState.toUpperCase() },
   ];

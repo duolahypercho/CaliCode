@@ -2,7 +2,13 @@ import { defineConfig } from "@playwright/test";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const PROJECTS_DIR = resolve(dirname(fileURLToPath(import.meta.url)), ".e2e-projects");
+const HERE = dirname(fileURLToPath(import.meta.url));
+const PROJECTS_DIR = resolve(HERE, ".e2e-projects");
+// Core reads ~/.cali/config.yaml by default, which now carries the developer's
+// attached workspaces — and a restored workspace changes the editor's default
+// view, so the suite silently started testing a different app. Isolating the
+// projects directory alone was not enough.
+const CONFIG_PATH = resolve(HERE, ".e2e-config.yaml");
 
 /**
  * The suite writes real projects through core, so it gets its own projects
@@ -34,7 +40,7 @@ export default defineConfig({
       // against. Stop your dev core before running the suite.
       reuseExistingServer: false,
       timeout: 180_000,
-      env: { CALI_PROJECTS_DIR: PROJECTS_DIR },
+      env: { CALI_PROJECTS_DIR: PROJECTS_DIR, CALI_CONFIG: CONFIG_PATH },
     },
     {
       command: "pnpm dev",

@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "pretest:e2e": "node -e \"require('node:fs').rmSync('.e2e-projects',{recursive:true,force:true})\""
+    "pretest:e2e": "node -e \"const fs=require('node:fs');fs.rmSync('.e2e-projects',{recursive:true,force:true});fs.rmSync('.e2e-config.yaml',{force:true})\""
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",

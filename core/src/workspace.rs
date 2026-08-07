@@ -138,25 +138,30 @@ pub fn describe(workspace: &Workspace) -> Value {
 /// dropped whatever folder the user had attached and the client came back
 /// with no workspace. Paths that no longer resolve are skipped rather than
 /// failing boot.
-pub fn restore(registry: &mut Registry, paths: &[String]) -> Vec<String> {
+pub fn restore(registry: &mut Registry, entries: &[crate::config::WorkspaceEntry]) -> Vec<String> {
     let mut opened = Vec::new();
-    for path in paths {
-        match open(registry, path, None) {
-            Ok(_) => opened.push(path.clone()),
-            Err(error) => tracing::warn!(%path, %error, "skipping unavailable workspace"),
+    for entry in entries {
+        match open(registry, &entry.path, entry.name.as_deref()) {
+            Ok(_) => opened.push(entry.path.clone()),
+            Err(error) => {
+                tracing::warn!(path = %entry.path, %error, "skipping unavailable workspace")
+            }
         }
     }
     opened
 }
 
 /// Absolute roots of every open workspace, for persisting to config.
-pub fn roots(registry: &Registry) -> Vec<String> {
-    let mut roots: Vec<String> = registry
+pub fn roots(registry: &Registry) -> Vec<crate::config::WorkspaceEntry> {
+    let mut entries: Vec<crate::config::WorkspaceEntry> = registry
         .values()
-        .map(|w| w.root.display().to_string())
+        .map(|w| crate::config::WorkspaceEntry {
+            path: w.root.display().to_string(),
+            name: Some(w.name.clone()),
+        })
         .collect();
-    roots.sort();
-    roots
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    entries
 }
 
 pub fn list(registry: &Registry) -> Value {
@@ -561,7 +566,16 @@ mod tests {
         let mut registry = Registry::new();
         let opened = restore(
             &mut registry,
-            &[root.clone(), "/nope/does/not/exist".into()],
+            &[
+                crate::config::WorkspaceEntry {
+                    path: root.clone(),
+                    name: Some("Labelled".into()),
+                },
+                crate::config::WorkspaceEntry {
+                    path: "/nope/does/not/exist".into(),
+                    name: None,
+                },
+            ],
         );
 
         assert_eq!(opened, vec![root.clone()]);
@@ -570,7 +584,12 @@ mod tests {
             1,
             "a missing path must not abort the restore"
         );
-        assert_eq!(roots(&registry), vec![root]);
+        let stored = roots(&registry);
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].path, root);
+        // The label the user gave must survive; deriving it from the folder
+        // name silently renamed "San Francisco" to "San Fransisco".
+        assert_eq!(stored[0].name.as_deref(), Some("Labelled"));
     }
 
     #[test]
@@ -581,7 +600,7 @@ mod tests {
         open(&mut registry, first.root.to_str().unwrap(), None).unwrap();
         open(&mut registry, second.root.to_str().unwrap(), None).unwrap();
 
-        let listed = roots(&registry);
+        let listed: Vec<String> = roots(&registry).into_iter().map(|e| e.path).collect();
         assert_eq!(listed.len(), 2);
         let mut sorted = listed.clone();
         sorted.sort();
