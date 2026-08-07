@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { readTree, type FileNode } from "../../lib/workspace";
 
 interface FileTreeProps {
@@ -14,6 +14,12 @@ interface FileTreeProps {
  * recursive walk would stall the pane.
  */
 export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileTreeProps) {
+  // Held in a ref, not a dependency. App passes an inline arrow, so a new
+  // identity every render meant: error -> pushLog -> re-render -> effect
+  // re-runs -> error. That measured 197 /rpc calls in 10.6s with the tree
+  // stuck on "Loading..." forever.
+  const reportError = useRef(onError);
+  reportError.current = onError;
   const [roots, setRoots] = useState<FileNode[]>([]);
   const [children, setChildren] = useState<Record<string, FileNode[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -26,14 +32,14 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
       .then((result) => {
         if (!cancelled) setRoots(result.entries);
       })
-      .catch((error: unknown) => onError(`file tree failed: ${describe(error)}`))
+      .catch((error: unknown) => reportError.current(`file tree failed: ${describe(error)}`))
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, onError]);
+  }, [workspaceId]);
 
   const toggle = useCallback(
     async (node: FileNode) => {
@@ -50,10 +56,10 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
         const result = await readTree(workspaceId, node.path, 1);
         setChildren((current) => ({ ...current, [node.path]: result.entries }));
       } catch (error) {
-        onError(`cannot open ${node.path}: ${describe(error)}`);
+        reportError.current(`cannot open ${node.path}: ${describe(error)}`);
       }
     },
-    [children, expanded, onError, workspaceId],
+    [children, expanded, workspaceId],
   );
 
   const renderNodes = (nodes: FileNode[], depth: number) =>
