@@ -55,7 +55,6 @@ function readView(): ViewState {
     return { tab: "play", workspaceFile: null };
   }
 }
-const PREVIEW_ORIGIN = "http://127.0.0.1:5199";
 
 export default function App() {
   const [project, setProject] = useState<Project>(starterProject);
@@ -438,7 +437,9 @@ export default function App() {
             active={tab}
             onChange={setTab}
             badges={{ test: failing || undefined }}
-            previewUrl={workspace ? workspace.root : `${PREVIEW_ORIGIN}/play/${project.slug}`}
+            // Without a workspace there is no preview server; core serves no
+            // /play route, and the old label hardcoded port 5199.
+            previewUrl={workspace ? workspace.root : `project · ${project.slug}`}
             onNewGame={() => setNewProjectOpen(true)}
             onExport={() => void saveProject()}
             exporting={exporting}
@@ -691,10 +692,30 @@ function reason(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+/**
+ * Sessions, validated on read.
+ *
+ * This used to JSON.parse without checking the shape, so a corrupted value —
+ * `"null"`, or any slug mapped to a non-array — threw inside GamesSidebar and
+ * white-screened the editor with no error boundary. The bad value persisted,
+ * so every reload crashed again and only clearing localStorage recovered.
+ * readView already validated; this now matches it.
+ */
 function readSessions(): Record<string, GameSession[]> {
   try {
     const raw = localStorage.getItem(SESSIONS_KEY);
-    return raw ? (JSON.parse(raw) as Record<string, GameSession[]>) : {};
+    const parsed: unknown = raw ? JSON.parse(raw) : {};
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
+
+    const clean: Record<string, GameSession[]> = {};
+    for (const [slug, value] of Object.entries(parsed as Record<string, unknown>)) {
+      if (!Array.isArray(value)) continue;
+      clean[slug] = value.filter(
+        (item): item is GameSession =>
+          typeof item === "object" && item !== null && typeof (item as GameSession).id === "string",
+      );
+    }
+    return clean;
   } catch {
     return {};
   }
