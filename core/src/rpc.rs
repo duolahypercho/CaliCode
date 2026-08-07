@@ -267,6 +267,12 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         )),
         "image3d_validate" => Ok(image3d::validate_spec(&params["spec"])?),
         "image3d_generate" => {
+            // serde_json IndexMut panics when indexing a non-object, and the
+            // handler assigns into `spec`. A caller sending {"spec":"x"} took
+            // the request down.
+            if !params.get("spec").is_some_and(Value::is_object) {
+                anyhow::bail!("spec must be an object");
+            }
             let mut spec = params.get("spec").cloned().unwrap_or_else(|| json!({}));
             if spec.get("assessment").is_none() {
                 spec["assessment"] = image3d::assess(
