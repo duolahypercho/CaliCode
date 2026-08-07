@@ -4,7 +4,7 @@ import type { LogEntry } from "./components/editor/ConsolePanel";
 import { AgentPanel } from "./components/editor/AgentPanel";
 import { TitleBar } from "./components/workspace/TitleBar";
 import { GamesSidebar, type GameSession } from "./components/workspace/GamesSidebar";
-import { WorkspaceTabs, type WorkspaceTab } from "./components/workspace/WorkspaceTabs";
+import { WORKSPACE_TABS, WorkspaceTabs, type WorkspaceTab } from "./components/workspace/WorkspaceTabs";
 import { PlayOverlay, type TweakPin } from "./components/workspace/PlayOverlay";
 import { TweakPanel, entityTweakControls, type TweakControl } from "./components/workspace/TweakPanel";
 import { LiveBar, type LiveStats } from "./components/workspace/LiveBar";
@@ -31,6 +31,30 @@ import type { Asset, CapturedFrame, Entity, ModelList, Project, TestResult } fro
 const snapshotScripts = (p: Project): Record<string, string> => Object.fromEntries(p.scripts.map((x) => [x.id, x.code]));
 
 const SESSIONS_KEY = "calicode-sessions";
+const VIEW_KEY = "calicode-view";
+
+/**
+ * The tab and open file, remembered across reloads.
+ *
+ * Core restarts are routine — the client reconnects fine, but the editor used
+ * to snap back to PLAY and drop whatever file you had open, which reads as
+ * lost work even though nothing was lost.
+ */
+interface ViewState {
+  tab: WorkspaceTab;
+  workspaceFile: string | null;
+}
+
+function readView(): ViewState {
+  try {
+    const raw = localStorage.getItem(VIEW_KEY);
+    const parsed = raw ? (JSON.parse(raw) as Partial<ViewState>) : {};
+    const tab = WORKSPACE_TABS.includes(parsed.tab as WorkspaceTab) ? (parsed.tab as WorkspaceTab) : "play";
+    return { tab, workspaceFile: typeof parsed.workspaceFile === "string" ? parsed.workspaceFile : null };
+  } catch {
+    return { tab: "play", workspaceFile: null };
+  }
+}
 const PREVIEW_ORIGIN = "http://127.0.0.1:5199";
 
 export default function App() {
@@ -46,7 +70,7 @@ export default function App() {
   const [modelList, setModelList] = useState<ModelList | null>(null);
   const [captureEvery, setCaptureEvery] = useState(3);
   const [assetSearch, setAssetSearch] = useState("");
-  const [tab, setTab] = useState<WorkspaceTab>("play");
+  const [tab, setTab] = useState<WorkspaceTab>(() => readView().tab);
   const [activePin, setActivePin] = useState<string | null>(null);
   const [loadMs, setLoadMs] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
@@ -59,7 +83,7 @@ export default function App() {
   const [scriptBaseline, setScriptBaseline] = useState<Record<string, string>>({});
   const [testing, setTesting] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
-  const [workspaceFile, setWorkspaceFile] = useState<string | null>(null);
+  const [workspaceFile, setWorkspaceFile] = useState<string | null>(() => readView().workspaceFile);
   // Below lg/md these panes leave the layout entirely; the toggles open them
   // as overlays so the agent and the games list stay reachable on a narrow
   // window rather than simply disappearing.
@@ -85,6 +109,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
   }, [sessions]);
+
+  useEffect(() => {
+    localStorage.setItem(VIEW_KEY, JSON.stringify({ tab, workspaceFile } satisfies ViewState));
+  }, [tab, workspaceFile]);
 
   useEffect(() => {
     const started = performance.now();
