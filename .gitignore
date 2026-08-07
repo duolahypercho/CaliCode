@@ -12,3 +12,6 @@ client/coverage/
 
 # e2e scratch projects root
 client/.e2e-projects/
+
+# e2e scratch config
+client/.e2e-config.yaml

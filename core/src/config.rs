@@ -14,10 +14,46 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub providers: Vec<ProviderPreset>,
     pub projects_dir: Option<String>,
-    /// Absolute paths of folders opened as workspaces, so an attached project
-    /// survives a core restart instead of having to be re-opened by hand.
+    /// Folders opened as workspaces, so an attached project survives a core
+    /// restart instead of having to be re-opened by hand.
     #[serde(default)]
-    pub workspaces: Vec<String>,
+    pub workspaces: Vec<WorkspaceEntry>,
+}
+
+/// A remembered workspace.
+///
+/// `name` is stored alongside the path because a user-supplied label ("San
+/// Francisco") is not recoverable from the folder name ("San Fransisco"), and
+/// dropping it made a restored workspace silently rename itself.
+///
+/// Deserializes from a bare string too, so configs written before the label
+/// was stored keep loading.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(from = "WorkspaceEntryRepr")]
+pub struct WorkspaceEntry {
+    pub path: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WorkspaceEntryRepr {
+    Path(String),
+    Full {
+        path: String,
+        #[serde(default)]
+        name: Option<String>,
+    },
+}
+
+impl From<WorkspaceEntryRepr> for WorkspaceEntry {
+    fn from(value: WorkspaceEntryRepr) -> Self {
+        match value {
+            WorkspaceEntryRepr::Path(path) => Self { path, name: None },
+            WorkspaceEntryRepr::Full { path, name } => Self { path, name },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

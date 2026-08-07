@@ -432,7 +432,7 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
 ///
 /// A failure here must not fail the RPC: losing the convenience of a restored
 /// workspace is not worth failing the open that just succeeded.
-async fn persist_workspaces(state: &AppState, roots: Vec<String>) {
+async fn persist_workspaces(state: &AppState, roots: Vec<crate::config::WorkspaceEntry>) {
     let mut config = state.config.write().await;
     if config.workspaces == roots {
         return;

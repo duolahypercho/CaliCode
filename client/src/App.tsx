@@ -48,7 +48,7 @@ export default function App() {
   const [assetSearch, setAssetSearch] = useState("");
   const [tab, setTab] = useState<WorkspaceTab>("play");
   const [activePin, setActivePin] = useState<string | null>(null);
-  const [buildMs, setBuildMs] = useState<number | null>(null);
+  const [loadMs, setLoadMs] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectName, setNewProjectName] = useState("");
@@ -95,7 +95,7 @@ export default function App() {
         setScriptBaseline(snapshotScripts(loaded));
         setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
         setProjects(await rpc<Project[]>("project_list", {}));
-        setBuildMs(performance.now() - started);
+        setLoadMs(performance.now() - started);
       } catch {
         pushLog("core unavailable; using local starter project", "error");
       }
@@ -338,7 +338,7 @@ export default function App() {
     frameMs: frameStats.frameMs,
     drawCalls: frameStats.drawCalls,
     entities: project.entities.length,
-    buildMs,
+    loadMs,
   };
 
   const failing = testResults.filter((result) => !result.pass).length;
