@@ -37,7 +37,12 @@ export function TitleBar({ projectTitle, modelList, onToggleSidebar, onToggleAge
         <span className="truncate text-xs uppercase tracking-[0.12em] text-[#828282]">{projectTitle}</span>
       </span>
       <div className="ml-auto flex items-center gap-3">
-        <span className="hidden text-[11px] uppercase tracking-[0.14em] text-[#949494] md:inline">
+        {/* data-active-model: masked in visual snapshots — depends on
+            whichever provider the machine has configured. */}
+        <span
+          data-active-model
+          className="hidden text-[11px] uppercase tracking-[0.14em] text-[#949494] md:inline"
+        >
           {provider} · {model}
         </span>
         {/* Below lg the agent column leaves the layout; this opens it as a drawer. */}

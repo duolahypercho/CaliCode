@@ -1,0 +1,58 @@
+name: Visual baselines
+
+# Screenshot baselines are per-platform — Playwright suffixes them `-darwin`,
+# `-linux` — because font rasterisation differs between operating systems.
+# Development happens on macOS and CI runs on Ubuntu, so the Linux set has to
+# be produced on Ubuntu. This job does that and uploads them to be committed.
+#
+# Run it from the Actions tab, or: gh workflow run visual-baselines.yml
+on:
+  workflow_dispatch:
+
+jobs:
+  generate:
+    name: Generate Linux baselines
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: core
+
+      - name: Build core
+        working-directory: core
+        run: cargo build
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: client/pnpm-lock.yaml
+
+      - name: Install
+        working-directory: client
+        run: pnpm install --frozen-lockfile
+
+      - name: Install browsers
+        working-directory: client
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Write baselines
+        working-directory: client
+        run: pnpm exec playwright test visual.spec.ts --update-snapshots
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-baselines-linux
+          path: client/e2e/visual.spec.ts-snapshots/*-linux.png
+          if-no-files-found: error
+          retention-days: 7

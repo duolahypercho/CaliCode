@@ -41,7 +41,9 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
     <div className="shrink-0 border-t border-white/[0.06] bg-[#0a0a0a]">
       <div className="flex h-10 items-center gap-2.5 px-3.5">
         <span className="calicode-label shrink-0">Live</span>
-        <div className="flex min-w-0 gap-2 overflow-x-auto">
+        {/* data-live-stats: masked in visual snapshots. fps, frame time and
+            load time are measured, so they differ on every run. */}
+        <div data-live-stats className="flex min-w-0 gap-2 overflow-x-auto">
           {chips.map((chip) => (
             <span
               key={chip.k}
@@ -62,7 +64,7 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
       </div>
       {open ? (
         <div className="flex h-[88px] gap-6 overflow-hidden border-t border-white/[0.06] px-3.5 py-2.5">
-          <div className="flex shrink-0 flex-wrap gap-5">
+          <div data-live-stats className="flex shrink-0 flex-wrap gap-5">
             {statCells.map((cell) => (
               <span key={cell.k} className="inline-flex flex-col gap-[3px]">
                 <span className="text-[9px] tracking-[0.16em] text-[#8a8a8a]">{cell.k}</span>
