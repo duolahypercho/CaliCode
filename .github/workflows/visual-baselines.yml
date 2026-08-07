@@ -45,9 +45,13 @@ jobs:
         working-directory: client
         run: pnpm exec playwright install --with-deps chromium
 
+      # The FULL suite, not just visual.spec.ts. Other specs create projects
+      # and mutate state, and the visual specs share that world — generating
+      # baselines in isolation produced screenshots that could never match a
+      # real CI run.
       - name: Write baselines
         working-directory: client
-        run: pnpm exec playwright test visual.spec.ts --update-snapshots
+        run: pnpm exec playwright test --grep-invert @live --update-snapshots
 
       - name: Upload
         uses: actions/upload-artifact@v4

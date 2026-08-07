@@ -77,7 +77,10 @@ export function GamesSidebar({
         />
       </div>
 
-      <div className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1">
+      {/* data-games-list: masked in visual snapshots. Other e2e specs create
+          projects with timestamped names, so the contents are not stable
+          between runs — the layout around it still is. */}
+      <div data-games-list className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1">
         {visible.length === 0 ? (
           <p className="px-2 py-1 text-xs text-[#8f8f8f]">{projects.length === 0 ? "No games yet." : "No matches."}</p>
         ) : (
