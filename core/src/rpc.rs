@@ -71,6 +71,11 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             store::write_project(&state.projects_root, slug, project)?;
             Ok(json!({ "saved": true, "slug": slug }))
         }
+        "project_set_workspace" => Ok(store::set_workspace_root(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+            params.get("workspaceRoot").and_then(|v| v.as_str()),
+        )?),
         "project_checkpoint" => Ok(store::checkpoint_project(
             &state.projects_root,
             str_param(&params, "slug")?,
@@ -85,12 +90,16 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         // Workspaces: a real folder on disk that CaliCode edits in place.
         // workspace_open is the only method that accepts an absolute path.
         "workspace_open" => {
+            let path = str_param(&params, "path")?;
+            // Probe before taking the registry lock. A folder on a volume the
+            // app has not been granted access to does not error — the read
+            // blocks indefinitely, which used to hang this RPC forever while
+            // holding the write lock, freezing every other workspace call and
+            // showing the user nothing but "no folder attached".
+            probe_readable(path).await?;
             let mut registry = state.workspaces.write().await;
-            let described = workspace::open(
-                &mut registry,
-                str_param(&params, "path")?,
-                params.get("name").and_then(Value::as_str),
-            )?;
+            let described =
+                workspace::open(&mut registry, path, params.get("name").and_then(Value::as_str))?;
             persist_workspaces(state, workspace::roots(&registry)).await;
             Ok(described)
         }
@@ -173,8 +182,9 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         }
         "file_read" => {
             let slug = str_param(&params, "slug")?;
-            let path = store::safe_join(
-                &store::project_dir(&state.projects_root, slug)?,
+            let (_, path) = crate::tools::resolve_game_file(
+                &state.projects_root,
+                slug,
                 str_param(&params, "path")?,
             )?;
             let content = std::fs::read_to_string(&path)?;
@@ -182,8 +192,9 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         }
         "file_write" => {
             let slug = str_param(&params, "slug")?;
-            let path = store::safe_join(
-                &store::project_dir(&state.projects_root, slug)?,
+            let (_, path) = crate::tools::resolve_game_file(
+                &state.projects_root,
+                slug,
                 str_param(&params, "path")?,
             )?;
             if let Some(parent) = path.parent() {
@@ -434,6 +445,33 @@ fn default_system_prompt(projects_root: &std::path::Path, slug: &str) -> String 
          Project context:\n{}",
         serde_json::to_string_pretty(&context).unwrap_or_default()
     )
+}
+
+/// How long to wait for a folder to prove it is readable.
+///
+/// Generous enough for a sleeping external drive to spin up, short enough that
+/// a permission-gated volume reports back instead of hanging the UI.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Confirm a folder can actually be listed, without blocking forever.
+///
+/// On macOS, reading a volume the app has not been granted access to blocks
+/// rather than returning a permission error, so a plain `read_dir` in the
+/// handler never returns. The probe runs on a blocking thread and is abandoned
+/// on timeout — one stranded thread is a far better outcome than an RPC that
+/// never answers.
+async fn probe_readable(path: &str) -> Result<()> {
+    let owned = std::path::PathBuf::from(path);
+    let probe = tokio::task::spawn_blocking(move || std::fs::read_dir(&owned).map(|_| ()));
+    match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(anyhow::anyhow!("cannot read {path}: {error}")),
+        Ok(Err(error)) => Err(anyhow::anyhow!("cannot read {path}: {error}")),
+        Err(_) => Err(anyhow::anyhow!(
+            "timed out reading {path}. If it is on an external drive, grant CaliCode \
+             access in System Settings > Privacy & Security > Files and Folders."
+        )),
+    }
 }
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str> {

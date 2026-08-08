@@ -43,6 +43,12 @@ export interface Project {
   assets: Asset[];
   tests: GameTest[];
   settings: Record<string, unknown>;
+  /**
+   * The folder on disk this game owns. Each game is its own workspace, so
+   * selecting a game switches the attached folder. Null means no folder is
+   * attached yet.
+   */
+  workspaceRoot?: string | null;
 }
 
 export interface ModelInfo {

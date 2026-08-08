@@ -41,6 +41,10 @@ export function GamesSidebar({
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<string | null>(activeSlug);
 
+  // The folder section belongs to the selected game, so it is labelled with
+  // that game's title rather than a generic "Workspace".
+  const activeTitle = projects.find((candidate) => candidate.slug === activeSlug)?.title ?? null;
+
   const visible = useMemo(() => {
     const query = search.trim().toLowerCase();
     if (!query) return projects;
@@ -147,10 +151,12 @@ export function GamesSidebar({
         )}
       </div>
 
-      {/* A workspace is a real folder on disk that CaliCode edits in place,
-          as opposed to a project it owns end to end. */}
+      {/* Each game owns one folder on disk, so this section describes the
+          SELECTED game's workspace — switching games switches the folder. */}
       <div className="mt-3 border-t border-white/5 pt-3">
-        <div className="calicode-label mx-1 mb-2">Workspace</div>
+        <div className="calicode-label mx-1 mb-2">
+          {activeTitle ? `${activeTitle} folder` : "Game folder"}
+        </div>
         {workspace ? (
           <div className="rounded-md border border-white/[0.07] bg-[#101010] px-2.5 py-2">
             <div className="truncate text-[12px] text-[#dcdcdc]">{workspace.name}</div>
@@ -158,13 +164,17 @@ export function GamesSidebar({
               {workspace.root}
             </div>
           </div>
-        ) : null}
+        ) : (
+          <p className="px-1 text-[11px] leading-relaxed text-[#7a7a7a]">
+            No folder attached to this game yet.
+          </p>
+        )}
         <button
           type="button"
           onClick={onOpenFolder}
           className="mt-1.5 w-full rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] transition-colors hover:border-white/25 hover:text-[#d0d0d0] active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
         >
-          {workspace ? "CHANGE FOLDER" : "OPEN FOLDER"}
+          {workspace ? "CHANGE FOLDER" : "ATTACH FOLDER"}
         </button>
       </div>
 

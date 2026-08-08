@@ -1,4 +1,5 @@
 import { rpc } from "./rpc";
+import type { Project } from "./types";
 
 export interface WorkspaceInfo {
   id: string;
@@ -40,6 +41,14 @@ export const openWorkspace = (path: string, name?: string) =>
   rpc<WorkspaceInfo>("workspace_open", { path, name });
 
 export const listWorkspaces = () => rpc<WorkspaceInfo[]>("workspace_list", {});
+
+/**
+ * Bind a game to its own folder (or detach with `null`). Each game is a unique
+ * workspace, so this travels with the project document rather than being a
+ * single global attachment.
+ */
+export const setProjectWorkspace = (slug: string, workspaceRoot: string | null) =>
+  rpc<Project>("project_set_workspace", { slug, workspaceRoot });
 
 export const closeWorkspace = (id: string) => rpc<{ closed: boolean }>("workspace_close", { id });
 

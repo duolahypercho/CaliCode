@@ -141,6 +141,15 @@ pub fn validate_project(project: &Value) -> Result<()> {
     if !object.get("settings").is_none_or(Value::is_object) {
         anyhow::bail!("project settings must be an object");
     }
+    // Each game owns its own folder on disk, so the workspace follows the
+    // project instead of being a single global attachment. Absent or null
+    // means "no folder attached yet".
+    if !object
+        .get("workspaceRoot")
+        .is_none_or(|value| value.is_null() || value.is_string())
+    {
+        anyhow::bail!("project workspaceRoot must be a string or null");
+    }
 
     for collection in ["entities", "scripts", "assets", "tests"] {
         let items = object
@@ -190,6 +199,29 @@ pub fn create_project(root: &Path, slug: &str, title: &str) -> Result<Value> {
     project["slug"] = json!(clean);
     project["title"] = json!(title);
     write_project(root, &clean, &project)?;
+    Ok(project)
+}
+
+/// Bind a game to its own folder on disk. Passing `None` detaches it.
+///
+/// Done here rather than as a client read-modify-write so two rapid folder
+/// changes cannot interleave and lose one — the read, mutate, and write happen
+/// under one call.
+pub fn set_workspace_root(root: &Path, slug: &str, workspace_root: Option<&str>) -> Result<Value> {
+    let mut project = read_project(root, slug)?;
+    let object = project
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("project must be an object"))?;
+    match workspace_root {
+        Some(path) if !path.trim().is_empty() => {
+            object.insert("workspaceRoot".into(), Value::String(path.to_string()));
+        }
+        _ => {
+            object.insert("workspaceRoot".into(), Value::Null);
+        }
+    }
+    validate_project(&project)?;
+    write_project(root, slug, &project)?;
     Ok(project)
 }
 
@@ -563,5 +595,41 @@ mod tests {
             leftovers.is_empty(),
             "temp files must be renamed, not left behind"
         );
+    }
+
+    #[test]
+    fn set_workspace_root_binds_and_detaches_a_game_folder() {
+        let root = tempfile::tempdir().unwrap();
+        create_project(root.path(), "demo", "Demo").unwrap();
+
+        let bound = set_workspace_root(root.path(), "demo", Some("/tmp/my-game")).unwrap();
+        assert_eq!(bound["workspaceRoot"], "/tmp/my-game");
+        assert_eq!(
+            read_project(root.path(), "demo").unwrap()["workspaceRoot"],
+            "/tmp/my-game"
+        );
+
+        let detached = set_workspace_root(root.path(), "demo", None).unwrap();
+        assert!(detached["workspaceRoot"].is_null());
+    }
+
+    #[test]
+    fn each_game_keeps_its_own_workspace_root() {
+        let root = tempfile::tempdir().unwrap();
+        create_project(root.path(), "one", "One").unwrap();
+        create_project(root.path(), "two", "Two").unwrap();
+
+        set_workspace_root(root.path(), "one", Some("/tmp/one")).unwrap();
+        set_workspace_root(root.path(), "two", Some("/tmp/two")).unwrap();
+
+        assert_eq!(read_project(root.path(), "one").unwrap()["workspaceRoot"], "/tmp/one");
+        assert_eq!(read_project(root.path(), "two").unwrap()["workspaceRoot"], "/tmp/two");
+    }
+
+    #[test]
+    fn validate_project_rejects_a_non_string_workspace_root() {
+        let mut project: Value = serde_json::from_str(SAMPLE_PROJECT).unwrap();
+        project["workspaceRoot"] = serde_json::json!(42);
+        assert!(validate_project(&project).is_err());
     }
 }

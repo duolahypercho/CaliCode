@@ -15,8 +15,17 @@ reconstruction is a Rust pipeline that emits a data-driven `.cali` asset.
 
 **Workspaces** are folders on disk that CaliCode edits *in place* — your own
 repository, unchanged. CaliCode browses the file tree, reads and writes real
-files, and runs the project's own dev server in the PLAY tab. Open one with
-**OPEN FOLDER** in the sidebar; it needs a `package.json` or a `.git`.
+files, and runs the project's own dev server in the PLAY tab.
+
+**Each game owns its own folder.** A workspace is attached to one game, not to
+the app, so switching games in the sidebar switches the folder, the file tree,
+and the dev server with it. Attach one with **ATTACH FOLDER** under the selected
+game; it needs a `package.json` or a `.git`. A game with no folder attached
+stays a pure scene document.
+
+This binding is what the agent's file tools follow: `file_read`, `file_write`,
+and `file_list` resolve inside the selected game's folder when it has one, and
+inside `~/.cali/projects/<slug>` when it does not.
 
 |                | Project              | Workspace                     |
 | -------------- | -------------------- | ----------------------------- |
@@ -24,6 +33,7 @@ files, and runs the project's own dev server in the PLAY tab. Open one with
 | Owned by       | CaliCode             | you                           |
 | Content        | scene JSON           | real source files             |
 | PLAY renders   | the PIE viewport     | the workspace's own dev server |
+| Attached to    | —                    | exactly one game              |
 
 ## Layout
 

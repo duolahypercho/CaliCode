@@ -2,6 +2,7 @@ import { useState } from "react";
 import { assetObject, renderThumbnail } from "../../lib/procedural";
 import { slugify, uid } from "../../lib/store";
 import type { Asset, Entity } from "../../lib/types";
+import { AssetPreview } from "./AssetPreview";
 
 interface ArtTabProps {
   assets: Asset[];
@@ -29,6 +30,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
   const [prompt, setPrompt] = useState("a hovering enemy drone with a glowing eye");
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState(false);
+  const [previewId, setPreviewId] = useState<string | null>(null);
 
   const generate = () => {
     const text = prompt.trim();
@@ -69,6 +71,9 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
   const visible = query
     ? assets.filter((asset) => asset.name.toLowerCase().includes(query) || asset.tags.some((tag) => tag.includes(query)))
     : assets;
+  // Derived rather than stored, so removing the previewed asset closes the
+  // panel instead of leaving it rendering a deleted spec.
+  const previewAsset = assets.find((asset) => asset.id === previewId) ?? null;
 
   return (
     <div className="flex h-full min-h-0 flex-col overflow-y-auto px-[22px] py-[18px]">
@@ -127,6 +132,8 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
         <span className="shrink-0 text-[10px] text-[#8f8f8f]">{visible.length}</span>
       </div>
 
+      {previewAsset ? <AssetPreview asset={previewAsset} onClose={() => setPreviewId(null)} /> : null}
+
       {visible.length === 0 ? (
         <p className="text-xs text-[#8f8f8f]">
           {assets.length === 0 ? "No assets yet — describe one above and generate." : "No assets match that search."}
@@ -137,13 +144,22 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
             const uses = entities.filter((entity) => entity.assetId === asset.id).length;
             return (
               <div key={asset.id} className="overflow-hidden rounded-[10px] border border-white/[0.07] bg-[#0e0e0e]">
-                <div className="flex h-[118px] items-center justify-center bg-[repeating-linear-gradient(45deg,#141414,#141414_8px,#1c1c1c_8px,#1c1c1c_16px)]">
+                {/* Rings rather than borders on the thumbnail: the card grid is
+                    snapshotted by the visual suite, and a border would resize
+                    every card by a pixel. */}
+                <button
+                  type="button"
+                  onClick={() => setPreviewId((current) => (current === asset.id ? null : asset.id))}
+                  aria-pressed={previewId === asset.id}
+                  aria-label={`Preview ${asset.name}`}
+                  className="flex h-[118px] w-full items-center justify-center bg-[repeating-linear-gradient(45deg,#141414,#141414_8px,#1c1c1c_8px,#1c1c1c_16px)] text-[#8f8f8f] transition-colors hover:text-[#dcdcdc] hover:ring-1 hover:ring-inset hover:ring-white/25 active:ring-white/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30 aria-pressed:ring-1 aria-pressed:ring-inset aria-pressed:ring-white/40"
+                >
                   {asset.thumbnail ? (
                     <img src={asset.thumbnail} alt="" className="h-full w-full object-contain" />
                   ) : (
-                    <span className="text-[10px] tracking-[0.1em] text-[#8f8f8f]">NO PREVIEW</span>
+                    <span className="text-[10px] tracking-[0.1em]">NO PREVIEW</span>
                   )}
-                </div>
+                </button>
                 <div className="flex items-center gap-2 px-2.5 py-2">
                   <span className="min-w-0 flex-1 truncate text-[11px] text-[#a0a0a0]" title={asset.name}>
                     {asset.name}

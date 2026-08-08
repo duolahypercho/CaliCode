@@ -2,10 +2,64 @@ use crate::baselines;
 use crate::image3d;
 use crate::store;
 use crate::AppState;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Where a game's file tools operate.
+///
+/// A game with a folder attached (`workspaceRoot`) reads and writes THAT
+/// folder — that is the whole point of a game owning a workspace. Without one
+/// the tools stay inside the CaliCode-owned project directory. Before this
+/// split, `file_read` always resolved under `~/.cali/projects/<slug>`, so an
+/// agent working on a real repo could not see a single one of its files.
+struct GameFileBase {
+    base: PathBuf,
+    /// True when `base` is a user folder, which needs the workspace module's
+    /// stricter resolution (symlink escapes, secret-file refusal).
+    is_workspace: bool,
+}
+
+fn game_file_base(root: &Path, slug: &str) -> Result<GameFileBase> {
+    let project = store::read_project(root, slug)?;
+    let attached = project
+        .get("workspaceRoot")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_dir());
+    match attached {
+        Some(base) => Ok(GameFileBase {
+            base,
+            is_workspace: true,
+        }),
+        None => Ok(GameFileBase {
+            base: store::project_dir(root, slug)?,
+            is_workspace: false,
+        }),
+    }
+}
+
+fn resolve_in_base(base: &GameFileBase, rel: &str) -> Result<PathBuf> {
+    if base.is_workspace {
+        crate::workspace::safe_resolve(&base.base, rel)
+    } else {
+        store::safe_join(&base.base, rel)
+    }
+}
+
+/// Resolve `rel` for a game, returning the base it resolved against so errors
+/// can say which folder was searched.
+///
+/// Shared with the JSON-RPC handlers so the client and the agent always see the
+/// same files — they had diverged, with each resolving its own way.
+pub(crate) fn resolve_game_file(root: &Path, slug: &str, rel: &str) -> Result<(PathBuf, PathBuf)> {
+    let base = game_file_base(root, slug)?;
+    let path = resolve_in_base(&base, rel)?;
+    Ok((base.base, path))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDef {
@@ -51,14 +105,20 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "file_read".into(),
-            description: "Read a UTF-8 text file inside the active project.".into(),
+            description: "Read a UTF-8 text file from the active game's folder (its attached workspace when it has one, otherwise the project).".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"path":{"type":"string"}},"required":["slug","path"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
             name: "file_write".into(),
-            description: "Write UTF-8 text inside the active project (scripts, tests, docs).".into(),
+            description: "Write UTF-8 text into the active game's folder (scripts, tests, docs).".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["slug","path","content"]}),
+            kind: ToolKind::Core,
+        },
+        ToolDef {
+            name: "file_list".into(),
+            description: "List files and folders in the active game's folder. Omit path for the root. Use this to explore before reading.".into(),
+            parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"path":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
         },
         ToolDef {
@@ -174,21 +234,62 @@ pub async fn execute_core_tool(
             required_str(args, "checkpointId")?,
         )?),
         "file_read" => {
-            let path = store::safe_join(
-                &store::project_dir(root, required_str(args, "slug")?)?,
-                required_str(args, "path")?,
-            )?;
-            let text = std::fs::read_to_string(&path)?;
+            let (base, path) =
+                resolve_game_file(root, required_str(args, "slug")?, required_str(args, "path")?)?;
+            let text = std::fs::read_to_string(&path).with_context(|| {
+                format!(
+                    "{} not found under {}",
+                    required_str(args, "path").unwrap_or_default(),
+                    base.display()
+                )
+            })?;
             Ok(json!({ "path": args["path"], "content": text }))
         }
         "file_write" => {
-            let dir = store::project_dir(root, required_str(args, "slug")?)?;
-            let path = store::safe_join(&dir, required_str(args, "path")?)?;
+            let (_, path) =
+                resolve_game_file(root, required_str(args, "slug")?, required_str(args, "path")?)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&path, required_str(args, "content")?)?;
             Ok(json!({ "path": args["path"], "written": true }))
+        }
+        "file_list" => {
+            let slug = required_str(args, "slug")?;
+            let rel = args.get("path").and_then(Value::as_str).unwrap_or("");
+            let base = game_file_base(root, slug)?;
+            let dir = if rel.is_empty() {
+                base.base.clone()
+            } else {
+                resolve_in_base(&base, rel)?
+            };
+            let mut entries: Vec<Value> = Vec::new();
+            for entry in std::fs::read_dir(&dir)
+                .with_context(|| format!("cannot list {}", dir.display()))?
+                .flatten()
+            {
+                let name = entry.file_name().to_string_lossy().to_string();
+                // Dotfiles are noise for an agent browsing a repo, and hiding
+                // them also keeps .env-style secrets out of the listing.
+                if name.starts_with('.') {
+                    continue;
+                }
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                entries.push(json!({
+                    "name": name,
+                    "kind": if is_dir { "dir" } else { "file" },
+                }));
+            }
+            entries.sort_by(|a, b| {
+                let key = |v: &Value| {
+                    (
+                        v["kind"].as_str() != Some("dir"),
+                        v["name"].as_str().unwrap_or("").to_string(),
+                    )
+                };
+                key(a).cmp(&key(b))
+            });
+            Ok(json!({ "path": rel, "root": base.base.display().to_string(), "entries": entries }))
         }
         "asset_import_file" => {
             let tags = args["tags"]
@@ -396,6 +497,61 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("session-"));
+    }
+
+    #[test]
+    fn file_tools_target_the_projects_dir_when_no_folder_is_attached() {
+        let root = tempfile::tempdir().unwrap();
+        store::create_project(root.path(), "demo", "Demo").unwrap();
+
+        let base = game_file_base(root.path(), "demo").unwrap();
+        assert!(!base.is_workspace);
+        assert_eq!(base.base, store::project_dir(root.path(), "demo").unwrap());
+    }
+
+    #[test]
+    fn file_tools_follow_the_game_to_its_attached_folder() {
+        // The bug this covers: an agent working on a real repo read from
+        // ~/.cali/projects/<slug> and got "No such file or directory" for
+        // every file in the game's actual folder.
+        let root = tempfile::tempdir().unwrap();
+        let game_folder = tempfile::tempdir().unwrap();
+        std::fs::write(game_folder.path().join("README.md"), "# real game").unwrap();
+
+        store::create_project(root.path(), "demo", "Demo").unwrap();
+        store::set_workspace_root(
+            root.path(),
+            "demo",
+            Some(game_folder.path().to_str().unwrap()),
+        )
+        .unwrap();
+
+        let base = game_file_base(root.path(), "demo").unwrap();
+        assert!(base.is_workspace);
+
+        let (_, resolved) = resolve_game_file(root.path(), "demo", "README.md").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(resolved).unwrap(),
+            "# real game"
+        );
+    }
+
+    #[test]
+    fn attached_folder_still_refuses_traversal_and_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        let game_folder = tempfile::tempdir().unwrap();
+        std::fs::write(game_folder.path().join(".env"), "SECRET=1").unwrap();
+        store::create_project(root.path(), "demo", "Demo").unwrap();
+        store::set_workspace_root(
+            root.path(),
+            "demo",
+            Some(game_folder.path().to_str().unwrap()),
+        )
+        .unwrap();
+
+        assert!(resolve_game_file(root.path(), "demo", "../escape.txt").is_err());
+        assert!(resolve_game_file(root.path(), "demo", "/etc/passwd").is_err());
+        assert!(resolve_game_file(root.path(), "demo", ".env").is_err());
     }
 
     #[test]

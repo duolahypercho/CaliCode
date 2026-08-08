@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Viewport } from "./components/editor/Viewport";
 import type { LogEntry } from "./components/editor/ConsolePanel";
 import { AgentPanel } from "./components/editor/AgentPanel";
@@ -24,7 +24,12 @@ import { TestTab, toIssues } from "./components/workspace/TestTab";
 import { FileTree } from "./components/workspace/FileTree";
 import { FileEditor } from "./components/workspace/FileEditor";
 import { LivePreview } from "./components/workspace/LivePreview";
-import { listWorkspaces, openWorkspace, type WorkspaceInfo } from "./lib/workspace";
+import { openWorkspace, setProjectWorkspace, type WorkspaceInfo } from "./lib/workspace";
+import {
+  useResizablePanels,
+  type ResizablePanel,
+  type ResizablePanelOptions,
+} from "./hooks/useResizablePanels";
 import type { PieRuntime, PieState } from "./lib/pie";
 import type { Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
 
@@ -32,6 +37,21 @@ const snapshotScripts = (p: Project): Record<string, string> => Object.fromEntri
 
 const SESSIONS_KEY = "calicode-sessions";
 const VIEW_KEY = "calicode-view";
+
+/** Panel bounds are shared by the hook and the handle's aria value range. */
+const AGENT_PANEL: ResizablePanelOptions = {
+  storageKey: "calicode-agent-width",
+  defaultWidth: 384,
+  minWidth: 280,
+  maxWidth: 720,
+};
+
+const FILE_TREE_PANEL: ResizablePanelOptions = {
+  storageKey: "calicode-filetree-width",
+  defaultWidth: 260,
+  minWidth: 180,
+  maxWidth: 560,
+};
 
 /**
  * The tab and open file, remembered across reloads.
@@ -88,6 +108,8 @@ export default function App() {
   // window rather than simply disappearing.
   const [agentOpen, setAgentOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const agentPanel = useResizablePanels(AGENT_PANEL);
+  const fileTreePanel = useResizablePanels(FILE_TREE_PANEL);
   const [openFolderOpen, setOpenFolderOpen] = useState(false);
   const [folderPath, setFolderPath] = useState("");
 
@@ -131,13 +153,9 @@ export default function App() {
       } catch (error) {
         pushLog(`model list failed: ${reason(error)}`);
       }
-      try {
-        // Workspaces survive a client reload because core owns the registry.
-        const open = await listWorkspaces();
-        if (open.length > 0) setWorkspace(open[0]);
-      } catch {
-        /* core may be offline; the scene editor still works */
-      }
+      // The attached folder now comes from the selected game's workspaceRoot
+      // (see the effect below), not from whatever core happened to have open —
+      // with several games that global pick was arbitrary.
     })();
   }, [pushLog]);
 
@@ -150,11 +168,50 @@ export default function App() {
       setWorkspaceFile(null);
       setOpenFolderOpen(false);
       setFolderPath("");
-      pushLog(`opened workspace ${info.name} (${info.root})`);
+      // The folder belongs to this game, not to the app — so a second game can
+      // point at a different repo and switching games switches folders.
+      if (project) {
+        await setProjectWorkspace(project.slug, info.root);
+        setProject((current) => (current ? { ...current, workspaceRoot: info.root } : current));
+      }
+      pushLog(`attached ${info.name} to ${project?.title ?? "this game"} (${info.root})`);
     } catch (error) {
       pushLog(`open folder failed: ${reason(error)}`, "error");
     }
   };
+
+  // Each game owns its folder, so switching games switches the attached
+  // workspace. A game with no folder shows none rather than inheriting the
+  // previous game's — that inheritance is what made the old single global
+  // workspace confusing once more than one game existed.
+  const projectSlug = project?.slug ?? null;
+  const projectWorkspaceRoot = project?.workspaceRoot ?? null;
+  useEffect(() => {
+    if (!projectSlug) return;
+    let cancelled = false;
+    void (async () => {
+      if (!projectWorkspaceRoot) {
+        if (!cancelled) {
+          setWorkspace(null);
+          setWorkspaceFile(null);
+        }
+        return;
+      }
+      try {
+        const info = await openWorkspace(projectWorkspaceRoot);
+        if (cancelled) return;
+        setWorkspace(info);
+        setWorkspaceFile(null);
+      } catch (error) {
+        if (cancelled) return;
+        setWorkspace(null);
+        pushLog(`could not open ${projectWorkspaceRoot}: ${reason(error)}`, "error");
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [projectSlug, projectWorkspaceRoot, pushLog]);
 
   const browserTools = useBrowserTools({
     project,
@@ -414,10 +471,13 @@ export default function App() {
           />
         )}
 
+        {/* The drag width applies only from lg up, where the panel is a real
+            column; below that it is an overlay drawer with its own sizing. */}
         <aside
+          style={{ "--agent-width": `${agentPanel.width}px` } as CSSProperties}
           className={`${
             agentOpen ? "fixed inset-y-0 right-0 z-40 block w-[min(384px,92vw)] shadow-2xl" : "hidden"
-          } shrink-0 border-l border-white/[0.06] bg-[#0a0a0a] lg:static lg:block lg:w-[384px] lg:border-l-0 lg:border-r lg:shadow-none`}
+          } shrink-0 border-l border-white/[0.06] bg-[#0a0a0a] lg:static lg:block lg:w-[var(--agent-width)] lg:border-l-0 lg:border-r lg:shadow-none`}
         >
           <AgentPanel
             projectSlug={project.slug}
@@ -431,6 +491,8 @@ export default function App() {
             onLog={pushLog}
           />
         </aside>
+
+        <ResizeHandle panel={agentPanel} bounds={AGENT_PANEL} label="Resize agent panel" className="hidden lg:block" />
 
         <main className="flex min-w-0 flex-1 flex-col bg-[#080808]">
           <WorkspaceTabs
@@ -503,7 +565,7 @@ export default function App() {
 
             {tab === "code" && workspace ? (
               <div role="tabpanel" id="workspace-panel-code" aria-labelledby="workspace-tab-code" className="absolute inset-0 flex min-h-0">
-                <div className="min-h-0 w-[260px] shrink-0 border-r border-white/[0.06]">
+                <div className="min-h-0 shrink-0 border-r border-white/[0.06]" style={{ width: fileTreePanel.width }}>
                   <FileTree
                     workspaceId={workspace.id}
                     activePath={workspaceFile}
@@ -511,6 +573,7 @@ export default function App() {
                     onError={(text) => pushLog(text, "error")}
                   />
                 </div>
+                <ResizeHandle panel={fileTreePanel} bounds={FILE_TREE_PANEL} label="Resize file tree" />
                 <div className="min-h-0 flex-1">
                   <FileEditor
                     workspaceId={workspace.id}
@@ -685,6 +748,40 @@ export default function App() {
         </DialogContent>
       </Dialog>
     </div>
+  );
+}
+
+interface ResizeHandleProps {
+  panel: ResizablePanel;
+  bounds: ResizablePanelOptions;
+  label: string;
+  className?: string;
+}
+
+/**
+ * The grab strip between two panels.
+ *
+ * A focusable separator so the layout is reachable without a pointer: arrows
+ * nudge it, double-click snaps back to the default width.
+ */
+function ResizeHandle({ panel, bounds, label, className = "" }: ResizeHandleProps) {
+  return (
+    <div
+      role="separator"
+      aria-orientation="vertical"
+      aria-label={label}
+      aria-valuenow={panel.width}
+      aria-valuemin={bounds.minWidth}
+      aria-valuemax={bounds.maxWidth}
+      tabIndex={0}
+      title="Drag to resize · double-click to reset"
+      onPointerDown={panel.onDragStart}
+      onKeyDown={panel.onKeyDown}
+      onDoubleClick={panel.reset}
+      className={`w-[5px] shrink-0 cursor-col-resize transition-colors hover:bg-white/15 active:bg-white/25 focus-visible:bg-white/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/40 ${
+        panel.isDragging ? "bg-white/25" : "bg-transparent"
+      } ${className}`}
+    />
   );
 }
 

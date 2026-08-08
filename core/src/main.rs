@@ -62,13 +62,15 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| projects_root.join("sessions"));
     std::fs::create_dir_all(&sessions_root).ok();
 
-    // Re-attach folders opened in a previous session before the router is up,
-    // so the first workspace_list already reflects them.
-    let mut workspaces = workspace::Registry::new();
-    let restored = workspace::restore(&mut workspaces, &config.workspaces);
-    if !restored.is_empty() {
-        tracing::info!(count = restored.len(), "restored workspaces");
-    }
+    // Workspaces are restored AFTER the port is bound, not before.
+    //
+    // Restoring touches every remembered folder, and that can block for a long
+    // time — or forever — when a folder lives on a slow or permission-gated
+    // volume. On macOS, replacing the app bundle invalidates its disk-access
+    // grant, so the first read of an external-drive workspace stalls behind a
+    // TCC prompt. Doing that before `bind` meant core never started listening
+    // and the whole app came up dead with "core failed to start".
+    let remembered = config.workspaces.clone();
 
     let (bus, _) = broadcast::channel(256);
     let state = AppState {
@@ -78,9 +80,35 @@ async fn main() -> anyhow::Result<()> {
         agents: AgentManager::new(bus.clone()),
         bus,
         tools: Arc::new(RwLock::new(HashMap::new())),
-        workspaces: Arc::new(RwLock::new(workspaces)),
+        workspaces: Arc::new(RwLock::new(workspace::Registry::new())),
         dev_servers: Arc::new(RwLock::new(devserver::Servers::new())),
     };
+
+    // Populate the registry in the background. `workspace_list` simply returns
+    // fewer entries until this lands, which is recoverable; a core that never
+    // binds is not.
+    {
+        let workspaces = state.workspaces.clone();
+        tokio::spawn(async move {
+            // spawn_blocking: restore is synchronous filesystem work and can
+            // stall for seconds, which would otherwise occupy a runtime worker.
+            let restored = tokio::task::spawn_blocking(move || {
+                let mut registry = workspace::Registry::new();
+                let count = workspace::restore(&mut registry, &remembered).len();
+                (registry, count)
+            })
+            .await;
+            match restored {
+                Ok((registry, count)) => {
+                    if count > 0 {
+                        tracing::info!(count, "restored workspaces");
+                    }
+                    *workspaces.write().await = registry;
+                }
+                Err(error) => tracing::warn!(%error, "workspace restore failed"),
+            }
+        });
+    }
 
     // The RPC surface is unauthenticated and can create, overwrite, and revert
     // projects, read files, and drive the agent loop against the user's API
