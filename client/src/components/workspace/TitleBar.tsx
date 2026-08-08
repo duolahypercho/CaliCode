@@ -17,12 +17,12 @@ export function TitleBar({ projectTitle, modelList, onToggleSidebar, onToggleAge
 
   return (
     <header className="flex h-11 shrink-0 items-center gap-3.5 border-b border-white/[0.06] bg-[#0c0c0c] px-4">
-      {/* Below md the games rail leaves the layout; this opens it as a drawer. */}
+      {/* Opens the games rail as a drawer below md and toggles its column above md. */}
       <button
         type="button"
         onClick={onToggleSidebar}
         aria-label="Toggle games sidebar"
-        className="inline-flex min-h-[28px] shrink-0 items-center rounded border border-white/10 px-2 py-1 text-[11px] text-[#9a9a9a] transition-colors hover:border-white/30 active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 md:hidden"
+        className="inline-flex min-h-[28px] shrink-0 items-center rounded border border-white/10 px-2 py-1 text-[11px] text-[#9a9a9a] transition-colors hover:border-white/30 active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
       >
         ☰
       </button>

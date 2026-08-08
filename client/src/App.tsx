@@ -39,6 +39,13 @@ const SESSIONS_KEY = "calicode-sessions";
 const VIEW_KEY = "calicode-view";
 
 /** Panel bounds are shared by the hook and the handle's aria value range. */
+const GAMES_SIDEBAR: ResizablePanelOptions = {
+  storageKey: "calicode-games-sidebar-width",
+  defaultWidth: 240,
+  minWidth: 180,
+  maxWidth: 420,
+};
+
 const AGENT_PANEL: ResizablePanelOptions = {
   storageKey: "calicode-agent-width",
   defaultWidth: 384,
@@ -107,7 +114,9 @@ export default function App() {
   // as overlays so the agent and the games list stay reachable on a narrow
   // window rather than simply disappearing.
   const [agentOpen, setAgentOpen] = useState(false);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
+  const [sidebarVisible, setSidebarVisible] = useState(true);
+  const gamesSidebar = useResizablePanels(GAMES_SIDEBAR);
   const agentPanel = useResizablePanels(AGENT_PANEL);
   const fileTreePanel = useResizablePanels(FILE_TREE_PANEL);
   const [openFolderOpen, setOpenFolderOpen] = useState(false);
@@ -432,7 +441,13 @@ export default function App() {
       <TitleBar
         projectTitle={project.title}
         modelList={modelList}
-        onToggleSidebar={() => setSidebarOpen((open) => !open)}
+        onToggleSidebar={() => {
+          if (window.matchMedia("(min-width: 768px)").matches) {
+            setSidebarVisible((visible) => !visible);
+          } else {
+            setSidebarDrawerOpen((open) => !open);
+          }
+        }}
         onToggleAgent={() => setAgentOpen((open) => !open)}
       />
 
@@ -453,19 +468,30 @@ export default function App() {
             setActiveSessionId(session.id);
           }}
           onNewGame={() => setNewProjectOpen(true)}
-          overlay={sidebarOpen}
+          overlay={sidebarDrawerOpen}
+          width={gamesSidebar.width}
+          desktopVisible={sidebarVisible}
           workspace={workspace ? { name: workspace.name, root: workspace.root } : null}
           onOpenFolder={() => setOpenFolderOpen(true)}
         />
 
+        {sidebarVisible ? (
+          <ResizeHandle
+            panel={gamesSidebar}
+            bounds={GAMES_SIDEBAR}
+            label="Resize games sidebar"
+            className="hidden md:block"
+          />
+        ) : null}
+
         {/* Overlay backdrop for the narrow-window drawers. */}
-        {(agentOpen || sidebarOpen) && (
+        {(agentOpen || sidebarDrawerOpen) && (
           <button
             type="button"
             aria-label="Close panel"
             onClick={() => {
               setAgentOpen(false);
-              setSidebarOpen(false);
+              setSidebarDrawerOpen(false);
             }}
             className="fixed inset-0 z-30 bg-black/60 lg:hidden"
           />

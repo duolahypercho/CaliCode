@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState, type CSSProperties } from "react";
 import type { Project } from "../../lib/types";
 
 export interface GameSession {
@@ -19,11 +19,15 @@ interface GamesSidebarProps {
   onOpenFolder: () => void;
   /** Open as an overlay when the rail is below its md breakpoint. */
   overlay?: boolean;
+  /** Width of the persistent rail at md and above. */
+  width?: number;
+  /** Whether the persistent rail is present at md and above. */
+  desktopVisible?: boolean;
 }
 
 /**
  * Left rail: new-game action, searchable game list, and each game's
- * agent sessions nested underneath. Matches the 208px sidebar in the design.
+ * agent sessions nested underneath. The desktop rail is user-resizable.
  */
 export function GamesSidebar({
   projects,
@@ -37,6 +41,8 @@ export function GamesSidebar({
   workspace,
   onOpenFolder,
   overlay = false,
+  width = 240,
+  desktopVisible = true,
 }: GamesSidebarProps) {
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<string | null>(activeSlug);
@@ -55,9 +61,14 @@ export function GamesSidebar({
 
   return (
     <aside
+      style={{ "--games-sidebar-width": `${width}px` } as CSSProperties}
       className={`${
-        overlay ? "fixed inset-y-0 left-0 z-40 flex w-52 shadow-2xl" : "hidden"
-      } shrink-0 flex-col border-r border-white/[0.06] bg-[#0b0b0b] p-3 md:static md:flex md:shadow-none`}
+        overlay
+          ? "fixed inset-y-0 left-0 z-40 flex w-[min(var(--games-sidebar-width),92vw)] shadow-2xl"
+          : "hidden"
+      } ${
+        desktopVisible ? "md:static md:flex md:w-[var(--games-sidebar-width)] md:shadow-none" : "md:hidden"
+      } shrink-0 flex-col border-r border-white/[0.06] bg-[#0b0b0b] p-3`}
     >
       <button
         type="button"
