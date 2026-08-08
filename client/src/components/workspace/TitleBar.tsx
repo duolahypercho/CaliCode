@@ -22,7 +22,7 @@ export function TitleBar({ projectTitle, modelList, onToggleSidebar, onToggleAge
         type="button"
         onClick={onToggleSidebar}
         aria-label="Toggle games sidebar"
-        className="shrink-0 rounded border border-white/10 px-2 py-1 text-[11px] text-[#9a9a9a] hover:border-white/30 md:hidden"
+        className="inline-flex min-h-[28px] shrink-0 items-center rounded border border-white/10 px-2 py-1 text-[11px] text-[#9a9a9a] transition-colors hover:border-white/30 active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 md:hidden"
       >
         ☰
       </button>
@@ -50,7 +50,7 @@ export function TitleBar({ projectTitle, modelList, onToggleSidebar, onToggleAge
           type="button"
           onClick={onToggleAgent}
           aria-label="Toggle agent panel"
-          className="shrink-0 rounded border border-white/10 px-2 py-1 text-[11px] tracking-[0.1em] text-[#9a9a9a] hover:border-white/30 lg:hidden"
+          className="inline-flex min-h-[28px] shrink-0 items-center rounded border border-white/10 px-2 py-1 text-[11px] tracking-[0.1em] text-[#9a9a9a] transition-colors hover:border-white/30 active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 lg:hidden"
         >
           AGENT
         </button>

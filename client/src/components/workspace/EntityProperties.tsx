@@ -56,7 +56,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
         onKeyDown={(event) => {
           if (event.key === "Enter") event.currentTarget.blur();
         }}
-        className="mb-3.5 w-full rounded-md border border-white/10 bg-[#101010] px-2.5 py-1.5 text-xs text-[#d0d0d0] outline-none focus-visible:border-white/30"
+        className="mb-3.5 w-full rounded-md border border-white/10 bg-[#101010] px-2.5 py-1.5 text-xs text-[#d0d0d0] outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
       />
 
       {(
@@ -77,7 +77,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
                 aria-label={`${label} ${axisLabel}`}
                 value={entity.transform[key][axis as 0 | 1 | 2]}
                 onChange={(event) => setVec(key, axis as 0 | 1 | 2, Number(event.target.value))}
-                className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none focus-visible:border-white/30"
+                className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
               />
             ))}
           </div>
@@ -91,7 +91,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
           aria-label="Colour"
           value={color}
           onChange={(event) => onChange({ material: { ...material, color: event.target.value } })}
-          className="h-[30px] w-full rounded-md border border-white/10 bg-[#101010] p-1 outline-none focus-visible:border-white/30"
+          className="h-[30px] w-full rounded-md border border-white/10 bg-[#101010] p-1 outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
         />
         <input
           type="number"
@@ -101,7 +101,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
           aria-label="Metalness"
           value={metalness}
           onChange={(event) => onChange({ material: { ...material, metalness: Number(event.target.value) } })}
-          className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none focus-visible:border-white/30"
+          className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
         />
         <input
           type="number"
@@ -111,14 +111,14 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
           aria-label="Roughness"
           value={roughness}
           onChange={(event) => onChange({ material: { ...material, roughness: Number(event.target.value) } })}
-          className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none focus-visible:border-white/30"
+          className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
         />
       </div>
 
       <button
         type="button"
         onClick={() => onRemove(entity.id)}
-        className="mt-auto rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#8f8f8f] hover:border-[#c98b8b]/50 hover:text-[#c98b8b]"
+        className="mt-auto rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#8f8f8f] transition-colors hover:border-[#c98b8b]/50 hover:text-[#c98b8b] active:border-[#c98b8b]/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#c06060]/50"
       >
         DELETE ENTITY
       </button>

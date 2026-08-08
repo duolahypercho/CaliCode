@@ -27,7 +27,7 @@ export function TweakPanel({ title, controls, onClose }: TweakPanelProps) {
           type="button"
           onClick={onClose}
           aria-label="Close tweak panel"
-          className="ml-auto h-5 w-5 rounded border border-white/[0.12] text-[11px] leading-none text-[#828282] hover:text-[#d0d0d0]"
+          className="ml-auto inline-flex min-h-[28px] min-w-[28px] items-center justify-center rounded border border-white/[0.12] text-[11px] leading-none text-[#828282] transition-colors hover:border-white/25 hover:text-[#d0d0d0] active:border-white/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
         >
           ✕
         </button>
@@ -52,7 +52,7 @@ export function TweakPanel({ title, controls, onClose }: TweakPanelProps) {
                 step={control.step}
                 value={control.value}
                 onChange={(event) => control.onChange(Number(event.target.value))}
-                className="h-[3px] w-full accent-[#9a9a9a]"
+                className="h-[3px] w-full cursor-pointer rounded-full accent-[#9a9a9a] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
               />
             </div>
           ))

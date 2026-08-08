@@ -49,6 +49,22 @@ them:
 CALI_PORT=8799 CALI_CLIENT_PORT=5299 ./scripts/dev.sh
 ```
 
+## Desktop app
+
+CaliCode also ships as a native macOS app (Tauri) — no browser, no visible
+terminal. The window is a native shell around the same editor: it launches the
+`cali-core` binary as a bundled sidecar and points one webview at core's own
+origin, so `/rpc`, `/events`, and the built client are all same-origin.
+
+```bash
+cd client && pnpm desktop:build   # -> CaliCode.app + .dmg
+pnpm desktop:dev                   # run the native shell against a live core
+```
+
+Bundles land in `client/src-tauri/target/release/bundle/` (`macos/CaliCode.app`
+and `dmg/`). The packaged app pins core to port `8765`, so quit any browser dev
+instance on that port before launching it.
+
 ## Tests
 
 ```bash

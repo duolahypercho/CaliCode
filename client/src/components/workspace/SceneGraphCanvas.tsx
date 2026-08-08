@@ -151,7 +151,7 @@ export function SceneGraphCanvas({
         <button
           type="button"
           onClick={onAddEntity}
-          className="mt-1.5 rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] hover:border-white/25 hover:text-[#d0d0d0]"
+          className="mt-1.5 rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] transition-colors hover:border-white/25 hover:text-[#d0d0d0] active:border-white/40 active:bg-white/[0.03] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
         >
           ADD ENTITY
         </button>
@@ -197,15 +197,15 @@ export function SceneGraphCanvas({
               key={node.id}
               style={{ left: node.x, top: node.y, width: NODE_WIDTH }}
               onPointerDown={(event) => onPointerDown(event, node)}
-              className={`absolute cursor-grab rounded-[9px] border bg-[#111] active:cursor-grabbing ${
-                selected ? "border-white/40" : "border-white/[0.12]"
+              className={`absolute cursor-grab rounded-[9px] border bg-[#111] transition-colors active:cursor-grabbing ${
+                selected ? "border-white/40 bg-white/[0.06]" : "border-white/[0.12]"
               }`}
             >
               <button
                 type="button"
                 onClick={() => entityId && onSelect(selected ? null : entityId)}
                 disabled={!entityId}
-                className="flex w-full items-center gap-2 border-b border-white/[0.07] px-2.5 py-2 text-left disabled:cursor-grab"
+                className="flex w-full items-center gap-2 border-b border-white/[0.07] px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30 enabled:hover:bg-white/[0.03] enabled:active:bg-white/[0.05] disabled:cursor-grab"
               >
                 <span aria-hidden className="h-[7px] w-[7px] shrink-0 border border-[#808080]" />
                 <span className="min-w-0 flex-1 truncate text-xs font-bold text-[#dadada]">{node.title}</span>

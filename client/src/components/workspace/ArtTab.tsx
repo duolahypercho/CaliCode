@@ -78,7 +78,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
       </div>
 
       <div className="mb-[18px] mt-2.5 flex flex-wrap gap-2.5">
-        <div className="flex min-w-[240px] flex-1 items-center rounded-lg border border-white/10 bg-[#0f0f0f] px-3.5 py-2.5">
+        <div className="flex min-w-[240px] flex-1 items-center rounded-lg border border-white/10 bg-[#0f0f0f] px-3.5 py-2.5 transition-colors focus-within:border-white/30">
           <input
             value={prompt}
             onChange={(event) => setPrompt(event.target.value)}
@@ -94,16 +94,16 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
           type="button"
           onClick={generate}
           disabled={busy || !prompt.trim()}
-          className="shrink-0 rounded-lg border border-white/[0.12] bg-[#2a2a2a] px-[18px] text-[11px] font-bold tracking-[0.12em] text-[#dcdcdc] hover:bg-[#333] disabled:opacity-40"
+          className="shrink-0 rounded-lg border border-white/[0.12] bg-[#2a2a2a] px-[18px] text-[11px] font-bold tracking-[0.12em] text-[#dcdcdc] transition-colors hover:bg-[#333] active:bg-[#222] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-[#2a2a2a]"
         >
           {busy ? "GENERATING…" : `GENERATE ${BATCH}`}
         </button>
-        <label className="shrink-0 cursor-pointer rounded-lg border border-white/[0.12] px-[18px] py-2.5 text-[11px] tracking-[0.12em] text-[#c0c0c0] hover:border-white/30">
+        <label className="inline-flex shrink-0 cursor-pointer items-center rounded-lg border border-white/[0.12] px-[18px] py-2.5 text-[11px] tracking-[0.12em] text-[#c0c0c0] transition-colors hover:border-white/30 active:border-white/40 focus-within:outline-none focus-within:ring-1 focus-within:ring-white/30">
           IMPORT
           <input
             type="file"
             accept="image/*,.glb,.gltf,.obj"
-            className="hidden"
+            className="sr-only"
             onChange={(event) => {
               const file = event.target.files?.[0];
               if (file) onImportImage(file);
@@ -113,7 +113,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
         </label>
       </div>
 
-      <div className="mb-3 flex items-center gap-2 rounded-md border border-white/[0.07] bg-[#101010] px-2.5 py-[7px]">
+      <div className="mb-3 flex items-center gap-2 rounded-md border border-white/[0.07] bg-[#101010] px-2.5 py-[7px] transition-colors focus-within:border-white/30">
         <span aria-hidden className="text-[#7d7d7d]">
           /
         </span>
@@ -160,7 +160,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
                     type="button"
                     onClick={() => onPromote(asset.id)}
                     aria-label={`Promote ${asset.name}`}
-                    className="flex-1 rounded border border-white/10 py-1 text-[10px] tracking-[0.1em] text-[#c0c0c0] hover:border-white/30"
+                    className="inline-flex min-h-[28px] flex-1 items-center justify-center rounded border border-white/10 py-1 text-[10px] tracking-[0.1em] text-[#c0c0c0] transition-colors hover:border-white/30 active:border-white/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
                   >
                     PROMOTE
                   </button>
@@ -168,7 +168,7 @@ export function ArtTab({ assets, entities, onGenerate, onPromote, onRemove, onIm
                     type="button"
                     onClick={() => onRemove(asset.id)}
                     aria-label={`Remove ${asset.name}`}
-                    className="rounded border border-white/10 px-2 py-1 text-[10px] text-[#9c9c9c] hover:border-white/30 hover:text-[#c0c0c0]"
+                    className="inline-flex min-h-[28px] items-center justify-center rounded border border-white/10 px-2 py-1 text-[10px] text-[#9c9c9c] transition-colors hover:border-white/30 hover:text-[#c0c0c0] active:border-white/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
                   >
                     ✕
                   </button>

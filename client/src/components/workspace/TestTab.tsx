@@ -55,7 +55,7 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
                 type="button"
                 onClick={onRun}
                 disabled={!canRun || running}
-                className="flex h-[52px] w-[52px] items-center justify-center rounded-full border border-white/20 text-lg text-[#c0c0c0] hover:border-white/40 disabled:opacity-40"
+                className="flex h-[52px] w-[52px] items-center justify-center rounded-full border border-white/20 text-lg text-[#c0c0c0] transition-colors enabled:hover:border-white/40 active:border-white/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-40"
                 aria-label="Run playtest"
               >
                 ▶
@@ -71,8 +71,8 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
           )}
           <div className="h-1 shrink-0 bg-white/[0.07]">
             <div
-              className="h-full bg-[#9a9a9a] transition-[width]"
-              style={{ width: results.length === 0 ? "0%" : `${(passed / results.length) * 100}%` }}
+              className="h-full w-full origin-left bg-[#9a9a9a] transition-transform duration-300"
+              style={{ transform: `scaleX(${results.length === 0 ? 0 : passed / results.length})` }}
             />
           </div>
         </div>
@@ -85,7 +85,7 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
             type="button"
             onClick={() => onFixAll(issues)}
             disabled={issues.length === 0}
-            className="ml-auto rounded-md border border-white/[0.12] bg-[#2a2a2a] px-3 py-1.5 text-[11px] font-bold tracking-[0.1em] text-[#dcdcdc] hover:bg-[#333] disabled:opacity-40"
+            className="ml-auto inline-flex min-h-[28px] items-center rounded-md border border-white/[0.12] bg-[#2a2a2a] px-3 py-1.5 text-[11px] font-bold tracking-[0.1em] text-[#dcdcdc] transition-colors enabled:hover:bg-[#333] active:bg-[#3a3a3a] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {issues.length === 0 ? "NOTHING TO FIX" : `FIX ALL ${issues.length}`}
           </button>

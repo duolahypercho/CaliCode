@@ -61,7 +61,7 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
           type="button"
           onClick={() => setOpen((current) => !current)}
           aria-expanded={open}
-          className="ml-auto shrink-0 rounded-md border border-white/10 px-2.5 py-[5px] text-[10px] tracking-[0.14em] text-[#8f8f8f] hover:border-white/25 hover:text-[#c0c0c0]"
+          className="ml-auto inline-flex min-h-[28px] shrink-0 items-center rounded-md border border-white/10 px-2.5 py-[5px] text-[10px] tracking-[0.14em] text-[#8f8f8f] transition-colors hover:border-white/25 hover:text-[#c0c0c0] active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
         >
           CONSOLE {open ? "▾" : "▸"}
         </button>

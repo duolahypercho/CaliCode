@@ -55,8 +55,10 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
                 key={entry.script.id}
                 type="button"
                 onClick={() => onSelect(entry.script.id)}
-                className={`mb-0.5 flex w-full items-center gap-2 rounded-md px-2 py-[7px] text-left text-xs ${
-                  isActive ? "bg-[#161616] text-[#dcdcdc]" : "text-[#8f8f8f] hover:text-[#c0c0c0]"
+                className={`mb-0.5 flex min-h-[28px] w-full items-center gap-2 rounded-md px-2 py-[7px] text-left text-xs transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 focus-visible:ring-inset ${
+                  isActive
+                    ? "bg-white/[0.08] text-[#dcdcdc] active:bg-white/[0.1]"
+                    : "text-[#8f8f8f] hover:bg-white/[0.03] hover:text-[#c0c0c0] active:bg-white/[0.05]"
                 }`}
               >
                 <span className="min-w-0 flex-1 truncate">{entry.script.name}</span>
@@ -75,7 +77,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
         <button
           type="button"
           onClick={onAdd}
-          className="m-2 rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] hover:border-white/25 hover:text-[#d0d0d0]"
+          className="m-2 min-h-[28px] rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] transition-colors hover:border-white/25 hover:text-[#d0d0d0] active:border-white/35 active:bg-white/[0.03] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
         >
           NEW SCRIPT
         </button>
@@ -91,10 +93,10 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
                 type="button"
                 onClick={() => setMode(option)}
                 aria-pressed={mode === option}
-                className={`rounded border px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] ${
+                className={`inline-flex min-h-[28px] items-center rounded border px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 focus-visible:ring-inset ${
                   mode === option
-                    ? "border-white/25 bg-[#1c1c1c] text-[#dcdcdc]"
-                    : "border-white/10 text-[#9c9c9c] hover:text-[#b0b0b0]"
+                    ? "border-white/25 bg-[#1c1c1c] text-[#dcdcdc] active:bg-[#242424]"
+                    : "border-white/10 text-[#9c9c9c] hover:border-white/20 hover:text-[#b0b0b0] active:bg-white/[0.03]"
                 }`}
               >
                 {option}
@@ -111,7 +113,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
             onChange={(event) => onChange({ ...active.script, code: event.target.value })}
             spellCheck={false}
             aria-label={`${active.script.name} source`}
-            className="min-h-0 flex-1 resize-none bg-transparent px-4 py-3 font-mono text-[12.5px] leading-[1.75] text-[#c8c8c8] outline-none"
+            className="min-h-0 flex-1 resize-none bg-transparent px-4 py-3 font-mono text-[12.5px] leading-[1.75] text-[#c8c8c8] outline-none transition-colors focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30"
           />
         ) : rows.length === 0 ? (
           <p className="p-4 text-xs text-[#8f8f8f]">
@@ -130,7 +132,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
                       : "text-[#a6a6a6]"
                 }`}
               >
-                <span className="inline-block w-10 select-none pr-3.5 text-right text-[#404040]">
+                <span className="inline-block w-10 select-none pr-3.5 text-right text-[#565656]">
                   {row.newLine ?? row.oldLine}
                 </span>
                 <span

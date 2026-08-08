@@ -58,7 +58,7 @@ export function GamesSidebar({
       <button
         type="button"
         onClick={onNewGame}
-        className="w-full rounded-md border border-white/10 bg-[#242424] py-2.5 text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc] hover:bg-[#2c2c2c]"
+        className="w-full rounded-md border border-white/10 bg-[#242424] py-2.5 text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc] transition-colors hover:bg-[#2c2c2c] active:bg-[#333] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
       >
         NEW GAME
       </button>
@@ -73,7 +73,7 @@ export function GamesSidebar({
           onChange={(event) => setSearch(event.target.value)}
           placeholder="search"
           aria-label="Search games"
-          className="min-w-0 flex-1 bg-transparent text-xs text-[#c6c6c6] outline-none placeholder:text-[#8f8f8f]"
+          className="min-w-0 flex-1 rounded-sm bg-transparent text-xs text-[#c6c6c6] transition-colors outline-none placeholder:text-[#8f8f8f] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
         />
       </div>
 
@@ -96,8 +96,10 @@ export function GamesSidebar({
                     setExpanded(open ? null : project.slug);
                     if (project.slug !== activeSlug) onOpenProject(project.slug);
                   }}
-                  className={`flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-[12.5px] ${
-                    project.slug === activeSlug ? "text-[#e0e0e0]" : "text-[#a0a0a0] hover:text-[#d0d0d0]"
+                  className={`flex min-h-[28px] w-full items-center gap-2 rounded-md px-2 py-2 text-left text-[12.5px] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30 ${
+                    project.slug === activeSlug
+                      ? "bg-white/[0.08] text-[#e0e0e0]"
+                      : "text-[#a0a0a0] hover:bg-white/[0.04] hover:text-[#d0d0d0] active:bg-white/[0.06]"
                   }`}
                 >
                   <span
@@ -119,8 +121,10 @@ export function GamesSidebar({
                           key={session.id}
                           type="button"
                           onClick={() => onSelectSession(project.slug, session.id)}
-                          className={`flex w-full items-center gap-2 rounded-md px-2 py-2 text-left text-[12.5px] ${
-                            active ? "bg-[#171717] text-[#dcdcdc]" : "text-[#8f8f8f] hover:text-[#c0c0c0]"
+                          className={`flex min-h-[28px] w-full items-center gap-2 rounded-md px-2 py-2 text-left text-[12.5px] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30 ${
+                            active
+                              ? "bg-white/[0.08] text-[#dcdcdc]"
+                              : "text-[#8f8f8f] hover:bg-white/[0.04] hover:text-[#c0c0c0] active:bg-white/[0.06]"
                           }`}
                         >
                           <span aria-hidden className={`h-3.5 w-[2px] ${active ? "bg-[#c0c0c0]" : "bg-transparent"}`} />
@@ -131,7 +135,7 @@ export function GamesSidebar({
                     <button
                       type="button"
                       onClick={() => onNewSession(project.slug)}
-                      className="px-2 py-1.5 text-left text-[11px] text-[#949494] hover:text-[#9a9a9a]"
+                      className="inline-flex min-h-[28px] items-center rounded-md px-2 py-1.5 text-left text-[11px] text-[#949494] transition-colors hover:text-[#9a9a9a] active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30"
                     >
                       + new session
                     </button>
@@ -158,7 +162,7 @@ export function GamesSidebar({
         <button
           type="button"
           onClick={onOpenFolder}
-          className="mt-1.5 w-full rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] hover:border-white/25 hover:text-[#d0d0d0]"
+          className="mt-1.5 w-full rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] transition-colors hover:border-white/25 hover:text-[#d0d0d0] active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
         >
           {workspace ? "CHANGE FOLDER" : "OPEN FOLDER"}
         </button>
@@ -169,7 +173,7 @@ export function GamesSidebar({
           href="https://github.com/duolahypercho/CaliCode#readme"
           target="_blank"
           rel="noreferrer"
-          className="px-1 py-[7px] text-xs tracking-[0.08em] text-[#828282] hover:text-[#c0c0c0]"
+          className="inline-flex min-h-[28px] items-center rounded px-1 py-[7px] text-xs tracking-[0.08em] text-[#828282] transition-colors hover:text-[#c0c0c0] active:text-[#e0e0e0] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
         >
           HELP
         </a>

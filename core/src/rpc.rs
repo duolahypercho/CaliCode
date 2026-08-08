@@ -410,6 +410,15 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             )
             .await?),
         "agent_sessions" => Ok(json!(state.agents.sessions().await)),
+        "session_save" => crate::sessions::save(&state.sessions_root, &params),
+        "session_list" => crate::sessions::list(&state.sessions_root),
+        "session_load" => crate::sessions::load(&state.sessions_root, str_param(&params, "id")?),
+        "session_delete" => crate::sessions::delete(&state.sessions_root, str_param(&params, "id")?),
+        "session_fork" => crate::sessions::fork(
+            &state.sessions_root,
+            str_param(&params, "id")?,
+            params.get("newId").and_then(|v| v.as_str()),
+        ),
         _ => anyhow::bail!("unknown method {}", method),
     }
 }

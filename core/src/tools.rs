@@ -367,6 +367,7 @@ mod tests {
         let state = crate::AppState {
             config: std::sync::Arc::new(tokio::sync::RwLock::new(config)),
             projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+            sessions_root: tempfile::tempdir().unwrap().path().to_path_buf(),
             agents: agents.clone(),
             bus: bus.clone(),
             workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(

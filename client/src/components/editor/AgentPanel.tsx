@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowRightLeft, Send, ShieldCheck, ShieldOff, Workflow } from "lucide-react";
+import { ArrowRightLeft, Repeat, Send, ShieldCheck, ShieldOff, Square, Workflow } from "lucide-react";
 import { AgentText } from "./AgentText";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -7,6 +7,21 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Textarea } from "../ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import { connectEvents, rpc, type AgentEvent } from "../../lib/rpc";
+import {
+  MAX_LOOP_ITERATIONS,
+  matchCommands,
+  parseSlash,
+  type SlashContext,
+} from "../../lib/slashCommands";
+import {
+  deleteSession,
+  forkSession,
+  listSessions,
+  loadSession,
+  relativeTime,
+  saveSession,
+  type SessionSummary,
+} from "../../lib/sessions";
 import type { AgentMessage, BrowserTool, ModelList, SubagentResult } from "../../lib/types";
 
 interface ApprovalRequest {
@@ -35,6 +50,11 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
   const [modelInput, setModelInput] = useState("");
   const [subagentRole, setSubagentRole] = useState("planner");
   const [subagentTask, setSubagentTask] = useState("");
+  const [looping, setLooping] = useState(false);
+  const [menuIndex, setMenuIndex] = useState(0);
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
+  const cancelLoopRef = useRef(false);
+  const saveTimer = useRef<number | null>(null);
   const transcriptRef = useRef<HTMLDivElement>(null);
   const toolsRef = useRef(browserTools);
   toolsRef.current = browserTools;
@@ -98,23 +118,52 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight });
   }, [messages, approval]);
 
-  const send = async () => {
-    const text = input.trim();
-    if (!text || busy) return;
-    setInput("");
-    if (text.startsWith("/model")) {
-      await handleModelCommand(text);
-      return;
-    }
+  const refreshSessions = () => {
+    void listSessions().then(setSessions).catch(() => {});
+  };
+
+  useEffect(() => {
+    refreshSessions();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Persist the transcript shortly after it settles, keyed by the session id
+  // core assigned. Debounced so a burst of streamed deltas saves once.
+  useEffect(() => {
+    if (!sessionId) return;
+    const hasConversation = messages.some((message) => message.role === "user" || message.role === "assistant");
+    if (!hasConversation) return;
+    if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    saveTimer.current = window.setTimeout(() => {
+      void saveSession({
+        id: sessionId,
+        projectSlug,
+        provider: modelList?.active.provider ?? null,
+        model: modelList?.active.model ?? null,
+        messages,
+      })
+        .then(() => refreshSessions())
+        .catch(() => {});
+    }, 800);
+    return () => {
+      if (saveTimer.current) window.clearTimeout(saveTimer.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages, sessionId]);
+
+  const say = (content: string, role: "assistant" | "tool" = "assistant") => {
+    setMessages((current) => [...current, { role, content }]);
+  };
+
+  // A single conversation turn. Only real user/assistant messages are replayed —
+  // the synthetic role:"tool" ticker entries would be sent as provider tool
+  // messages with no preceding tool_calls, a protocol violation that hard-failed
+  // every turn after the first with a 502/422.
+  const runTurn = async (text: string): Promise<string> => {
     const userMessage: AgentMessage = { role: "user", content: text };
     setMessages((current) => [...current, userMessage]);
     setBusy(true);
     try {
-      // Only real conversation turns. `messages` also holds synthetic
-      // role:"tool" entries pushed for the tool-call ticker; replaying those
-      // sends the provider a tool message with no preceding tool_calls, which
-      // is a protocol violation — every turn after the first hard-failed with
-      // a 502/422 and the panel was single-turn only in practice.
       const history = messages
         .filter((message) => message.role === "user" || message.role === "assistant")
         .map((message) => ({ role: message.role, content: message.content }));
@@ -126,40 +175,233 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
         messages: [...history, userMessage],
       })) as { sessionId: string; reply: string; toolCalls: unknown[] };
       setSessionId(result.sessionId);
+      const reply = result.reply || "Done.";
       setMessages((current) => {
         const last = current[current.length - 1];
-        if (last?.role === "assistant" && last.content === (result.reply || "Done.")) {
-          return current;
-        }
-        return [...current, { role: "assistant", content: result.reply || "Done." }];
+        if (last?.role === "assistant" && last.content === reply) return current;
+        return [...current, { role: "assistant", content: reply }];
       });
       if (result.toolCalls.length > 0) {
         onLog(`agent completed ${result.toolCalls.length} tool calls`);
       }
+      return reply;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       setMessages((current) => [...current, { role: "assistant", content: `Error: ${message}` }]);
       onLog(`agent error: ${message}`);
+      return "";
     } finally {
       setBusy(false);
     }
   };
 
-  const handleModelCommand = async (text: string) => {
-    const parts = text.split(/\s+/).filter(Boolean);
-    if (parts.length < 2) {
-      setMessages((current) => [...current, { role: "assistant", content: "Usage: /model <provider>:<model> or /model <model>" }]);
-      return;
-    }
-    const raw = parts[1];
-    const [provider, model] = raw.includes(":") ? raw.split(":") : [modelList?.active.provider ?? "openai", raw];
+  const switchModel = async (raw: string) => {
+    const [provider, model] = raw.includes(":")
+      ? (raw.split(":") as [string, string])
+      : [modelList?.active.provider ?? "openai", raw];
     try {
       await rpc("model_switch", { provider, model });
       onModelChange();
-      setMessages((current) => [...current, { role: "assistant", content: `Switched to ${provider} / ${model}.` }]);
+      say(`Switched to ${provider} / ${model}.`);
     } catch (error) {
-      setMessages((current) => [...current, { role: "assistant", content: `Error: ${error instanceof Error ? error.message : String(error)}` }]);
+      say(`Error: ${error instanceof Error ? error.message : String(error)}`);
     }
+  };
+
+  const compact = async () => {
+    if (busy || looping) return;
+    const history = messages
+      .filter((message) => message.role === "user" || message.role === "assistant")
+      .map((message) => ({ role: message.role, content: message.content }));
+    if (history.length === 0) {
+      say("Nothing to compact yet.");
+      return;
+    }
+    setBusy(true);
+    try {
+      const result = (await rpc("agent_chat", {
+        sessionId,
+        projectSlug,
+        permissionMode: "supervised",
+        maxTurns: 1,
+        messages: [
+          ...history,
+          {
+            role: "user",
+            content:
+              "Summarize our conversation so far as 5-8 concise bullet points capturing decisions made, the current state, and next steps. Reply with only the summary.",
+          },
+        ],
+      })) as { sessionId: string; reply: string };
+      setSessionId(result.sessionId);
+      setMessages([{ role: "assistant", content: `Context compacted:\n${result.reply || "(empty)"}` }]);
+    } catch (error) {
+      say(`Compact failed: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const diff = async () => {
+    if (busy || looping) return;
+    await runTurn(
+      "List every file you have changed in this session and summarize what changed in each. If nothing changed, say so.",
+    );
+  };
+
+  // Autonomous loop: drive the agent toward a goal, feeding a "continue" each
+  // turn, until it replies DONE, the cap is reached, or the user hits Stop.
+  // History is threaded locally because setState lands after the closure reads it.
+  const runLoop = async (goal: string) => {
+    if (busy || looping) return;
+    setLooping(true);
+    setBusy(true);
+    cancelLoopRef.current = false;
+    let localSession = sessionId;
+    let history = messages
+      .filter((message) => message.role === "user" || message.role === "assistant")
+      .map((message) => ({ role: message.role, content: message.content }));
+    say(`▶ loop started — goal: ${goal}`, "tool");
+    let completed = false;
+    for (let iteration = 1; iteration <= MAX_LOOP_ITERATIONS; iteration += 1) {
+      if (cancelLoopRef.current) {
+        say(`■ loop stopped after ${iteration - 1} iterations`, "tool");
+        break;
+      }
+      const userMessage: AgentMessage = {
+        role: "user",
+        content:
+          iteration === 1
+            ? goal
+            : "Continue toward the goal. When it is fully complete, reply with exactly DONE on its own line and nothing else.",
+      };
+      say(`loop ${iteration}/${MAX_LOOP_ITERATIONS}`, "tool");
+      try {
+        const result = (await rpc("agent_chat", {
+          sessionId: localSession,
+          projectSlug,
+          permissionMode,
+          maxTurns: 10,
+          messages: [...history, userMessage],
+        })) as { sessionId: string; reply: string; toolCalls: unknown[] };
+        localSession = result.sessionId;
+        setSessionId(result.sessionId);
+        const reply = result.reply || "Done.";
+        history = [...history, userMessage, { role: "assistant", content: reply }];
+        setMessages((current) => [...current, { role: "assistant", content: reply }]);
+        if (/(^|\n)\s*DONE\s*($|\n|$)/i.test(reply)) {
+          say(`✔ loop complete in ${iteration} iterations`, "tool");
+          completed = true;
+          break;
+        }
+      } catch (error) {
+        say(`Loop error: ${error instanceof Error ? error.message : String(error)}`);
+        break;
+      }
+    }
+    if (!completed && !cancelLoopRef.current) {
+      say(`loop hit the ${MAX_LOOP_ITERATIONS}-iteration cap`, "tool");
+    }
+    setLooping(false);
+    setBusy(false);
+  };
+
+  const stopLoop = () => {
+    cancelLoopRef.current = true;
+  };
+
+  const resumeSession = async (id: string) => {
+    if (looping) return;
+    try {
+      const record = await loadSession(id);
+      setSessionId(record.id);
+      setMessages(record.messages ?? []);
+      say(`Resumed “${record.title}”.`, "tool");
+    } catch (error) {
+      say(`Resume failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const resumeLast = async () => {
+    const candidate = sessions.find((session) => session.id !== sessionId) ?? sessions[0];
+    if (!candidate) {
+      say("No saved sessions yet.");
+      return;
+    }
+    await resumeSession(candidate.id);
+  };
+
+  const forkCurrent = async () => {
+    if (!sessionId) {
+      say("No session to fork yet — send a message first.");
+      return;
+    }
+    try {
+      const record = await forkSession(sessionId);
+      setSessionId(record.id);
+      say(`Forked to a new session “${record.title}”.`, "tool");
+      refreshSessions();
+    } catch (error) {
+      say(`Fork failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const listSessionsCommand = async () => {
+    const current = await listSessions().catch(() => [] as SessionSummary[]);
+    setSessions(current);
+    if (current.length === 0) {
+      say("No saved sessions yet.");
+      return;
+    }
+    const lines = current
+      .slice(0, 12)
+      .map((session) => `• ${session.title} — ${session.messageCount} msgs, ${relativeTime(session.updatedAt)}`);
+    say(["Saved sessions (open the ··· menu to pick one):", ...lines].join("\n"));
+  };
+
+  const removeSession = async (id: string) => {
+    try {
+      await deleteSession(id);
+      if (id === sessionId) {
+        setSessionId(null);
+      }
+      refreshSessions();
+    } catch {
+      /* best effort */
+    }
+  };
+
+  const slashContext: SlashContext = {
+    say,
+    clear: () => setMessages([]),
+    newSession: () => {
+      setSessionId(null);
+      setMessages([{ role: "tool", content: "Started a new session.", tool: "session" }]);
+    },
+    switchModel,
+    runLoop,
+    compact,
+    diff,
+    resumeLast,
+    fork: forkCurrent,
+    listSessions: listSessionsCommand,
+  };
+
+  const send = async () => {
+    const text = input.trim();
+    if (!text || busy || looping) return;
+    setInput("");
+    setMenuIndex(0);
+    const parsed = parseSlash(text);
+    if (parsed) {
+      if (!parsed.command) {
+        say(`Unknown command /${parsed.name}. Type /help for the list.`);
+        return;
+      }
+      await parsed.command.run(parsed.args, slashContext);
+      return;
+    }
+    await runTurn(text);
   };
 
   const respondToApproval = async (approved: boolean) => {
@@ -210,19 +452,84 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     ["Show the diff", "List every file you changed and what changed in each."],
   ];
 
+  const commandMenu = matchCommands(input);
+  const menuActive = commandMenu.length > 0;
+  const activeMenuIndex = Math.min(menuIndex, commandMenu.length - 1);
+
+  const completeCommand = (name: string) => {
+    setInput(`/${name} `);
+    setMenuIndex(0);
+  };
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 items-center gap-2 border-b border-white/5 px-[18px] py-[15px]">
         <span className="font-display text-[15px] font-bold text-[#dadada]">{projectSlug}</span>
-        <span className="text-[10px] tracking-[0.12em] text-[#949494]">{busy ? "working" : "ready"}</span>
+        {looping ? (
+          <span className="flex items-center gap-1 text-[10px] tracking-[0.12em] text-[#d0b060]">
+            <Repeat className="h-3 w-3 [animation:spin_1.6s_linear_infinite]" /> looping
+          </span>
+        ) : (
+          <span className="text-[10px] tracking-[0.12em] text-[#949494]">{busy ? "working" : "ready"}</span>
+        )}
         <details className="relative ml-auto">
           <summary
             aria-label="Session settings"
-            className="cursor-pointer list-none px-1 text-[11px] tracking-[0.1em] text-[#8a8a8a] hover:text-[#a0a0a0]"
+            className="inline-flex min-h-[28px] cursor-pointer list-none items-center rounded px-1 text-[11px] tracking-[0.1em] text-[#8a8a8a] transition-colors hover:text-[#a0a0a0] active:text-[#c0c0c0] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
           >
             · · ·
           </summary>
           <div className="absolute right-0 z-20 mt-2 w-[264px] rounded-lg border border-white/[0.14] bg-[#0e0e0e] p-3 shadow-xl">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="calicode-label">Sessions</span>
+              <button
+                type="button"
+                className="inline-flex min-h-[28px] items-center rounded px-1 text-[10px] tracking-[0.08em] text-[#8a8a8a] transition-colors hover:text-[#c0c0c0] active:text-[#e0e0e0] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
+                onClick={() => {
+                  setSessionId(null);
+                  setMessages([{ role: "tool", content: "Started a new session.", tool: "session" }]);
+                }}
+              >
+                + NEW
+              </button>
+            </div>
+            <div className="mb-3 max-h-40 space-y-1 overflow-y-auto">
+              {sessions.length === 0 ? (
+                <p className="text-[11px] text-[#7a7a7a]">No saved sessions yet.</p>
+              ) : (
+                sessions.slice(0, 20).map((session) => (
+                  <div
+                    key={session.id}
+                    className={`group flex min-h-[28px] items-center gap-2 rounded-md px-2 py-1 transition-colors ${
+                      session.id === sessionId
+                        ? "bg-white/[0.08] ring-1 ring-inset ring-white/10"
+                        : "hover:bg-white/[0.04]"
+                    }`}
+                  >
+                    <button
+                      type="button"
+                      className="min-w-0 flex-1 rounded-sm text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30"
+                      onClick={() => void resumeSession(session.id)}
+                    >
+                      <div className="truncate text-[11.5px] text-[#cfcfcf]">{session.title}</div>
+                      <div className="text-[9.5px] text-[#7a7a7a]">
+                        {session.messageCount} msgs · {relativeTime(session.updatedAt)}
+                        {session.id === sessionId ? " · current" : ""}
+                      </div>
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Delete session"
+                      className="inline-flex min-h-[28px] shrink-0 items-center rounded px-1 text-[13px] leading-none text-[#6a6a6a] opacity-0 transition duration-150 hover:text-[#c06060] active:text-[#e08080] group-hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#c06060]/50"
+                      onClick={() => void removeSession(session.id)}
+                    >
+                      ×
+                    </button>
+                  </div>
+                ))
+              )}
+            </div>
+
             <div className="calicode-label mb-2">Model</div>
             <div className="mb-3 flex items-center gap-1.5">
               <Select value={providerTarget} onValueChange={setProviderTarget}>
@@ -254,7 +561,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
                 variant="secondary"
                 className="h-7 w-7 shrink-0 px-0"
                 aria-label="Switch model"
-                onClick={() => void handleModelCommand(`/model ${providerTarget}:${modelInput}`)}
+                onClick={() => void switchModel(`${providerTarget}:${modelInput}`)}
               >
                 <ArrowRightLeft className="h-3.5 w-3.5" />
               </Button>
@@ -373,18 +680,62 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
               type="button"
               disabled={busy}
               onClick={() => setInput(prompt)}
-              className="rounded-[14px] border border-white/10 px-2.5 py-[5px] text-[11px] text-[#9a9a9a] hover:border-white/[0.28] hover:text-[#d0d0d0] disabled:opacity-40"
+              className="inline-flex min-h-[28px] items-center rounded-[14px] border border-white/10 px-2.5 py-[5px] text-[11px] text-[#9a9a9a] transition-colors enabled:hover:border-white/[0.28] enabled:hover:text-[#d0d0d0] active:border-white/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {label}
             </button>
           ))}
         </div>
 
-        <div className="rounded-[10px] border border-white/[0.11] bg-[#0d0d0d] px-3.5 pb-2.5 pt-3">
+        {menuActive && (
+          <div className="mb-2 overflow-hidden rounded-[10px] border border-white/[0.12] bg-[#0e0e0e]">
+            {commandMenu.map((command, index) => (
+              <button
+                key={command.name}
+                type="button"
+                onMouseDown={(event) => {
+                  event.preventDefault();
+                  completeCommand(command.name);
+                }}
+                className={`flex min-h-[28px] w-full items-baseline gap-2 px-3 py-1.5 text-left text-xs transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30 active:bg-white/[0.09] ${
+                  index === activeMenuIndex ? "bg-white/[0.07]" : "hover:bg-white/[0.04]"
+                }`}
+              >
+                <span className="font-mono text-[#d0d0d0]">/{command.name}</span>
+                {command.usage && <span className="font-mono text-[10px] text-[#7a7a7a]">{command.usage}</span>}
+                <span className="ml-auto truncate text-[#8a8a8a]">{command.summary}</span>
+              </button>
+            ))}
+          </div>
+        )}
+
+        <div className="rounded-[10px] border border-white/[0.11] bg-[#0d0d0d] px-3.5 pb-2.5 pt-3 transition-colors focus-within:border-white/[0.2]">
           <Textarea
             value={input}
             onChange={(event) => setInput(event.target.value)}
             onKeyDown={(event) => {
+              if (menuActive) {
+                if (event.key === "ArrowDown") {
+                  event.preventDefault();
+                  setMenuIndex((current) => (current + 1) % commandMenu.length);
+                  return;
+                }
+                if (event.key === "ArrowUp") {
+                  event.preventDefault();
+                  setMenuIndex((current) => (current - 1 + commandMenu.length) % commandMenu.length);
+                  return;
+                }
+                if (event.key === "Tab") {
+                  event.preventDefault();
+                  completeCommand(commandMenu[activeMenuIndex].name);
+                  return;
+                }
+                if (event.key === "Enter" && !event.shiftKey && !parseSlash(input)?.command) {
+                  event.preventDefault();
+                  completeCommand(commandMenu[activeMenuIndex].name);
+                  return;
+                }
+              }
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
                 void send();
@@ -392,7 +743,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
             }}
             rows={2}
             aria-label="Agent prompt"
-            placeholder="What do you want to build?"
+            placeholder="What do you want to build?  ·  type / for commands"
             className="min-h-0 resize-none border-0 bg-transparent p-0 text-[13px] text-[#d0d0d0] focus-visible:ring-0"
           />
           <div className="mt-2.5 flex items-center gap-3">
@@ -401,7 +752,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
             </span>
             <Select value={permissionMode} onValueChange={setPermissionMode}>
               <SelectTrigger
-                className="h-6 w-[116px] border-0 bg-transparent px-0 text-[10.5px] tracking-[0.1em] text-[#828282]"
+                className="h-7 w-[116px] border-0 bg-transparent px-0 text-[10.5px] tracking-[0.1em] text-[#828282]"
                 aria-label="Permission mode"
               >
                 <SelectValue />
@@ -413,14 +764,25 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
                 <SelectItem value="supervised">Supervised</SelectItem>
               </SelectContent>
             </Select>
-            <button
-              type="button"
-              onClick={() => void send()}
-              disabled={busy || !input.trim()}
-              className="ml-auto flex shrink-0 items-center gap-1.5 rounded-[5px] border border-white/[0.12] bg-[#2a2a2a] px-4 py-[7px] text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc] hover:bg-[#333] disabled:opacity-40"
-            >
-              <Send className="h-3 w-3" /> SEND
-            </button>
+            {looping ? (
+              <button
+                type="button"
+                onClick={stopLoop}
+                disabled={cancelLoopRef.current}
+                className="ml-auto flex shrink-0 items-center gap-1.5 rounded-[5px] border border-[#7a2a2a] bg-[#3a1f1f] px-4 py-[7px] text-[11px] font-bold tracking-[0.16em] text-[#f0c0c0] transition-colors enabled:hover:bg-[#492525] active:bg-[#2f1818] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#c06060]/50 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Square className="h-3 w-3" /> STOP
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void send()}
+                disabled={busy || !input.trim()}
+                className="ml-auto flex shrink-0 items-center gap-1.5 rounded-[5px] border border-white/[0.12] bg-[#2a2a2a] px-4 py-[7px] text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc] transition-colors enabled:hover:bg-[#333] active:bg-[#242424] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <Send className="h-3 w-3" /> SEND
+              </button>
+            )}
           </div>
         </div>
       </div>

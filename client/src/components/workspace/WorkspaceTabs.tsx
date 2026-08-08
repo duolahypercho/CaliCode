@@ -60,8 +60,10 @@ export function WorkspaceTabs({
                 document.getElementById(`workspace-tab-${next}`)?.focus();
               }}
               onClick={() => onChange(tab)}
-              className={`shrink-0 border-r border-white/[0.08] px-[15px] py-2 text-[11px] font-bold uppercase tracking-[0.14em] last:border-r-0 ${
-                selected ? "bg-[#1c1c1c] text-[#e0e0e0]" : "text-[#9c9c9c] hover:text-[#b0b0b0]"
+              className={`shrink-0 border-r border-white/[0.08] px-[15px] py-2 text-[11px] font-bold uppercase tracking-[0.14em] transition-colors last:border-r-0 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30 ${
+                selected
+                  ? "bg-[#1c1c1c] text-[#e0e0e0] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)] active:bg-[#232323]"
+                  : "text-[#9c9c9c] hover:bg-white/[0.03] hover:text-[#b0b0b0] active:bg-white/[0.06]"
               }`}
             >
               {tab}
@@ -82,7 +84,7 @@ export function WorkspaceTabs({
       <button
         type="button"
         onClick={onNewGame}
-        className="shrink-0 rounded-md border border-white/[0.12] px-3 py-[7px] text-[11px] tracking-[0.12em] text-[#c0c0c0] hover:border-white/30"
+        className="shrink-0 rounded-md border border-white/[0.12] px-3 py-[7px] text-[11px] tracking-[0.12em] text-[#c0c0c0] transition-colors hover:border-white/30 active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
       >
         NEW GAME
       </button>
@@ -90,7 +92,7 @@ export function WorkspaceTabs({
         type="button"
         onClick={onExport}
         disabled={exporting}
-        className="shrink-0 rounded-md border border-white/[0.12] bg-[#2a2a2a] px-[15px] py-[7px] text-[11px] font-bold tracking-[0.12em] text-[#dcdcdc] hover:bg-[#333] disabled:opacity-50"
+        className="shrink-0 rounded-md border border-white/[0.12] bg-[#2a2a2a] px-[15px] py-[7px] text-[11px] font-bold tracking-[0.12em] text-[#dcdcdc] transition-colors hover:bg-[#333] active:bg-[#3a3a3a] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-[#2a2a2a]"
       >
         {exporting ? "SAVING…" : "SAVE"}
       </button>

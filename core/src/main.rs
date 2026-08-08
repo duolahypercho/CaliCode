@@ -6,6 +6,7 @@ mod devserver;
 mod image3d;
 mod model;
 mod rpc;
+mod sessions;
 mod store;
 mod tools;
 mod workspace;
@@ -33,6 +34,7 @@ use tower_http::services::{ServeDir, ServeFile};
 pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub projects_root: PathBuf,
+    pub sessions_root: PathBuf,
     pub agents: AgentManager,
     pub bus: broadcast::Sender<Value>,
     pub tools: Arc<RwLock<HashMap<String, tools::ToolDef>>>,
@@ -53,6 +55,13 @@ async fn main() -> anyhow::Result<()> {
         store::create_project(&projects_root, "starter", "Starter")?;
     }
 
+    // Sessions live alongside projects under `~/.cali/sessions`.
+    let sessions_root = projects_root
+        .parent()
+        .map(|parent| parent.join("sessions"))
+        .unwrap_or_else(|| projects_root.join("sessions"));
+    std::fs::create_dir_all(&sessions_root).ok();
+
     // Re-attach folders opened in a previous session before the router is up,
     // so the first workspace_list already reflects them.
     let mut workspaces = workspace::Registry::new();
@@ -65,6 +74,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
         projects_root,
+        sessions_root,
         agents: AgentManager::new(bus.clone()),
         bus,
         tools: Arc::new(RwLock::new(HashMap::new())),

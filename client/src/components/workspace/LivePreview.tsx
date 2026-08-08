@@ -85,7 +85,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
               <button
                 type="button"
                 onClick={() => setNonce((n) => n + 1)}
-                className="rounded border border-white/[0.12] px-2.5 py-1 text-[10px] tracking-[0.12em] text-[#d4d4d4] hover:border-white/30"
+                className="inline-flex min-h-[28px] items-center rounded border border-white/[0.12] px-2.5 py-1 text-[10px] tracking-[0.12em] text-[#d4d4d4] transition-colors hover:border-white/30 active:border-white/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
               >
                 RELOAD
               </button>
@@ -93,7 +93,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
                 href={status.url}
                 target="_blank"
                 rel="noreferrer"
-                className="rounded border border-white/[0.12] px-2.5 py-1 text-[10px] tracking-[0.12em] text-[#d4d4d4] hover:border-white/30"
+                className="inline-flex min-h-[28px] items-center rounded border border-white/[0.12] px-2.5 py-1 text-[10px] tracking-[0.12em] text-[#d4d4d4] transition-colors hover:border-white/30 active:border-white/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
               >
                 POP OUT
               </a>
@@ -103,7 +103,9 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
             type="button"
             onClick={() => void (running ? stop() : start())}
             disabled={busy}
-            className="rounded border border-white/[0.12] bg-[#2a2a2a] px-3 py-1 text-[10px] font-bold tracking-[0.12em] text-[#dcdcdc] hover:bg-[#333] disabled:opacity-40"
+            className={`inline-flex min-h-[28px] items-center rounded border border-white/[0.12] bg-[#2a2a2a] px-3 py-1 text-[10px] font-bold tracking-[0.12em] text-[#dcdcdc] transition-colors enabled:hover:bg-[#333] active:bg-[#3a3a3a] focus-visible:outline-none focus-visible:ring-1 disabled:cursor-not-allowed disabled:opacity-40 ${
+              running ? "focus-visible:ring-[#c06060]/50" : "focus-visible:ring-white/30"
+            }`}
           >
             {running ? "STOP" : "START"}
           </button>

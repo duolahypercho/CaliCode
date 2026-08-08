@@ -101,7 +101,7 @@ export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorPr
         <button
           type="button"
           onClick={reload}
-          className="ml-auto shrink-0 rounded border border-white/10 px-2.5 py-1 text-[10px] tracking-[0.1em] text-[#8f8f8f] hover:border-white/25"
+          className="ml-auto inline-flex min-h-[28px] shrink-0 items-center rounded border border-white/10 px-2.5 py-1 text-[10px] tracking-[0.1em] text-[#8f8f8f] transition-colors hover:border-white/25 hover:text-[#b0b0b0] active:bg-white/[0.03] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
         >
           RELOAD
         </button>
@@ -109,7 +109,7 @@ export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorPr
           type="button"
           onClick={() => void save()}
           disabled={busy || !dirty || file?.truncated}
-          className="shrink-0 rounded border border-white/[0.12] bg-[#2a2a2a] px-3 py-1 text-[10px] font-bold tracking-[0.1em] text-[#dcdcdc] hover:bg-[#333] disabled:opacity-40"
+          className="inline-flex min-h-[28px] shrink-0 items-center rounded border border-white/[0.12] bg-[#2a2a2a] px-3 py-1 text-[10px] font-bold tracking-[0.1em] text-[#dcdcdc] transition-colors enabled:hover:bg-[#333] active:bg-[#242424] disabled:cursor-not-allowed disabled:opacity-40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
         >
           {busy ? "SAVING…" : "SAVE"}
         </button>
@@ -130,7 +130,7 @@ export function FileEditor({ workspaceId, path, onSaved, onError }: FileEditorPr
         }}
         spellCheck={false}
         aria-label={`${path} source`}
-        className="min-h-0 flex-1 resize-none bg-transparent px-4 py-3 font-mono text-[12.5px] leading-[1.7] text-[#c8c8c8] outline-none"
+        className="min-h-0 flex-1 resize-none bg-transparent px-4 py-3 font-mono text-[12.5px] leading-[1.7] text-[#c8c8c8] outline-none transition-colors focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30"
       />
     </div>
   );

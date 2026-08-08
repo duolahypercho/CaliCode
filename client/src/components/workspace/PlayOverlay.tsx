@@ -48,14 +48,14 @@ export function PlayOverlay({
         <button
           type="button"
           onClick={onTogglePlay}
-          className="h-8 min-w-[44px] rounded-md border border-white/[0.12] bg-black/50 px-3 text-[10px] tracking-[0.12em] text-[#d4d4d4] backdrop-blur hover:border-white/30"
+          className="h-8 min-w-[44px] rounded-md border border-white/[0.12] bg-black/50 px-3 text-[10px] tracking-[0.12em] text-[#d4d4d4] backdrop-blur transition-colors hover:border-white/30 active:border-white/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
         >
           {running ? "PAUSE" : "PLAY"}
         </button>
         <button
           type="button"
           onClick={onReset}
-          className="h-8 min-w-[44px] rounded-md border border-white/[0.12] bg-black/50 px-3 text-[10px] tracking-[0.12em] text-[#d4d4d4] backdrop-blur hover:border-white/30"
+          className="h-8 min-w-[44px] rounded-md border border-white/[0.12] bg-black/50 px-3 text-[10px] tracking-[0.12em] text-[#d4d4d4] backdrop-blur transition-colors hover:border-white/30 active:border-white/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40"
         >
           RESET
         </button>
@@ -71,8 +71,10 @@ export function PlayOverlay({
               type="button"
               onClick={() => onTogglePin(pin.id)}
               aria-pressed={active}
-              className={`rounded border border-white/[0.14] px-2.5 py-[5px] text-[10px] font-bold tracking-[0.1em] backdrop-blur ${
-                active ? "bg-[#c6c6c6] text-[#0a0a0a]" : "bg-black/50 text-[#c6c6c6] hover:border-white/30"
+              className={`inline-flex min-h-[28px] items-center rounded border border-white/[0.14] px-2.5 py-[5px] text-[10px] font-bold tracking-[0.1em] backdrop-blur transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40 ${
+                active
+                  ? "bg-[#c6c6c6] text-[#0a0a0a] active:bg-[#b4b4b4]"
+                  : "bg-black/50 text-[#c6c6c6] hover:border-white/30 active:border-white/50"
               }`}
             >
               {pin.label}

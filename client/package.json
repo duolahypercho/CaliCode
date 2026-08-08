@@ -7,6 +7,9 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
+    "tauri": "tauri",
+    "desktop:dev": "bash ../scripts/desktop.sh dev",
+    "desktop:build": "bash ../scripts/desktop.sh build",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "pretest:e2e": "node -e \"const fs=require('node:fs');fs.rmSync('.e2e-projects',{recursive:true,force:true});fs.rmSync('.e2e-config.yaml',{force:true})\""
@@ -18,6 +21,7 @@
     "@radix-ui/react-select": "^2.1.2",
     "@radix-ui/react-tabs": "^1.1.1",
     "@radix-ui/react-tooltip": "^1.1.4",
+    "@tauri-apps/api": "^2.11.1",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.468.0",
@@ -31,6 +35,7 @@
   "devDependencies": {
     "@playwright/test": "^1.49.0",
     "@tailwindcss/vite": "^4.0.0",
+    "@tauri-apps/cli": "^2.11.4",
     "@testing-library/react": "^16.0.1",
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",

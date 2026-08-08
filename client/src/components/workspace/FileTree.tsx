@@ -84,8 +84,10 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
             aria-expanded={node.kind === "dir" ? open : undefined}
             style={{ paddingLeft: `${depth * 12 + 8}px` }}
             aria-busy={pending.has(node.path) || undefined}
-            className={`flex w-full items-center gap-1.5 rounded py-[5px] pr-2 text-left text-[12px] ${
-              active ? "bg-[#171717] text-[#dcdcdc]" : "text-[#8f8f8f] hover:text-[#c6c6c6]"
+            className={`flex min-h-[28px] w-full items-center gap-1.5 rounded py-[5px] pr-2 text-left text-[12px] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 focus-visible:ring-inset ${
+              active
+                ? "bg-white/[0.08] text-[#dcdcdc] active:bg-white/[0.1]"
+                : "text-[#8f8f8f] hover:bg-white/[0.03] hover:text-[#c6c6c6] active:bg-white/[0.05]"
             }`}
           >
             <span aria-hidden className="w-2.5 shrink-0 text-[9px] text-[#8f8f8f]">
