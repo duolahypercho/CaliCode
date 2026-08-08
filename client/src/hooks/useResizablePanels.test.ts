@@ -1,8 +1,27 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { clampWidth, readStoredWidth, writeStoredWidth } from "./useResizablePanels";
 
 const BOUNDS = { defaultWidth: 384, minWidth: 280, maxWidth: 640 };
 const KEY = "test-panel-width";
+
+// jsdom's global localStorage binding is unreliable across Node versions.
+// A deterministic stub avoids depending on which version of Node / jsdom
+// happens to be installed and keeps the tests fast.
+let store: Map<string, string>;
+
+beforeAll(() => {
+  store = new Map();
+  vi.stubGlobal("localStorage", {
+    getItem: (key: string) => store.get(key) ?? null,
+    setItem: (key: string, value: string) => void store.set(key, value),
+    removeItem: (key: string) => void store.delete(key),
+    clear: () => void store.clear(),
+  });
+});
+
+afterAll(() => {
+  vi.unstubAllGlobals();
+});
 
 describe("clampWidth", () => {
   it("returns a width that is already inside the range", () => {
@@ -33,7 +52,7 @@ describe("clampWidth", () => {
 
 describe("readStoredWidth", () => {
   beforeEach(() => {
-    localStorage.clear();
+    store.clear();
   });
 
   it("returns the default when nothing is stored", () => {
@@ -41,19 +60,19 @@ describe("readStoredWidth", () => {
   });
 
   it("restores a previously stored width", () => {
-    localStorage.setItem(KEY, "512");
+    store.set(KEY, "512");
 
     expect(readStoredWidth(KEY, BOUNDS)).toBe(512);
   });
 
   it("clamps a stored width that no longer fits the bounds", () => {
-    localStorage.setItem(KEY, "5000");
+    store.set(KEY, "5000");
 
     expect(readStoredWidth(KEY, BOUNDS)).toBe(640);
   });
 
   it("falls back to the default for a non-numeric stored value", () => {
-    localStorage.setItem(KEY, "wide-please");
+    store.set(KEY, "wide-please");
 
     expect(readStoredWidth(KEY, BOUNDS)).toBe(384);
   });
