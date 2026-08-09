@@ -26,10 +26,19 @@ use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, watch, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 use tower_http::set_header::SetResponseHeaderLayer;
+
+/// How long shutdown may take before the process exits regardless.
+///
+/// This is a backstop, not the normal path: `/events` streams end as soon as
+/// [`AppState::shutdown`] flips, so graceful shutdown usually finishes in
+/// milliseconds. It only engages when some other response refuses to drain —
+/// an in-flight agent turn, say — and it exists because a core that ignores
+/// SIGTERM leaks a process on every restart.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Clone)]
 pub struct AppState {
@@ -41,6 +50,11 @@ pub struct AppState {
     pub tools: Arc<RwLock<HashMap<String, tools::ToolDef>>>,
     pub workspaces: Arc<RwLock<workspace::Registry>>,
     pub dev_servers: Arc<RwLock<devserver::Servers>>,
+    /// Flips to true once shutdown starts. Long-lived responses subscribe and
+    /// end themselves; without that, axum's graceful shutdown waits on an SSE
+    /// stream that never completes. Held as the sender so any state — including
+    /// one built in a test — can hand out fresh receivers.
+    pub shutdown: Arc<watch::Sender<bool>>,
 }
 
 #[tokio::main]
@@ -74,6 +88,7 @@ async fn main() -> anyhow::Result<()> {
     let remembered = config.workspaces.clone();
 
     let (bus, _) = broadcast::channel(256);
+    let shutdown = Arc::new(watch::channel(false).0);
     let state = AppState {
         config: Arc::new(RwLock::new(config)),
         projects_root,
@@ -83,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
         tools: Arc::new(RwLock::new(HashMap::new())),
         workspaces: Arc::new(RwLock::new(workspace::Registry::new())),
         dev_servers: Arc::new(RwLock::new(devserver::Servers::new())),
+        shutdown: shutdown.clone(),
     };
 
     // Populate the registry in the background. `workspace_list` simply returns
@@ -190,6 +206,17 @@ async fn main() -> anyhow::Result<()> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
+
+            // axum's graceful shutdown waits for every in-flight response, and
+            // /events is a long-lived SSE stream that never completes on its
+            // own — so a core with a browser attached released the port but
+            // lingered forever, ignoring repeated SIGTERM and needing SIGKILL.
+            // Telling the streams to end is what actually lets shutdown
+            // finish; the timer below is only a backstop. `send_replace` rather
+            // than `send` so the flag is stored even with no client attached,
+            // and a request that arrives mid-shutdown still sees it.
+            shutdown.send_replace(true);
+
             tracing::info!("shutting down; stopping dev servers");
             let ids: Vec<String> = dev_servers.read().await.keys().cloned().collect();
             {
@@ -199,14 +226,12 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            // axum's graceful shutdown waits for every in-flight response, and
-            // /events is a long-lived SSE stream that never completes on its
-            // own — so the process released the port but lingered forever,
-            // ignoring repeated SIGTERM and needing SIGKILL. Give connections
-            // a moment to drain, then exit for real.
             tokio::spawn(async {
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                tracing::info!("shutdown grace elapsed; exiting");
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+                tracing::warn!(
+                    seconds = SHUTDOWN_GRACE.as_secs(),
+                    "shutdown grace elapsed with responses still open; exiting"
+                );
                 std::process::exit(0);
             });
         })
@@ -290,15 +315,26 @@ async fn events(
     State(state): State<AppState>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.bus.subscribe();
-    let stream = futures::stream::unfold(rx, |mut rx| async move {
+    let shutdown = state.shutdown.subscribe();
+    // The stream ends when shutdown starts. It is checked before every wait
+    // rather than only selected on, so a client that connects *after* the flag
+    // flips gets an ended stream instead of pinning the process open.
+    let stream = futures::stream::unfold((rx, shutdown), |(mut rx, mut shutdown)| async move {
         loop {
-            match rx.recv().await {
+            if *shutdown.borrow_and_update() {
+                return None;
+            }
+            let received = tokio::select! {
+                _ = shutdown.changed() => return None,
+                received = rx.recv() => received,
+            };
+            match received {
                 Ok(value) => {
                     let event = Event::default()
                         .event("message")
                         .json_data(value)
                         .unwrap_or_else(|_| Event::default().data("{}"));
-                    return Some((Ok(event), rx));
+                    return Some((Ok(event), (rx, shutdown)));
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(_) => return None,
