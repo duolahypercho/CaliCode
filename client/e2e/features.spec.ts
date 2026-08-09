@@ -128,10 +128,17 @@ test("games sidebar nests agent sessions under each game", async ({ page }) => {
 
 test("agent panel exposes model and subagent controls", async ({ page }) => {
   await page.goto("/");
-  // The active model is shown inline on the composer; the switcher and
-  // subagent controls live behind the session menu.
+  // Permission and active-model switching live directly in the composer;
+  // detailed provider and subagent controls remain in session settings.
   await expect(page.getByLabel("Agent prompt")).toBeVisible();
   await expect(page.getByLabel("Permission mode")).toBeVisible();
+  await expect(page.getByLabel("Active model")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Send message" })).toBeVisible();
+
+  const composerRadius = await page.locator("[data-agent-composer]").evaluate((element) =>
+    Number.parseFloat(getComputedStyle(element).borderRadius),
+  );
+  expect(composerRadius).toBeGreaterThanOrEqual(20);
 
   await page.getByLabel("Session settings").click();
   await expect(page.getByLabel("Model provider")).toBeVisible();

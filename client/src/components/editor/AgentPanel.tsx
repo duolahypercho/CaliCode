@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { ArrowRightLeft, Repeat, Send, ShieldCheck, ShieldOff, Square, Workflow } from "lucide-react";
+import { ArrowRightLeft, ArrowUp, Repeat, ShieldCheck, ShieldOff, Square, Workflow, Zap } from "lucide-react";
 import { AgentText } from "./AgentText";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -64,6 +64,20 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
     ...(modelList?.active.provider === providerTarget && modelList.active.model ? [modelList.active.model] : []),
     ...(targetProvider?.models ?? []),
   ].filter((model, index, models) => model && models.indexOf(model) === index);
+
+  // Keep the active model in the compact composer, where it is visible and
+  // switchable without opening the larger session-settings popover.
+  const modelChoices = (modelList?.providers ?? []).flatMap((provider) => {
+    const models = [
+      ...(modelList?.active.provider === provider.id && modelList.active.model ? [modelList.active.model] : []),
+      ...(provider.models ?? []),
+    ].filter((model, index, choices) => model && choices.indexOf(model) === index);
+    return models.map((model) => ({
+      value: `${provider.id}:${model}`,
+      label: `${provider.label} · ${model}`,
+    }));
+  });
+  const activeModelValue = modelList ? `${modelList.active.provider}:${modelList.active.model}` : "";
 
   const selectProvider = (provider: string) => {
     setProviderTarget(provider);
@@ -686,7 +700,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
         )}
       </div>
 
-      <div className="shrink-0 border-t border-white/5 px-3.5 pb-3.5 pt-2.5">
+      <div className="shrink-0 border-t border-white/[0.045] bg-[#0a0a0a] px-3.5 pb-3.5 pt-2.5">
         <div className="mb-2.5 flex flex-wrap gap-[7px]">
           {suggestions.map(([label, prompt]) => (
             <button
@@ -694,7 +708,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
               type="button"
               disabled={busy}
               onClick={() => setInput(prompt)}
-              className="inline-flex min-h-[28px] items-center rounded-[14px] border border-white/10 px-2.5 py-[5px] text-[11px] text-[#9a9a9a] transition-colors enabled:hover:border-white/[0.28] enabled:hover:text-[#d0d0d0] active:border-white/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-40"
+              className="inline-flex min-h-[28px] items-center rounded-full border border-white/[0.09] bg-white/[0.015] px-2.5 py-[5px] text-[11px] text-[#9d9d9d] transition-[color,background-color,border-color,transform] duration-200 enabled:hover:border-white/[0.2] enabled:hover:bg-white/[0.035] enabled:hover:text-[#d4d4d4] enabled:active:scale-[0.98] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-40"
             >
               {label}
             </button>
@@ -723,7 +737,10 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
           </div>
         )}
 
-        <div className="rounded-[10px] border border-white/[0.11] bg-[#0d0d0d] px-3.5 pb-2.5 pt-3 transition-colors focus-within:border-white/[0.2]">
+        <div
+          data-agent-composer
+          className="rounded-[20px] border border-white/[0.1] bg-[#242423] p-1.5 shadow-[0_14px_34px_rgba(0,0,0,0.28),inset_0_1px_0_rgba(255,255,255,0.055)] transition-[border-color,box-shadow] duration-200 focus-within:border-white/[0.23] focus-within:shadow-[0_16px_38px_rgba(0,0,0,0.34),inset_0_1px_0_rgba(255,255,255,0.075)]"
+        >
           <Textarea
             value={input}
             onChange={(event) => setInput(event.target.value)}
@@ -755,20 +772,20 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
                 void send();
               }
             }}
-            rows={2}
+            rows={3}
             aria-label="Agent prompt"
-            placeholder="What do you want to build?  ·  type / for commands"
-            className="min-h-0 resize-none border-0 bg-transparent p-0 text-[13px] text-[#d0d0d0] focus-visible:ring-0"
+            placeholder="What do you want to build?  Type / for commands"
+            className="min-h-[76px] resize-none border-0 bg-transparent px-3 py-2.5 text-[13px] leading-[1.55] text-[#e0e0de] shadow-none placeholder:text-[#8d8d89] hover:border-0 focus-visible:!outline-none focus-visible:ring-0"
           />
-          <div className="mt-2.5 flex items-center gap-3">
-            <span className="truncate text-[10.5px] tracking-[0.1em] text-[#828282]">
-              {(modelList?.active.model ?? "no model").toUpperCase()}
-            </span>
+          <div className="flex min-h-10 items-center gap-1.5 px-1.5 pb-0.5">
             <Select value={permissionMode} onValueChange={setPermissionMode}>
               <SelectTrigger
-                className="h-7 w-[116px] border-0 bg-transparent px-0 text-[10.5px] tracking-[0.1em] text-[#828282]"
+                className={`h-8 w-[124px] shrink-0 justify-start gap-1.5 rounded-full border-0 bg-transparent px-2 text-[11px] tracking-normal shadow-none transition-colors hover:bg-white/[0.055] focus-visible:ring-1 ${
+                  permissionMode === "full-access" ? "text-[#e58a52]" : "text-[#aaa9a5]"
+                }`}
                 aria-label="Permission mode"
               >
+                <ShieldCheck aria-hidden className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -778,23 +795,50 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
                 <SelectItem value="supervised">Supervised</SelectItem>
               </SelectContent>
             </Select>
+
+            <Select
+              value={activeModelValue}
+              onValueChange={(value) => void switchModel(value)}
+              disabled={!modelList || modelChoices.length === 0 || busy || looping}
+            >
+              <SelectTrigger
+                className="ml-auto h-8 min-w-0 flex-1 justify-end gap-1.5 rounded-full border-0 bg-transparent px-2 text-[10.5px] tracking-normal text-[#b8b7b3] shadow-none transition-colors hover:bg-white/[0.055] focus-visible:ring-1"
+                aria-label="Active model"
+                title={modelList ? `${modelList.active.provider} · ${modelList.active.model}` : "No model"}
+              >
+                <Zap aria-hidden className="h-3.5 w-3.5 shrink-0 text-[#d8d6d1]" strokeWidth={1.8} />
+                <span className="min-w-0 truncate">
+                  <SelectValue placeholder="No model" />
+                </span>
+              </SelectTrigger>
+              <SelectContent className="max-w-[340px]">
+                {modelChoices.map((choice) => (
+                  <SelectItem key={choice.value} value={choice.value} className="font-mono text-xs">
+                    {choice.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
             {looping ? (
               <button
                 type="button"
+                aria-label="Stop agent loop"
                 onClick={stopLoop}
                 disabled={cancelLoopRef.current}
-                className="ml-auto flex shrink-0 items-center gap-1.5 rounded-[5px] border border-[#7a2a2a] bg-[#3a1f1f] px-4 py-[7px] text-[11px] font-bold tracking-[0.16em] text-[#f0c0c0] transition-colors enabled:hover:bg-[#492525] active:bg-[#2f1818] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#c06060]/50 disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#7a2a2a] bg-[#3a1f1f] text-[#f0c0c0] transition-[background-color,transform] enabled:hover:bg-[#492525] enabled:active:scale-[0.96] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#c06060]/50 disabled:cursor-not-allowed disabled:opacity-40"
               >
-                <Square className="h-3 w-3" /> STOP
+                <Square aria-hidden className="h-3.5 w-3.5" />
               </button>
             ) : (
               <button
                 type="button"
+                aria-label="Send message"
                 onClick={() => void send()}
                 disabled={busy || !input.trim()}
-                className="ml-auto flex shrink-0 items-center gap-1.5 rounded-[5px] border border-white/[0.12] bg-[#2a2a2a] px-4 py-[7px] text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc] transition-colors enabled:hover:bg-[#333] active:bg-[#242424] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-white/[0.16] bg-[#efefed] text-[#252524] shadow-[inset_0_1px_0_rgba(255,255,255,0.7)] transition-[background-color,transform,opacity] enabled:hover:bg-white enabled:active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 focus-visible:ring-offset-2 focus-visible:ring-offset-[#242423] disabled:cursor-not-allowed disabled:bg-[#3a3a38] disabled:text-[#777773] disabled:opacity-70"
               >
-                <Send className="h-3 w-3" /> SEND
+                <ArrowUp aria-hidden className="h-4 w-4" strokeWidth={2.2} />
               </button>
             )}
           </div>
