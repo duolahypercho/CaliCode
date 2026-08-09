@@ -497,6 +497,7 @@ mod tests {
             dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::devserver::Servers::new(),
             )),
+            shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
         };
 
@@ -586,6 +587,7 @@ mod tests {
             dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::devserver::Servers::new(),
             )),
+            shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
         };
 
