@@ -59,6 +59,19 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
   const toolsRef = useRef(browserTools);
   toolsRef.current = browserTools;
 
+  const targetProvider = modelList?.providers.find((provider) => provider.id === providerTarget);
+  const availableModels = [
+    ...(modelList?.active.provider === providerTarget && modelList.active.model ? [modelList.active.model] : []),
+    ...(targetProvider?.models ?? []),
+  ].filter((model, index, models) => model && models.indexOf(model) === index);
+
+  const selectProvider = (provider: string) => {
+    setProviderTarget(provider);
+    const preset = modelList?.providers.find((candidate) => candidate.id === provider);
+    const activeModel = modelList?.active.provider === provider ? modelList.active.model : "";
+    setModelInput(activeModel || preset?.models?.[0] || "");
+  };
+
   useEffect(() => {
     setProviderTarget(modelList?.active.provider ?? "openai");
     setModelInput(modelList?.active.model ?? "");
@@ -196,9 +209,9 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
   };
 
   const switchModel = async (raw: string) => {
-    const [provider, model] = raw.includes(":")
-      ? (raw.split(":") as [string, string])
-      : [modelList?.active.provider ?? "openai", raw];
+    const separator = raw.indexOf(":");
+    const provider = separator >= 0 ? raw.slice(0, separator) : (modelList?.active.provider ?? "openai");
+    const model = separator >= 0 ? raw.slice(separator + 1) : raw;
     try {
       await rpc("model_switch", { provider, model });
       onModelChange();
@@ -532,7 +545,7 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
 
             <div className="calicode-label mb-2">Model</div>
             <div className="mb-3 flex items-center gap-1.5">
-              <Select value={providerTarget} onValueChange={setProviderTarget}>
+              <Select value={providerTarget} onValueChange={selectProvider}>
                 <SelectTrigger className="h-7 min-w-0 flex-1" aria-label="Model provider">
                   <SelectValue />
                 </SelectTrigger>
@@ -544,23 +557,24 @@ export function AgentPanel({ projectSlug, modelList, browserTools, onModelChange
                   ))}
                 </SelectContent>
               </Select>
-              <Input
-                className="h-7 min-w-0 flex-1"
-                value={modelInput}
-                onChange={(event) => setModelInput(event.target.value)}
-                list="calicode-models"
-                aria-label="Target model"
-              />
-              <datalist id="calicode-models">
-                {[...new Set(modelList?.providers.flatMap((provider) => provider.models ?? []) ?? [])].map((model) => (
-                  <option key={model} value={model} />
-                ))}
-              </datalist>
+              <Select value={modelInput} onValueChange={setModelInput} disabled={availableModels.length === 0}>
+                <SelectTrigger className="h-7 min-w-0 flex-1" aria-label="Target model" title={modelInput}>
+                  <SelectValue placeholder="No models" />
+                </SelectTrigger>
+                <SelectContent className="max-w-[320px]">
+                  {availableModels.map((model) => (
+                    <SelectItem key={model} value={model} className="font-mono text-xs">
+                      {model}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
               <Button
                 size="sm"
                 variant="secondary"
                 className="h-7 w-7 shrink-0 px-0"
                 aria-label="Switch model"
+                disabled={!modelInput}
                 onClick={() => void switchModel(`${providerTarget}:${modelInput}`)}
               >
                 <ArrowRightLeft className="h-3.5 w-3.5" />
