@@ -28,6 +28,7 @@ import { TestTab, toIssues } from "./components/workspace/TestTab";
 import { FileTree } from "./components/workspace/FileTree";
 import { FileEditor } from "./components/workspace/FileEditor";
 import { LivePreview } from "./components/workspace/LivePreview";
+import { NewProjectDialog } from "./components/workspace/NewProjectDialog";
 import { openWorkspace, setProjectWorkspace, type WorkspaceInfo } from "./lib/workspace";
 import {
   useResizablePanels,
@@ -36,6 +37,7 @@ import {
 } from "./hooks/useResizablePanels";
 import type { PieRuntime, PieState } from "./lib/pie";
 import type { Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
+import type { ProjectTemplate } from "./lib/projectTemplates";
 
 const snapshotScripts = (p: Project): Record<string, string> => Object.fromEntries(p.scripts.map((x) => [x.id, x.code]));
 
@@ -113,8 +115,8 @@ export default function App() {
   const [loadMs, setLoadMs] = useState<number | null>(null);
   const [exporting, setExporting] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
-  const [newProjectName, setNewProjectName] = useState("");
   const [newProjectBusy, setNewProjectBusy] = useState(false);
+  const [newProjectError, setNewProjectError] = useState("");
   const [sessions, setSessions] = useState<Record<string, GameSession[]>>(readSessions);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [pinnedProjectSlugs, setPinnedProjectSlugs] = useState<string[]>(readPinnedProjects);
@@ -296,17 +298,18 @@ export default function App() {
     [pushLog],
   );
 
-  const createProject = async () => {
-    const title = newProjectName.trim();
+  const createProject = async (projectName: string, templateId: ProjectTemplate["id"]) => {
+    const title = projectName.trim();
     if (!title || newProjectBusy) return;
     const slug = slugify(title);
     if (projects.some((item) => item.slug === slug)) {
-      pushLog(`project ${slug} already exists`, "error");
+      setNewProjectError("A project with this name already exists. Choose another name.");
       return;
     }
     setNewProjectBusy(true);
+    setNewProjectError("");
     try {
-      const created = await rpc<Project>("project_create", { slug, title });
+      const created = await rpc<Project>("project_create", { slug, title, template: templateId });
       setProjects((current) => [...current.filter((item) => item.slug !== slug), created]);
       setProject(created);
       setScriptBaseline(snapshotScripts(created));
@@ -314,10 +317,11 @@ export default function App() {
       setSelectedScriptId(created.scripts[0]?.id ?? null);
       setFrames([]);
       setTestResults([]);
-      setNewProjectName("");
       setNewProjectOpen(false);
       pushLog(`created ${title}`);
     } catch (error) {
+      const message = `Couldn't create the project. ${reason(error)}`;
+      setNewProjectError(message);
       pushLog(`create failed: ${reason(error)}`, "error");
     } finally {
       setNewProjectBusy(false);
@@ -856,39 +860,16 @@ export default function App() {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={newProjectOpen} onOpenChange={setNewProjectOpen}>
-        <DialogContent className="max-w-sm">
-          <DialogTitle>New game</DialogTitle>
-          <DialogDescription>Create a CaliCode project in core and open it in the editor.</DialogDescription>
-          <form
-            className="mt-3"
-            onSubmit={(event) => {
-              event.preventDefault();
-              void createProject();
-            }}
-          >
-            <Label htmlFor="new-project-name">Name</Label>
-            <Input
-              id="new-project-name"
-              className="mt-1"
-              value={newProjectName}
-              onChange={(event) => setNewProjectName(event.target.value)}
-              autoFocus
-              placeholder="My Game"
-            />
-            <div className="mt-3 flex justify-end gap-2">
-              <DialogClose asChild>
-                <Button type="button" variant="ghost" size="sm">
-                  Cancel
-                </Button>
-              </DialogClose>
-              <Button type="submit" size="sm" disabled={newProjectBusy || !newProjectName.trim()}>
-                {newProjectBusy ? "Creating..." : "Create & open"}
-              </Button>
-            </div>
-          </form>
-        </DialogContent>
-      </Dialog>
+      <NewProjectDialog
+        open={newProjectOpen}
+        busy={newProjectBusy}
+        error={newProjectError}
+        onOpenChange={(open) => {
+          setNewProjectOpen(open);
+          if (open) setNewProjectError("");
+        }}
+        onCreate={createProject}
+      />
 
       <Dialog
         open={pendingProjectAction !== null}

@@ -73,6 +73,99 @@ pub const SAMPLE_PROJECT: &str = r##"{
   "settings": { "pie": { "captureEvery": 3, "fixedStepHz": 60 } }
 }"##;
 
+pub const DEFAULT_PROJECT_TEMPLATE: &str = "starter";
+
+const BLANK_PROJECT: &str = r##"{
+  "schemaVersion": 1,
+  "slug": "blank",
+  "title": "Blank Scene",
+  "entities": [],
+  "scripts": [],
+  "assets": [],
+  "tests": [],
+  "settings": { "pie": { "captureEvery": 3, "fixedStepHz": 60 } }
+}"##;
+
+const SHOWCASE_PROJECT: &str = r##"{
+  "schemaVersion": 1,
+  "slug": "showcase",
+  "title": "Showcase Scene",
+  "entities": [
+    {
+      "id": "floor",
+      "name": "Gallery Floor",
+      "kind": "plane",
+      "transform": { "position": [0, 0, 0], "rotation": [-1.5707963, 0, 0], "scale": [8, 8, 1] },
+      "material": { "color": "#d8d4cc", "metalness": 0.05, "roughness": 0.92 },
+      "light": {},
+      "scriptIds": [],
+      "assetId": null
+    },
+    {
+      "id": "pedestal",
+      "name": "Pedestal",
+      "kind": "cylinder",
+      "transform": { "position": [0, 0.3, 0], "rotation": [0, 0, 0], "scale": [2.2, 0.6, 2.2] },
+      "material": { "color": "#3f3f46", "metalness": 0.35, "roughness": 0.5 },
+      "light": {},
+      "scriptIds": [],
+      "assetId": null
+    },
+    {
+      "id": "subject",
+      "name": "Showcase Subject",
+      "kind": "sphere",
+      "transform": { "position": [0, 1.45, 0], "rotation": [0, 0, 0], "scale": [1, 1, 1] },
+      "material": { "color": "#fb923c", "metalness": 0.25, "roughness": 0.35 },
+      "light": {},
+      "scriptIds": ["turntable"],
+      "assetId": "asset-subject"
+    },
+    {
+      "id": "key",
+      "name": "Gallery Light",
+      "kind": "light",
+      "transform": { "position": [4, 6, 5], "rotation": [0, 0, 0], "scale": [1, 1, 1] },
+      "material": {},
+      "light": { "type": "directional", "intensity": 2.5, "color": "#fff7ed" },
+      "scriptIds": [],
+      "assetId": null
+    }
+  ],
+  "scripts": [
+    {
+      "id": "turntable",
+      "name": "turntable",
+      "code": "function update(entity, state, delta) {\n  entity.rotation.y += delta * 0.6;\n  return state;\n}"
+    }
+  ],
+  "assets": [
+    {
+      "id": "asset-subject",
+      "name": "Showcase Sphere",
+      "type": "procedural",
+      "source": "procedural:sphere",
+      "tags": ["subject", "showcase"],
+      "usage": ["subject"],
+      "thumbnail": null,
+      "metadata": { "generator": "sphere", "radius": 0.75, "segments": 32 }
+    }
+  ],
+  "tests": [
+    {
+      "id": "test-pedestal",
+      "name": "Pedestal exists",
+      "script": "assert(scene.entities.some(e => e.name === 'Pedestal'), 'Pedestal is missing');"
+    },
+    {
+      "id": "test-subject",
+      "name": "Subject turns",
+      "script": "const before = entityFor('Showcase Subject').rotation.y; await step(30); assert(Math.abs(entityFor('Showcase Subject').rotation.y - before) > 0.1, 'Showcase subject did not turn');"
+    }
+  ],
+  "settings": { "pie": { "captureEvery": 3, "fixedStepHz": 60 } }
+}"##;
+
 const MAX_SLUG_LEN: usize = 64;
 
 /// Validates a project slug. This rejects rather than filters on purpose:
@@ -190,13 +283,28 @@ pub fn write_project(root: &Path, slug: &str, project: &Value) -> Result<()> {
 }
 
 pub fn create_project(root: &Path, slug: &str, title: &str) -> Result<Value> {
+    create_project_from_template(root, slug, title, DEFAULT_PROJECT_TEMPLATE)
+}
+
+pub fn create_project_from_template(
+    root: &Path,
+    slug: &str,
+    title: &str,
+    template_id: &str,
+) -> Result<Value> {
     let clean = sanitize_slug(slug)?;
     // Without this guard, re-creating an existing slug silently replaced the
     // user's work with the sample template.
     if project_file(root, &clean)?.exists() {
         anyhow::bail!("project {} already exists", clean);
     }
-    let mut project: Value = serde_json::from_str(SAMPLE_PROJECT)?;
+    let template = match template_id {
+        "blank" => BLANK_PROJECT,
+        "starter" => SAMPLE_PROJECT,
+        "showcase" => SHOWCASE_PROJECT,
+        _ => anyhow::bail!("unknown project template {template_id}"),
+    };
+    let mut project: Value = serde_json::from_str(template)?;
     project["slug"] = json!(clean);
     project["title"] = json!(title);
     write_project(root, &clean, &project)?;
@@ -558,6 +666,30 @@ mod tests {
         assert_eq!(project["title"], "Demo");
         let loaded = read_project(root.path(), "demo").unwrap();
         assert_eq!(loaded["slug"], "demo");
+    }
+
+    #[test]
+    fn creates_each_project_template() {
+        let root = tempfile::tempdir().unwrap();
+
+        let blank = create_project_from_template(root.path(), "empty", "Empty", "blank").unwrap();
+        assert_eq!(blank["entities"].as_array().unwrap().len(), 0);
+        assert_eq!(blank["scripts"].as_array().unwrap().len(), 0);
+
+        let showcase =
+            create_project_from_template(root.path(), "gallery", "Gallery", "showcase").unwrap();
+        assert_eq!(showcase["entities"].as_array().unwrap().len(), 4);
+        assert_eq!(showcase["scripts"][0]["id"], "turntable");
+        assert_eq!(showcase["slug"], "gallery");
+        assert_eq!(showcase["title"], "Gallery");
+    }
+
+    #[test]
+    fn rejects_unknown_project_templates_without_writing_a_project() {
+        let root = tempfile::tempdir().unwrap();
+
+        assert!(create_project_from_template(root.path(), "demo", "Demo", "missing").is_err());
+        assert!(!project_dir(root.path(), "demo").unwrap().exists());
     }
 
     #[test]

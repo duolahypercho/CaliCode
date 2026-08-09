@@ -57,7 +57,16 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         "project_create" => {
             let slug = str_param(&params, "slug")?;
             let title = params.get("title").and_then(|v| v.as_str()).unwrap_or(slug);
-            Ok(store::create_project(&state.projects_root, slug, title)?)
+            let template = params
+                .get("template")
+                .and_then(Value::as_str)
+                .unwrap_or(store::DEFAULT_PROJECT_TEMPLATE);
+            Ok(store::create_project_from_template(
+                &state.projects_root,
+                slug,
+                title,
+                template,
+            )?)
         }
         "project_list" => Ok(store::list_projects(&state.projects_root)?),
         "project_open" => Ok(store::read_project(
