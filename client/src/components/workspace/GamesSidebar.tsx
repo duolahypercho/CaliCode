@@ -23,6 +23,8 @@ export interface GameSession {
   name: string;
 }
 
+export type ProjectMenuAction = "pin" | "reveal" | "worktree" | "edit" | "archive" | "remove";
+
 interface GamesSidebarProps {
   projects: Project[];
   activeSlug: string;
@@ -32,6 +34,8 @@ interface GamesSidebarProps {
   onSelectSession: (slug: string, sessionId: string) => void;
   onNewSession: (slug: string) => void;
   onNewGame: () => void;
+  pinnedProjectSlugs?: string[];
+  onProjectAction?: (project: Project, action: ProjectMenuAction) => void;
   workspace: { name: string; root: string } | null;
   onOpenFolder: () => void;
   /** Open as an overlay when the rail is below its md breakpoint. */
@@ -55,6 +59,8 @@ export function GamesSidebar({
   onSelectSession,
   onNewSession,
   onNewGame,
+  pinnedProjectSlugs = [],
+  onProjectAction = () => undefined,
   workspace,
   onOpenFolder,
   overlay = false,
@@ -183,8 +189,10 @@ export function GamesSidebar({
 
                   <ProjectActions
                     title={project.title}
+                    pinned={pinnedProjectSlugs.includes(project.slug)}
                     open={actionMenuSlug === project.slug}
                     onOpenChange={(nextOpen) => setActionMenuSlug(nextOpen ? project.slug : null)}
+                    onAction={(action) => onProjectAction(project, action)}
                   />
                 </div>
                 {open ? (
@@ -277,12 +285,16 @@ export function GamesSidebar({
 /** Hover-revealed project menu; the parent also opens it from a row right-click. */
 function ProjectActions({
   title,
+  pinned,
   open,
   onOpenChange,
+  onAction,
 }: {
   title: string;
+  pinned: boolean;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onAction: (action: ProjectMenuAction) => void;
 }) {
   return (
     <DropdownMenu.Root open={open} onOpenChange={onOpenChange}>
@@ -302,12 +314,12 @@ function ProjectActions({
           collisionPadding={8}
           className="z-50 min-w-[216px] rounded-[14px] border border-white/[0.09] bg-[#2c2c2c] p-1.5 text-[13px] text-[#efefef] shadow-[0_18px_45px_rgba(0,0,0,0.48),0_1px_0_rgba(255,255,255,0.06)_inset] outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
         >
-          <ProjectAction icon={Pin} label="Pin project" />
-          <ProjectAction icon={Folder} label="Reveal in Finder" />
-          <ProjectAction icon={GitBranch} label="Create permanent worktree" />
-          <ProjectAction icon={Settings} label="Edit project" />
-          <ProjectAction icon={Archive} label="Archive chats" />
-          <ProjectAction icon={X} label="Remove" />
+          <ProjectAction icon={Pin} label={pinned ? "Unpin project" : "Pin project"} onSelect={() => onAction("pin")} />
+          <ProjectAction icon={Folder} label="Reveal in Finder" onSelect={() => onAction("reveal")} />
+          <ProjectAction icon={GitBranch} label="Create permanent worktree" onSelect={() => onAction("worktree")} />
+          <ProjectAction icon={Settings} label="Edit project" onSelect={() => onAction("edit")} />
+          <ProjectAction icon={Archive} label="Archive chats" onSelect={() => onAction("archive")} />
+          <ProjectAction icon={X} label="Remove" onSelect={() => onAction("remove")} destructive />
         </DropdownMenu.Content>
       </DropdownMenu.Portal>
     </DropdownMenu.Root>
@@ -317,13 +329,22 @@ function ProjectActions({
 function ProjectAction({
   icon: Icon,
   label,
+  onSelect,
+  destructive = false,
 }: {
   icon: LucideIcon;
   label: string;
+  onSelect: () => void;
+  destructive?: boolean;
 }) {
   return (
-    <DropdownMenu.Item className="flex min-h-7 cursor-default select-none items-center gap-2.5 rounded-lg px-2 py-1.5 outline-none transition-colors data-[highlighted]:bg-white/[0.09] data-[highlighted]:text-white">
-      <Icon aria-hidden size={14} strokeWidth={1.8} className="shrink-0 text-[#c8c8c8]" />
+    <DropdownMenu.Item
+      onSelect={onSelect}
+      className={`flex min-h-7 cursor-default select-none items-center gap-2.5 rounded-lg px-2 py-1.5 outline-none transition-colors data-[highlighted]:bg-white/[0.09] ${
+        destructive ? "text-[#f0a29b] data-[highlighted]:text-[#ffc1bb]" : "data-[highlighted]:text-white"
+      }`}
+    >
+      <Icon aria-hidden size={14} strokeWidth={1.8} className={`shrink-0 ${destructive ? "text-[#e7867d]" : "text-[#c8c8c8]"}`} />
       <span>{label}</span>
     </DropdownMenu.Item>
   );

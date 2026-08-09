@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { GamesSidebar } from "./GamesSidebar";
 import type { Project } from "../../lib/types";
@@ -16,7 +16,7 @@ const project: Project = {
 
 afterEach(cleanup);
 
-function renderSidebar() {
+function renderSidebar(onProjectAction = vi.fn()) {
   window.PointerEvent = MouseEvent as typeof PointerEvent;
   return render(
     <GamesSidebar
@@ -28,6 +28,7 @@ function renderSidebar() {
       onSelectSession={() => {}}
       onNewSession={() => {}}
       onNewGame={() => {}}
+      onProjectAction={onProjectAction}
       workspace={null}
       onOpenFolder={() => {}}
     />,
@@ -69,5 +70,43 @@ describe("GamesSidebar project actions", () => {
     expect(trigger.className).toContain("opacity-0");
     expect(trigger.className).toContain("group-hover:opacity-100");
     expect(trigger.className).toContain("group-focus-within:opacity-100");
+  });
+
+  it("dispatches each selected action for the project", async () => {
+    const onProjectAction = vi.fn();
+    renderSidebar(onProjectAction);
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open actions for CaliCode Starter" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Edit project" }));
+
+    expect(onProjectAction).toHaveBeenCalledWith(project, "edit");
+  });
+
+  it("shows unpin for a pinned project and dispatches the pin toggle", async () => {
+    const onProjectAction = vi.fn();
+    window.PointerEvent = MouseEvent as typeof PointerEvent;
+    render(
+      <GamesSidebar
+        projects={[project]}
+        activeSlug={project.slug}
+        sessions={{}}
+        activeSessionId={null}
+        onOpenProject={() => {}}
+        onSelectSession={() => {}}
+        onNewSession={() => {}}
+        onNewGame={() => {}}
+        pinnedProjectSlugs={[project.slug]}
+        onProjectAction={onProjectAction}
+        workspace={null}
+        onOpenFolder={() => {}}
+      />,
+    );
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "CaliCode Starter 0" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Unpin project" }));
+    expect(onProjectAction).toHaveBeenCalledWith(project, "pin");
   });
 });

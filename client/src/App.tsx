@@ -3,7 +3,11 @@ import { Viewport } from "./components/editor/Viewport";
 import type { LogEntry } from "./components/editor/ConsolePanel";
 import { AgentPanel } from "./components/editor/AgentPanel";
 import { TitleBar } from "./components/workspace/TitleBar";
-import { GamesSidebar, type GameSession } from "./components/workspace/GamesSidebar";
+import {
+  GamesSidebar,
+  type GameSession,
+  type ProjectMenuAction,
+} from "./components/workspace/GamesSidebar";
 import { WORKSPACE_TABS, WorkspaceTabs, type WorkspaceTab } from "./components/workspace/WorkspaceTabs";
 import { PlayOverlay, type TweakPin } from "./components/workspace/PlayOverlay";
 import { TweakPanel, entityTweakControls, type TweakControl } from "./components/workspace/TweakPanel";
@@ -37,6 +41,14 @@ const snapshotScripts = (p: Project): Record<string, string> => Object.fromEntri
 
 const SESSIONS_KEY = "calicode-sessions";
 const VIEW_KEY = "calicode-view";
+const PINNED_PROJECTS_KEY = "calicode-pinned-projects";
+
+type DialogProjectAction = Exclude<ProjectMenuAction, "pin" | "reveal">;
+
+interface PendingProjectAction {
+  action: DialogProjectAction;
+  project: Project;
+}
 
 /** Panel bounds are shared by the hook and the handle's aria value range. */
 const GAMES_SIDEBAR: ResizablePanelOptions = {
@@ -105,6 +117,12 @@ export default function App() {
   const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [sessions, setSessions] = useState<Record<string, GameSession[]>>(readSessions);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  const [pinnedProjectSlugs, setPinnedProjectSlugs] = useState<string[]>(readPinnedProjects);
+  const [pendingProjectAction, setPendingProjectAction] = useState<PendingProjectAction | null>(null);
+  const [projectActionTitle, setProjectActionTitle] = useState("");
+  const [projectActionBusy, setProjectActionBusy] = useState(false);
+  const [projectActionError, setProjectActionError] = useState("");
+  const [sessionRevision, setSessionRevision] = useState(0);
   // Scripts as of the last load or save, so CODE can show a real diff.
   const [scriptBaseline, setScriptBaseline] = useState<Record<string, string>>({});
   const [testing, setTesting] = useState(false);
@@ -139,6 +157,10 @@ export default function App() {
   useEffect(() => {
     localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
   }, [sessions]);
+
+  useEffect(() => {
+    localStorage.setItem(PINNED_PROJECTS_KEY, JSON.stringify(pinnedProjectSlugs));
+  }, [pinnedProjectSlugs]);
 
   useEffect(() => {
     localStorage.setItem(VIEW_KEY, JSON.stringify({ tab, workspaceFile } satisfies ViewState));
@@ -302,6 +324,97 @@ export default function App() {
     }
   };
 
+  const displayedProjects = useMemo(() => {
+    const source = projects.length > 0 ? projects : [project];
+    const pinned = new Set(pinnedProjectSlugs);
+    return [...source].sort((left, right) => Number(pinned.has(right.slug)) - Number(pinned.has(left.slug)));
+  }, [pinnedProjectSlugs, project, projects]);
+
+  const handleProjectAction = useCallback(
+    (target: Project, action: ProjectMenuAction) => {
+      if (action === "pin") {
+        setPinnedProjectSlugs((current) =>
+          current.includes(target.slug)
+            ? current.filter((slug) => slug !== target.slug)
+            : [...current, target.slug],
+        );
+        return;
+      }
+      if (action === "reveal") {
+        void rpc<{ path: string }>("project_reveal", { slug: target.slug })
+          .then((result) => pushLog(`revealed ${result.path}`))
+          .catch((error) => pushLog(`reveal failed: ${reason(error)}`, "error"));
+        return;
+      }
+      setProjectActionError("");
+      setProjectActionTitle(target.title);
+      setPendingProjectAction({ action, project: target });
+    },
+    [pushLog],
+  );
+
+  const runPendingProjectAction = async () => {
+    const pending = pendingProjectAction;
+    if (!pending || projectActionBusy) return;
+    const target = pending.project;
+    setProjectActionBusy(true);
+    setProjectActionError("");
+    try {
+      if (pending.action === "edit") {
+        const renamed = await rpc<Project>("project_rename", {
+          slug: target.slug,
+          title: projectActionTitle.trim(),
+        });
+        setProjects((current) => current.map((item) => (item.slug === target.slug ? renamed : item)));
+        if (project.slug === target.slug) setProject(renamed);
+        pushLog(`renamed ${target.title} to ${renamed.title}`);
+      } else if (pending.action === "worktree") {
+        const result = await rpc<{ project: Project; path: string; branch: string; created: boolean }>(
+          "project_create_worktree",
+          { slug: target.slug },
+        );
+        setProjects((current) => current.map((item) => (item.slug === target.slug ? result.project : item)));
+        if (project.slug === target.slug) setProject(result.project);
+        pushLog(`${result.created ? "created" : "reused"} ${result.branch} at ${result.path}`);
+      } else if (pending.action === "archive") {
+        const result = await rpc<{ deleted: number }>("session_archive_project", { slug: target.slug });
+        setSessions((current) => ({ ...current, [target.slug]: [] }));
+        if (project.slug === target.slug) {
+          setActiveSessionId(null);
+          setSessionRevision((current) => current + 1);
+        }
+        pushLog(`archived ${result.deleted} chat${result.deleted === 1 ? "" : "s"} for ${target.title}`);
+      } else if (pending.action === "remove") {
+        await rpc("project_delete", { slug: target.slug });
+        try {
+          await rpc("session_archive_project", { slug: target.slug });
+        } catch (error) {
+          pushLog(`project removed, but its chat cleanup failed: ${reason(error)}`, "error");
+        }
+        const remaining = projects.filter((item) => item.slug !== target.slug);
+        setProjects(remaining);
+        setPinnedProjectSlugs((current) => current.filter((slug) => slug !== target.slug));
+        setSessions((current) => {
+          const next = { ...current };
+          delete next[target.slug];
+          return next;
+        });
+        if (project.slug === target.slug && remaining[0]) {
+          setActiveSessionId(null);
+          await openProject(remaining[0].slug);
+        }
+        pushLog(`removed ${target.title}`);
+      }
+      setPendingProjectAction(null);
+    } catch (error) {
+      const message = reason(error);
+      setProjectActionError(message);
+      pushLog(`${pending.action} failed: ${message}`, "error");
+    } finally {
+      setProjectActionBusy(false);
+    }
+  };
+
   const runTestSuite = useCallback(async () => {
     if (!runtime) return;
     setTesting(true);
@@ -453,7 +566,7 @@ export default function App() {
 
       <div className="flex min-h-0 flex-1">
         <GamesSidebar
-          projects={projects.length > 0 ? projects : [project]}
+          projects={displayedProjects}
           activeSlug={project.slug}
           sessions={sessions}
           activeSessionId={activeSessionId}
@@ -468,6 +581,8 @@ export default function App() {
             setActiveSessionId(session.id);
           }}
           onNewGame={() => setNewProjectOpen(true)}
+          pinnedProjectSlugs={pinnedProjectSlugs}
+          onProjectAction={handleProjectAction}
           overlay={sidebarDrawerOpen}
           width={gamesSidebar.width}
           desktopVisible={sidebarVisible}
@@ -506,6 +621,7 @@ export default function App() {
           } shrink-0 border-l border-white/[0.06] bg-[#0a0a0a] lg:static lg:block lg:w-[var(--agent-width)] lg:border-l-0 lg:border-r lg:shadow-none`}
         >
           <AgentPanel
+            key={`${project.slug}:${sessionRevision}`}
             projectSlug={project.slug}
             modelList={modelList}
             browserTools={browserTools}
@@ -773,8 +889,130 @@ export default function App() {
           </form>
         </DialogContent>
       </Dialog>
+
+      <Dialog
+        open={pendingProjectAction !== null}
+        onOpenChange={(open) => {
+          if (!open && !projectActionBusy) {
+            setPendingProjectAction(null);
+            setProjectActionError("");
+          }
+        }}
+      >
+        <DialogContent className="max-w-sm border-white/[0.1] bg-[#1d1d1c] text-[#eceae7] shadow-[0_24px_80px_rgba(0,0,0,0.6)]">
+          {pendingProjectAction ? (
+            <>
+              <DialogTitle>{projectActionDialogTitle(pendingProjectAction.action)}</DialogTitle>
+              <DialogDescription className="mt-1 leading-relaxed text-[#aaa7a1]">
+                {projectActionDialogDescription(pendingProjectAction)}
+              </DialogDescription>
+
+              {pendingProjectAction.action === "edit" ? (
+                <form
+                  className="mt-4"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    void runPendingProjectAction();
+                  }}
+                >
+                  <Label htmlFor="edit-project-title">Project name</Label>
+                  <Input
+                    id="edit-project-title"
+                    className="mt-1 border-white/[0.12] bg-[#111110]"
+                    value={projectActionTitle}
+                    onChange={(event) => setProjectActionTitle(event.target.value)}
+                    autoFocus
+                  />
+                  {projectActionError ? <p className="mt-2 text-xs text-[#f0a29b]">{projectActionError}</p> : null}
+                  <ProjectActionButtons
+                    busy={projectActionBusy}
+                    disabled={!projectActionTitle.trim()}
+                    confirmLabel="Save changes"
+                  />
+                </form>
+              ) : (
+                <div className="mt-4">
+                  {pendingProjectAction.action === "worktree" && !pendingProjectAction.project.workspaceRoot ? (
+                    <p className="rounded-md border border-[#b6803c]/30 bg-[#8b5e25]/10 px-3 py-2 text-xs leading-relaxed text-[#d8b47f]">
+                      Attach a Git project folder first, then run this action again.
+                    </p>
+                  ) : null}
+                  {projectActionError ? <p className="mt-2 text-xs text-[#f0a29b]">{projectActionError}</p> : null}
+                  <ProjectActionButtons
+                    busy={projectActionBusy}
+                    disabled={pendingProjectAction.action === "worktree" && !pendingProjectAction.project.workspaceRoot}
+                    confirmLabel={projectActionConfirmLabel(pendingProjectAction.action)}
+                    destructive={pendingProjectAction.action === "archive" || pendingProjectAction.action === "remove"}
+                    onConfirm={() => void runPendingProjectAction()}
+                  />
+                </div>
+              )}
+            </>
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </div>
   );
+}
+
+function ProjectActionButtons({
+  busy,
+  disabled,
+  confirmLabel,
+  destructive = false,
+  onConfirm,
+}: {
+  busy: boolean;
+  disabled: boolean;
+  confirmLabel: string;
+  destructive?: boolean;
+  onConfirm?: () => void;
+}) {
+  return (
+    <div className="mt-4 flex justify-end gap-2">
+      <DialogClose asChild>
+        <Button type="button" variant="ghost" size="sm" disabled={busy}>
+          Cancel
+        </Button>
+      </DialogClose>
+      <Button
+        type={onConfirm ? "button" : "submit"}
+        size="sm"
+        disabled={busy || disabled}
+        onClick={onConfirm}
+        className={destructive ? "bg-[#a83d35] text-white hover:bg-[#bd4b42]" : ""}
+      >
+        {busy ? "Working..." : confirmLabel}
+      </Button>
+    </div>
+  );
+}
+
+function projectActionDialogTitle(action: DialogProjectAction): string {
+  return {
+    edit: "Edit project",
+    worktree: "Create permanent worktree",
+    archive: "Archive chats",
+    remove: "Remove project",
+  }[action];
+}
+
+function projectActionDialogDescription({ action, project }: PendingProjectAction): string {
+  if (action === "edit") return `Rename ${project.title}. Its slug and files will stay unchanged.`;
+  if (action === "worktree") {
+    return `Create calicode/${project.slug} under ~/.cali/worktrees and attach ${project.title} to it.`;
+  }
+  if (action === "archive") return `Permanently delete every saved chat for ${project.title}. The project files stay intact.`;
+  return `Permanently remove ${project.title} and its saved chats. This cannot be undone.`;
+}
+
+function projectActionConfirmLabel(action: DialogProjectAction): string {
+  return {
+    edit: "Save changes",
+    worktree: "Create worktree",
+    archive: "Archive chats",
+    remove: "Remove project",
+  }[action];
 }
 
 interface ResizeHandleProps {
@@ -841,6 +1079,18 @@ function readSessions(): Record<string, GameSession[]> {
     return clean;
   } catch {
     return {};
+  }
+}
+
+function readPinnedProjects(): string[] {
+  try {
+    const raw = localStorage.getItem(PINNED_PROJECTS_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed)
+      ? [...new Set(parsed.filter((slug): slug is string => typeof slug === "string"))]
+      : [];
+  } catch {
+    return [];
   }
 }
 
