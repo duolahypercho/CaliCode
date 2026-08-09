@@ -101,6 +101,14 @@ export default function App() {
     ]);
   }, []);
 
+  // Stable identities for the workspace panes. FileTree and FileEditor read
+  // these inside effects; an inline arrow here means a fresh identity every
+  // render, which is how a single failed RPC once turned into ~200 requests in
+  // ten seconds. They hold the callback in a ref too — this keeps the prop
+  // honest so that defence never has to carry it alone.
+  const handleWorkspaceError = useCallback((text: string) => pushLog(text, "error"), [pushLog]);
+  const handleWorkspaceSaved = useCallback((path: string) => pushLog(`saved ${path}`), [pushLog]);
+
   useEffect(() => {
     document.documentElement.classList.add("dark");
   }, []);
@@ -454,7 +462,7 @@ export default function App() {
                   workspaceId={workspace.id}
                   workspaceName={workspace.name}
                   script={workspace.scripts.dev ? "dev" : Object.keys(workspace.scripts)[0] ?? "dev"}
-                  onError={(text) => pushLog(text, "error")}
+                  onError={handleWorkspaceError}
                 />
               </div>
             ) : null}
@@ -508,15 +516,15 @@ export default function App() {
                     workspaceId={workspace.id}
                     activePath={workspaceFile}
                     onOpenFile={setWorkspaceFile}
-                    onError={(text) => pushLog(text, "error")}
+                    onError={handleWorkspaceError}
                   />
                 </div>
                 <div className="min-h-0 flex-1">
                   <FileEditor
                     workspaceId={workspace.id}
                     path={workspaceFile}
-                    onSaved={(path) => pushLog(`saved ${path}`)}
-                    onError={(text) => pushLog(text, "error")}
+                    onSaved={handleWorkspaceSaved}
+                    onError={handleWorkspaceError}
                   />
                 </div>
               </div>

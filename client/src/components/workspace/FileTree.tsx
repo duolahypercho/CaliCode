@@ -24,6 +24,13 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
   const [children, setChildren] = useState<Record<string, FileNode[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
+  // A failed load is a state the pane renders, not just a log line. Without it
+  // the tree fell through to "Nothing to show." and gave no way back short of
+  // reloading the page.
+  const [failure, setFailure] = useState<string | null>(null);
+  // Bumped by Retry. The only thing that re-runs the root load, so a retry is
+  // always a deliberate click rather than a render-loop side effect.
+  const [attempt, setAttempt] = useState(0);
   // Per-node, so expanding one folder shows a spinner on that row instead of
   // blanking the whole tree.
   const [pending, setPending] = useState<Set<string>>(new Set());
@@ -31,18 +38,23 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
+    setFailure(null);
     readTree(workspaceId, "", 1)
       .then((result) => {
         if (!cancelled) setRoots(result.entries);
       })
-      .catch((error: unknown) => reportError.current(`file tree failed: ${describe(error)}`))
+      .catch((error: unknown) => {
+        const message = describe(error);
+        if (!cancelled) setFailure(message);
+        reportError.current(`file tree failed: ${message}`);
+      })
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [workspaceId]);
+  }, [workspaceId, attempt]);
 
   const toggle = useCallback(
     async (node: FileNode) => {
@@ -103,6 +115,17 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
       <div className="calicode-label px-3 pb-2">Files</div>
       {loading ? (
         <p className="px-3 text-xs text-[#8f8f8f]">Loading…</p>
+      ) : failure ? (
+        <div role="alert" className="px-3 text-xs text-[#c98b8b]">
+          <p className="leading-[1.5]">Could not read the file tree. {failure}</p>
+          <button
+            type="button"
+            onClick={() => setAttempt((current) => current + 1)}
+            className="mt-2 rounded border border-white/[0.12] px-2.5 py-1 text-[10px] tracking-[0.12em] text-[#d4d4d4] hover:border-white/30"
+          >
+            RETRY
+          </button>
+        </div>
       ) : roots.length === 0 ? (
         <p className="px-3 text-xs text-[#8f8f8f]">Nothing to show.</p>
       ) : (
