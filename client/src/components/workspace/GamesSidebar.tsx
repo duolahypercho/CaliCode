@@ -1,12 +1,20 @@
 import { useMemo, useState, type CSSProperties } from "react";
+import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
+  Archive,
   ChevronDown,
   ChevronRight,
   CircleHelp,
   Folder,
   FolderOpen,
+  GitBranch,
+  MoreHorizontal,
+  Pin,
   Plus,
   Search,
+  Settings,
+  X,
+  type LucideIcon,
 } from "lucide-react";
 import type { Project } from "../../lib/types";
 
@@ -133,37 +141,41 @@ export function GamesSidebar({
             const list = sessions[project.slug] ?? [];
             return (
               <div key={project.slug} className="mb-1">
-                <button
-                  type="button"
-                  aria-expanded={open}
-                  onClick={() => {
-                    setExpanded(open ? null : project.slug);
-                    if (project.slug !== activeSlug) onOpenProject(project.slug);
-                  }}
-                  className={`group flex min-h-9 w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/40 ${
-                    project.slug === activeSlug
-                      ? "bg-[#3b3a38] text-[#f0eeeb] shadow-[0_1px_0_rgba(255,255,255,0.04)_inset]"
-                      : "text-[#b0ada8] hover:bg-white/[0.055] hover:text-[#e0dedb] active:bg-white/[0.08]"
-                  }`}
-                >
-                  <ChevronRight
-                    aria-hidden
-                    size={13}
-                    strokeWidth={1.8}
-                    className={`shrink-0 text-[#85827e] transition-transform ${open ? "rotate-90" : ""}`}
-                  />
-                  {open ? (
-                    <FolderOpen aria-hidden size={15} strokeWidth={1.7} className="shrink-0 text-[#c3c0bb]" />
-                  ) : (
-                    <Folder aria-hidden size={15} strokeWidth={1.7} className="shrink-0 text-[#aaa7a1]" />
-                  )}
-                  <span className="min-w-0 flex-1 truncate" title={project.title}>
-                    {project.title}
-                  </span>
-                  <span className="min-w-3 text-right text-[10px] tabular-nums text-[#85827e] transition-colors group-hover:text-[#aaa7a1]">
-                    {list.length}
-                  </span>
-                </button>
+                <div className="group relative">
+                  <button
+                    type="button"
+                    aria-expanded={open}
+                    onClick={() => {
+                      setExpanded(open ? null : project.slug);
+                      if (project.slug !== activeSlug) onOpenProject(project.slug);
+                    }}
+                    className={`flex min-h-9 w-full items-center gap-1.5 rounded-md px-2 py-1.5 pr-9 text-left text-[12px] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/40 ${
+                      project.slug === activeSlug
+                        ? "bg-[#3b3a38] text-[#f0eeeb] shadow-[0_1px_0_rgba(255,255,255,0.04)_inset]"
+                        : "text-[#b0ada8] hover:bg-white/[0.055] hover:text-[#e0dedb] active:bg-white/[0.08]"
+                    }`}
+                  >
+                    <ChevronRight
+                      aria-hidden
+                      size={13}
+                      strokeWidth={1.8}
+                      className={`shrink-0 text-[#85827e] transition-transform ${open ? "rotate-90" : ""}`}
+                    />
+                    {open ? (
+                      <FolderOpen aria-hidden size={15} strokeWidth={1.7} className="shrink-0 text-[#c3c0bb]" />
+                    ) : (
+                      <Folder aria-hidden size={15} strokeWidth={1.7} className="shrink-0 text-[#aaa7a1]" />
+                    )}
+                    <span className="min-w-0 flex-1 truncate" title={project.title}>
+                      {project.title}
+                    </span>
+                    <span className="min-w-3 text-right text-[10px] tabular-nums text-[#85827e] transition-opacity group-hover:opacity-0">
+                      {list.length}
+                    </span>
+                  </button>
+
+                  <ProjectActions title={project.title} />
+                </div>
                 {open ? (
                   <div className="mb-1.5 ml-[13px] mt-1 flex flex-col gap-0.5 border-l border-[#393835] pl-2.5">
                     {list.map((session) => {
@@ -248,5 +260,52 @@ export function GamesSidebar({
         </a>
       </footer>
     </aside>
+  );
+}
+
+/** Left-click project menu, visually matched to the compact desktop reference. */
+function ProjectActions({ title }: { title: string }) {
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          aria-label={`Open actions for ${title}`}
+          className="absolute right-1 top-1 inline-flex h-7 w-7 items-center justify-center rounded text-[#aaa7a1] opacity-55 transition-[color,background-color,opacity] hover:bg-white/[0.08] hover:text-[#efedea] hover:opacity-100 focus-visible:opacity-100 data-[state=open]:bg-white/[0.1] data-[state=open]:text-[#f0eeeb] data-[state=open]:opacity-100"
+        >
+          <MoreHorizontal aria-hidden size={15} strokeWidth={1.8} />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="end"
+          sideOffset={5}
+          collisionPadding={8}
+          className="z-50 min-w-[216px] rounded-[14px] border border-white/[0.09] bg-[#2c2c2c] p-1.5 text-[13px] text-[#efefef] shadow-[0_18px_45px_rgba(0,0,0,0.48),0_1px_0_rgba(255,255,255,0.06)_inset] outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
+        >
+          <ProjectAction icon={Pin} label="Pin project" />
+          <ProjectAction icon={Folder} label="Reveal in Finder" />
+          <ProjectAction icon={GitBranch} label="Create permanent worktree" />
+          <ProjectAction icon={Settings} label="Edit project" />
+          <ProjectAction icon={Archive} label="Archive chats" />
+          <ProjectAction icon={X} label="Remove" />
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+function ProjectAction({
+  icon: Icon,
+  label,
+}: {
+  icon: LucideIcon;
+  label: string;
+}) {
+  return (
+    <DropdownMenu.Item className="flex min-h-7 cursor-default select-none items-center gap-2.5 rounded-lg px-2 py-1.5 outline-none transition-colors data-[highlighted]:bg-white/[0.09] data-[highlighted]:text-white">
+      <Icon aria-hidden size={14} strokeWidth={1.8} className="shrink-0 text-[#c8c8c8]" />
+      <span>{label}</span>
+    </DropdownMenu.Item>
   );
 }

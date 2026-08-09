@@ -67,6 +67,21 @@ test.describe("games sidebar", () => {
       await expectWidth(page, 240);
     });
 
+    test("left-clicking a project's action button opens its menu", async ({ page }) => {
+      await page.goto("/");
+
+      const sidebar = page.getByRole("complementary", { name: "Games sidebar" });
+      await sidebar.getByRole("button", { name: /Open actions for / }).first().click();
+
+      const menu = page.getByRole("menu");
+      await expect(menu.getByRole("menuitem", { name: "Pin project" })).toBeVisible();
+      await expect(menu.getByRole("menuitem", { name: "Reveal in Finder" })).toBeVisible();
+      await expect(menu.getByRole("menuitem", { name: "Create permanent worktree" })).toBeVisible();
+      await expect(menu.getByRole("menuitem", { name: "Edit project" })).toBeVisible();
+      await expect(menu.getByRole("menuitem", { name: "Archive chats" })).toBeVisible();
+      await expect(menu.getByRole("menuitem", { name: "Remove" })).toBeVisible();
+    });
+
     test("dragging the handle changes the sidebar width", async ({ page }) => {
       await page.goto("/");
       const handle = page.getByRole("separator", RESIZE_HANDLE);
