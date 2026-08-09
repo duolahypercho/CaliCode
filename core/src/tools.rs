@@ -234,8 +234,11 @@ pub async fn execute_core_tool(
             required_str(args, "checkpointId")?,
         )?),
         "file_read" => {
-            let (base, path) =
-                resolve_game_file(root, required_str(args, "slug")?, required_str(args, "path")?)?;
+            let (base, path) = resolve_game_file(
+                root,
+                required_str(args, "slug")?,
+                required_str(args, "path")?,
+            )?;
             let text = std::fs::read_to_string(&path).with_context(|| {
                 format!(
                     "{} not found under {}",
@@ -246,8 +249,11 @@ pub async fn execute_core_tool(
             Ok(json!({ "path": args["path"], "content": text }))
         }
         "file_write" => {
-            let (_, path) =
-                resolve_game_file(root, required_str(args, "slug")?, required_str(args, "path")?)?;
+            let (_, path) = resolve_game_file(
+                root,
+                required_str(args, "slug")?,
+                required_str(args, "path")?,
+            )?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -531,10 +537,7 @@ mod tests {
         assert!(base.is_workspace);
 
         let (_, resolved) = resolve_game_file(root.path(), "demo", "README.md").unwrap();
-        assert_eq!(
-            std::fs::read_to_string(resolved).unwrap(),
-            "# real game"
-        );
+        assert_eq!(std::fs::read_to_string(resolved).unwrap(), "# real game");
     }
 
     #[test]
