@@ -29,6 +29,7 @@ use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+use tower_http::set_header::SetResponseHeaderLayer;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -162,6 +163,15 @@ async fn main() -> anyhow::Result<()> {
         .fallback_service(
             ServeDir::new(&dist).not_found_service(ServeFile::new(dist.join("index.html"))),
         )
+        // `no-cache` means revalidate, not "never store". Without it the
+        // desktop shell's WKWebView heuristically caches `index.html` off
+        // `last-modified` and keeps replaying a previous build's asset hashes
+        // after an update — the app looks like it silently ignored the new
+        // bundle. On loopback the revalidation is a 304 and costs nothing.
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("no-cache"),
+        ))
         .layer(cors)
         .layer(host_guard)
         .layer(tower_http::trace::TraceLayer::new_for_http())
