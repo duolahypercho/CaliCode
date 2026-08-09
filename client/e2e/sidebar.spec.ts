@@ -67,11 +67,17 @@ test.describe("games sidebar", () => {
       await expectWidth(page, 240);
     });
 
-    test("left-clicking a project's action button opens its menu", async ({ page }) => {
+    test("project actions appear on hover and open from left or right click", async ({ page }) => {
       await page.goto("/");
 
       const sidebar = page.getByRole("complementary", { name: "Games sidebar" });
-      await sidebar.getByRole("button", { name: /Open actions for / }).first().click();
+      const project = sidebar.getByRole("button", { name: /Starter/ }).first();
+      const actions = sidebar.getByRole("button", { name: /Open actions for Starter/ });
+
+      await expect(actions).toHaveCSS("opacity", "0");
+      await project.hover();
+      await expect(actions).toHaveCSS("opacity", "1");
+      await actions.click();
 
       const menu = page.getByRole("menu");
       await expect(menu.getByRole("menuitem", { name: "Pin project" })).toBeVisible();
@@ -80,6 +86,10 @@ test.describe("games sidebar", () => {
       await expect(menu.getByRole("menuitem", { name: "Edit project" })).toBeVisible();
       await expect(menu.getByRole("menuitem", { name: "Archive chats" })).toBeVisible();
       await expect(menu.getByRole("menuitem", { name: "Remove" })).toBeVisible();
+
+      await page.keyboard.press("Escape");
+      await project.click({ button: "right" });
+      await expect(menu.getByRole("menuitem", { name: "Pin project" })).toBeVisible();
     });
 
     test("dragging the handle changes the sidebar width", async ({ page }) => {

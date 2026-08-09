@@ -63,6 +63,7 @@ export function GamesSidebar({
 }: GamesSidebarProps) {
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<string | null>(activeSlug);
+  const [actionMenuSlug, setActionMenuSlug] = useState<string | null>(null);
 
   // The parent keeps this value within the resize bounds, but clamping here
   // keeps the rail safe when it is rendered in isolation (or with persisted
@@ -141,7 +142,13 @@ export function GamesSidebar({
             const list = sessions[project.slug] ?? [];
             return (
               <div key={project.slug} className="mb-1">
-                <div className="group relative">
+                <div
+                  className="group relative"
+                  onContextMenu={(event) => {
+                    event.preventDefault();
+                    setActionMenuSlug(project.slug);
+                  }}
+                >
                   <button
                     type="button"
                     aria-expanded={open}
@@ -169,12 +176,16 @@ export function GamesSidebar({
                     <span className="min-w-0 flex-1 truncate" title={project.title}>
                       {project.title}
                     </span>
-                    <span className="min-w-3 text-right text-[10px] tabular-nums text-[#85827e] transition-opacity group-hover:opacity-0">
+                    <span className="min-w-3 text-right text-[10px] tabular-nums text-[#85827e] transition-opacity group-hover:opacity-0 group-focus-within:opacity-0">
                       {list.length}
                     </span>
                   </button>
 
-                  <ProjectActions title={project.title} />
+                  <ProjectActions
+                    title={project.title}
+                    open={actionMenuSlug === project.slug}
+                    onOpenChange={(nextOpen) => setActionMenuSlug(nextOpen ? project.slug : null)}
+                  />
                 </div>
                 {open ? (
                   <div className="mb-1.5 ml-[13px] mt-1 flex flex-col gap-0.5 border-l border-[#393835] pl-2.5">
@@ -263,15 +274,23 @@ export function GamesSidebar({
   );
 }
 
-/** Left-click project menu, visually matched to the compact desktop reference. */
-function ProjectActions({ title }: { title: string }) {
+/** Hover-revealed project menu; the parent also opens it from a row right-click. */
+function ProjectActions({
+  title,
+  open,
+  onOpenChange,
+}: {
+  title: string;
+  open: boolean;
+  onOpenChange: (open: boolean) => void;
+}) {
   return (
-    <DropdownMenu.Root>
+    <DropdownMenu.Root open={open} onOpenChange={onOpenChange}>
       <DropdownMenu.Trigger asChild>
         <button
           type="button"
           aria-label={`Open actions for ${title}`}
-          className="absolute right-1 top-1 inline-flex h-7 w-7 items-center justify-center rounded text-[#aaa7a1] opacity-55 transition-[color,background-color,opacity] hover:bg-white/[0.08] hover:text-[#efedea] hover:opacity-100 focus-visible:opacity-100 data-[state=open]:bg-white/[0.1] data-[state=open]:text-[#f0eeeb] data-[state=open]:opacity-100"
+          className="pointer-events-none absolute right-1 top-1 inline-flex h-7 w-7 items-center justify-center rounded text-[#aaa7a1] opacity-0 transition-[color,background-color,opacity] duration-150 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 hover:bg-white/[0.08] hover:text-[#efedea] focus-visible:pointer-events-auto focus-visible:opacity-100 data-[state=open]:pointer-events-auto data-[state=open]:bg-white/[0.1] data-[state=open]:text-[#f0eeeb] data-[state=open]:opacity-100"
         >
           <MoreHorizontal aria-hidden size={15} strokeWidth={1.8} />
         </button>
