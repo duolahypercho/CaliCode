@@ -10,6 +10,7 @@
     "tauri": "tauri",
     "desktop:dev": "bash ../scripts/desktop.sh dev",
     "desktop:build": "bash ../scripts/desktop.sh build",
+    "desktop:install": "bash ../scripts/desktop.sh install",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "pretest:e2e": "node -e \"const fs=require('node:fs');fs.rmSync('.e2e-projects',{recursive:true,force:true});fs.rmSync('.e2e-config.yaml',{force:true})\""

@@ -68,12 +68,14 @@ origin, so `/rpc`, `/events`, and the built client are all same-origin.
 
 ```bash
 cd client && pnpm desktop:build   # -> CaliCode.app + .dmg
+pnpm desktop:install              # rebuild, update /Applications/CaliCode.app, reopen
 pnpm desktop:dev                   # run the native shell against a live core
 ```
 
 Bundles land in `client/src-tauri/target/release/bundle/` (`macos/CaliCode.app`
-and `dmg/`). The packaged app pins core to port `8765`, so quit any browser dev
-instance on that port before launching it.
+and `dmg/`). Use `desktop:install` after source changes when you want the copy in
+Applications to update too. The packaged app pins core to port `8765`, so quit
+any browser dev instance on that port before launching it.
 
 ## Tests
 
