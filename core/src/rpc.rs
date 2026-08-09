@@ -76,6 +76,24 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             str_param(&params, "slug")?,
             params.get("workspaceRoot").and_then(|v| v.as_str()),
         )?),
+        "project_rename" => Ok(store::rename_project(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+            str_param(&params, "title")?,
+        )?),
+        "project_reveal" => {
+            let path = store::project_location(&state.projects_root, str_param(&params, "slug")?)?;
+            reveal_in_file_manager(&path)?;
+            Ok(json!({ "path": path }))
+        }
+        "project_create_worktree" => Ok(store::create_permanent_worktree(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+        )?),
+        "project_delete" => Ok(store::delete_project(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+        )?),
         "project_checkpoint" => Ok(store::checkpoint_project(
             &state.projects_root,
             str_param(&params, "slug")?,
@@ -98,8 +116,11 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             // showing the user nothing but "no folder attached".
             probe_readable(path).await?;
             let mut registry = state.workspaces.write().await;
-            let described =
-                workspace::open(&mut registry, path, params.get("name").and_then(Value::as_str))?;
+            let described = workspace::open(
+                &mut registry,
+                path,
+                params.get("name").and_then(Value::as_str),
+            )?;
             persist_workspaces(state, workspace::roots(&registry)).await;
             Ok(described)
         }
@@ -424,7 +445,12 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         "session_save" => crate::sessions::save(&state.sessions_root, &params),
         "session_list" => crate::sessions::list(&state.sessions_root),
         "session_load" => crate::sessions::load(&state.sessions_root, str_param(&params, "id")?),
-        "session_delete" => crate::sessions::delete(&state.sessions_root, str_param(&params, "id")?),
+        "session_delete" => {
+            crate::sessions::delete(&state.sessions_root, str_param(&params, "id")?)
+        }
+        "session_archive_project" => {
+            crate::sessions::archive_project(&state.sessions_root, str_param(&params, "slug")?)
+        }
         "session_fork" => crate::sessions::fork(
             &state.sessions_root,
             str_param(&params, "id")?,
@@ -432,6 +458,32 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         ),
         _ => anyhow::bail!("unknown method {}", method),
     }
+}
+
+fn reveal_in_file_manager(path: &std::path::Path) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = std::process::Command::new("open");
+        command.arg("-R").arg(path);
+        command
+    };
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = std::process::Command::new("explorer");
+        command.arg(format!("/select,{}", path.display()));
+        command
+    };
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut command = std::process::Command::new("xdg-open");
+        command.arg(path.parent().unwrap_or(path));
+        command
+    };
+
+    command
+        .spawn()
+        .context("failed to open the system file manager")?;
+    Ok(())
 }
 
 fn default_system_prompt(projects_root: &std::path::Path, slug: &str) -> String {

@@ -79,7 +79,10 @@ fn summary(record: &Value) -> Value {
 /// Create or update a session from the client's transcript. `createdAt` and an
 /// explicit `title` survive re-saves. Returns the saved summary.
 pub fn save(root: &Path, params: &Value) -> Result<Value> {
-    let id = params.get("id").and_then(Value::as_str).context("id required")?;
+    let id = params
+        .get("id")
+        .and_then(Value::as_str)
+        .context("id required")?;
     let clean = clean_id(id)?;
     std::fs::create_dir_all(root)?;
     let path = session_file(root, &clean)?;
@@ -92,10 +95,7 @@ pub fn save(root: &Path, params: &Value) -> Result<Value> {
         .and_then(|record| record.get("createdAt").and_then(Value::as_u64))
         .unwrap_or_else(now_secs);
 
-    let messages = params
-        .get("messages")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
+    let messages = params.get("messages").cloned().unwrap_or_else(|| json!([]));
     let title = params
         .get("title")
         .and_then(Value::as_str)
@@ -154,8 +154,7 @@ pub fn list(root: &Path) -> Result<Value> {
 /// Load a full session record including messages.
 pub fn load(root: &Path, id: &str) -> Result<Value> {
     let path = session_file(root, id)?;
-    let text =
-        std::fs::read_to_string(&path).with_context(|| format!("session {id} not found"))?;
+    let text = std::fs::read_to_string(&path).with_context(|| format!("session {id} not found"))?;
     Ok(serde_json::from_str(&text)?)
 }
 
@@ -166,6 +165,42 @@ pub fn delete(root: &Path, id: &str) -> Result<Value> {
         std::fs::remove_file(&path)?;
     }
     Ok(json!({ "id": id, "deleted": true }))
+}
+
+/// Delete every persisted chat belonging to one project.
+pub fn archive_project(root: &Path, project_slug: &str) -> Result<Value> {
+    if project_slug.is_empty()
+        || !project_slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+    {
+        anyhow::bail!("invalid project slug");
+    }
+
+    let mut deleted = 0usize;
+    if root.exists() {
+        for entry in std::fs::read_dir(root)? {
+            let path = entry?.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let belongs_to_project = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+                .and_then(|record| {
+                    record
+                        .get("projectSlug")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .is_some_and(|slug| slug == project_slug);
+            if belongs_to_project {
+                std::fs::remove_file(&path)?;
+                deleted += 1;
+            }
+        }
+    }
+    Ok(json!({ "projectSlug": project_slug, "deleted": deleted }))
 }
 
 /// Copy a session under a fresh id so a divergent path can be explored without
@@ -223,9 +258,17 @@ mod tests {
     #[test]
     fn save_preserves_created_at_and_title() {
         let root = root();
-        let first = save(&root, &json!({ "id": "s1", "title": "Keep me", "messages": [] })).unwrap();
+        let first = save(
+            &root,
+            &json!({ "id": "s1", "title": "Keep me", "messages": [] }),
+        )
+        .unwrap();
         let created = first["createdAt"].as_u64().unwrap();
-        let second = save(&root, &json!({ "id": "s1", "messages": [{ "role": "user", "content": "x" }] })).unwrap();
+        let second = save(
+            &root,
+            &json!({ "id": "s1", "messages": [{ "role": "user", "content": "x" }] }),
+        )
+        .unwrap();
         assert_eq!(second["title"], "Keep me");
         assert_eq!(second["createdAt"].as_u64().unwrap(), created);
     }
@@ -233,7 +276,11 @@ mod tests {
     #[test]
     fn fork_creates_independent_copy() {
         let root = root();
-        save(&root, &json!({ "id": "src", "messages": [{ "role": "user", "content": "hi" }] })).unwrap();
+        save(
+            &root,
+            &json!({ "id": "src", "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .unwrap();
         let forked = fork(&root, "src", Some("dst")).unwrap();
         assert_eq!(forked["id"], "dst");
         assert!(forked["title"].as_str().unwrap().ends_with("(fork)"));
@@ -258,5 +305,31 @@ mod tests {
         let root = root();
         assert!(save(&root, &json!({ "id": "../evil", "messages": [] })).is_err());
         assert!(load(&root, "../../etc/passwd").is_err());
+    }
+
+    #[test]
+    fn archive_project_only_removes_matching_sessions() {
+        let root = root();
+        save(
+            &root,
+            &json!({ "id": "one", "projectSlug": "starter", "messages": [] }),
+        )
+        .unwrap();
+        save(
+            &root,
+            &json!({ "id": "two", "projectSlug": "other", "messages": [] }),
+        )
+        .unwrap();
+        save(
+            &root,
+            &json!({ "id": "three", "projectSlug": "starter", "messages": [] }),
+        )
+        .unwrap();
+
+        let result = archive_project(&root, "starter").unwrap();
+        assert_eq!(result["deleted"], 2);
+        assert!(load(&root, "one").is_err());
+        assert!(load(&root, "three").is_err());
+        assert_eq!(load(&root, "two").unwrap()["projectSlug"], "other");
     }
 }

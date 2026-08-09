@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 pub const SAMPLE_PROJECT: &str = r##"{
   "schemaVersion": 1,
@@ -223,6 +224,142 @@ pub fn set_workspace_root(root: &Path, slug: &str, workspace_root: Option<&str>)
     validate_project(&project)?;
     write_project(root, slug, &project)?;
     Ok(project)
+}
+
+/// Update the display name without replacing any other project data.
+pub fn rename_project(root: &Path, slug: &str, title: &str) -> Result<Value> {
+    let title = title.trim();
+    if title.is_empty() {
+        anyhow::bail!("project title cannot be empty");
+    }
+    if title.chars().count() > 120 {
+        anyhow::bail!("project title cannot exceed 120 characters");
+    }
+    let mut project = read_project(root, slug)?;
+    project["title"] = json!(title);
+    validate_project(&project)?;
+    write_project(root, slug, &project)?;
+    Ok(project)
+}
+
+/// The folder Finder should reveal for a project: its attached workspace when
+/// present, otherwise CaliCode's own project directory.
+pub fn project_location(root: &Path, slug: &str) -> Result<PathBuf> {
+    let project = read_project(root, slug)?;
+    if let Some(path) = project.get("workspaceRoot").and_then(Value::as_str) {
+        let workspace = PathBuf::from(path);
+        if workspace.exists() {
+            return Ok(workspace);
+        }
+    }
+    Ok(project_dir(root, slug)?)
+}
+
+/// Create a durable git worktree next to the projects directory, then attach
+/// the project to it. The default layout is `~/.cali/worktrees/<slug>`.
+pub fn create_permanent_worktree(root: &Path, slug: &str) -> Result<Value> {
+    let project = read_project(root, slug)?;
+    let source = project
+        .get("workspaceRoot")
+        .and_then(Value::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .context("attach a git folder before creating a permanent worktree")?;
+    let source_path = Path::new(source);
+    if !source_path.is_dir() {
+        anyhow::bail!("attached folder {} is unavailable", source_path.display());
+    }
+
+    let repo_text = git_stdout(source_path, &["rev-parse", "--show-toplevel"])
+        .context("attached folder is not inside a git repository")?;
+    let repo = PathBuf::from(repo_text.trim());
+    let worktrees_root = root.parent().unwrap_or(root).join("worktrees");
+    std::fs::create_dir_all(&worktrees_root)?;
+    let destination = worktrees_root.join(sanitize_slug(slug)?);
+    let branch = format!("calicode/{slug}");
+
+    let created = if destination.exists() {
+        let existing = git_stdout(&destination, &["rev-parse", "--show-toplevel"]).context(
+            "the permanent worktree destination already exists and is not a git worktree",
+        )?;
+        let existing_root = PathBuf::from(existing.trim()).canonicalize()?;
+        if existing_root != destination.canonicalize()? {
+            anyhow::bail!("the permanent worktree destination belongs to another repository");
+        }
+        false
+    } else {
+        let branch_exists = Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["show-ref", "--verify", "--quiet"])
+            .arg(format!("refs/heads/{branch}"))
+            .status()
+            .context("failed to inspect git branches")?
+            .success();
+
+        let mut command = Command::new("git");
+        command.arg("-C").arg(&repo).arg("worktree").arg("add");
+        if branch_exists {
+            command.arg(&destination).arg(&branch);
+        } else {
+            command.arg("-b").arg(&branch);
+            command.arg(&destination);
+        }
+        let output = command.output().context("failed to run git worktree add")?;
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            anyhow::bail!("could not create permanent worktree: {detail}");
+        }
+        true
+    };
+
+    let path = destination.to_string_lossy().to_string();
+    let project = set_workspace_root(root, slug, Some(&path))?;
+    Ok(json!({
+        "project": project,
+        "path": path,
+        "branch": branch,
+        "created": created,
+    }))
+}
+
+fn git_stdout(directory: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(args)
+        .output()
+        .context("failed to run git")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        anyhow::bail!(if detail.is_empty() {
+            "git command failed".to_string()
+        } else {
+            detail
+        });
+    }
+    Ok(String::from_utf8(output.stdout).context("git returned non-UTF-8 output")?)
+}
+
+/// Permanently remove one explicitly named project. Refuse to remove the last
+/// project so the editor always has a valid project to open.
+pub fn delete_project(root: &Path, slug: &str) -> Result<Value> {
+    let clean = sanitize_slug(slug)?;
+    let directory = project_dir(root, &clean)?;
+    if !project_file(root, &clean)?.exists() {
+        anyhow::bail!("project {clean} not found");
+    }
+    let count = list_projects(root)?.as_array().map(Vec::len).unwrap_or(0);
+    if count <= 1 {
+        anyhow::bail!("cannot remove the last project");
+    }
+
+    let root_real = root.canonicalize()?;
+    let directory_real = directory.canonicalize()?;
+    if directory_real.parent() != Some(root_real.as_path()) {
+        anyhow::bail!("refusing to remove a project outside the projects directory");
+    }
+    std::fs::remove_dir_all(&directory_real)?;
+    Ok(json!({ "slug": clean, "deleted": true }))
 }
 
 pub fn list_projects(root: &Path) -> Result<Value> {
@@ -495,6 +632,80 @@ mod tests {
     }
 
     #[test]
+    fn rename_changes_only_the_title() {
+        let root = tempfile::tempdir().unwrap();
+        let before = create_project(root.path(), "demo", "Demo").unwrap();
+        let renamed = rename_project(root.path(), "demo", "  Better Demo  ").unwrap();
+        assert_eq!(renamed["title"], "Better Demo");
+        assert_eq!(renamed["entities"], before["entities"]);
+        assert!(rename_project(root.path(), "demo", "   ").is_err());
+    }
+
+    #[test]
+    fn project_location_prefers_an_existing_workspace() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        create_project(root.path(), "demo", "Demo").unwrap();
+        set_workspace_root(root.path(), "demo", workspace.path().to_str()).unwrap();
+        assert_eq!(
+            project_location(root.path(), "demo").unwrap(),
+            workspace.path()
+        );
+    }
+
+    #[test]
+    fn delete_removes_one_project_but_not_the_last() {
+        let root = tempfile::tempdir().unwrap();
+        create_project(root.path(), "one", "One").unwrap();
+        create_project(root.path(), "two", "Two").unwrap();
+
+        delete_project(root.path(), "one").unwrap();
+        assert!(!root.path().join("one").exists());
+        assert!(root.path().join("two/project.json").exists());
+        assert!(delete_project(root.path(), "two").is_err());
+    }
+
+    #[test]
+    fn permanent_worktree_is_created_and_attached() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join("projects");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init"]).unwrap();
+        run_git(&repo, &["config", "user.email", "tests@example.com"]).unwrap();
+        run_git(&repo, &["config", "user.name", "CaliCode Tests"]).unwrap();
+        std::fs::write(repo.join("README.md"), "demo").unwrap();
+        run_git(&repo, &["add", "README.md"]).unwrap();
+        run_git(&repo, &["commit", "-m", "initial"]).unwrap();
+
+        create_project(&projects, "demo", "Demo").unwrap();
+        set_workspace_root(&projects, "demo", repo.to_str()).unwrap();
+        let result = create_permanent_worktree(&projects, "demo").unwrap();
+        let destination = home.path().join("worktrees/demo");
+
+        assert_eq!(result["branch"], "calicode/demo");
+        assert_eq!(result["created"], true);
+        assert_eq!(result["path"], destination.to_string_lossy().as_ref());
+        assert!(destination.join("README.md").exists());
+        assert_eq!(
+            read_project(&projects, "demo").unwrap()["workspaceRoot"],
+            destination.to_string_lossy().as_ref()
+        );
+    }
+
+    fn run_git(directory: &Path, args: &[&str]) -> Result<()> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(args)
+            .output()?;
+        if !output.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn checkpoint_requires_an_existing_project() {
         let root = tempfile::tempdir().unwrap();
         assert!(checkpoint_project(root.path(), "totally-absent").is_err());
@@ -622,8 +833,14 @@ mod tests {
         set_workspace_root(root.path(), "one", Some("/tmp/one")).unwrap();
         set_workspace_root(root.path(), "two", Some("/tmp/two")).unwrap();
 
-        assert_eq!(read_project(root.path(), "one").unwrap()["workspaceRoot"], "/tmp/one");
-        assert_eq!(read_project(root.path(), "two").unwrap()["workspaceRoot"], "/tmp/two");
+        assert_eq!(
+            read_project(root.path(), "one").unwrap()["workspaceRoot"],
+            "/tmp/one"
+        );
+        assert_eq!(
+            read_project(root.path(), "two").unwrap()["workspaceRoot"],
+            "/tmp/two"
+        );
     }
 
     #[test]
