@@ -16,6 +16,7 @@
  */
 
 import { hardenWorkerScope } from "./hardenWorkerScope";
+import { deepFreeze } from "./scriptSandboxState";
 
 /** Live transform of one scene object, as scripts observe it. */
 export interface EntitySnapshot {
@@ -29,6 +30,8 @@ export interface RunRequest {
   script: string;
   /** Transforms at the moment the test starts. Refreshed on every host reply. */
   snapshot: Record<string, EntitySnapshot>;
+  /** Read-only shared script state at test start. */
+  world: Record<string, unknown>;
   /** Lightweight scene descriptor. Deliberately excludes asset payloads and
    *  script source — a test never needs them inside the sandbox. */
   scene: { slug: string; entities: Array<{ id: string; name: string; kind: string }> };
@@ -48,6 +51,8 @@ export interface HostResult {
   error?: string;
   /** Scene state after the call, so `entityFor` can stay synchronous. */
   snapshot: Record<string, EntitySnapshot>;
+  /** Shared script state after the call, especially after step(). */
+  world: Record<string, unknown>;
 }
 
 export interface RunResult {
@@ -90,9 +95,12 @@ hardenWorkerScope(self);
  * reply and reads are served from here.
  */
 let snapshot: Record<string, EntitySnapshot> = {};
+let world: Record<string, unknown> = {};
 
 let nextCallId = 1;
 const pending = new Map<number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
+let outstanding: Promise<void>[] = [];
+let capabilityError: Error | null = null;
 
 function post(message: Outbound): void {
   reply(message);
@@ -101,10 +109,38 @@ function post(message: Outbound): void {
 /** Round-trips one capability call to the host. */
 function callHost(method: HostCall["method"], args: unknown[]): Promise<unknown> {
   const callId = nextCallId++;
-  return new Promise((resolve, reject) => {
+  const raw = new Promise<unknown>((resolve, reject) => {
     pending.set(callId, { resolve, reject });
     post({ type: "call", callId, method, args });
   });
+  // The caller-facing promise resolves after recording failures instead of
+  // rejecting. drainCalls() is the sole rejection point, so both awaited and
+  // unawaited capability failures follow the same deterministic path without
+  // creating a global unhandled rejection.
+  const promise = raw.then(
+    (value) => value,
+    (error) => {
+      capabilityError ??= error instanceof Error ? error : new Error(String(error));
+      return undefined;
+    },
+  );
+  outstanding.push(promise.then(() => undefined));
+  return promise;
+}
+
+/**
+ * Waits until the capability queue reaches quiescence. A promise continuation
+ * can issue another call (step().then(() => assert(...))), so one snapshot of
+ * the queue is insufficient; the loop includes calls appended while draining.
+ */
+async function drainCalls(): Promise<void> {
+  let cursor = 0;
+  while (cursor < outstanding.length) {
+    const batch = outstanding.slice(cursor);
+    cursor = outstanding.length;
+    await Promise.all(batch);
+  }
+  if (capabilityError) throw capabilityError;
 }
 
 self.onmessage = (event: MessageEvent<RunRequest | HostResult>) => {
@@ -115,6 +151,7 @@ self.onmessage = (event: MessageEvent<RunRequest | HostResult>) => {
     if (!entry) return;
     pending.delete(message.callId);
     if (message.snapshot) snapshot = message.snapshot;
+    if (message.world) world = deepFreeze(message.world);
     if (message.error) entry.reject(new Error(message.error));
     else entry.resolve(message.value);
     return;
@@ -123,10 +160,19 @@ self.onmessage = (event: MessageEvent<RunRequest | HostResult>) => {
   if (message.type !== "run") return;
 
   snapshot = message.snapshot;
+  world = deepFreeze(message.world ?? {});
+  outstanding = [];
+  capabilityError = null;
 
   void (async () => {
+    const state = Object.freeze({
+      get world() {
+        return world;
+      },
+    });
     const context = {
       scene: message.scene,
+      state,
       entityFor: (name: string): EntitySnapshot | null => snapshot[name] ?? null,
       assert: async (condition: boolean, text = "assertion failed") => {
         await callHost("assert", [condition, text]);
@@ -140,6 +186,7 @@ self.onmessage = (event: MessageEvent<RunRequest | HostResult>) => {
     try {
       const body = [
         "const scene = context.scene;",
+        "const state = context.state;",
         "const entityFor = context.entityFor;",
         "const assert = context.assert;",
         "const log = context.log;",
@@ -156,6 +203,7 @@ self.onmessage = (event: MessageEvent<RunRequest | HostResult>) => {
       ) as (...args: unknown[]) => Promise<void>;
 
       await run(...NETWORK_GLOBALS.map(() => undefined), context);
+      await drainCalls();
       post({ type: "done", testId: message.testId });
     } catch (error) {
       post({ type: "done", testId: message.testId, error: error instanceof Error ? error.message : String(error) });

@@ -1,7 +1,11 @@
 use crate::model::{self, ToolCall};
-use crate::tools::{core_tool_defs, execute_core_tool, to_openai_schema, ToolDef};
+use crate::tools::{
+    core_tool_defs, execute_core_tool_with_activity, take_internal_activity, to_openai_schema,
+    ToolDef,
+};
 use crate::AppState;
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -10,6 +14,254 @@ use uuid::Uuid;
 
 /// Idle sessions above this are evicted when a new one is created.
 const MAX_SESSIONS: usize = 32;
+
+/// A single assistant turn may fan out at most this many subagents; spawn
+/// calls past the cap fail with an error result instead of forking.
+const MAX_SPAWNS_PER_TURN: usize = 8;
+
+/// Backstop on one tool result as it enters the message history.
+///
+/// A tool result is not paid for once. It sits in `messages` and is re-sent to
+/// the model on every following turn until compaction, so an unbounded result
+/// is a recurring charge. `file_read` bounds itself far below this (see
+/// `crate::fileread`) and so do the search tools; this catches everything that
+/// does not — above all MCP tools, whose output comes from a third-party
+/// server that has no idea it is spending our context window.
+///
+/// Deliberately above every core tool's own ceiling: a specific tool should
+/// hit its own tight, self-describing cap and explain how to page past it. By
+/// the time a result reaches this one, nothing better is available.
+const MAX_TOOL_RESULT_BYTES: usize = 192 * 1024;
+/// A drain failure is returned to graph/monitor callers, so keep provider
+/// errors bounded even when a gateway returns a very large error body.
+const MAX_DRAIN_REASON_CHARS: usize = 512;
+
+/// Finalization directive appended to the schema-less drain call.
+///
+/// The instruction travels inside the same session-style snapshot the model
+/// already saw, so the provider's prompt cache stays warm and the model
+/// treats this as a terminal reply, not as another agentic turn. The judge
+/// node continues to emit JSON when its system prompt asked for it; the
+/// directive only forbids tool calls and provider tags, not JSON itself.
+const FINALIZATION_INSTRUCTION: &str = "FINAL RESPONSE ONLY. Do not emit tool calls, tool-call \
+     XML, or provider tags. Return the terminal format required by earlier instructions: plain \
+     text unless they require JSON. Summarize concrete changes and evidence.";
+
+/// Detects whether a provider returned a textual tool-call protocol inside
+/// its `content` field instead of structured `tool_calls`.
+///
+/// Some providers emit a tool-call wrapper inline instead of a structured
+/// call. The streaming parser correctly leaves that untrusted protocol in
+/// `content`; the drain must not mistake it for a final report.
+///
+/// Patterns are plain ASCII so the live artifact matches byte-for-byte;
+/// the matcher strips invisible Unicode (U+200B/C/D, U+FEFF) before
+/// comparing so the detection still fires when a provider slips in a
+/// zero-width space or BOM alongside the markup.
+fn content_carries_textual_tool_protocol(content: &str) -> bool {
+    let normalized = content
+        .chars()
+        .filter(|c| !is_invisible_unicode(*c))
+        .collect::<String>()
+        .to_ascii_lowercase();
+    let provider_sentinel = normalized.contains("]<]minimax[>[")
+        || normalized.contains("<|minimax|>")
+        || normalized.contains("<|tool_call|>");
+    let xml_tool_call = normalized.contains("<tool_call>")
+        && (normalized.contains("<invoke name=")
+            || normalized.contains("<invoke name =")
+            || normalized.contains("</tool_call>"));
+    provider_sentinel || xml_tool_call
+}
+
+/// Invisible Unicode characters that providers occasionally insert to
+/// disguise tool-call markup; the matcher strips them so the plain-ASCII
+/// patterns still match even when the wire payload is "decorated".
+fn is_invisible_unicode(c: char) -> bool {
+    matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{FEFF}')
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Some tool-capable gateways occasionally emit `graph_plan({})` even though
+/// the schema requires `goal`. Replaying that invalid assistant tool call can
+/// make the same gateway reject the next request before it gets a chance to
+/// read CaliCode's structured tool error. The latest user turn is the trusted
+/// planning objective already in context, so restore only that required field
+/// before the call is persisted; every other graph field still goes through
+/// normal validation and must be supplied by the model.
+fn repair_missing_graph_goal(tool_calls: &mut [ToolCall], messages: &[Value]) {
+    let Some(goal) = messages.iter().rev().find_map(|message| {
+        if message["role"] != "user" {
+            return None;
+        }
+        message["content"]
+            .as_str()
+            .map(str::trim)
+            .filter(|content| !content.is_empty())
+            .map(str::to_string)
+    }) else {
+        return;
+    };
+    for call in tool_calls {
+        if call.name != "graph_plan" {
+            continue;
+        }
+        if call.arguments.is_null() {
+            call.arguments = json!({});
+        }
+        let Some(arguments) = call.arguments.as_object_mut() else {
+            continue;
+        };
+        let missing = arguments
+            .get("goal")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_none_or(str::is_empty);
+        if missing {
+            arguments.insert("goal".into(), json!(goal));
+        }
+    }
+}
+
+/// Add routing fields from trusted session state before a tool call is
+/// recorded or executed. This keeps provider replay and the public tool-call
+/// log aligned with what core actually dispatched, while preventing a model
+/// from redirecting graph/report writes to a different project or loop.
+fn bind_trusted_call_context(
+    tool: &str,
+    arguments: &mut Value,
+    options: &AgentOptions,
+    session_id: &str,
+) {
+    if tool == "graph_plan" {
+        let Some(object) = arguments.as_object_mut() else {
+            return;
+        };
+        let root_session = options.approval_session.as_deref().unwrap_or(session_id);
+        object.insert("ownerSession".into(), json!(root_session));
+        if let Some(project_slug) = options.project_slug.as_deref() {
+            object.insert("slug".into(), json!(project_slug));
+        }
+        if let Some(workspace_root) = options.workspace_root.as_deref() {
+            object.insert("workspaceRoot".into(), json!(workspace_root));
+        }
+        if let Some(reasoning_effort) = options.reasoning_effort.as_deref() {
+            object.insert("reasoningEffort".into(), json!(reasoning_effort));
+        }
+        return;
+    }
+    if !matches!(
+        tool,
+        "loop_report_start" | "loop_report_iteration" | "loop_report_update" | "loop_report_open"
+    ) {
+        return;
+    }
+    if !arguments.is_object() {
+        *arguments = json!({});
+    }
+    let Some(object) = arguments.as_object_mut() else {
+        return;
+    };
+    if let Some(project_slug) = options.project_slug.as_deref() {
+        object.insert("slug".into(), json!(project_slug));
+    }
+    if let Some(loop_id) = options.loop_id.as_deref() {
+        object.insert("loopId".into(), json!(loop_id));
+    }
+}
+
+/// Serialise `outcome` for the message history, bounded by
+/// `MAX_TOOL_RESULT_BYTES`.
+///
+/// The overflow form stays valid JSON. Handing the model a JSON document cut
+/// off mid-string would cost it a turn to discover the result is unparseable,
+/// on top of the turn that produced it.
+fn bound_tool_result(tool: &str, outcome: &Value) -> String {
+    let text = outcome.to_string();
+    if text.len() <= MAX_TOOL_RESULT_BYTES {
+        return text;
+    }
+    let preview = String::from_utf8_lossy(utf8_prefix(text.as_bytes(), MAX_TOOL_RESULT_BYTES / 2))
+        .into_owned();
+    json!({
+        "truncated": true,
+        "tool": tool,
+        "bytes": text.len(),
+        "notice": format!(
+            "{tool} returned {} bytes, over the {}KB tool-result cap; the first half is \
+             below as text. Narrow the call — by path, pattern, or limit — rather than \
+             repeating it.",
+            text.len(),
+            MAX_TOOL_RESULT_BYTES / 1024
+        ),
+        "preview": preview,
+    })
+    .to_string()
+}
+
+/// Longest prefix of `bytes` within `max` that ends on a UTF-8 boundary.
+fn utf8_prefix(bytes: &[u8], max: usize) -> &[u8] {
+    if bytes.len() <= max {
+        return bytes;
+    }
+    let mut end = max;
+    while end > 0 && (bytes[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    &bytes[..end]
+}
+
+/// Ids of the tool calls an assistant message issues (empty for every other
+/// message shape).
+fn tool_call_ids(message: &Value) -> impl Iterator<Item = &str> {
+    message["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|call| call["id"].as_str())
+}
+
+/// Whether `suffix` can be appended to `compacted` without orphaning a tool
+/// result.
+///
+/// Providers reject a transcript containing a `tool` message whose
+/// `tool_call_id` no answer to any visible assistant `tool_calls` entry — and
+/// they reject the whole request, not just that message, so the session is
+/// bricked until someone truncates it by hand. Compaction can archive the
+/// assistant message that issued a call while a concurrent turn appends the
+/// result, which is exactly that shape. Ids introduced within the suffix
+/// count, so a complete call/result pair appended during the summary merges
+/// fine.
+fn suffix_is_clean_tail(compacted: &[Value], suffix: &[Value]) -> bool {
+    let mut issued: std::collections::HashSet<&str> =
+        compacted.iter().flat_map(tool_call_ids).collect();
+    for message in suffix {
+        if message["role"] == "tool" {
+            match message["tool_call_id"].as_str() {
+                Some(id) if issued.contains(id) => {}
+                _ => return false,
+            }
+        }
+        issued.extend(tool_call_ids(message));
+    }
+    true
+}
+
+fn bound_drain_reason(text: &str) -> String {
+    let mut chars = text.chars();
+    let bounded: String = chars.by_ref().take(MAX_DRAIN_REASON_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{bounded}…")
+    } else {
+        bounded
+    }
+}
 
 #[derive(Clone)]
 pub struct AgentManager {
@@ -21,14 +273,93 @@ pub struct AgentSession {
     pub id: String,
     pub messages: Vec<Value>,
     pub pending: HashMap<String, oneshot::Sender<Value>>,
+    /// Cumulative token totals across every model call in this session.
+    pub usage: model::Usage,
+    /// Prompt tokens of the most recent model call — i.e. the current
+    /// context occupancy. Overwritten per call, never reset.
+    pub last_prompt_tokens: u64,
+    /// Generation counter for wholesale rewrites of `messages` (compaction).
+    ///
+    /// Every other write to `messages` is an append, so this counter plus the
+    /// length observed before an await is enough to classify what happened
+    /// while the lock was dropped: same generation means the transcript only
+    /// grew and the first `len` entries are untouched; a bumped generation
+    /// means the head moved under us and nothing may be assumed.
+    /// `compact_session` reads it before its multi-second summary call and
+    /// re-checks it before swapping the result in.
+    pub compactions: u64,
+}
+
+struct ToolExecutionContext<'a> {
+    state: &'a AppState,
+    registered: &'a HashMap<String, ToolDef>,
+    session: Arc<Mutex<AgentSession>>,
+    sid: &'a str,
+    options: &'a AgentOptions,
+}
+
+impl AgentSession {
+    /// Auto-compaction hook: fires once the latest model call's prompt met
+    /// or crossed `context_budget_tokens`. The trigger's owner computes the
+    /// budget from compaction config (e.g. threshold × context_length −
+    /// reserved) and invokes `session_compact` when this returns true. A
+    /// zero budget disables the check.
+    pub fn should_compact(&self, context_budget_tokens: u64) -> bool {
+        context_budget_tokens > 0 && self.last_prompt_tokens >= context_budget_tokens
+    }
+}
+
+/// Context length assumed when neither the config's `compaction.context_length`
+/// override nor any provider metadata says otherwise.
+const DEFAULT_CONTEXT_LENGTH: u32 = 128_000;
+
+/// Token budget that triggers (and bounds) compaction:
+/// `threshold × context_length − reserved`, clamped at zero. A non-positive
+/// result disables auto-compaction (`should_compact` treats 0 as off).
+fn context_budget_tokens(config: &crate::config::AppConfig) -> u64 {
+    let compaction = &config.compaction;
+    let context_length = compaction
+        .context_length
+        .unwrap_or(DEFAULT_CONTEXT_LENGTH)
+        .max(1);
+    let threshold = compaction.threshold.clamp(0.0, 1.0) as f64;
+    let budget = (f64::from(context_length) * threshold) as u64;
+    budget.saturating_sub(u64::from(compaction.reserved))
 }
 
 #[derive(Clone, Default)]
 pub struct AgentOptions {
     pub permission_mode: String,
     pub max_turns: usize,
+    /// Bounded orchestration escape hatch: after the final allowed turn executes tools,
+    /// make one schema-less provider call for a textual handoff. Public
+    /// ordinary top-level/subagent callers leave this false. Graph workers
+    /// and trusted `/loop` requests may enable it.
+    pub final_response_drain: bool,
+    /// Per-turn reasoning effort selected by the composer. It is forwarded
+    /// only for this request, never written into the provider config.
+    pub reasoning_effort: Option<String>,
+    /// Active client-owned /loop identifier. Core injects this and the
+    /// already-bound project slug into loop-report tool calls so a model does
+    /// not have to retype opaque routing fields on every iteration.
+    pub loop_id: Option<String>,
     pub system: Option<String>,
     pub project_slug: Option<String>,
+    /// Immutable workspace selected by the durable session. Core file tools
+    /// resolve here instead of following the project's mutable default.
+    pub workspace_root: Option<String>,
+    /// Session whose events and pending map carry this agent's approval
+    /// requests. `None` means this agent's own session — the default for
+    /// top-level chats. Subagents get their root ancestor's id here so the
+    /// client (which only watches the session it opened) sees the prompt.
+    pub approval_session: Option<String>,
+    /// How many `subagent_spawn` hops sit above this agent (0 = top level).
+    /// Capped by `crate::tools::MAX_SUBAGENT_DEPTH`.
+    pub subagent_depth: usize,
+    /// Ordered permission rules from config (global first, then per-project
+    /// so project rules win under last-match-wins). Evaluated before mode
+    /// logic. Subagents must inherit their parent's rules, never looser.
+    pub permission_rules: Vec<PermissionRule>,
 }
 
 impl AgentManager {
@@ -37,6 +368,149 @@ impl AgentManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             events,
         }
+    }
+
+    /// Pre-allocate the in-memory half of a durable session. The UI uses this
+    /// before the first turn so its editor/worktree binding already has the
+    /// same id the model and outside MCP clients will use.
+    pub async fn ensure_session(&self, id: &str) -> Result<()> {
+        self.restore_session(id, &[]).await
+    }
+
+    pub async fn restore_session(&self, id: &str, messages: &[Value]) -> Result<()> {
+        if id.is_empty()
+            || !id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            anyhow::bail!("invalid session id");
+        }
+        let mut sessions = self.sessions.lock().await;
+        sessions.entry(id.to_string()).or_insert_with(|| {
+            Arc::new(Mutex::new(AgentSession {
+                id: id.to_string(),
+                messages: messages.to_vec(),
+                pending: HashMap::new(),
+                usage: model::Usage::default(),
+                last_prompt_tokens: 0,
+                compactions: 0,
+            }))
+        });
+        Ok(())
+    }
+
+    /// Allocate a fresh session id before its first turn starts.
+    ///
+    /// Graph scheduling needs the id in its persisted `node_started` snapshot
+    /// so the client can demultiplex the very first delta/tool event. Going
+    /// through the same allocator as an unbound chat keeps MAX_SESSIONS
+    /// eviction intact; `ensure_session` only inserts a caller-chosen id and
+    /// deliberately does not run that lifecycle policy.
+    pub async fn reserve_session(&self) -> Result<String> {
+        let session = self.get_or_create(None).await?;
+        let id = session.lock().await.id.clone();
+        Ok(id)
+    }
+
+    /// Remove the in-memory state for a deleted/archived durable session.
+    ///
+    /// Dropping the pending oneshot senders wakes browser-tool and approval
+    /// calls immediately; otherwise an abandoned session remains reachable
+    /// until each request's multi-minute timeout and keeps its entry in the
+    /// manager map.
+    pub async fn remove_session(&self, id: &str) -> (bool, usize) {
+        let session = self.sessions.lock().await.remove(id);
+        let Some(session) = session else {
+            return (false, 0);
+        };
+        let mut guard = session.lock().await;
+        let pending = std::mem::take(&mut guard.pending);
+        let cancelled = pending.len();
+        drop(pending);
+        (true, cancelled)
+    }
+
+    async fn record_usage(
+        &self,
+        session: &Arc<Mutex<AgentSession>>,
+        session_id: &str,
+        usage: Option<model::Usage>,
+    ) {
+        let mut guard = session.lock().await;
+        if let Some(usage) = usage {
+            guard.usage.prompt_tokens += usage.prompt_tokens;
+            guard.usage.completion_tokens += usage.completion_tokens;
+            guard.usage.cache_read_tokens += usage.cache_read_tokens;
+            guard.usage.cache_write_tokens += usage.cache_write_tokens;
+            guard.usage.total_tokens += usage.total_tokens;
+            // Current context occupancy includes cached prefix tokens; cache
+            // hits are cheaper, not absent from the window.
+            guard.last_prompt_tokens = usage
+                .prompt_tokens
+                .saturating_add(usage.cache_read_tokens)
+                .saturating_add(usage.cache_write_tokens);
+        }
+        let _ = self.events.send(json!({
+            "type": "agent.usage",
+            "sessionId": session_id,
+            "usage": {
+                "promptTokens": guard.usage.prompt_tokens,
+                "completionTokens": guard.usage.completion_tokens,
+                "cacheReadTokens": guard.usage.cache_read_tokens,
+                "cacheWriteTokens": guard.usage.cache_write_tokens,
+                "totalTokens": guard.usage.total_tokens,
+                "lastPromptTokens": guard.last_prompt_tokens,
+                "lastCacheReadTokens": usage.map(|value| value.cache_read_tokens).unwrap_or(0)
+            }
+        }));
+    }
+
+    /// Ask the provider once for a report after the final tool turn. The
+    /// snapshot is the same reserved session transcript, but `tools: None`
+    /// guarantees a report cannot trigger another mutation.
+    async fn final_response_drain(
+        &self,
+        state: &AppState,
+        session: &Arc<Mutex<AgentSession>>,
+        session_id: &str,
+        options: &AgentOptions,
+    ) -> Result<model::ChatResult> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let bus = self.events.clone();
+        let sid_for_delta = session_id.to_string();
+        tokio::spawn(async move {
+            while let Some(delta) = rx.recv().await {
+                let _ = bus.send(json!({
+                    "type": "agent.delta",
+                    "sessionId": sid_for_delta,
+                    "delta": delta
+                }));
+            }
+        });
+        let config = { state.config.read().await.clone() };
+        let mut snapshot = {
+            let guard = session.lock().await;
+            guard.messages.clone()
+        };
+        // Same session history: the snapshot the model receives is the
+        // resolved transcript plus one finalization directive. Keeping the
+        // prefix intact preserves the provider's prompt-cache prefix; the
+        // appended user message is the only thing that changes on the wire.
+        snapshot.push(json!({
+            "role": "user",
+            "content": FINALIZATION_INSTRUCTION,
+        }));
+        let result = model::chat_with_effort_session_once(
+            &config,
+            &snapshot,
+            None,
+            Some(&tx),
+            options.reasoning_effort.as_deref(),
+            Some(session_id),
+        )
+        .await;
+        drop(tx);
+        result
     }
 
     pub async fn chat(
@@ -73,7 +547,7 @@ impl AgentManager {
                 break;
             }
             turns += 1;
-            let defs = self.build_tools(registered_tools);
+            let defs = self.build_tools(registered_tools, &options.permission_rules);
             let schemas: Vec<Value> = defs.iter().map(to_openai_schema).collect();
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
             let bus = self.events.clone();
@@ -92,18 +566,58 @@ impl AgentManager {
             // blocks every later reader — a switch during a subagent run was
             // measured starving the whole harness for >270s.
             let config = { state.config.read().await.clone() };
+            // Auto-compaction: when the previous call's prompt crossed the
+            // configured budget, compact before growing the context further.
+            // Failure is non-fatal — the turn proceeds uncompacted.
+            if config.compaction.auto {
+                let budget = context_budget_tokens(&config);
+                let wants = { session.lock().await.should_compact(budget) };
+                if wants {
+                    if let Err(error) = self.compact_session(state, &current_session_id).await {
+                        tracing::warn!(%error, session = %current_session_id,
+                            "auto-compaction failed; continuing uncompacted");
+                    }
+                }
+            }
             let snapshot = {
                 let guard = session.lock().await;
                 guard.messages.clone()
             };
-            let result = model::chat(&config, &snapshot, Some(&schemas), Some(&tx)).await?;
+            let mut result = model::chat_with_effort_session(
+                &config,
+                &snapshot,
+                Some(&schemas),
+                Some(&tx),
+                options.reasoning_effort.as_deref(),
+                Some(&current_session_id),
+            )
+            .await?;
             drop(tx);
-            if result.content.is_empty() && result.tool_calls.is_empty() {
-                let mut guard = session.lock().await;
-                guard.messages.push(
-                    json!({ "role": "assistant", "content": "I could not produce a response." }),
+            repair_missing_graph_goal(&mut result.tool_calls, &snapshot);
+            for call in &mut result.tool_calls {
+                bind_trusted_call_context(
+                    &call.name,
+                    &mut call.arguments,
+                    &options,
+                    &current_session_id,
                 );
-                break;
+            }
+            // Cumulative token accounting: fold this call's usage (when the
+            // provider reported any) into the session totals, then publish
+            // them so the client can render a context meter and the
+            // compaction auto-trigger can compare against its budget
+            // (`AgentSession::should_compact`).
+            self.record_usage(&session, &current_session_id, result.usage)
+                .await;
+            if result.content.is_empty() && result.tool_calls.is_empty() {
+                // `model::chat_with_effort` retries/falls back empty
+                // completions. Keep this guard for a future provider parser
+                // regression, but never turn an opaque success into a fake
+                // assistant sentence: the RPC error is actionable and the
+                // session remains resumable.
+                anyhow::bail!(
+                    "model returned an empty completion (no content or tool calls) after retries"
+                );
             }
 
             if result.tool_calls.is_empty() {
@@ -117,7 +631,9 @@ impl AgentManager {
                     "sessionId": current_session_id,
                     "reply": result.content,
                     "toolCalls": tool_calls_log,
-                    "turns": turns
+                    "turns": turns,
+                    "status": "completed",
+                    "completed": true
                 }));
             }
 
@@ -130,63 +646,268 @@ impl AgentManager {
                 }));
             }
 
+            // The fan-out cap counts spawns in call order BEFORE anything
+            // runs, so it cannot race execution: the first N spawn calls by
+            // position run, later ones are refused deterministically.
+            let mut spawn_seen = 0usize;
+            let over_caps: Vec<bool> = result
+                .tool_calls
+                .iter()
+                .map(|call| {
+                    if call.name == "subagent_spawn" {
+                        spawn_seen += 1;
+                        spawn_seen > MAX_SPAWNS_PER_TURN
+                    } else {
+                        false
+                    }
+                })
+                .collect();
+            // Each log entry starts as the attempted call. Outcomes pair
+            // with `result.tool_calls` in provider order, so we patch the
+            // freshly-pushed suffix once execution finishes — a failed
+            // loop_report_iteration is otherwise indistinguishable from a
+            // completed one when the client only sees the attempt list.
+            let log_attempt_start = tool_calls_log.len();
             for call in &result.tool_calls {
                 tool_calls_log.push(json!({
                     "name": call.name,
                     "arguments": call.arguments,
                     "id": call.id
                 }));
-                let _ = self.events.send(json!({
-                    "type": "agent.tool_started",
-                    "sessionId": current_session_id,
-                    "tool": call.name,
-                    "arguments": call.arguments
-                }));
-                let outcome = self
-                    .execute_tool_call(
-                        state,
-                        registered_tools,
-                        &session,
-                        &current_session_id,
-                        call,
-                        &options,
-                    )
-                    .await;
-                let outcome = match outcome {
-                    Ok(value) => value,
-                    Err(error) => json!({ "error": error.to_string() }),
-                };
-                {
-                    let mut guard = session.lock().await;
-                    guard.messages.push(json!({ "role": "tool", "tool_call_id": call.id, "content": outcome.to_string() }));
+            }
+            // Stateful calls must observe provider order: a generated asset
+            // has to exist before promotion, PIE must have started before a
+            // capture, and browser approvals/cancellation must not leave
+            // later calls racing the first one. The one explicit fan-out
+            // contract is a batch made entirely of subagent_spawn calls;
+            // graph waves provide the other parallel orchestration path.
+            let outcomes = if result
+                .tool_calls
+                .iter()
+                .all(|call| call.name == "subagent_spawn")
+            {
+                let started_at_ms: Vec<u64> =
+                    result.tool_calls.iter().map(|_| unix_time_ms()).collect();
+                for (call, started_at_ms) in result.tool_calls.iter().zip(&started_at_ms) {
+                    self.emit_tool_started(&current_session_id, call, *started_at_ms, &options);
                 }
-                let _ = self.events.send(json!({
-                    "type": "agent.tool_finished",
-                    "sessionId": current_session_id,
-                    "tool": call.name,
-                    "result": outcome
-                }));
+                let sid_ref = &current_session_id;
+                let options_ref = &options;
+                futures::future::join_all(
+                    result
+                        .tool_calls
+                        .iter()
+                        .zip(over_caps)
+                        .zip(started_at_ms)
+                        .map(|((call, over_cap), started_at_ms)| {
+                            let session = session.clone();
+                            async move {
+                                let context = ToolExecutionContext {
+                                    state,
+                                    registered: registered_tools,
+                                    session,
+                                    sid: sid_ref,
+                                    options: options_ref,
+                                };
+                                self.execute_tool_call_outcome(
+                                    &context,
+                                    call,
+                                    over_cap,
+                                    started_at_ms,
+                                )
+                                .await
+                            }
+                        }),
+                )
+                .await
+            } else {
+                let mut outcomes = Vec::with_capacity(result.tool_calls.len());
+                let context = ToolExecutionContext {
+                    state,
+                    registered: registered_tools,
+                    session: session.clone(),
+                    sid: &current_session_id,
+                    options: &options,
+                };
+                for (call, over_cap) in result.tool_calls.iter().zip(over_caps) {
+                    let started_at_ms = unix_time_ms();
+                    self.emit_tool_started(&current_session_id, call, started_at_ms, &options);
+                    outcomes.push(
+                        self.execute_tool_call_outcome(&context, call, over_cap, started_at_ms)
+                            .await,
+                    );
+                }
+                outcomes
+            };
+            {
+                let mut guard = session.lock().await;
+                for (call, outcome) in result.tool_calls.iter().zip(&outcomes) {
+                    guard.messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": bound_tool_result(&call.name, outcome)
+                    }));
+                }
+            }
+            // Stamp the just-executed suffix of `tool_calls_log` with its
+            // terminal status. The client loop correlates by tool call id,
+            // so it can finally tell a `loop_report_iteration` that
+            // returned `{"error": "..."}` from one that succeeded.
+            for (entry, outcome) in tool_calls_log
+                .iter_mut()
+                .skip(log_attempt_start)
+                .zip(&outcomes)
+            {
+                entry["status"] = json!(if outcome.get("error").is_some() {
+                    "error"
+                } else {
+                    "done"
+                });
+            }
+
+            // A graph worker may spend its last counted turn on tools. Give
+            // it exactly one schema-less request to report what those tools
+            // accomplished, but never execute a tool call returned by this
+            // bounded drain.
+            if turns >= max_turns && options.final_response_drain {
+                let drain = self
+                    .final_response_drain(state, &session, &current_session_id, &options)
+                    .await;
+                match drain {
+                    Ok(result) if content_carries_textual_tool_protocol(&result.content) => {
+                        // Tool protocol embedded in `content` is not a final
+                        // report: the provider parsed no structured
+                        // tool_calls, so nothing would be dispatched, but
+                        // pretending the markup is a report would silently
+                        // hide a confused model from the graph monitor.
+                        let reason = "final response drain returned a textual tool-call \
+                             protocol (provider did not emit structured tool_calls); no drain \
+                             tools were executed"
+                            .to_string();
+                        return Ok(self
+                            .max_turns_result(
+                                &session,
+                                &current_session_id,
+                                max_turns,
+                                tool_calls_log,
+                                Some(reason),
+                            )
+                            .await);
+                    }
+                    Ok(result)
+                        if !result.content.trim().is_empty() && result.tool_calls.is_empty() =>
+                    {
+                        self.record_usage(&session, &current_session_id, result.usage)
+                            .await;
+                        let reply = result.content;
+                        let mut guard = session.lock().await;
+                        guard
+                            .messages
+                            .push(json!({ "role": "assistant", "content": reply.clone() }));
+                        return Ok(json!({
+                            "sessionId": current_session_id,
+                            "reply": reply,
+                            "toolCalls": tool_calls_log,
+                            "turns": turns,
+                            "status": "completed",
+                            "completed": true
+                        }));
+                    }
+                    Ok(result) if !result.tool_calls.is_empty() => {
+                        let reason = "final response drain requested more tools; no drain tools were executed"
+                            .to_string();
+                        return Ok(self
+                            .max_turns_result(
+                                &session,
+                                &current_session_id,
+                                max_turns,
+                                tool_calls_log,
+                                Some(reason),
+                            )
+                            .await);
+                    }
+                    Ok(_) => {
+                        let reason =
+                            "final response drain returned no textual report; no additional tools were executed"
+                                .to_string();
+                        return Ok(self
+                            .max_turns_result(
+                                &session,
+                                &current_session_id,
+                                max_turns,
+                                tool_calls_log,
+                                Some(reason),
+                            )
+                            .await);
+                    }
+                    Err(error) => {
+                        let reason = format!(
+                            "final response drain failed: {}; no additional tools were executed",
+                            bound_drain_reason(&error.to_string())
+                        );
+                        return Ok(self
+                            .max_turns_result(
+                                &session,
+                                &current_session_id,
+                                max_turns,
+                                tool_calls_log,
+                                Some(reason),
+                            )
+                            .await);
+                    }
+                }
             }
         }
 
-        let last = {
-            let guard = session.lock().await;
+        Ok(self
+            .max_turns_result(
+                &session,
+                &current_session_id,
+                max_turns,
+                tool_calls_log,
+                None,
+            )
+            .await)
+    }
+
+    async fn max_turns_result(
+        &self,
+        session: &Arc<Mutex<AgentSession>>,
+        session_id: &str,
+        max_turns: usize,
+        tool_calls_log: Vec<Value>,
+        reason: Option<String>,
+    ) -> Value {
+        let reply = match reason.as_deref() {
+            Some(reason) => format!(
+                "The agent stopped after {max_turns} turns before producing a final answer. \
+                 {reason}. Send another message to continue."
+            ),
+            None => format!(
+                "The agent stopped after {max_turns} turns before producing a final answer. \
+                 Send another message to continue."
+            ),
+        };
+        {
+            let mut guard = session.lock().await;
             guard
                 .messages
-                .iter()
-                .rev()
-                .find(|m| m["role"] == "assistant")
-                .and_then(|m| m["content"].as_str())
-                .filter(|content| !content.trim().is_empty())
-                .unwrap_or("Turn limit reached before the agent finished.")
-                .to_string()
-        };
-        Ok(json!({
-            "sessionId": current_session_id,
-            "reply": last,
+                .push(json!({ "role": "assistant", "content": reply.clone() }));
+        }
+        let mut result = json!({
+            "sessionId": session_id,
+            "reply": reply,
             "toolCalls": tool_calls_log,
-            "turns": turns
-        }))
+            "turns": max_turns,
+            "status": "max_turns",
+            "completed": false,
+            "terminalReason": "max_turns",
+            "maxTurns": max_turns
+        });
+        if let Some(reason) = reason {
+            result["reason"] = json!(reason);
+        }
+        result
     }
 
     pub async fn submit_tool_result(
@@ -221,6 +942,109 @@ impl AgentManager {
         }
     }
 
+    /// Compact one session in place: prune stale tool results, summarize the
+    /// middle of the transcript with a single model call, and rewrite
+    /// `messages` as `[head, summary, tail]` (`compaction::apply`). Replaced
+    /// turns are soft-archived under the session file's `archived` key before
+    /// the rewrite, so nothing is destroyed. Serves both the
+    /// `session_compact` RPC and the auto-trigger in the chat loop.
+    ///
+    /// The summary is a multi-second model call made with the session lock
+    /// dropped, and core is an HTTP API: a second turn can append to the same
+    /// session meanwhile (the client-side busy guard only covers one client).
+    /// So the swap is conditional. The transcript's length and generation are
+    /// captured before the await and re-checked under the lock after it; a
+    /// clean appended tail is re-merged onto the compacted result, and
+    /// anything else refuses with a "transcript moved" error rather than
+    /// destroying the appended turns. Dropping an appended assistant
+    /// `tool_calls` message is the expensive case — the next turn would push
+    /// tool results answering a call the provider can no longer see, and the
+    /// whole session 400s.
+    pub async fn compact_session(&self, state: &AppState, session_id: &str) -> Result<Value> {
+        use crate::compaction;
+        let session = self.session(session_id).await?;
+        let config = { state.config.read().await.clone() };
+        let budget = context_budget_tokens(&config).max(1) as usize;
+        let (mut messages, snapshot_len, generation) = {
+            let guard = session.lock().await;
+            (
+                guard.messages.clone(),
+                guard.messages.len(),
+                guard.compactions,
+            )
+        };
+        let tokens_before = compaction::estimate_tokens(&messages);
+        let Some(bounds) = compaction::select_boundaries(&messages, budget) else {
+            return Ok(json!({
+                "sessionId": session_id,
+                "compacted": false,
+                "reason": "nothing to compact",
+                "estimatedTokens": tokens_before,
+            }));
+        };
+        let pruned = compaction::prune_old_tool_results(&mut messages, bounds.tail_start);
+        let request = compaction::build_summary_request(&messages, &bounds);
+        let summary = model::chat(&config, &request, None, None).await?.content;
+        let summary = summary.trim();
+        if summary.is_empty() {
+            anyhow::bail!("compaction summary model call returned no content");
+        }
+        let archived: Vec<Value> = messages[bounds.head_end..bounds.tail_start].to_vec();
+        let mut merged = compaction::apply(&messages, &bounds, summary);
+
+        // Everything below runs under the lock, archive write included, so
+        // the re-check and the swap are one atomic step: a turn that appends
+        // between them would otherwise be dropped by exactly the race this
+        // guards. The write is a small local JSON file and this session is
+        // already stalled behind the summary call.
+        let mut guard = session.lock().await;
+        if guard.compactions != generation || guard.messages.len() < snapshot_len {
+            anyhow::bail!(
+                "transcript moved during compaction of session {session_id}: another \
+                 compaction rewrote it while the summary was in flight; retry"
+            );
+        }
+        let appended = guard.messages.len() - snapshot_len;
+        if appended > 0 {
+            // Re-merge rather than refuse when the appended suffix is a clean
+            // tail — a concurrent turn's work survives and the ordering is
+            // exactly what it would have been.
+            if !suffix_is_clean_tail(&merged, &guard.messages[snapshot_len..]) {
+                anyhow::bail!(
+                    "transcript moved during compaction of session {session_id}: {appended} \
+                     message(s) appended while the summary was in flight answer tool calls \
+                     that compaction removed, so they cannot be re-merged; retry"
+                );
+            }
+            merged.extend_from_slice(&guard.messages[snapshot_len..]);
+        }
+        let tokens_after = compaction::estimate_tokens(&merged);
+        // Archive before swapping the live transcript: if the disk write
+        // fails, the session keeps its full history and the user can retry.
+        crate::sessions::archive_turns(&state.sessions_root, session_id, &archived)
+            .context("archiving compacted turns")?;
+        guard.messages = merged;
+        guard.compactions += 1;
+        // Estimate the new occupancy so the auto-trigger doesn't refire
+        // until a real model call reports fresh usage.
+        guard.last_prompt_tokens = tokens_after as u64;
+        drop(guard);
+
+        let result = json!({
+            "sessionId": session_id,
+            "compacted": true,
+            "archivedMessages": archived.len(),
+            "remergedMessages": appended,
+            "prunedToolResults": pruned,
+            "estimatedTokensBefore": tokens_before,
+            "estimatedTokensAfter": tokens_after,
+        });
+        let mut event = result.clone();
+        event["type"] = json!("agent.compacted");
+        let _ = self.events.send(event);
+        Ok(result)
+    }
+
     pub async fn sessions(&self) -> Vec<Value> {
         let guard = self.sessions.lock().await;
         guard
@@ -242,9 +1066,20 @@ impl AgentManager {
         // model::chat. A long-lived core accumulated them along with their
         // full message history, base64 screenshots included.
         if guard.len() >= MAX_SESSIONS {
+            // An idle-looking session is not necessarily idle. A session
+            // parked on a browser-tool or approval oneshot holds no lock —
+            // it registered its sender in `pending` and released — so
+            // try_lock alone happily evicts it, after which
+            // agent_tool_result/submit_approval answer "session not found"
+            // and the tool hangs to its 300s timeout. Non-empty `pending`
+            // means somebody is waiting on a reply: never a victim.
             let victims: Vec<String> = guard
                 .iter()
-                .filter(|(_, session)| session.try_lock().is_ok())
+                .filter(|(_, session)| {
+                    session
+                        .try_lock()
+                        .is_ok_and(|session| session.pending.is_empty())
+                })
                 .map(|(id, _)| id.clone())
                 .take(guard.len() + 1 - MAX_SESSIONS)
                 .collect();
@@ -259,6 +1094,9 @@ impl AgentManager {
             id: id.clone(),
             messages: Vec::new(),
             pending: HashMap::new(),
+            usage: model::Usage::default(),
+            last_prompt_tokens: 0,
+            compactions: 0,
         }));
         guard.insert(id, session.clone());
         Ok(session)
@@ -269,10 +1107,113 @@ impl AgentManager {
         guard.get(session_id).cloned().context("session not found")
     }
 
-    fn build_tools(&self, registered: &HashMap<String, ToolDef>) -> Vec<ToolDef> {
+    fn build_tools(
+        &self,
+        registered: &HashMap<String, ToolDef>,
+        rules: &[PermissionRule],
+    ) -> Vec<ToolDef> {
         let mut defs = core_tool_defs();
         defs.extend(registered.values().cloned());
+        // Provider selection is global application state. Only the user's
+        // model picker may mutate it; exposing model_switch to one agent let
+        // that task silently reroute every other session and persist the
+        // change across restarts.
+        defs.retain(|def| def.name != "model_switch" && def.name != "editor_model_switch");
+        // A live editor owns the transaction around image-to-3D generation:
+        // it saves first, reopens the generated metadata, and only then
+        // exposes the asset to the scene. Hiding the raw core schema prevents
+        // an attached model from choosing the split-brain path; headless
+        // sessions still receive `image3d_mesh` when no browser wrapper exists.
+        let has_live_image3d_wrapper = registered.values().any(|def| {
+            def.name == "editor_image3d_mesh" && def.kind == crate::tools::ToolKind::Browser
+        });
+        if has_live_image3d_wrapper {
+            defs.retain(|def| def.name != "image3d_mesh");
+        }
+        // The editor wrapper captures and persists in one browser call. The
+        // raw core schema requires replaying a multi-megabyte data URL through
+        // the model, where result bounding can truncate it and providers may
+        // reject the payload. Keep the raw tool for headless callers only.
+        let has_live_capture_wrapper = registered.values().any(|def| {
+            def.name == "editor_persist_capture" && def.kind == crate::tools::ToolKind::Browser
+        });
+        if has_live_capture_wrapper {
+            defs.retain(|def| def.name != "capture_persist");
+        }
+        // `deny` rules hide the tool from the model entirely; the gate in
+        // execute_tool_call is the backstop for hallucinated calls.
+        defs.retain(|def| rule_decision(rules, &def.name) != Some(RuleAction::Deny));
+        // HashMap iteration is randomized per process. Provider prompt caches
+        // key the serialized prefix, so a different browser/MCP tool order on
+        // restart invalidates the whole otherwise-identical system prefix.
+        // Exact-name sorting also makes snapshots and provider traces stable.
+        defs.sort_by(|left, right| left.name.cmp(&right.name));
         defs
+    }
+
+    fn emit_tool_started(
+        &self,
+        session_id: &str,
+        call: &ToolCall,
+        started_at_ms: u64,
+        options: &AgentOptions,
+    ) {
+        let _ = self.events.send(json!({
+            "type": "agent.tool_started",
+            "sessionId": session_id,
+            "tool": call.name,
+            "toolCallId": call.id,
+            "startedAtMs": started_at_ms,
+            "projectSlug": options.project_slug,
+            "workspaceRoot": options.workspace_root,
+            "arguments": call.arguments
+        }));
+    }
+
+    async fn execute_tool_call_outcome(
+        &self,
+        context: &ToolExecutionContext<'_>,
+        call: &ToolCall,
+        over_cap: bool,
+        started_at_ms: u64,
+    ) -> Value {
+        let outcome = if over_cap {
+            Err(anyhow::anyhow!(
+                "subagent fan-out cap reached: at most {MAX_SPAWNS_PER_TURN} subagent_spawn calls per turn"
+            ))
+        } else {
+            self.execute_tool_call(
+                context.state,
+                context.registered,
+                &context.session,
+                context.sid,
+                call,
+                context.options,
+            )
+            .await
+        };
+        let mut outcome = match outcome {
+            Ok(value) => value,
+            Err(error) => json!({ "error": error.to_string() }),
+        };
+        let activity = take_internal_activity(&mut outcome);
+        let finished_at_ms = unix_time_ms();
+        let mut event = json!({
+            "type": "agent.tool_finished",
+            "sessionId": context.sid,
+            "tool": call.name,
+            "toolCallId": call.id,
+            "startedAtMs": started_at_ms,
+            "finishedAtMs": finished_at_ms,
+            "projectSlug": context.options.project_slug,
+            "workspaceRoot": context.options.workspace_root,
+            "result": outcome
+        });
+        if let Some(activity) = activity {
+            event["activity"] = activity;
+        }
+        let _ = self.events.send(event);
+        outcome
     }
 
     async fn execute_tool_call(
@@ -284,6 +1225,14 @@ impl AgentManager {
         call: &ToolCall,
         options: &AgentOptions,
     ) -> Result<Value> {
+        // Backstop the schema filter above: a provider can hallucinate a
+        // tool name that was never advertised, and that must not become a
+        // path to changing global model state.
+        if call.name == "model_switch" || call.name == "editor_model_switch" {
+            anyhow::bail!(
+                "model selection is user-controlled; choose a model from the CaliCode model picker"
+            );
+        }
         let core_def = core_tool_defs().into_iter().find(|d| d.name == call.name);
         let def = if let Some(def) = core_def {
             def
@@ -294,20 +1243,69 @@ impl AgentManager {
                 .context("tool not registered")?
         };
 
-        if requires_approval(&options.permission_mode, &def.name) {
+        // Approvals surface on the root ancestor's session when this agent is
+        // a subagent — the client only watches the session it opened, so a
+        // prompt emitted under a child session id would hang unanswered.
+        let root_sid = options
+            .approval_session
+            .clone()
+            .unwrap_or_else(|| sid.to_string());
+
+        // Plan mode is a dispatch gate, not an approval question: outside
+        // the read-only whitelist nothing runs — not even under an `allow`
+        // rule — and the model gets a refusal tool result to plan around.
+        if options.permission_mode == "plan" && !plan_mode_allows(&def.name) {
+            anyhow::bail!(
+                "plan mode: tool '{}' is unavailable (read-only inspection only) — describe the intended change instead of applying it",
+                def.name
+            );
+        }
+
+        let mcp_trusted =
+            def.kind == crate::tools::ToolKind::Mcp && state.mcp.is_trusted(&def.name).await;
+        // Config permission rules run BEFORE mode logic (last match wins):
+        // `deny` rejects outright, `allow` skips the prompt, `ask` forces
+        // one; only unmatched tools fall through to the mode's own policy.
+        let needs_approval = match tool_gate(
+            &options.permission_rules,
+            &options.permission_mode,
+            &def.name,
+            mcp_trusted,
+        ) {
+            Gate::Deny => anyhow::bail!("tool '{}' is denied by permission rules", def.name),
+            Gate::Prompt => true,
+            Gate::Run => false,
+        };
+        if needs_approval {
+            // The pending sender and the event's sessionId must name the same
+            // session, or the client's agent_approval_response finds nothing.
+            let (approval_sid, approval_session) = if root_sid == sid {
+                (sid.to_string(), session.clone())
+            } else {
+                match self.session(&root_sid).await {
+                    Ok(parent) => (root_sid.clone(), parent),
+                    // Root session evicted: fall back to our own so the event
+                    // and the pending entry stay consistent.
+                    Err(_) => (sid.to_string(), session.clone()),
+                }
+            };
             let request_id = format!("approval-{}", Uuid::new_v4().simple());
             let (tx, rx) = oneshot::channel();
             {
-                let mut guard = session.lock().await;
+                let mut guard = approval_session.lock().await;
                 guard.pending.insert(request_id.clone(), tx);
             }
-            let _ = self.events.send(json!({
+            let mut event = json!({
                 "type": "agent.approval_request",
-                "sessionId": sid,
+                "sessionId": approval_sid,
                 "requestId": request_id,
                 "tool": def.name,
                 "arguments": call.arguments
-            }));
+            });
+            if approval_sid != sid {
+                event["subagentSessionId"] = json!(sid);
+            }
+            let _ = self.events.send(event);
             // On timeout the receiver drops but the sender used to stay in
             // session.pending forever, so a late agent_tool_result answered
             // {"accepted": true} to nobody.
@@ -315,7 +1313,7 @@ impl AgentManager {
             {
                 Ok(inner) => inner.context("approval channel closed")?,
                 Err(_) => {
-                    session.lock().await.pending.remove(&request_id);
+                    approval_session.lock().await.pending.remove(&request_id);
                     anyhow::bail!("approval timed out for {}", def.name);
                 }
             };
@@ -329,7 +1327,37 @@ impl AgentManager {
         }
 
         if def.kind == crate::tools::ToolKind::Core {
-            return execute_core_tool(&def, &call.arguments, state, &state.projects_root).await;
+            if def.name == "subagent_spawn" {
+                // Children inherit this agent's permission mode — never wider
+                // — and route their approvals to the same root session. Going
+                // through execute_core_tool here would run the child at the
+                // legacy full-access default.
+                let parent = crate::tools::SpawnParent {
+                    permission_mode: options.permission_mode.clone(),
+                    reasoning_effort: options.reasoning_effort.clone(),
+                    approval_session: root_sid,
+                    depth: options.subagent_depth,
+                    permission_rules: options.permission_rules.clone(),
+                    workspace_root: options.workspace_root.clone(),
+                };
+                return crate::tools::spawn_subagent_for_parent(state, &call.arguments, parent)
+                    .await;
+            }
+            return execute_core_tool_with_activity(
+                &def,
+                &call.arguments,
+                state,
+                &state.projects_root,
+                options.workspace_root.as_deref().map(std::path::Path::new),
+                true,
+            )
+            .await;
+        }
+
+        // MCP tools proxy to their server; the per-server timeout_secs is
+        // applied inside the client, so no wrapper here.
+        if def.kind == crate::tools::ToolKind::Mcp {
+            return state.mcp.call(&def.name, &call.arguments).await;
         }
 
         let request_id = format!("tool-{}", Uuid::new_v4().simple());
@@ -338,13 +1366,36 @@ impl AgentManager {
             let mut guard = session.lock().await;
             guard.pending.insert(request_id.clone(), tx);
         }
-        let _ = self.events.send(json!({
+        // Broadcast is shared by every open frontend. Include the owner
+        // client when the session is attached so foreign panels ignore this
+        // request instead of racing to answer the pending oneshot.
+        let target_client_id = {
+            let attachments = state.editor_attachment.read().await;
+            attachments.get(&root_sid).and_then(|attachment| {
+                let project_matches = options
+                    .project_slug
+                    .as_deref()
+                    .is_some_and(|project| project == attachment.project_slug);
+                let workspace_matches = options.workspace_root.as_deref().is_some_and(|root| {
+                    crate::editor_bridge::same_path(root, &attachment.workspace_root)
+                });
+                (project_matches && workspace_matches).then(|| attachment.client_id.clone())
+            })
+        };
+        let mut event = json!({
             "type": "agent.tool_request",
             "sessionId": sid,
+            "targetSessionId": root_sid,
+            "projectSlug": options.project_slug,
+            "workspaceRoot": options.workspace_root,
             "requestId": request_id,
             "tool": def.name,
             "arguments": call.arguments
-        }));
+        });
+        if let Some(client_id) = target_client_id {
+            event["targetClientId"] = json!(client_id);
+        }
+        let _ = self.events.send(event);
         match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await {
             Ok(inner) => inner.context("browser tool channel closed"),
             Err(_) => {
@@ -366,17 +1417,154 @@ fn assistant_tool_call(call: &ToolCall) -> Value {
     })
 }
 
+/// One entry under config `permissions:` — `pattern` is a tool-name glob
+/// (`*` matches any run, `?` one char, `[abc]`/`[a-z]`/`[!abc]` character
+/// classes), `action` is `allow` | `ask` | `deny`. Matching is
+/// [`crate::mcp::glob_match`], the one glob dialect shared with MCP tool
+/// filters — a pattern means the same thing in both places.
+/// Rules are evaluated in order and the LAST match wins, so
+/// specific rules belong after broad ones and per-project rules (appended
+/// after global ones by the config merge) override them naturally.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct PermissionRule {
+    pub pattern: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleAction {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// Last matching rule wins; `None` means no rule matched and the mode's own
+/// logic decides. An unrecognized action fails closed to `Ask` rather than
+/// silently allowing (or bricking) the tool.
+pub fn rule_decision(rules: &[PermissionRule], tool: &str) -> Option<RuleAction> {
+    let mut decision = None;
+    for rule in rules {
+        if crate::mcp::glob_match(&rule.pattern, tool) {
+            decision = Some(match rule.action.as_str() {
+                "allow" => RuleAction::Allow,
+                "deny" => RuleAction::Deny,
+                _ => RuleAction::Ask,
+            });
+        }
+    }
+    decision
+}
+
+/// Rule layer stacked over mode layer: what actually happens to a call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Deny,
+    Prompt,
+    Run,
+}
+
+fn tool_gate(rules: &[PermissionRule], mode: &str, tool: &str, mcp_trusted: bool) -> Gate {
+    match rule_decision(rules, tool) {
+        Some(RuleAction::Deny) => Gate::Deny,
+        Some(RuleAction::Allow) => Gate::Run,
+        Some(RuleAction::Ask) => Gate::Prompt,
+        None if requires_approval(mode, tool, mcp_trusted) => Gate::Prompt,
+        None => Gate::Run,
+    }
+}
+
+/// Every tool plan mode may dispatch, by exact name. Kept in
+/// `is_destructive`'s module so the two classifications evolve together.
+///
+/// Membership means all three of: reads only, touches nothing outside the
+/// projects root, and makes no network request. Names are exact because the
+/// list is a security boundary — see `plan_mode_allows`.
+///
+/// Deliberately absent, and why:
+/// - `asset_search` — its `polyhaven` source is an outbound HTTP query, so a
+///   "read-only" planning turn would still send the project's vocabulary to a
+///   third party and burn quota. Plan mode is where a user expects *nothing*
+///   to leave the machine; local discovery (`file_glob`, `asset_usage`) still
+///   works, and the search runs the moment they leave plan mode.
+/// - `project_open` stays in: unlike `asset_search` it is a pure local read of
+///   `<root>/<slug>` with no egress.
+/// - `graph_plan`, `test_baseline_save`, `asset_hash_dedupe`,
+///   `asset_export_gltf` — each persists something under the projects root.
+/// - `editor_select_entity`, `editor_asset_builder_open` — cheap, but they
+///   move the user's editor out from under them mid-plan.
+/// - anything under `mcp__` — the core cannot know what a third-party server
+///   does with a call, trusted or not.
+const PLAN_MODE_TOOLS: &[&str] = &[
+    // Core: local reads.
+    "file_read",
+    "file_list",
+    "file_grep",
+    "file_glob",
+    "skill_list",
+    "skill_load",
+    "model_list",
+    "project_list",
+    "project_open",
+    "graph_status",
+    "graph_list",
+    "loop_report_list",
+    "loop_report_open",
+    "template_list",
+    "asset_usage",
+    "test_baseline_compare",
+    "image3d_validate",
+    // Browser/editor: the inspect-and-report corner of that namespace.
+    // The rest of `editor_*` mutates the scene, writes files, or spends
+    // money on generation. Mirrors client/src/lib/useBrowserTools.ts.
+    "editor_scene_inspect",
+    "editor_capture_frame",
+    "editor_asset_builder_state",
+    "editor_console_log",
+];
+
+/// Whether plan mode may dispatch this tool at all.
+///
+/// Exact names only — no prefix or substring rule. This used to admit any
+/// `editor_*` tool whose name contained "inspect"/"capture" or ended in
+/// `_state`/`_log`, which reads the tool's *name* as if it were its
+/// contract: a later `editor_capture_and_overwrite` or
+/// `editor_inspect_and_repair` would have walked straight through the
+/// read-only gate on the day it was registered. No prefix in this harness is
+/// provably safe — `editor_` and `file_` each span readers and writers, and
+/// `mcp__` is opaque by definition — so the gate fails closed and a new
+/// read-only tool must be added to `PLAN_MODE_TOOLS` by hand.
+pub fn plan_mode_allows(tool: &str) -> bool {
+    PLAN_MODE_TOOLS.contains(&tool)
+}
+
 /// Tools that change something outside the current scene, or that cost money.
 /// These are what a permission mode is actually protecting.
-fn is_destructive(tool: &str) -> bool {
+///
+/// MCP tools are destructive unless their server is configured `trust: true` —
+/// the core cannot know what a third-party tool does.
+fn is_destructive(tool: &str, mcp_trusted: bool) -> bool {
+    if tool.starts_with(crate::mcp::MCP_PREFIX) {
+        return !mcp_trusted;
+    }
     matches!(
         tool,
         "project_revert"
             | "project_save"
             | "project_create"
             | "file_write"
+            | "file_edit"
             | "model_switch"
             | "subagent_spawn"
+            | "asset_pick"
+            | "image3d_mesh"
+            | "project_asset_write"
+            | "graph_run"
+            | "graph_cancel"
+            | "video_contact_sheet"
+            | "loop_report_start"
+            | "loop_report_iteration"
+            | "loop_report_update"
     ) || tool.starts_with("workspace_file_write")
         || tool.starts_with("devserver_")
 }
@@ -388,19 +1576,25 @@ fn is_destructive(tool: &str) -> bool {
 /// browser tool while prompting only for revert and image3d; and `auto` and
 /// `full-access` both fell through to the same `_ => false`, so the "Auto"
 /// entry in the UI dropdown changed nothing at all.
-fn requires_approval(mode: &str, tool: &str) -> bool {
+fn requires_approval(mode: &str, tool: &str, mcp_trusted: bool) -> bool {
     match mode {
         // Ask before every tool call.
         "supervised" => true,
         // Scene edits flow; anything that writes outside the scene asks.
-        "auto-accept-edits" => is_destructive(tool),
-        // Ask only for the genuinely irreversible ones.
+        "auto-accept-edits" => is_destructive(tool, mcp_trusted),
+        // Ask only for the genuinely irreversible ones — plus untrusted MCP
+        // tools, whose behavior the core cannot vouch for.
         "auto" => {
-            matches!(tool, "project_revert" | "file_write")
+            matches!(tool, "project_revert" | "file_write" | "file_edit")
                 || tool.starts_with("workspace_file_write")
+                || (tool.starts_with(crate::mcp::MCP_PREFIX) && !mcp_trusted)
         }
         // No prompts. Explicitly opted into.
         "full-access" => false,
+        // Plan mode: dispatch is already restricted to the read-only
+        // whitelist upstream; whitelisted tools flow without prompts, and
+        // anything else stays fail-closed should a caller skip that gate.
+        "plan" => !plan_mode_allows(tool),
         // Unknown modes fail closed rather than silently granting everything.
         _ => true,
     }
@@ -415,8 +1609,93 @@ mod tests {
     use axum::routing::post;
     use axum::Router;
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    #[test]
+    fn missing_graph_goal_is_repaired_from_latest_user_turn_only() {
+        let mut calls = vec![ToolCall {
+            id: "call-plan".into(),
+            name: "graph_plan".into(),
+            arguments: Value::Null,
+        }];
+        repair_missing_graph_goal(
+            &mut calls,
+            &[
+                json!({ "role": "user", "content": "old objective" }),
+                json!({ "role": "assistant", "content": "working" }),
+                json!({ "role": "user", "content": "  build Neon Relay  " }),
+            ],
+        );
+        assert_eq!(calls[0].arguments["goal"], json!("build Neon Relay"));
+        assert_eq!(calls[0].arguments.as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn graph_goal_repair_preserves_provider_goal_and_ignores_other_tools() {
+        let mut calls = vec![
+            ToolCall {
+                id: "call-plan".into(),
+                name: "graph_plan".into(),
+                arguments: json!({ "goal": "provider goal", "nodes": [] }),
+            },
+            ToolCall {
+                id: "call-list".into(),
+                name: "project_list".into(),
+                arguments: json!({}),
+            },
+        ];
+        repair_missing_graph_goal(
+            &mut calls,
+            &[json!({ "role": "user", "content": "different user goal" })],
+        );
+        assert_eq!(calls[0].arguments["goal"], json!("provider goal"));
+        assert_eq!(calls[0].arguments["nodes"], json!([]));
+        assert_eq!(calls[1].arguments, json!({}));
+    }
+
+    #[test]
+    fn trusted_loop_context_is_injected_and_cannot_be_spoofed() {
+        let options = AgentOptions {
+            project_slug: Some("active-project".into()),
+            loop_id: Some("loop-active".into()),
+            ..Default::default()
+        };
+        let mut arguments = json!({
+            "slug": "other-project",
+            "loopId": "loop-other",
+            "iteration": { "outcome": "passed" }
+        });
+        bind_trusted_call_context(
+            "loop_report_iteration",
+            &mut arguments,
+            &options,
+            "session-owner",
+        );
+        assert_eq!(arguments["slug"], "active-project");
+        assert_eq!(arguments["loopId"], "loop-active");
+        assert_eq!(arguments["iteration"]["outcome"], "passed");
+    }
+
+    #[test]
+    fn trusted_loop_context_repairs_non_object_arguments() {
+        let options = AgentOptions {
+            project_slug: Some("active-project".into()),
+            loop_id: Some("loop-active".into()),
+            ..Default::default()
+        };
+        let mut arguments = Value::Null;
+        bind_trusted_call_context(
+            "loop_report_open",
+            &mut arguments,
+            &options,
+            "session-owner",
+        );
+        assert_eq!(
+            arguments,
+            json!({ "slug": "active-project", "loopId": "loop-active" })
+        );
+    }
 
     fn mock_chat_stream(
         has_tool_result: bool,
@@ -451,6 +1730,323 @@ mod tests {
         mock_chat_stream(has_tool_result)
     }
 
+    async fn missing_graph_goal_provider(
+        State(requests): State<Arc<std::sync::Mutex<Vec<Value>>>>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        requests.lock().unwrap().push(body.clone());
+        let messages = body["messages"].as_array().cloned().unwrap_or_default();
+        let has_tool_result = messages.iter().any(|message| message["role"] == "tool");
+        let events = if has_tool_result {
+            content_stream("retry safely")
+        } else {
+            vec![
+                Ok(Event::default().data(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-plan","function":{"name":"graph_plan","arguments":"{}"}}]}}]}"#,
+                )),
+                Ok(Event::default().data(
+                    r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#,
+                )),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
+    #[tokio::test]
+    async fn missing_graph_goal_is_repaired_before_provider_history_replay() {
+        let requests: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let app = Router::new()
+            .route("/v1/chat/completions", post(missing_graph_goal_provider))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::new();
+        let state = make_state(addr, bus, agents.clone(), tools.clone());
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "Build Neon Relay" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(result["reply"], json!("retry safely"));
+        assert_eq!(result["toolCalls"][0]["status"], json!("error"));
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let replayed_call = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "assistant" && message["tool_calls"].is_array())
+            .expect("assistant tool call replayed");
+        let arguments = replayed_call["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("tool arguments are JSON text");
+        assert_eq!(
+            serde_json::from_str::<Value>(arguments).unwrap()["goal"],
+            json!("Build Neon Relay")
+        );
+        let error = requests[1]["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .unwrap_or_default();
+        assert!(error.contains("provide either template"));
+    }
+
+    /// Shared state for the drain-mock provider. Tracks every request, lets
+    /// the test flip `malicious_drain` to make the schema-less drain call
+    /// return a tool call that must not be executed.
+    struct DrainMockState {
+        requests: std::sync::Mutex<Vec<Value>>,
+        malicious_drain: AtomicBool,
+        textual_tool_protocol: AtomicBool,
+    }
+
+    /// Mock that distinguishes the schema-less drain call from normal calls.
+    ///
+    /// The drain request omits the `tools` array entirely (see `chat_once`
+    /// in `model.rs`); a normal chat request always carries it. The mock
+    /// uses that as the boundary and records every call so the test can
+    /// assert call count and shape.
+    async fn drain_provider(
+        State(state): State<Arc<DrainMockState>>,
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let has_tools = body["tools"].is_array();
+        let has_tool_result = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .map(|messages| messages.iter().any(|m| m["role"] == "tool"))
+            .unwrap_or(false);
+        // Record the last message so the test can prove the finalization
+        // directive was appended to the snapshot before the schema-less
+        // drain request went out.
+        let last_message = body
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|msgs| msgs.last())
+            .and_then(|m| m["content"].as_str())
+            .unwrap_or("")
+            .to_string();
+        state.requests.lock().unwrap().push(json!({
+            "hasTools": has_tools,
+            "hasToolResult": has_tool_result,
+            "lastMessage": last_message,
+        }));
+        let events: Vec<Result<Event, Infallible>> = if !has_tools {
+            // Schema-less drain call. A confused or hostile model may still
+            // return a tool call here; `final_response_drain` must ignore
+            // it (never execute) regardless of which branch the mock picks.
+            if state.malicious_drain.load(Ordering::SeqCst) {
+                vec![
+                    Ok(Event::default().data(
+                        r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-malicious","function":{"name":"editor_echo","arguments":"{\"message\":\"never-runs\"}"}}]}}]}"#,
+                    )),
+                    Ok(Event::default()
+                        .data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                    Ok(Event::default().data("[DONE]")),
+                ]
+            } else if state.textual_tool_protocol.load(Ordering::SeqCst) {
+                // MiniMax-style: provider tool protocol sits inside the
+                // `content` delta and no structured tool_calls are emitted.
+                let content = "]<]minimax[>[<tool_call>]<]minimax[>[<invoke name=\"file_read\">\
+                     <path>/tmp/cali-final.json</path></invoke></tool_call>";
+                vec![
+                    Ok(Event::default().data(
+                        json!({"choices":[{"delta":{"role":"assistant","content": content}}]})
+                            .to_string(),
+                    )),
+                    Ok(Event::default().data("[DONE]")),
+                ]
+            } else {
+                vec![
+                    Ok(Event::default().data(
+                        json!({"choices":[{"delta":{"role":"assistant","content":"drained report"}}]})
+                            .to_string(),
+                    )),
+                    Ok(Event::default().data("[DONE]")),
+                ]
+            }
+        } else if has_tool_result {
+            // Post-tool normal call: this path is never reached under
+            // max_turns=1 because the loop exits for the drain, but the
+            // helper still classifies it so the trace is readable if a
+            // future test bumps the budget.
+            vec![
+                Ok(Event::default().data(
+                    json!({"choices":[{"delta":{"role":"assistant","content":"normal report"}}]})
+                        .to_string(),
+                )),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        } else {
+            // Initial call: editor_echo tool call.
+            vec![
+                Ok(Event::default().data(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-echo","function":{"name":"editor_echo","arguments":"{\"message\":\"hello\"}"}}]}}]}"#,
+                )),
+                Ok(Event::default()
+                    .data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+    fn make_state(
+        addr: std::net::SocketAddr,
+        bus: tokio::sync::broadcast::Sender<Value>,
+        agents: AgentManager,
+        tools: HashMap<String, ToolDef>,
+    ) -> crate::AppState {
+        let config = AppConfig {
+            model: ModelConfig {
+                default: "mock".into(),
+                provider: "mock".into(),
+                base_url: format!("http://{}/v1", addr),
+                api_key_env: "CALI_MOCK_KEY".into(),
+                temperature: 0.0,
+                max_tokens: Some(128),
+            },
+            providers: vec![],
+            ..Default::default()
+        };
+        crate::AppState {
+            config: std::sync::Arc::new(tokio::sync::RwLock::new(config)),
+            projects_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+            sessions_root: tempfile::tempdir().unwrap().path().to_path_buf(),
+            agents,
+            bus: bus.clone(),
+            workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::workspace::Registry::new(),
+            )),
+            dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
+                crate::devserver::Servers::new(),
+            )),
+            shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
+            tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools)),
+            editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
+            editor_attachment: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            graphs: crate::graph::GraphManager::new(),
+            mcp: std::sync::Arc::new(crate::mcp::McpManager::default()),
+            asset_catalog: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+        }
+    }
+
+    fn content_stream(text: &str) -> Vec<Result<Event, Infallible>> {
+        vec![
+            Ok(Event::default().data(
+                json!({"choices":[{"delta":{"role":"assistant","content": text}}]}).to_string(),
+            )),
+            Ok(Event::default().data("[DONE]")),
+        ]
+    }
+
+    #[test]
+    fn textual_tool_protocol_detector_matches_live_markup_without_rejecting_ordinary_xml() {
+        assert!(content_carries_textual_tool_protocol(
+            "]<]minimax[>[<tool_call>]<]minimax[>[<invoke name=\"file_read\">"
+        ));
+        assert!(content_carries_textual_tool_protocol(
+            "]<]\u{200b}minimax[>[<\u{200b}tool_call><invoke name=\"file_read\">"
+        ));
+        assert!(content_carries_textual_tool_protocol(
+            "<tool_call><invoke name=\"file_read\"></invoke></tool_call>"
+        ));
+        assert!(!content_carries_textual_tool_protocol(
+            "Edited the <invoke name=\"example\"> XML element in docs."
+        ));
+        assert!(!content_carries_textual_tool_protocol(
+            "Return <tool_call> as escaped documentation without an invocation."
+        ));
+    }
+
+    /// Parent (no system prompt) delegates via subagent_spawn; the child
+    /// (spawned with a system prompt) calls the browser tool editor_echo,
+    /// then both finish with plain content after their tool results land.
+    async fn subagent_flow_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let empty = vec![];
+        let messages = body["messages"].as_array().unwrap_or(&empty);
+        let is_child = messages.iter().any(|m| m["role"] == "system");
+        let has_tool = messages.iter().any(|m| m["role"] == "tool");
+        let events = if has_tool {
+            content_stream(if is_child {
+                "child done"
+            } else {
+                "parent done"
+            })
+        } else if is_child {
+            vec![
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-echo","function":{"name":"editor_echo","arguments":"{\"message\":\"hi\"}"}}]}}]}"#)),
+                Ok(Event::default().data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        } else {
+            vec![
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-spawn","function":{"name":"subagent_spawn","arguments":"{\"role\":\"helper\",\"instructions\":\"echo something\",\"maxTurns\":3}"}}]}}]}"#)),
+                Ok(Event::default().data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
+    /// Parent (no system prompt) fans out nine subagent_spawn calls in one
+    /// turn; children (system prompt present) reply immediately.
+    async fn fanout_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let empty = vec![];
+        let messages = body["messages"].as_array().unwrap_or(&empty);
+        let is_child = messages.iter().any(|m| m["role"] == "system");
+        let has_tool = messages.iter().any(|m| m["role"] == "tool");
+        let events = if is_child || has_tool {
+            content_stream(if is_child {
+                "child done"
+            } else {
+                "parent done"
+            })
+        } else {
+            let calls: Vec<Value> = (0..9)
+                .map(|i| {
+                    json!({
+                        "index": i,
+                        "id": format!("call-{i}"),
+                        "function": {
+                            "name": "subagent_spawn",
+                            "arguments": "{\"role\":\"helper\",\"instructions\":\"work\",\"maxTurns\":1}"
+                        }
+                    })
+                })
+                .collect();
+            vec![
+                Ok(Event::default()
+                    .data(json!({"choices":[{"delta":{"tool_calls": calls}}]}).to_string())),
+                Ok(Event::default()
+                    .data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
     #[tokio::test]
     async fn browser_tool_loop_completes() {
         let app = Router::new()
@@ -472,8 +2068,7 @@ mod tests {
                 max_tokens: Some(128),
             },
             providers: vec![],
-            projects_dir: None,
-            workspaces: Vec::new(),
+            ..Default::default()
         };
         let (bus, _) = tokio::sync::broadcast::channel(64);
         let agents = AgentManager::new(bus.clone());
@@ -500,6 +2095,11 @@ mod tests {
             )),
             shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
+            editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
+            editor_attachment: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            graphs: crate::graph::GraphManager::new(),
+            mcp: std::sync::Arc::new(crate::mcp::McpManager::default()),
+            asset_catalog: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         };
 
         let responder_agents = agents.clone();
@@ -524,8 +2124,7 @@ mod tests {
         let options = AgentOptions {
             permission_mode: "full-access".into(),
             max_turns: 5,
-            system: None,
-            project_slug: None,
+            ..Default::default()
         };
         let result = agents
             .chat(
@@ -539,7 +2138,425 @@ mod tests {
             .unwrap();
         assert_eq!(result["toolCalls"].as_array().unwrap().len(), 1);
         assert!(result["reply"].as_str().unwrap().contains("hello-agent"));
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["completed"], true);
+        // The browser loop correlates each entry by tool call id, so the
+        // attempt and terminal status must travel together on the same row.
+        let entry = &result["toolCalls"][0];
+        assert_eq!(entry["name"], "editor_echo");
+        assert_eq!(entry["id"], "call-1");
+        assert!(entry["arguments"].is_object());
+        assert_eq!(entry["status"], "done");
         responder.abort();
+    }
+
+    #[tokio::test]
+    async fn max_turns_returns_an_actionable_terminal_status() {
+        // A tool-only turn consumes the one allowed model turn. The previous
+        // implementation returned the generic "Turn limit reached..." (or a
+        // stale assistant reply), giving the caller no reliable way to tell
+        // whether work finished. The result must be explicit and resumable.
+        let app = Router::new()
+            .route("/v1/chat/completions", post(mock_provider))
+            .with_state(Arc::new(AtomicUsize::new(0)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+
+        let responder_agents = agents.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                if event["type"] == "agent.tool_request" {
+                    let session_id = event["sessionId"].as_str().unwrap().to_string();
+                    let request_id = event["requestId"].as_str().unwrap().to_string();
+                    responder_agents
+                        .submit_tool_result(
+                            &session_id,
+                            &request_id,
+                            json!({ "message": "hello-agent" }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "call editor_echo" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        responder.abort();
+
+        assert_eq!(result["status"], "max_turns");
+        assert_eq!(result["completed"], false);
+        assert_eq!(result["terminalReason"], "max_turns");
+        assert_eq!(result["maxTurns"], 1);
+        let reply = result["reply"].as_str().unwrap();
+        assert!(
+            reply.contains("stopped after 1 turns"),
+            "unexpected reply: {reply}"
+        );
+        assert!(!reply.contains("Turn limit reached before the agent finished"));
+    }
+
+    #[tokio::test]
+    async fn final_response_drain_false_preserves_old_max_turns_status() {
+        let mock = Arc::new(DrainMockState {
+            requests: std::sync::Mutex::new(Vec::new()),
+            malicious_drain: AtomicBool::new(false),
+            textual_tool_protocol: AtomicBool::new(false),
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(drain_provider))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+
+        let responder_agents = agents.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                if event["type"] == "agent.tool_request" {
+                    let session_id = event["sessionId"].as_str().unwrap().to_string();
+                    let request_id = event["requestId"].as_str().unwrap().to_string();
+                    responder_agents
+                        .submit_tool_result(
+                            &session_id,
+                            &request_id,
+                            json!({ "message": "hello-agent" }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "call editor_echo" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 1,
+                    final_response_drain: false,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        responder.abort();
+
+        assert_eq!(result["status"], "max_turns");
+        assert_eq!(result["completed"], false);
+        assert_eq!(result["terminalReason"], "max_turns");
+        assert_eq!(result["maxTurns"], 1);
+        let reply = result["reply"].as_str().unwrap();
+        assert!(
+            reply.contains("stopped after 1 turns"),
+            "unexpected reply: {reply}"
+        );
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "drain must not fire when flag is false");
+        assert_eq!(requests[0]["hasTools"], json!(true));
+        assert_eq!(requests[0]["hasToolResult"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn final_response_drain_returns_schema_less_report() {
+        let mock = Arc::new(DrainMockState {
+            requests: std::sync::Mutex::new(Vec::new()),
+            malicious_drain: AtomicBool::new(false),
+            textual_tool_protocol: AtomicBool::new(false),
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(drain_provider))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+
+        let responder_agents = agents.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                if event["type"] == "agent.tool_request" {
+                    let session_id = event["sessionId"].as_str().unwrap().to_string();
+                    let request_id = event["requestId"].as_str().unwrap().to_string();
+                    responder_agents
+                        .submit_tool_result(
+                            &session_id,
+                            &request_id,
+                            json!({ "message": "hello-agent" }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "call editor_echo" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 1,
+                    final_response_drain: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        responder.abort();
+
+        assert_eq!(result["status"], "completed");
+        assert_eq!(result["completed"], true);
+        assert_eq!(result["reply"], "drained report");
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "expected exactly one tool-bearing turn plus one schema-less drain"
+        );
+        assert_eq!(requests[0]["hasTools"], json!(true));
+        assert_eq!(requests[0]["hasToolResult"], json!(false));
+        assert_eq!(requests[1]["hasTools"], json!(false));
+        assert_eq!(
+            requests[1]["hasToolResult"],
+            json!(true),
+            "drain call must run with the tool result already in history"
+        );
+        assert_eq!(requests[1]["lastMessage"], FINALIZATION_INSTRUCTION);
+    }
+
+    #[tokio::test]
+    async fn final_response_drain_rejects_live_minimax_textual_tool_protocol() {
+        let mock = Arc::new(DrainMockState {
+            requests: std::sync::Mutex::new(Vec::new()),
+            malicious_drain: AtomicBool::new(false),
+            textual_tool_protocol: AtomicBool::new(true),
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(drain_provider))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+        let responder_agents = agents.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                if event["type"] == "agent.tool_request" {
+                    responder_agents
+                        .submit_tool_result(
+                            event["sessionId"].as_str().unwrap(),
+                            event["requestId"].as_str().unwrap(),
+                            json!({ "message": "hello-agent" }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "call editor_echo" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 1,
+                    final_response_drain: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        responder.abort();
+
+        assert_eq!(result["status"], "max_turns");
+        assert_eq!(result["completed"], false);
+        let reason = result["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains("textual tool-call protocol"), "{reason}");
+        assert!(reason.contains("no drain tools were executed"), "{reason}");
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["hasTools"], json!(false));
+        assert_eq!(requests[1]["lastMessage"], FINALIZATION_INSTRUCTION);
+    }
+
+    #[tokio::test]
+    async fn final_response_drain_malicious_tool_call_is_not_dispatched() {
+        let mock = Arc::new(DrainMockState {
+            requests: std::sync::Mutex::new(Vec::new()),
+            malicious_drain: AtomicBool::new(true),
+            textual_tool_protocol: AtomicBool::new(false),
+        });
+        let app = Router::new()
+            .route("/v1/chat/completions", post(drain_provider))
+            .with_state(mock.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let (bus, _) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+        let mut rx = bus.subscribe();
+
+        let responder_agents = agents.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                if event["type"] == "agent.tool_request" {
+                    let session_id = event["sessionId"].as_str().unwrap().to_string();
+                    let request_id = event["requestId"].as_str().unwrap().to_string();
+                    responder_agents
+                        .submit_tool_result(
+                            &session_id,
+                            &request_id,
+                            json!({ "message": "hello-agent" }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "call editor_echo" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 1,
+                    final_response_drain: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        responder.abort();
+
+        assert_eq!(result["status"], "max_turns");
+        assert_eq!(result["completed"], false);
+        assert_eq!(result["terminalReason"], "max_turns");
+        let reason = result["reason"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("final response drain requested more tools"),
+            "unexpected reason: {reason}"
+        );
+        assert!(
+            reason.contains("no drain tools were executed"),
+            "reason must promise no drain tools ran: {reason}"
+        );
+
+        let mut malicious_seen = false;
+        let mut finished_for = std::collections::HashSet::new();
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "agent.tool_finished" {
+                let id = event["toolCallId"].as_str().unwrap_or("").to_string();
+                finished_for.insert(id);
+                if event["toolCallId"] == "call-malicious" {
+                    malicious_seen = true;
+                }
+            }
+        }
+        assert!(!malicious_seen, "drain tool call must never be dispatched");
+        assert_eq!(finished_for.len(), 1);
+        assert!(finished_for.contains("call-echo"));
+
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[1]["hasTools"], json!(false));
     }
 
     #[tokio::test]
@@ -563,8 +2580,7 @@ mod tests {
                 max_tokens: Some(128),
             },
             providers: vec![],
-            projects_dir: None,
-            workspaces: Vec::new(),
+            ..Default::default()
         };
         let (bus, _) = tokio::sync::broadcast::channel(64);
         let agents = AgentManager::new(bus.clone());
@@ -591,6 +2607,11 @@ mod tests {
             )),
             shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
+            editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
+            editor_attachment: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            graphs: crate::graph::GraphManager::new(),
+            mcp: std::sync::Arc::new(crate::mcp::McpManager::default()),
+            asset_catalog: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         };
 
         let responder_agents = agents.clone();
@@ -623,8 +2644,7 @@ mod tests {
         let options = AgentOptions {
             permission_mode: "supervised".into(),
             max_turns: 5,
-            system: None,
-            project_slug: None,
+            ..Default::default()
         };
         let result = agents
             .chat(
@@ -657,7 +2677,7 @@ mod tests {
                     "project_list",
                 ]
                 .iter()
-                .filter(|tool| requires_approval(mode, tool))
+                .filter(|tool| requires_approval(mode, tool, false))
                 .count()
             })
             .collect();
@@ -675,20 +2695,1457 @@ mod tests {
         // The semantics used to be inverted: it auto-accepted file_write and
         // every scene-mutating browser tool, and prompted only for revert and
         // image3d.
-        assert!(!requires_approval("auto-accept-edits", "editor_object_add"));
         assert!(!requires_approval(
             "auto-accept-edits",
-            "editor_update_transform"
+            "editor_object_add",
+            false
         ));
-        assert!(requires_approval("auto-accept-edits", "file_write"));
-        assert!(requires_approval("auto-accept-edits", "project_revert"));
-        assert!(requires_approval("auto-accept-edits", "subagent_spawn"));
-        assert!(requires_approval("auto-accept-edits", "devserver_start"));
+        assert!(!requires_approval(
+            "auto-accept-edits",
+            "editor_update_transform",
+            false
+        ));
+        assert!(requires_approval("auto-accept-edits", "file_write", false));
+        assert!(requires_approval(
+            "auto-accept-edits",
+            "project_revert",
+            false
+        ));
+        assert!(requires_approval(
+            "auto-accept-edits",
+            "subagent_spawn",
+            false
+        ));
+        assert!(requires_approval(
+            "auto-accept-edits",
+            "devserver_start",
+            false
+        ));
     }
 
     #[test]
     fn unknown_permission_modes_fail_closed() {
-        assert!(requires_approval("", "file_write"));
-        assert!(requires_approval("typo-mode", "editor_object_add"));
+        assert!(requires_approval("", "file_write", false));
+        assert!(requires_approval("typo-mode", "editor_object_add", false));
+    }
+
+    #[test]
+    fn provider_tool_schema_order_is_deterministic() {
+        let (bus, _) = tokio::sync::broadcast::channel(8);
+        let manager = AgentManager::new(bus);
+        let registered = HashMap::from([
+            (
+                "editor_zebra".to_string(),
+                ToolDef {
+                    name: "editor_zebra".into(),
+                    description: "z".into(),
+                    parameters: json!({"type":"object"}),
+                    kind: crate::tools::ToolKind::Browser,
+                },
+            ),
+            (
+                "editor_alpha".to_string(),
+                ToolDef {
+                    name: "editor_alpha".into(),
+                    description: "a".into(),
+                    parameters: json!({"type":"object"}),
+                    kind: crate::tools::ToolKind::Browser,
+                },
+            ),
+        ]);
+
+        let first: Vec<String> = manager
+            .build_tools(&registered, &[])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        let second: Vec<String> = manager
+            .build_tools(&registered, &[])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+
+        assert_eq!(first, second);
+        assert!(first.windows(2).all(|pair| pair[0] <= pair[1]));
+    }
+
+    #[test]
+    fn live_image3d_wrapper_hides_raw_core_schema() {
+        let (bus, _) = tokio::sync::broadcast::channel(8);
+        let manager = AgentManager::new(bus);
+        let wrapper = ToolDef {
+            name: "editor_image3d_mesh".into(),
+            description: "Transactional live image-to-3D mesh".into(),
+            parameters: json!({"type":"object"}),
+            kind: crate::tools::ToolKind::Browser,
+        };
+        let registered = HashMap::from([(wrapper.name.clone(), wrapper)]);
+
+        let live_names: Vec<String> = manager
+            .build_tools(&registered, &[])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(live_names.iter().any(|name| name == "editor_image3d_mesh"));
+        assert!(
+            !live_names.iter().any(|name| name == "image3d_mesh"),
+            "the raw image3d_mesh schema must not compete with the live wrapper"
+        );
+
+        let headless_names: Vec<String> = manager
+            .build_tools(&HashMap::new(), &[])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(
+            headless_names.iter().any(|name| name == "image3d_mesh"),
+            "headless sessions still need the raw core image3d_mesh tool"
+        );
+        assert!(
+            !headless_names.iter().any(|name| name == "model_switch"),
+            "global model selection belongs to the user-facing RPC, never an agent schema"
+        );
+    }
+
+    #[test]
+    fn live_capture_wrapper_hides_the_raw_data_url_schema() {
+        let (bus, _) = tokio::sync::broadcast::channel(8);
+        let manager = AgentManager::new(bus);
+        let wrapper = ToolDef {
+            name: "editor_persist_capture".into(),
+            description: "Capture and persist one live frame".into(),
+            parameters: json!({"type":"object"}),
+            kind: crate::tools::ToolKind::Browser,
+        };
+        let registered = HashMap::from([(wrapper.name.clone(), wrapper)]);
+
+        let live_names: Vec<String> = manager
+            .build_tools(&registered, &[])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(live_names
+            .iter()
+            .any(|name| name == "editor_persist_capture"));
+        assert!(!live_names.iter().any(|name| name == "capture_persist"));
+
+        let headless_names: Vec<String> = manager
+            .build_tools(&HashMap::new(), &[])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(headless_names.iter().any(|name| name == "capture_persist"));
+    }
+
+    #[test]
+    fn agents_never_receive_the_global_model_switch_tool() {
+        let (bus, _) = tokio::sync::broadcast::channel(8);
+        let manager = AgentManager::new(bus);
+        let names: Vec<String> = manager
+            .build_tools(&HashMap::new(), &[])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(names.iter().any(|name| name == "model_list"));
+        assert!(!names.iter().any(|name| name == "model_switch"));
+        assert!(
+            core_tool_defs()
+                .iter()
+                .any(|tool| tool.name == "model_switch"),
+            "the user-facing RPC still owns model_switch"
+        );
+    }
+
+    #[test]
+    fn agents_never_receive_a_browser_model_switch_alias() {
+        let (bus, _) = tokio::sync::broadcast::channel(8);
+        let manager = AgentManager::new(bus);
+        let browser_switch = ToolDef {
+            name: "editor_model_switch".into(),
+            description: "unsafe alias".into(),
+            parameters: json!({"type":"object"}),
+            kind: crate::tools::ToolKind::Browser,
+        };
+        let registered = HashMap::from([(browser_switch.name.clone(), browser_switch)]);
+        let names: Vec<String> = manager
+            .build_tools(&registered, &[])
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect();
+        assert!(!names.iter().any(|name| name == "editor_model_switch"));
+    }
+
+    #[tokio::test]
+    async fn subagent_approvals_route_to_parent_session() {
+        // A supervised parent spawns a child; the child inherits supervised
+        // (never wider) and its editor_echo approval prompt must surface
+        // under the PARENT session id — the one the client is watching.
+        let app = Router::new().route("/v1/chat/completions", post(subagent_flow_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (bus, _) = tokio::sync::broadcast::channel(256);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+
+        let recorded: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let recorder = recorded.clone();
+        let responder_agents = agents.clone();
+        let responder_bus = bus.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = responder_bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                recorder.lock().unwrap().push(event.clone());
+                let sid = event["sessionId"].as_str().unwrap_or("").to_string();
+                let rid = event["requestId"].as_str().unwrap_or("").to_string();
+                if event["type"] == "agent.approval_request" {
+                    responder_agents
+                        .submit_approval(&sid, &rid, true)
+                        .await
+                        .unwrap();
+                }
+                if event["type"] == "agent.tool_request" {
+                    responder_agents
+                        .submit_tool_result(&sid, &rid, json!({ "message": "hi" }))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let options = AgentOptions {
+            permission_mode: "supervised".into(),
+            max_turns: 5,
+            ..Default::default()
+        };
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "delegate the echo" })],
+                options,
+            )
+            .await
+            .unwrap();
+        responder.abort();
+        assert!(result["reply"].as_str().unwrap().contains("parent done"));
+        let parent_sid = result["sessionId"].as_str().unwrap().to_string();
+
+        let events = recorded.lock().unwrap().clone();
+        let approvals: Vec<&Value> = events
+            .iter()
+            .filter(|e| e["type"] == "agent.approval_request")
+            .collect();
+        // The parent asked before spawning at all (supervised gates
+        // subagent_spawn itself).
+        assert!(
+            approvals
+                .iter()
+                .any(|e| e["tool"] == "subagent_spawn" && e["sessionId"] == json!(parent_sid)),
+            "missing parent spawn approval: {approvals:?}"
+        );
+        // The child's own tool call ALSO asked — proof it did not run
+        // full-access — and the prompt carried the parent's session id.
+        let child_approval = approvals
+            .iter()
+            .find(|e| e["tool"] == "editor_echo")
+            .expect("child approval event missing: child escaped supervision");
+        assert_eq!(child_approval["sessionId"], json!(parent_sid));
+        let child_sid = child_approval["subagentSessionId"].as_str().unwrap();
+        assert_ne!(child_sid, parent_sid);
+    }
+
+    #[tokio::test]
+    async fn subagent_fanout_is_capped_per_turn() {
+        let app = Router::new().route("/v1/chat/completions", post(fanout_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (bus, _) = tokio::sync::broadcast::channel(256);
+        let agents = AgentManager::new(bus.clone());
+        let tools: HashMap<String, ToolDef> = HashMap::new();
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+        let mut rx = bus.subscribe();
+
+        let options = AgentOptions {
+            permission_mode: "full-access".into(),
+            max_turns: 3,
+            ..Default::default()
+        };
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "fan out" })],
+                options,
+            )
+            .await
+            .unwrap();
+        assert!(result["reply"].as_str().unwrap().contains("parent done"));
+        assert_eq!(result["toolCalls"].as_array().unwrap().len(), 9);
+
+        let (mut spawned, mut capped) = (0usize, 0usize);
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "agent.tool_finished" && event["tool"] == "subagent_spawn" {
+                match event["result"].get("error").and_then(Value::as_str) {
+                    Some(message) => {
+                        assert!(message.contains("fan-out cap"), "unexpected: {message}");
+                        capped += 1;
+                    }
+                    None => spawned += 1,
+                }
+            }
+        }
+        assert_eq!(spawned, MAX_SPAWNS_PER_TURN, "first eight spawns must run");
+        assert_eq!(capped, 1, "the ninth spawn must be refused");
+    }
+
+    #[test]
+    fn permission_rules_last_match_wins() {
+        let rules = vec![
+            PermissionRule {
+                pattern: "*".into(),
+                action: "deny".into(),
+            },
+            PermissionRule {
+                pattern: "file_*".into(),
+                action: "allow".into(),
+            },
+            PermissionRule {
+                pattern: "file_write".into(),
+                action: "ask".into(),
+            },
+        ];
+        // Broad deny, overridden per-prefix, overridden per-tool — in order.
+        assert_eq!(
+            rule_decision(&rules, "editor_object_add"),
+            Some(RuleAction::Deny)
+        );
+        assert_eq!(rule_decision(&rules, "file_read"), Some(RuleAction::Allow));
+        assert_eq!(rule_decision(&rules, "file_write"), Some(RuleAction::Ask));
+        assert_eq!(rule_decision(&[], "anything"), None);
+        // Unrecognized actions fail closed to a prompt.
+        let weird = vec![PermissionRule {
+            pattern: "x".into(),
+            action: "yolo".into(),
+        }];
+        assert_eq!(rule_decision(&weird, "x"), Some(RuleAction::Ask));
+    }
+
+    #[test]
+    fn glob_patterns_match_tool_names() {
+        // Permission rules and MCP tool filters share ONE glob dialect:
+        // there is no agent-local implementation to drift from mcp's.
+        use crate::mcp::glob_match;
+        assert!(glob_match("*", "anything"));
+        assert!(glob_match("file_*", "file_write"));
+        assert!(!glob_match("file_*", "project_save"));
+        assert!(glob_match("mcp__*__write", "mcp__fs__write"));
+        assert!(glob_match("file_????", "file_read"));
+        assert!(!glob_match("file_????", "file_write"));
+        assert!(!glob_match("file", "file_read"));
+        assert!(glob_match("*_write", "file_write"));
+    }
+
+    #[test]
+    fn permission_rules_honor_character_classes() {
+        // Regression: permission rules used to run a weaker glob with no
+        // `[...]` support, so this deny matched nothing and silently let the
+        // servers through while the identical pattern worked in mcp filters.
+        let rules = vec![PermissionRule {
+            pattern: "mcp__[ab]*".into(),
+            action: "deny".into(),
+        }];
+        assert_eq!(
+            rule_decision(&rules, "mcp__alpha__write"),
+            Some(RuleAction::Deny)
+        );
+        assert_eq!(
+            rule_decision(&rules, "mcp__blender__execute"),
+            Some(RuleAction::Deny)
+        );
+        assert_eq!(rule_decision(&rules, "mcp__zeta__read"), None);
+        // Negation and ranges come along with the shared dialect.
+        let ranged = vec![PermissionRule {
+            pattern: "tool_[!0-9]".into(),
+            action: "ask".into(),
+        }];
+        assert_eq!(rule_decision(&ranged, "tool_x"), Some(RuleAction::Ask));
+        assert_eq!(rule_decision(&ranged, "tool_7"), None);
+    }
+
+    #[test]
+    fn rules_override_mode_logic_in_both_directions() {
+        let allow_writes = vec![PermissionRule {
+            pattern: "file_write".into(),
+            action: "allow".into(),
+        }];
+        // supervised would prompt; the allow rule runs it straight through —
+        // but only for the matched tool.
+        assert_eq!(
+            tool_gate(&allow_writes, "supervised", "file_write", false),
+            Gate::Run
+        );
+        assert_eq!(
+            tool_gate(&allow_writes, "supervised", "project_save", false),
+            Gate::Prompt
+        );
+        // full-access never prompts; an ask rule still forces one.
+        let ask_lists = vec![PermissionRule {
+            pattern: "project_list".into(),
+            action: "ask".into(),
+        }];
+        assert_eq!(
+            tool_gate(&ask_lists, "full-access", "project_list", false),
+            Gate::Prompt
+        );
+        // Last match wins across allow-then-deny stacks.
+        let deny_spawn = vec![
+            PermissionRule {
+                pattern: "*".into(),
+                action: "allow".into(),
+            },
+            PermissionRule {
+                pattern: "subagent_*".into(),
+                action: "deny".into(),
+            },
+        ];
+        assert_eq!(
+            tool_gate(&deny_spawn, "full-access", "subagent_spawn", false),
+            Gate::Deny
+        );
+        assert_eq!(
+            tool_gate(&deny_spawn, "supervised", "editor_object_add", false),
+            Gate::Run
+        );
+    }
+
+    #[test]
+    fn plan_mode_whitelist_is_read_only() {
+        assert!(plan_mode_allows("file_read"));
+        assert!(plan_mode_allows("file_grep"));
+        assert!(plan_mode_allows("file_glob"));
+        assert!(plan_mode_allows("editor_scene_inspect"));
+        assert!(plan_mode_allows("editor_capture_frame"));
+        assert!(plan_mode_allows("editor_asset_builder_state"));
+        assert!(plan_mode_allows("editor_console_log"));
+        assert!(!plan_mode_allows("file_write"));
+        assert!(!plan_mode_allows("editor_object_add"));
+        assert!(!plan_mode_allows("editor_script_write"));
+        assert!(!plan_mode_allows("editor_project_save"));
+        assert!(!plan_mode_allows("subagent_spawn"));
+        assert!(!plan_mode_allows("devserver_start"));
+        assert!(!plan_mode_allows("mcp__x__y"));
+        // Whitelisted tools run without prompts; everything else stays
+        // fail-closed even if the dispatch gate were somehow skipped.
+        assert!(!requires_approval("plan", "file_read", false));
+        assert!(requires_approval("plan", "file_write", false));
+    }
+
+    /// The whole point of the exact-name list: a tool whose *name* reads
+    /// read-only but whose body writes must not be admitted. Under the old
+    /// substring heuristic every one of these passed.
+    #[test]
+    fn plan_mode_refuses_tools_that_only_look_read_only() {
+        for tool in [
+            "editor_capture_and_overwrite",
+            "editor_inspect_and_repair",
+            "editor_scene_inspect_apply",
+            "editor_rebuild_state",
+            "editor_wipe_log",
+            "file_read_write",
+        ] {
+            assert!(
+                !plan_mode_allows(tool),
+                "{tool} must not pass the read-only gate on the strength of its name"
+            );
+        }
+        // Trailing/leading whitespace or casing is not a match either.
+        assert!(!plan_mode_allows("File_Read"));
+        assert!(!plan_mode_allows("file_read "));
+    }
+
+    /// Network egress is not read-only. `asset_search` queries PolyHaven, so
+    /// plan mode refuses it even though it writes nothing locally.
+    #[test]
+    fn plan_mode_refuses_network_egress() {
+        assert!(!plan_mode_allows("asset_search"));
+        assert!(requires_approval("plan", "asset_search", false));
+        // Its local-read sibling is still available for planning.
+        assert!(plan_mode_allows("asset_usage"));
+        assert!(plan_mode_allows("project_open"));
+    }
+
+    /// Accuracy pass: an exact-name list rots silently when a tool is renamed
+    /// or removed. Every core name in it must still be a registered core
+    /// tool, and none of them may be classified destructive.
+    #[test]
+    fn plan_mode_whitelist_names_are_real_and_nondestructive() {
+        let registered: Vec<String> = crate::tools::core_tool_defs()
+            .into_iter()
+            .map(|def| def.name)
+            .collect();
+        for tool in PLAN_MODE_TOOLS {
+            if !tool.starts_with("editor_") {
+                assert!(
+                    registered.iter().any(|name| name == tool),
+                    "{tool} is whitelisted for plan mode but is not a registered core tool"
+                );
+            }
+            assert!(
+                !is_destructive(tool, false),
+                "{tool} is both plan-mode-allowed and destructive"
+            );
+        }
+    }
+
+    #[test]
+    fn denied_tools_are_filtered_from_defs() {
+        let (bus, _) = tokio::sync::broadcast::channel(8);
+        let agents = AgentManager::new(bus);
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object"}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let rules = vec![PermissionRule {
+            pattern: "editor_*".into(),
+            action: "deny".into(),
+        }];
+        let filtered = agents.build_tools(&tools, &rules);
+        assert!(filtered.iter().all(|d| d.name != "editor_echo"));
+        assert!(!filtered.is_empty(), "core tools must survive the filter");
+        let unfiltered = agents.build_tools(&tools, &[]);
+        assert!(unfiltered.iter().any(|d| d.name == "editor_echo"));
+    }
+
+    /// First round: the model asks for file_write. In plan mode that must
+    /// come back as a refusal tool result (nothing executes), after which
+    /// the model finishes with plain content.
+    async fn plan_flow_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let empty = vec![];
+        let messages = body["messages"].as_array().unwrap_or(&empty);
+        let has_tool = messages.iter().any(|m| m["role"] == "tool");
+        let events = if has_tool {
+            content_stream("plan ready")
+        } else {
+            vec![
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-write","function":{"name":"file_write","arguments":"{\"path\":\"notes.txt\",\"content\":\"x\"}"}}]}}]}"#)),
+                Ok(Event::default().data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
+    async fn activity_write_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let empty = vec![];
+        let messages = body["messages"].as_array().unwrap_or(&empty);
+        let has_tool = messages.iter().any(|message| message["role"] == "tool");
+        let events = if has_tool {
+            content_stream("write complete")
+        } else {
+            vec![
+                Ok(Event::default().data(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-write","function":{"name":"file_write","arguments":"{\"slug\":\"demo\",\"path\":\"notes.txt\",\"content\":\"hello\"}"}}]}}]}"#,
+                )),
+                Ok(Event::default().data(
+                    r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#,
+                )),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
+    #[tokio::test]
+    async fn plan_mode_refuses_file_write() {
+        let app = Router::new().route("/v1/chat/completions", post(plan_flow_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (bus, _) = tokio::sync::broadcast::channel(256);
+        let agents = AgentManager::new(bus.clone());
+        let tools: HashMap<String, ToolDef> = HashMap::new();
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+        let mut rx = bus.subscribe();
+
+        let options = AgentOptions {
+            permission_mode: "plan".into(),
+            max_turns: 3,
+            project_slug: Some("demo".into()),
+            workspace_root: Some("/tmp/cali-plan-workspace".into()),
+            ..Default::default()
+        };
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "write the file" })],
+                options,
+            )
+            .await
+            .unwrap();
+        assert!(result["reply"].as_str().unwrap().contains("plan ready"));
+        // The refused file_write must show up in the tool-call log with
+        // `status: "error"`, otherwise the loop worker cannot tell this
+        // attempt apart from one that succeeded.
+        assert_eq!(result["toolCalls"].as_array().unwrap().len(), 1);
+        let entry = &result["toolCalls"][0];
+        assert_eq!(entry["name"], "file_write");
+        assert_eq!(entry["id"], "call-write");
+        assert_eq!(entry["status"], "error");
+
+        let mut refusal = None;
+        let mut finished = None;
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "agent.tool_finished" && event["tool"] == "file_write" {
+                refusal = event["result"]["error"].as_str().map(String::from);
+                finished = Some(event);
+            }
+        }
+        let refusal = refusal.expect("file_write must produce an error tool result");
+        assert!(
+            refusal.contains("plan mode"),
+            "unexpected refusal: {refusal}"
+        );
+        let finished = finished.expect("tool_finished event");
+        assert_eq!(finished["toolCallId"], "call-write");
+        assert!(finished["startedAtMs"].is_u64());
+        assert!(finished["finishedAtMs"].is_u64());
+        assert!(
+            finished["finishedAtMs"].as_u64().unwrap() >= finished["startedAtMs"].as_u64().unwrap()
+        );
+        assert_eq!(finished["projectSlug"], "demo");
+        assert_eq!(finished["workspaceRoot"], "/tmp/cali-plan-workspace");
+        assert!(finished["result"]
+            .get(crate::tools::INTERNAL_ACTIVITY_KEY)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn file_write_activity_is_separate_from_result_and_history() {
+        let app = Router::new().route("/v1/chat/completions", post(activity_write_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (bus, _) = tokio::sync::broadcast::channel(256);
+        let agents = AgentManager::new(bus.clone());
+        let tools: HashMap<String, ToolDef> = HashMap::new();
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+        crate::store::create_project(&state.projects_root, "demo", "Demo").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        crate::store::set_workspace_root(
+            &state.projects_root,
+            "demo",
+            Some(workspace.path().to_str().unwrap()),
+        )
+        .unwrap();
+        let mut rx = bus.subscribe();
+
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "write a note" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 3,
+                    project_slug: Some("demo".into()),
+                    workspace_root: Some(workspace.path().display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["reply"], "write complete");
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join("notes.txt")).unwrap(),
+            "hello"
+        );
+
+        let mut started = None;
+        let mut finished = None;
+        while let Ok(event) = rx.try_recv() {
+            match event["type"].as_str() {
+                Some("agent.tool_started") => started = Some(event),
+                Some("agent.tool_finished") => finished = Some(event),
+                _ => {}
+            }
+        }
+        let started = started.expect("tool_started event");
+        let finished = finished.expect("tool_finished event");
+        assert_eq!(started["toolCallId"], "call-write");
+        assert_eq!(finished["toolCallId"], started["toolCallId"]);
+        assert_eq!(finished["projectSlug"], "demo");
+        assert_eq!(
+            finished["workspaceRoot"],
+            workspace.path().display().to_string()
+        );
+        assert!(finished["activity"].is_object());
+        assert_eq!(finished["activity"]["operation"], "write");
+        assert_eq!(finished["activity"]["after"], "hello");
+        assert!(finished["result"]
+            .get(crate::tools::INTERNAL_ACTIVITY_KEY)
+            .is_none());
+
+        let session_id = result["sessionId"].as_str().unwrap();
+        let session = agents.session(session_id).await.unwrap();
+        let guard = session.lock().await;
+        let tool_message = guard
+            .messages
+            .iter()
+            .find(|message| message["role"] == "tool")
+            .expect("tool history message");
+        assert!(!tool_message["content"]
+            .as_str()
+            .unwrap()
+            .contains(crate::tools::INTERNAL_ACTIVITY_KEY));
+    }
+
+    /// One turn with two editor_echo calls. The first browser request is
+    /// deliberately delayed; provider-order execution must not issue the
+    /// second request until the first one has finished.
+    async fn parallel_calls_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let empty = vec![];
+        let messages = body["messages"].as_array().unwrap_or(&empty);
+        let has_tool = messages.iter().any(|m| m["role"] == "tool");
+        let events = if has_tool {
+            content_stream("both done")
+        } else {
+            vec![
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-a","function":{"name":"editor_echo","arguments":"{\"message\":\"one\"}"}},{"index":1,"id":"call-b","function":{"name":"editor_echo","arguments":"{\"message\":\"two\"}"}}]}}]}"#)),
+                Ok(Event::default().data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
+    #[tokio::test]
+    async fn stateful_tool_calls_execute_in_provider_order() {
+        let app = Router::new().route("/v1/chat/completions", post(parallel_calls_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (bus, _) = tokio::sync::broadcast::channel(256);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+
+        let recorded: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+        let recorder = recorded.clone();
+        let responder_agents = agents.clone();
+        let responder_bus = bus.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = responder_bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                let event_type = event["type"].as_str().unwrap_or_default();
+                let call_id = if event_type == "agent.tool_request" {
+                    event["arguments"]["message"].as_str().unwrap_or_default()
+                } else {
+                    event["toolCallId"].as_str().unwrap_or_default()
+                };
+                if matches!(
+                    event_type,
+                    "agent.tool_started" | "agent.tool_request" | "agent.tool_finished"
+                ) {
+                    recorder
+                        .lock()
+                        .unwrap()
+                        .push(format!("{event_type}:{call_id}"));
+                }
+                if event_type == "agent.tool_request" {
+                    let sid = event["sessionId"].as_str().unwrap().to_string();
+                    let rid = event["requestId"].as_str().unwrap().to_string();
+                    let msg = event["arguments"]["message"].as_str().unwrap();
+                    if msg == "one" {
+                        // Keep the first stateful call in flight long enough
+                        // for a concurrent implementation to issue call-b.
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                    responder_agents
+                        .submit_tool_result(
+                            &sid,
+                            &rid,
+                            json!({ "message": format!("result-{msg}") }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let options = AgentOptions {
+            permission_mode: "full-access".into(),
+            max_turns: 3,
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            agents.chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "echo twice" })],
+                options,
+            ),
+        )
+        .await
+        .expect("stateful calls must complete")
+        .unwrap();
+        responder.abort();
+        assert!(result["reply"].as_str().unwrap().contains("both done"));
+
+        let events = recorded.lock().unwrap().clone();
+        let first_finished = events
+            .iter()
+            .position(|event| event == "agent.tool_finished:call-a")
+            .expect("first tool_finished event");
+        let second_request = events
+            .iter()
+            .position(|event| event == "agent.tool_request:two")
+            .expect("second tool_request event");
+        assert!(
+            first_finished < second_request,
+            "second stateful call raced first: {events:?}"
+        );
+
+        // Tool messages sit in call order, each paired with its own result.
+        let sid = result["sessionId"].as_str().unwrap();
+        let session = agents.session(sid).await.unwrap();
+        let guard = session.lock().await;
+        let tool_messages: Vec<(String, String)> = guard
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| {
+                (
+                    m["tool_call_id"].as_str().unwrap().to_string(),
+                    m["content"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(tool_messages.len(), 2);
+        assert_eq!(tool_messages[0].0, "call-a");
+        assert!(tool_messages[0].1.contains("result-one"));
+        assert_eq!(tool_messages[1].0, "call-b");
+        assert!(tool_messages[1].1.contains("result-two"));
+    }
+
+    /// Reports usage on every call: 100/10 for the tool-calling round,
+    /// 200/20 for the follow-up — cumulative totals must be 300/30/330.
+    async fn usage_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let empty = vec![];
+        let messages = body["messages"].as_array().unwrap_or(&empty);
+        let has_tool = messages.iter().any(|m| m["role"] == "tool");
+        let events = if has_tool {
+            vec![
+                Ok(Event::default().data(
+                    json!({"choices":[{"delta":{"role":"assistant","content":"done"}}]})
+                        .to_string(),
+                )),
+                Ok(Event::default().data(r#"{"choices":[],"usage":{"prompt_tokens":200,"completion_tokens":20,"total_tokens":220}}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        } else {
+            vec![
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","function":{"name":"editor_echo","arguments":"{\"message\":\"hi\"}"}}]}}]}"#)),
+                Ok(Event::default().data(r#"{"choices":[{"finish_reason":"tool_calls","index":0,"delta":{}}]}"#)),
+                Ok(Event::default().data(r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"total_tokens":110}}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
+    #[tokio::test]
+    async fn usage_accumulates_across_model_calls() {
+        let app = Router::new().route("/v1/chat/completions", post(usage_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (bus, _) = tokio::sync::broadcast::channel(256);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::from([(
+            "editor_echo".to_string(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
+                kind: crate::tools::ToolKind::Browser,
+            },
+        )]);
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+        let mut rx = bus.subscribe();
+
+        let responder_agents = agents.clone();
+        let responder_bus = bus.clone();
+        let responder = tokio::spawn(async move {
+            let mut rx = responder_bus.subscribe();
+            while let Ok(event) = rx.recv().await {
+                if event["type"] == "agent.tool_request" {
+                    let sid = event["sessionId"].as_str().unwrap().to_string();
+                    let rid = event["requestId"].as_str().unwrap().to_string();
+                    responder_agents
+                        .submit_tool_result(&sid, &rid, json!({ "message": "hi" }))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+
+        let options = AgentOptions {
+            permission_mode: "full-access".into(),
+            max_turns: 3,
+            ..Default::default()
+        };
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "echo then finish" })],
+                options,
+            )
+            .await
+            .unwrap();
+        responder.abort();
+        assert!(result["reply"].as_str().unwrap().contains("done"));
+
+        // Session totals accumulated across both model calls.
+        let sid = result["sessionId"].as_str().unwrap();
+        let session = agents.session(sid).await.unwrap();
+        let guard = session.lock().await;
+        assert_eq!(guard.usage.prompt_tokens, 300);
+        assert_eq!(guard.usage.completion_tokens, 30);
+        assert_eq!(guard.usage.total_tokens, 330);
+        assert_eq!(guard.last_prompt_tokens, 200);
+        // Compaction hook keys off the LATEST prompt size, not the sum.
+        assert!(guard.should_compact(150));
+        assert!(guard.should_compact(200));
+        assert!(!guard.should_compact(201));
+        assert!(!guard.should_compact(0), "zero budget disables the check");
+        drop(guard);
+
+        // The last agent.usage event carries the cumulative totals.
+        let mut last_usage = None;
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "agent.usage" {
+                last_usage = Some(event);
+            }
+        }
+        let event = last_usage.expect("agent.usage must be emitted after each model call");
+        assert_eq!(event["usage"]["promptTokens"], json!(300));
+        assert_eq!(event["usage"]["completionTokens"], json!(30));
+        assert_eq!(event["usage"]["totalTokens"], json!(330));
+        assert_eq!(event["usage"]["lastPromptTokens"], json!(200));
+    }
+
+    /// Provider that always streams a fixed summary — what compact_session's
+    /// single summary model call receives.
+    async fn summary_provider() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        Sse::new(futures::stream::iter(content_stream(
+            "Goal: verify compaction. Progress: transcript summarized.",
+        )))
+    }
+
+    #[tokio::test]
+    async fn compact_session_summarizes_prunes_and_archives() {
+        let app = Router::new().route("/v1/chat/completions", post(summary_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (bus, mut rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let state = make_state(addr, bus, agents.clone(), HashMap::new());
+        {
+            // budget = 1.0 × 120 − 20 = 100 tokens.
+            let mut config = state.config.write().await;
+            config.compaction.context_length = Some(120);
+            config.compaction.threshold = 1.0;
+            config.compaction.reserved = 20;
+        }
+
+        // Seed a transcript far over budget: protected head, a compactable
+        // middle with an oversized tool result, and a fresh tail.
+        let mut messages = vec![
+            json!({ "role": "system", "content": "sys" }),
+            json!({ "role": "user", "content": "u".repeat(400) }),
+            json!({ "role": "assistant", "content": "a".repeat(400) }),
+        ];
+        messages.push(json!({
+            "role": "assistant", "content": "",
+            "tool_calls": [{ "id": "call-old", "type": "function",
+                "function": { "name": "file_read", "arguments": "{}" } }]
+        }));
+        messages.push(json!({
+            "role": "tool", "tool_call_id": "call-old",
+            "content": "t".repeat(1000)
+        }));
+        for i in 0..4 {
+            messages
+                .push(json!({ "role": "user", "content": format!("q{i} {}", "z".repeat(300)) }));
+            messages.push(
+                json!({ "role": "assistant", "content": format!("r{i} {}", "y".repeat(300)) }),
+            );
+        }
+        let session = Arc::new(Mutex::new(AgentSession {
+            id: "compact-me".into(),
+            messages,
+            pending: HashMap::new(),
+            usage: model::Usage::default(),
+            last_prompt_tokens: 0,
+            compactions: 0,
+        }));
+        agents
+            .sessions
+            .lock()
+            .await
+            .insert("compact-me".into(), session.clone());
+
+        let result = agents.compact_session(&state, "compact-me").await.unwrap();
+        assert_eq!(result["compacted"], json!(true));
+        assert!(result["archivedMessages"].as_u64().unwrap() > 0);
+        let before = result["estimatedTokensBefore"].as_u64().unwrap();
+        let after = result["estimatedTokensAfter"].as_u64().unwrap();
+        assert!(after < before, "compaction must shrink the transcript");
+
+        // The live transcript now carries the summary marker and still opens
+        // with the protected head.
+        let guard = session.lock().await;
+        assert_eq!(guard.messages[0]["role"], json!("system"));
+        assert!(guard.messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with(crate::compaction::SUMMARY_MARKER))));
+        drop(guard);
+
+        // Replaced turns were soft-archived in the session file.
+        let record = crate::sessions::load(&state.sessions_root, "compact-me").unwrap();
+        let archived = record["archived"].as_array().unwrap();
+        assert_eq!(
+            archived.len() as u64,
+            result["archivedMessages"].as_u64().unwrap()
+        );
+
+        // And the event bus announced the compaction.
+        let mut saw_event = false;
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "agent.compacted" {
+                assert_eq!(event["sessionId"], json!("compact-me"));
+                saw_event = true;
+            }
+        }
+        assert!(saw_event, "agent.compacted event must be emitted");
+
+        // With a generous budget the transcript fits: compact is a no-op,
+        // not an error.
+        {
+            let mut config = state.config.write().await;
+            config.compaction.context_length = Some(1_000_000);
+        }
+        let again = agents.compact_session(&state, "compact-me").await.unwrap();
+        assert_eq!(again["compacted"], json!(false));
+    }
+
+    /// Transcript that compaction will split into an archived middle and a
+    /// preserved tail. Index 3/4 are a `call-old` tool call and its result,
+    /// deep enough in the middle to be archived — the concurrency tests below
+    /// lean on that.
+    fn over_budget_transcript() -> Vec<Value> {
+        let mut messages = vec![
+            json!({ "role": "system", "content": "sys" }),
+            json!({ "role": "user", "content": "u".repeat(400) }),
+            json!({ "role": "assistant", "content": "a".repeat(400) }),
+            json!({
+                "role": "assistant", "content": "",
+                "tool_calls": [{ "id": "call-old", "type": "function",
+                    "function": { "name": "file_read", "arguments": "{}" } }]
+            }),
+            json!({ "role": "tool", "tool_call_id": "call-old", "content": "t".repeat(1000) }),
+        ];
+        for i in 0..4 {
+            messages
+                .push(json!({ "role": "user", "content": format!("q{i} {}", "z".repeat(300)) }));
+            messages.push(
+                json!({ "role": "assistant", "content": format!("r{i} {}", "y".repeat(300)) }),
+            );
+        }
+        messages
+    }
+
+    /// Session plus the messages a concurrent turn appends to it.
+    type ConcurrentAppend = Arc<(Arc<Mutex<AgentSession>>, Vec<Value>)>;
+
+    /// Summary provider that first simulates a second HTTP turn landing on
+    /// the same session — appending to `messages` in the exact window where
+    /// `compact_session` has released the lock to await this call.
+    async fn appending_summary_provider(
+        State(hook): State<ConcurrentAppend>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let (session, appended) = &*hook;
+        let mut guard = session.lock().await;
+        for message in appended {
+            guard.messages.push(message.clone());
+        }
+        drop(guard);
+        Sse::new(futures::stream::iter(content_stream(
+            "Goal: verify compaction. Progress: transcript summarized.",
+        )))
+    }
+
+    /// Builds a manager + state whose summary provider appends `appended` to
+    /// the session mid-call, and registers the session under `id`.
+    async fn compaction_race_fixture(
+        id: &str,
+        appended: Vec<Value>,
+    ) -> (AgentManager, crate::AppState, Arc<Mutex<AgentSession>>) {
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let session = Arc::new(Mutex::new(AgentSession {
+            id: id.into(),
+            messages: over_budget_transcript(),
+            pending: HashMap::new(),
+            usage: model::Usage::default(),
+            last_prompt_tokens: 0,
+            compactions: 0,
+        }));
+        agents
+            .sessions
+            .lock()
+            .await
+            .insert(id.into(), session.clone());
+
+        let hook: ConcurrentAppend = Arc::new((session.clone(), appended));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(appending_summary_provider))
+            .with_state(hook);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let state = make_state(addr, bus, agents.clone(), HashMap::new());
+        {
+            // budget = 1.0 × 120 − 20 = 100 tokens: far under the transcript.
+            let mut config = state.config.write().await;
+            config.compaction.context_length = Some(120);
+            config.compaction.threshold = 1.0;
+            config.compaction.reserved = 20;
+        }
+        (agents, state, session)
+    }
+
+    #[tokio::test]
+    async fn compaction_remerges_a_turn_appended_during_the_summary_call() {
+        // A plain user/assistant exchange appended while the summary model
+        // call is in flight. Nothing in it depends on the archived middle, so
+        // it must survive the swap instead of being silently overwritten.
+        let appended = vec![
+            json!({ "role": "user", "content": "concurrent question" }),
+            json!({ "role": "assistant", "content": "concurrent answer" }),
+        ];
+        let (agents, state, session) =
+            compaction_race_fixture("race-merge", appended.clone()).await;
+
+        let result = agents.compact_session(&state, "race-merge").await.unwrap();
+        assert_eq!(result["compacted"], json!(true));
+        assert_eq!(result["remergedMessages"], json!(2));
+
+        let guard = session.lock().await;
+        // Compaction still happened...
+        assert_eq!(guard.messages[0]["role"], json!("system"));
+        assert!(guard.messages.iter().any(|m| m["content"]
+            .as_str()
+            .is_some_and(|c| c.starts_with(crate::compaction::SUMMARY_MARKER))));
+        // ...and the concurrent turn is intact, in order, at the end.
+        assert_eq!(&guard.messages[guard.messages.len() - 2..], &appended[..]);
+        assert_eq!(guard.compactions, 1, "the generation counter must advance");
+    }
+
+    #[tokio::test]
+    async fn compaction_refuses_when_the_appended_tail_orphans_a_tool_result() {
+        // The dangerous shape: a tool result for `call-old`, whose assistant
+        // `tool_calls` message compaction is about to archive. Re-merging it
+        // would hand the provider an unanswerable tool message and 400 the
+        // whole session, so compaction must refuse and leave the transcript
+        // exactly as it found it.
+        let appended =
+            vec![json!({ "role": "tool", "tool_call_id": "call-old", "content": "late result" })];
+        let (agents, state, session) =
+            compaction_race_fixture("race-orphan", appended.clone()).await;
+
+        let error = agents
+            .compact_session(&state, "race-orphan")
+            .await
+            .expect_err("compaction must refuse an unmergeable tail")
+            .to_string();
+        assert!(
+            error.contains("transcript moved"),
+            "error must name the cause, got: {error}"
+        );
+
+        // The appended message is still there, and so is the full history:
+        // refusing costs a retry, swapping would have cost the session.
+        let guard = session.lock().await;
+        let expected: Vec<Value> = over_budget_transcript()
+            .into_iter()
+            .chain(appended)
+            .collect();
+        assert_eq!(guard.messages, expected);
+        assert_eq!(
+            guard.compactions, 0,
+            "a refused compaction is not a generation"
+        );
+    }
+
+    #[test]
+    fn clean_tail_check_tracks_ids_introduced_by_the_suffix() {
+        let compacted = vec![json!({
+            "role": "assistant", "content": "",
+            "tool_calls": [{ "id": "kept", "type": "function",
+                "function": { "name": "file_read", "arguments": "{}" } }]
+        })];
+        // Answering a call the compacted transcript still shows: mergeable.
+        assert!(suffix_is_clean_tail(
+            &compacted,
+            &[json!({ "role": "tool", "tool_call_id": "kept", "content": "ok" })]
+        ));
+        // A complete call/result pair appended during the summary carries its
+        // own issuing message, so it is mergeable too.
+        assert!(suffix_is_clean_tail(
+            &compacted,
+            &[
+                json!({ "role": "assistant", "content": "",
+                    "tool_calls": [{ "id": "fresh", "type": "function",
+                        "function": { "name": "file_read", "arguments": "{}" } }] }),
+                json!({ "role": "tool", "tool_call_id": "fresh", "content": "ok" }),
+            ]
+        ));
+        // Order matters: the result may not precede its call.
+        assert!(!suffix_is_clean_tail(
+            &compacted,
+            &[
+                json!({ "role": "tool", "tool_call_id": "fresh", "content": "ok" }),
+                json!({ "role": "assistant", "content": "",
+                    "tool_calls": [{ "id": "fresh", "type": "function",
+                        "function": { "name": "file_read", "arguments": "{}" } }] }),
+            ]
+        ));
+        // Answering a call that compaction archived: not mergeable.
+        assert!(!suffix_is_clean_tail(
+            &compacted,
+            &[json!({ "role": "tool", "tool_call_id": "gone", "content": "orphan" })]
+        ));
+        // A tool message with no id at all is not a tail we can reason about.
+        assert!(!suffix_is_clean_tail(
+            &compacted,
+            &[json!({ "role": "tool", "content": "idless" })]
+        ));
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_drops_pending_tool_requests() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(8);
+        let agents = AgentManager::new(bus);
+        agents.ensure_session("session-remove").await.unwrap();
+        let session = agents.session("session-remove").await.unwrap();
+        let (tx, rx) = oneshot::channel();
+        session
+            .lock()
+            .await
+            .pending
+            .insert("pending-tool".into(), tx);
+
+        assert_eq!(agents.remove_session("session-remove").await, (true, 1));
+        assert!(
+            rx.await.is_err(),
+            "removing a session must close pending tool/approval requests"
+        );
+        assert!(agents.session("session-remove").await.is_err());
+        assert_eq!(agents.remove_session("session-remove").await, (false, 0));
+    }
+
+    #[tokio::test]
+    async fn eviction_spares_sessions_awaiting_a_tool_or_approval_reply() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus);
+
+        // A session parked on a browser-tool oneshot holds no lock — it has
+        // only registered a sender in `pending` — so try_lock alone would
+        // happily evict it.
+        let waiting = agents.get_or_create(None).await.unwrap();
+        let waiting_id = waiting.lock().await.id.clone();
+        let (tx, rx) = oneshot::channel();
+        waiting
+            .lock()
+            .await
+            .pending
+            .insert("tool-waiting".into(), tx);
+
+        // Push the manager well past the cap with fresh, idle sessions.
+        let mut idle_ids = Vec::new();
+        for _ in 0..MAX_SESSIONS * 2 {
+            idle_ids.push(
+                agents
+                    .get_or_create(None)
+                    .await
+                    .unwrap()
+                    .lock()
+                    .await
+                    .id
+                    .clone(),
+            );
+        }
+
+        // Eviction ran (idle sessions were dropped) but spared the waiter.
+        let live = agents.sessions.lock().await;
+        assert!(live.len() <= MAX_SESSIONS + 1, "eviction must still run");
+        assert!(
+            live.contains_key(&waiting_id),
+            "a session with pending requests must never be evicted"
+        );
+        assert!(
+            idle_ids.iter().any(|id| !live.contains_key(id)),
+            "idle sessions must still be evictable"
+        );
+        drop(live);
+
+        // And the symptom the eviction bug produced is gone: the reply still
+        // lands instead of failing with "session not found" and hanging the
+        // tool to its 300s timeout.
+        agents
+            .submit_tool_result(&waiting_id, "tool-waiting", json!({ "ok": true }))
+            .await
+            .expect("pending request must still be answerable");
+        assert_eq!(rx.await.unwrap(), json!({ "ok": true }));
+    }
+
+    #[tokio::test]
+    async fn reserved_sessions_use_the_bounded_allocator() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus);
+        let mut ids = Vec::new();
+        for _ in 0..MAX_SESSIONS * 2 {
+            ids.push(agents.reserve_session().await.unwrap());
+        }
+
+        let live = agents.sessions.lock().await;
+        assert!(live.len() <= MAX_SESSIONS);
+        assert!(
+            ids.iter().any(|id| !live.contains_key(id)),
+            "reservations must evict old idle sessions instead of leaking them"
+        );
+        assert!(live.contains_key(ids.last().unwrap()));
+    }
+
+    #[test]
+    fn mcp_tools_gate_on_server_trust() {
+        // Untrusted MCP tools count as destructive; trusted ones flow like
+        // scene edits.
+        assert!(requires_approval("auto-accept-edits", "mcp__x__y", false));
+        assert!(!requires_approval("auto-accept-edits", "mcp__x__y", true));
+        assert!(requires_approval("auto", "mcp__x__y", false));
+        assert!(!requires_approval("auto", "mcp__x__y", true));
+        assert!(!requires_approval("full-access", "mcp__x__y", false));
+        assert!(requires_approval("supervised", "mcp__x__y", true));
+    }
+
+    #[test]
+    fn an_ordinary_tool_result_reaches_the_history_untouched() {
+        // The backstop must cost nothing in the common case: it is the last
+        // line of defence, not a second formatter.
+        let outcome = json!({ "path": "a.txt", "content": "hello" });
+        assert_eq!(
+            bound_tool_result("file_read", &outcome),
+            outcome.to_string()
+        );
+    }
+
+    #[test]
+    fn an_oversized_tool_result_is_bounded_and_stays_parseable() {
+        // MCP servers are third parties with no idea they are spending our
+        // context window, and their output lands in `messages` for the rest of
+        // the session.
+        let flood = json!({ "content": "z".repeat(MAX_TOOL_RESULT_BYTES * 2) });
+        let bounded = bound_tool_result("mcp__scraper__fetch", &flood);
+        assert!(
+            bounded.len() < MAX_TOOL_RESULT_BYTES,
+            "bounded result was {} bytes",
+            bounded.len()
+        );
+
+        // Cutting JSON mid-string would cost the model a turn to discover the
+        // result is unparseable, on top of the turn that produced it.
+        let parsed: Value = serde_json::from_str(&bounded).expect("bounded result must be JSON");
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["tool"], "mcp__scraper__fetch");
+        assert!(parsed["notice"]
+            .as_str()
+            .unwrap()
+            .contains("Narrow the call"));
+        assert!(parsed["preview"]
+            .as_str()
+            .unwrap()
+            .starts_with("{\"content"));
+    }
+
+    #[test]
+    fn bounding_never_splits_a_codepoint() {
+        let flood = json!({ "content": "漢".repeat(MAX_TOOL_RESULT_BYTES) });
+        let bounded = bound_tool_result("mcp__x__y", &flood);
+        let parsed: Value = serde_json::from_str(&bounded).unwrap();
+        assert!(!parsed["preview"].as_str().unwrap().contains('\u{fffd}'));
     }
 }

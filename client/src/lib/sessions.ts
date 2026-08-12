@@ -11,6 +11,9 @@ export interface SessionSummary {
   projectSlug: string | null;
   provider: string | null;
   model: string | null;
+  workspaceRoot?: string | null;
+  worktreeId?: string | null;
+  branch?: string | null;
   createdAt: number;
   updatedAt: number;
   messageCount: number;
@@ -18,6 +21,11 @@ export interface SessionSummary {
 
 export interface SessionRecord extends SessionSummary {
   messages: AgentMessage[];
+  /**
+   * Raw provider-shaped turns core's compaction soft-archived out of the live
+   * transcript (sessions.rs `archive_turns`). Absent until a compaction runs.
+   */
+  archived?: unknown[];
 }
 
 export interface SaveSessionInput {
@@ -26,11 +34,17 @@ export interface SaveSessionInput {
   projectSlug?: string | null;
   provider?: string | null;
   model?: string | null;
+  workspaceRoot?: string | null;
+  worktreeId?: string | null;
+  branch?: string | null;
   title?: string;
 }
 
 export const saveSession = (input: SaveSessionInput): Promise<SessionSummary> =>
   rpc<SessionSummary>("session_save", { ...input });
+
+export const createSession = (projectSlug: string): Promise<SessionSummary> =>
+  rpc<SessionSummary>("session_create", { projectSlug });
 
 export const listSessions = (): Promise<SessionSummary[]> => rpc<SessionSummary[]>("session_list", {});
 

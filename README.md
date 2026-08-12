@@ -1,12 +1,14 @@
 # CaliCode
 
-CaliCode is a native AI game-coding harness for the web. A Rust control plane
-pairs with a three.js editor: asset workbench, asset library, Play-In-Editor
-(PIE) runtime, deterministic frame capture, scripted tests, and an agent panel
-that drives the editor through real tool calls.
+CaliCode is a native coding agent built for game development. The agent is the
+main work surface; a dedicated game workspace adds live play, source editing,
+assets, scene tools, runtime capture, and playtests beside the conversation.
+A Rust control plane drives the editor through real tool calls.
 
-No MCP, no harness fork, and no generated Three.js code — image-to-3D
-reconstruction is a Rust pipeline that emits a data-driven `.cali` asset.
+No harness fork and no generated Three.js code — image-to-3D reconstruction is
+a Rust pipeline that emits a data-driven `.cali` asset. The core is also an MCP
+client: user-configured MCP servers can contribute tools to agent sessions (see
+[Extending CaliCode](#extending-calicode)).
 
 ## Two ways to work
 
@@ -17,15 +19,15 @@ reconstruction is a Rust pipeline that emits a data-driven `.cali` asset.
 repository, unchanged. CaliCode browses the file tree, reads and writes real
 files, and runs the project's own dev server in the PLAY tab.
 
-**Each game owns its own folder.** A workspace is attached to one game, not to
-the app, so switching games in the sidebar switches the folder, the file tree,
-and the dev server with it. Attach one with **ATTACH FOLDER** under the selected
-game; it needs a `package.json` or a `.git`. A game with no folder attached
-stays a pure scene document.
+**Each task owns its effective folder.** A workspace attached to a game is the
+source/default. On the first turn of a task, CaliCode records an immutable
+workspace binding and creates a dedicated Git worktree when possible. Switching
+tasks switches the file tree and dev-server root. A non-Git folder is bound but
+shared; use separate folders when concurrent tasks need isolated writes.
 
-This binding is what the agent's file tools follow: `file_read`, `file_write`,
-and `file_list` resolve inside the selected game's folder when it has one, and
-inside `~/.cali/projects/<slug>` when it does not.
+This task binding is what the agent's file tools follow: `file_read`,
+`file_write`, and `file_list` resolve inside the active task's worktree, never
+whichever project or editor happened to be selected most recently.
 
 |                | Project              | Workspace                     |
 | -------------- | -------------------- | ----------------------------- |
@@ -33,7 +35,143 @@ inside `~/.cali/projects/<slug>` when it does not.
 | Owned by       | CaliCode             | you                           |
 | Content        | scene JSON           | real source files             |
 | PLAY renders   | the PIE viewport     | the workspace's own dev server |
-| Attached to    | —                    | exactly one game              |
+| Attached to    | —                    | one task (game default before the first turn) |
+
+## Asset library
+
+The sidebar's **Assets** section is a curated registry of external repos —
+VFX, shaders, models, tooling — the studio knows about. The library stores
+metadata only (link, tags, license, a settings schema), never third-party
+source. Attaching a repo to a game saves its id and chosen setting values in
+the project document, where the agent can read them.
+
+To add a repo, drop one file in `client/src/lib/assetLibrary/repos/` exporting
+`repo: AssetRepo` — it is picked up automatically, no index edit needed. See
+`linear-ability-casting.ts` for the shape.
+
+## Extending CaliCode
+
+Two extension points, both configured without touching CaliCode's source.
+
+### Skills
+
+A skill is a markdown file with YAML frontmatter — `name` (`[A-Za-z0-9_-]`,
+≤48 chars) and a one-line `description` are required, the body is free-form
+instructions:
+
+```markdown
+---
+name: blockout-standards
+description: How to build blockout geometry that passes review
+---
+Free-form markdown body with the actual instructions.
+```
+
+Global skills live in `~/.cali/skills/*.md` and apply to every game.
+Per-project skills live in `<project>/.cali/skills/*.md` — inside the attached
+workspace when the game has one (so they version with your repo), otherwise
+under `~/.cali/projects/<slug>/.cali/skills`. A project skill shadows a global
+skill of the same name.
+
+Skills are progressive-disclosure: the system prompt carries only an index of
+names and descriptions, and the agent pulls a full body with the `skill_load`
+tool when one is relevant. Enable state lives in config (`skills.disabled`
+holds `"<scope>:<name>"` keys), so toggling a skill from Settings never
+rewrites your markdown.
+
+### MCP servers
+
+Add MCP servers under `mcp_servers` in `~/.cali/config.yaml`; their tools
+join agent sessions namespaced as `mcp__<id>__<tool>`:
+
+```yaml
+mcp_servers:
+  - id: blender            # [a-z0-9-], ≤24 chars; becomes the tool prefix
+    transport: stdio       # stdio (default) or http
+    command: uvx
+    args: ["blender-mcp"]
+    env:
+      BLENDER_HOST: "127.0.0.1"
+    enabled: true          # default true
+    trust: false           # default false
+    timeout_secs: 120      # per-call timeout, default 120
+    tools:                 # optional per-server tool filter
+      include: []          #   non-empty = allowlist (fnmatch globs)
+      exclude: ["render_*"] # hidden unless include claims them first
+  - id: issues             # http transport: url instead of command
+    transport: http
+    url: "http://127.0.0.1:9000/mcp"
+```
+
+Servers are spawned at core boot and on `mcp_reload`; invalid entries are
+dropped with a warning rather than blocking startup. `enabled: false` keeps
+the entry but spawns nothing. Spawned children get a scrubbed environment —
+only the declared `env` plus a safe baseline, never `CALI_*` API keys.
+
+**Per-project servers.** A game folder's `.cali/config.yaml` may carry its own
+`mcp_servers:` list. Entries are merged over the global list by id when that
+game is opened: a project entry with the same id overrides the global one
+(`enabled: false` disables a global server for that project only), and new ids
+add project-scoped servers. The MCP settings panel badges each server
+global/project and shows its tool filter.
+
+**Tool filters.** `tools: {include: [...], exclude: [...]}` narrows what the
+agent sees, matched against the server's own tool names with fnmatch globs
+(`*`, `?`, `[...]`). A non-empty `include` is an allowlist and wins on
+conflict with `exclude`; with `include` empty, everything not matching
+`exclude` is exposed.
+
+MCP tools are treated as destructive by default: under `supervised` and
+`auto-accept-edits` every call is approval-gated. Set `trust: true` on a
+server you control to let its calls through ungated. `full-access` bypasses
+gating as usual.
+
+### Codex and Claude CLI editor control
+
+The built-in agent and external MCP clients share the same live editor tool
+surface. The bundled stdio adapter resolves the CLI's working directory to a
+saved task and refuses to drive CaliCode when another task is open. See
+[Session-scoped editor agents](docs/editor-agent-bridge.md) for the Codex CLI
+and Claude Code setup commands.
+
+### Permission rules
+
+An optional `permissions:` list in `~/.cali/config.yaml` overrides the
+per-session permission mode tool by tool. Rules are fnmatch globs over tool
+names; the **last** matching rule wins:
+
+```yaml
+permissions:
+  - { pattern: "file_*", action: allow }        # never ask
+  - { pattern: "mcp__blender__*", action: ask } # always ask
+  - { pattern: "file_write", action: deny }     # hidden from the model
+```
+
+`allow` skips the approval prompt regardless of mode, `ask` forces one, and
+`deny` removes the tool from the agent's tool list entirely (denied calls are
+also refused if the model hallucinates one). Tools no rule matches fall back
+to the mode logic. Subagents inherit the parent's rules. The composer's
+**Plan** mode is separate and stricter: it restricts dispatch to a read-only
+whitelist, so planning turns cannot modify anything.
+
+### Context compaction
+
+Core tracks per-session token usage from provider `usage` reports (the meter
+next to the composer; `/usage` prints totals) and compacts long sessions in
+place: old oversized tool results are pruned, the middle of the transcript is
+replaced with one structured summary (goal / progress / decisions / files /
+next steps), and the replaced turns are soft-archived into the session file —
+resuming shows them as a collapsed row. `/compact` triggers it on demand;
+by default it also auto-triggers when the context crosses the threshold.
+Tune it in `~/.cali/config.yaml`:
+
+```yaml
+compaction:
+  auto: true           # auto-compact when the threshold is crossed
+  threshold: 0.75      # fraction of the context window that triggers it
+  reserved: 8192       # tokens held back for the reply + summary
+  context_length: null # override the assumed context window (default 128000)
+```
 
 ## Layout
 

@@ -129,23 +129,37 @@ pub fn usage(root: &Path, slug: &str) -> Result<Value> {
     Ok(Value::Object(counts))
 }
 
-pub fn export_gltf(root: &Path, slug: &str, asset_id: &str) -> Result<Value> {
+/// Write a builder-edited `.cali.json` spec back into the project's assets/.
+///
+/// The target is the asset entry's `source` from project.json when it ends in
+/// `.cali.json`, otherwise `assets/<assetId>.cali.json`. Always resolves under
+/// the CaliCode-owned project dir (never a workspace) and refuses anything
+/// outside `assets/`.
+pub fn write_project_asset(
+    root: &Path,
+    slug: &str,
+    asset_id: &str,
+    content: &str,
+) -> Result<Value> {
     let project = crate::store::read_project(root, slug)?;
-    let asset = project["assets"]
+    let source = project["assets"]
         .as_array()
         .and_then(|arr| arr.iter().find(|a| a["id"] == asset_id))
-        .context("asset not found")?;
-    let gltf = json!({
-        "asset": { "version": "2.0", "generator": "cali-core" },
-        "scene": 0,
-        "scenes": [{ "nodes": [0] }],
-        "nodes": [{ "name": asset["name"], "translation": [0, 0, 0] }],
-        "materials": [{ "name": asset["name"], "pbrMetallicRoughness": { "baseColorFactor": [0.9, 0.6, 0.2, 1.0], "metallicFactor": 0.1, "roughnessFactor": 0.6 } }]
-    });
-    let dir = project_dir(root, slug)?.join("assets");
-    let file_name = format!("{}.gltf", asset_id);
-    std::fs::write(dir.join(&file_name), serde_json::to_string_pretty(&gltf)?)?;
-    Ok(json!({ "path": format!("assets/{}", file_name), "gltf": gltf }))
+        .and_then(|asset| asset["source"].as_str())
+        .filter(|source| source.ends_with(".cali.json"))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{asset_id}.cali.json"));
+    let dir = project_dir(root, slug)?;
+    let rel = format!("assets/{source}");
+    let path = crate::store::safe_join(&dir, &rel)?;
+    if !path.starts_with(dir.join("assets")) {
+        anyhow::bail!("asset writes must stay inside assets/");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&path, content).with_context(|| format!("cannot write {}", path.display()))?;
+    Ok(json!({ "written": rel, "bytes": content.len() }))
 }
 
 fn short_id() -> String {
@@ -173,10 +187,14 @@ mod tests {
     }
 
     #[test]
-    fn gltf_export_is_valid_json() {
+    fn write_project_asset_targets_assets_dir_and_refuses_escapes() {
         let root = tempfile::tempdir().unwrap();
         create_project(root.path(), "demo", "Demo").unwrap();
-        let out = export_gltf(root.path(), "demo", "asset-cube").unwrap();
-        assert_eq!(out["gltf"]["asset"]["version"], "2.0");
+        let out =
+            write_project_asset(root.path(), "demo", "widget", "{\"targetName\":\"W\"}").unwrap();
+        assert_eq!(out["written"], "assets/widget.cali.json");
+        let dir = project_dir(root.path(), "demo").unwrap();
+        assert!(dir.join("assets/widget.cali.json").is_file());
+        assert!(write_project_asset(root.path(), "demo", "../evil", "{}").is_err());
     }
 }

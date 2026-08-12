@@ -2,7 +2,7 @@ import { expect, test } from "@playwright/test";
 
 test("editor boots with the CaliCode workspace shell", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByRole("heading", { name: /CaliCode/i })).toBeVisible();
+  await expect(page.getByLabel("Agent prompt")).toBeVisible();
   await expect(page.locator("canvas").first()).toBeVisible();
   for (const name of ["play", "code", "art", "scene", "test"]) {
     await expect(page.getByRole("tab", { name, exact: true })).toBeVisible();

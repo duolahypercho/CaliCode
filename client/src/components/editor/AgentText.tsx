@@ -29,14 +29,14 @@ function renderInline(line: string): ReactNode[] {
   return line.split(INLINE).map((segment, index) => {
     if (segment.startsWith("**") && segment.endsWith("**") && segment.length > 4) {
       return (
-        <strong key={index} className="font-bold text-[#e6e6e6]">
+        <strong key={index} className="font-bold text-ink-strong">
           {segment.slice(2, -2)}
         </strong>
       );
     }
     if (segment.startsWith("`") && segment.endsWith("`") && segment.length > 2) {
       return (
-        <code key={index} className="rounded bg-white/[0.07] px-1 py-px text-[12px] text-[#dadada]">
+        <code key={index} className="rounded bg-surface-2 px-1 py-px text-[12px] text-ink-strong">
           {segment.slice(1, -1)}
         </code>
       );

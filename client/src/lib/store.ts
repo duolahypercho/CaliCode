@@ -67,14 +67,14 @@ export function starterProject(): Project {
     tests: [
       {
         id: "test-floor",
-        name: "Floor exists",
-        script: "assert(scene.entities.some((e) => e.name === 'Floor'), 'Floor is missing');",
+        name: "Playable surface exists",
+        script: "await assert(scene.entities.some((e) => e.kind === 'plane'), 'Playable surface exists');",
       },
       {
         id: "test-hero",
         name: "Hero moves",
         script:
-          "const before = entityFor('Hero Cube').rotation.y; await step(30); assert(Math.abs(entityFor('Hero Cube').rotation.y - before) > 0.1, 'Hero did not rotate');",
+          "const before = entityFor('Hero Cube').rotation.y; await step(30); await assert(Math.abs(entityFor('Hero Cube').rotation.y - before) > 0.1, 'Hero moves during PIE');",
       },
     ],
     settings: { pie: { captureEvery: 3, fixedStepHz: 60 } },
@@ -124,7 +124,9 @@ export function updateScript(project: Project, id: string, patch: Partial<Script
 
 export function addAsset(project: Project, asset: Partial<Asset>): Project {
   const next: Asset = {
-    id: uid("asset"),
+    // Honor a caller-chosen id (the builder tools name the `.cali.json` file
+    // after it before the asset exists); generate one otherwise.
+    id: asset.id ?? uid("asset"),
     name: asset.name ?? "Asset",
     type: asset.type ?? "procedural",
     source: asset.source ?? "procedural:box",
@@ -144,12 +146,20 @@ export function updateAsset(project: Project, id: string, patch: Partial<Asset>)
 }
 
 export function addTest(project: Project, test: Partial<GameTest>): Project {
+  const id = test.id ?? uid("test");
   const next: GameTest = {
-    id: uid("test"),
+    id,
     name: test.name ?? "New test",
     script: test.script ?? "assert(true, 'passes');",
   };
   return { ...project, tests: [...project.tests, next] };
+}
+
+export function updateTest(project: Project, id: string, patch: Partial<GameTest>): Project {
+  return {
+    ...project,
+    tests: project.tests.map((test) => (test.id === id ? { ...test, ...patch } : test)),
+  };
 }
 
 export function clampVec3(value: Vec3): Vec3 {

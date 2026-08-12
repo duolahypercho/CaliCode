@@ -101,17 +101,13 @@ export function classifyActivityOperation(tool: string, explicit?: string): Acti
   if (operation === "write") return "write";
   if (operation === "command") return "command";
   const name = tool.toLowerCase();
-  if (name.includes("read") || name === "file_list") return "read";
-  if (name.includes("grep") || name.includes("glob") || name.includes("search") || name.includes("find")) return "search";
-  if (name.includes("edit") || name.includes("patch") || name.includes("update")) return "edit";
-  if (name.includes("write") || name.includes("create") || name.includes("save")) return "write";
+  const parts = name.split(/[^a-z0-9]+/).filter(Boolean);
+  if (parts.includes("read") || name === "file_list") return "read";
+  if (["grep", "glob", "search", "find"].some((part) => parts.includes(part))) return "search";
+  if (["edit", "patch", "update"].some((part) => parts.includes(part))) return "edit";
+  if (["write", "create", "save"].some((part) => parts.includes(part))) return "write";
   if (
-    name.includes("command") ||
-    name.includes("shell") ||
-    name.includes("exec") ||
-    name.includes("run") ||
-    name.includes("build") ||
-    name.includes("test")
+    ["command", "shell", "exec", "run", "build", "test"].some((part) => parts.includes(part))
   ) {
     return "command";
   }
@@ -154,20 +150,24 @@ export function buildActivityFileChange(
 ): ActivityFileChange | undefined {
   const path = payload.path ?? context.fallbackPath;
   if (!path) return undefined;
-  const before = payload.before ?? payload.beforeSnippet;
-  const after = payload.after ?? payload.afterSnippet;
+  const before = payload.truncated ? payload.beforeSnippet ?? payload.before : payload.before ?? payload.beforeSnippet;
+  const after = payload.truncated ? payload.afterSnippet ?? payload.after : payload.after ?? payload.afterSnippet;
   const operation = classifyActivityOperation(context.tool, payload.operation);
   const counts =
     before !== undefined || after !== undefined
       ? boundedDiff(before ?? "", after ?? "")
       : { diff: [], additions: 0, deletions: 0 };
+  const multiplier =
+    payload.truncated && operation === "edit" && Number.isFinite(payload.replacements)
+      ? Math.max(1, Math.floor(payload.replacements ?? 1))
+      : 1;
   return {
     path,
     workspaceRoot: context.workspaceRoot,
     projectSlug: context.projectSlug,
     operation,
-    additions: counts.additions,
-    deletions: counts.deletions,
+    additions: counts.additions * multiplier,
+    deletions: counts.deletions * multiplier,
     diff: counts.diff,
     truncated: payload.truncated,
     turnId: context.turnId,
@@ -177,7 +177,19 @@ export function buildActivityFileChange(
 
 export function activityDetail(result: unknown): string | undefined {
   if (result == null) return undefined;
-  const text = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+  const text =
+    typeof result === "string"
+      ? result
+      : JSON.stringify(result, (key, value) => {
+          if (key === "__cali_internal_activity" || key === "activity") return undefined;
+          // Tool results from older cores sometimes nested the transient
+          // snapshots directly. They are not useful in the compact row and
+          // can be much larger than the rest of the result.
+          if (key === "before" || key === "after" || key === "beforeSnippet" || key === "afterSnippet") {
+            return undefined;
+          }
+          return value;
+        }, 2);
   return boundedText(text);
 }
 
@@ -200,7 +212,7 @@ export function activitySummary(
       const counts = `+${file.additions} -${file.deletions}`;
       return `${operation === "edit" ? "Edited" : "Wrote"} ${name ?? "file"} ${file.truncated ? `${counts} (partial)` : counts}`;
     }
-    return `${operation === "edit" ? "Edited" : "Wrote"} ${name ?? "file"}`;
+    return name ? `${operation === "edit" ? "Edited" : "Wrote"} ${name}` : `Used ${tool}`;
   }
   if (operation === "command") {
     const command =
@@ -209,7 +221,17 @@ export function activitySummary(
       (typeof params.script === "string" && params.script);
     return command ? `Ran ${command}` : `Ran ${tool}`;
   }
-  return tool || "Used tool";
+  return tool ? `Used ${tool}` : "Used tool";
+}
+
+/**
+ * Early activity builds persisted generic edit/write labels even when a
+ * browser tool had not touched a file. Reclassify only those known legacy
+ * labels; richer path/diff summaries remain untouched.
+ */
+export function repairLegacyActivitySummary(tool: string | undefined, content: string): string {
+  if (!tool || (content !== "Edited file" && content !== "Wrote file")) return content;
+  return activitySummary(tool, classifyActivityOperation(tool));
 }
 
 export function formatDuration(durationMs: number): string {

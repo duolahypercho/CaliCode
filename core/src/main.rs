@@ -1,14 +1,27 @@
 mod agent;
+mod asset_search;
 mod assets;
 mod baselines;
+mod blender;
+mod capture_persist;
+mod compaction;
 mod config;
 mod devserver;
+mod editor_bridge;
+mod fileread;
+mod graph;
 mod image3d;
+mod image_mesh;
+pub(crate) mod loop_report;
+mod mcp;
 mod model;
+mod pathlock;
 mod rpc;
 mod sessions;
+mod skills;
 mod store;
 mod tools;
+pub(crate) mod video_analysis;
 mod workspace;
 
 use agent::AgentManager;
@@ -46,8 +59,17 @@ pub struct AppState {
     pub projects_root: PathBuf,
     pub sessions_root: PathBuf,
     pub agents: AgentManager,
+    pub graphs: graph::GraphManager,
     pub bus: broadcast::Sender<Value>,
     pub tools: Arc<RwLock<HashMap<String, tools::ToolDef>>>,
+    pub editor_bridge: editor_bridge::EditorBridge,
+    /// Current editor owner per durable session. A single global attachment
+    /// made opening a second chat invalidate the first chat's tool routing.
+    pub editor_attachment: Arc<RwLock<HashMap<String, editor_bridge::EditorAttachment>>>,
+    pub mcp: Arc<mcp::McpManager>,
+    /// Client-published asset catalogue (library repos etc.), replaced whole
+    /// by `asset_catalog_publish`; read by `asset_search`/`asset_pick`.
+    pub asset_catalog: Arc<RwLock<Vec<Value>>>,
     pub workspaces: Arc<RwLock<workspace::Registry>>,
     pub dev_servers: Arc<RwLock<devserver::Servers>>,
     /// Flips to true once shutdown starts. Long-lived responses subscribe and
@@ -86,6 +108,9 @@ async fn main() -> anyhow::Result<()> {
     // TCC prompt. Doing that before `bind` meant core never started listening
     // and the whole app came up dead with "core failed to start".
     let remembered = config.workspaces.clone();
+    // Cloned before `config` moves into state; MCP boot runs in the
+    // background so a slow server command never delays the port bind.
+    let mcp_servers = config.mcp_servers.clone();
 
     let (bus, _) = broadcast::channel(256);
     let shutdown = Arc::new(watch::channel(false).0);
@@ -94,12 +119,26 @@ async fn main() -> anyhow::Result<()> {
         projects_root,
         sessions_root,
         agents: AgentManager::new(bus.clone()),
-        bus,
+        graphs: graph::GraphManager::new(),
+        bus: bus.clone(),
         tools: Arc::new(RwLock::new(HashMap::new())),
+        editor_bridge: editor_bridge::EditorBridge::new(bus.clone()),
+        editor_attachment: Arc::new(RwLock::new(HashMap::new())),
+        mcp: Arc::new(mcp::McpManager::default()),
+        asset_catalog: Arc::new(RwLock::new(Vec::new())),
         workspaces: Arc::new(RwLock::new(workspace::Registry::new())),
         dev_servers: Arc::new(RwLock::new(devserver::Servers::new())),
         shutdown: shutdown.clone(),
     };
+
+    // Start configured MCP servers in the background (non-fatal): a broken
+    // entry shows up in mcp_list as failed, it must never block startup.
+    {
+        let mcp = state.mcp.clone();
+        tokio::spawn(async move {
+            mcp.start_all(&mcp_servers).await;
+        });
+    }
 
     // Populate the registry in the background. `workspace_list` simply returns
     // fewer entries until this lands, which is recoverable; a core that never
@@ -158,8 +197,12 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|_| PathBuf::from("../client/dist"));
 
     // Cloned before `state` moves into the router, so shutdown can still
-    // reach the running dev servers.
+    // reach the running dev servers and MCP children.
     let dev_servers = state.dev_servers.clone();
+    let mcp_for_shutdown = state.mcp.clone();
+    // Static project files (downloaded glTF models etc.) for the client's
+    // loaders, e.g. /projects/<slug>/assets/polyhaven/<id>/<file>.gltf.
+    let projects_dir_service = state.projects_root.clone();
 
     // CORS is not sufficient on its own. A DNS-rebinding attack sends a
     // same-origin-looking request with NO Origin header and a foreign Host, so
@@ -170,12 +213,23 @@ async fn main() -> anyhow::Result<()> {
     let host_guard = axum::middleware::from_fn(require_loopback_host);
 
     let app = Router::new()
-        .route("/rpc", post(rpc::rpc_handler))
+        // `DefaultBodyLimit::max` is the per-route cap that lets `video_contact_sheet`
+        // send multi-frame base64 payloads up to `video_analysis::MAX_INPUT_BYTES`
+        // without axum's plain-text 413 being mis-parsed by the client as a transport
+        // outage. The custom `RpcEnvelope` extractor turns a too-large body into a
+        // structured JSON-RPC error envelope so the client surfaces the message.
+        .route(
+            "/rpc",
+            post(rpc::rpc_handler).layer(axum::extract::DefaultBodyLimit::max(
+                rpc::RPC_BODY_LIMIT_BYTES,
+            )),
+        )
         // A GET liveness probe. `/` serves the built client, which does not
         // exist until `pnpm build` has run, so it is not a usable readiness
         // signal for tooling — CI waited 180s on it and timed out.
         .route("/health", get(health))
         .route("/events", get(events))
+        .nest_service("/projects", ServeDir::new(projects_dir_service))
         .fallback_service(
             ServeDir::new(&dist).not_found_service(ServeFile::new(dist.join("index.html"))),
         )
@@ -225,6 +279,8 @@ async fn main() -> anyhow::Result<()> {
                     let _ = devserver::stop(&mut servers, &id).await;
                 }
             }
+            // MCP children are real processes too; leave none behind.
+            mcp_for_shutdown.shutdown_all().await;
 
             tokio::spawn(async {
                 tokio::time::sleep(SHUTDOWN_GRACE).await;

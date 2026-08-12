@@ -1,0 +1,87 @@
+{
+  "id": "cozy-sim",
+  "name": "Cozy Sim Slice",
+  "description": "Cozy life/farming sim vertical slice judged against the genre's warmth-and-readability bar.",
+  "defaultThreshold": 90,
+  "nodes": [
+    {
+      "id": "design",
+      "title": "Design doc",
+      "kind": "build",
+      "role": "planner",
+      "instructions": "Design for: {{goal}}. Define the core loop (tend -> collect -> spend), one plot/placeable system with growth or build stages and timings, one friendly NPC with a 3-line interaction, day/night or season ambience, and the session's satisfying end-beat. Concrete numbers. Save as design.md.",
+      "acceptance": [
+        "design.md exists",
+        "core loop, stages+timings, NPC lines, ambience, end-beat all specified with numbers"
+      ],
+      "deps": []
+    },
+    {
+      "id": "world",
+      "title": "Cozy world blockout",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Build the cozy plot from design.md: ground, plots/placeables, home structure, path, props. Soft rounded scale, no bare edges in frame.",
+      "acceptance": [
+        "world entities exist and are named",
+        "player spawn + >=4 interactable plots placed",
+        "frame captured with no untextured/default-material geometry in view"
+      ],
+      "deps": ["design"]
+    },
+    {
+      "id": "loop",
+      "title": "Tend-collect-spend loop",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Implement the tend->collect->spend loop as entity scripts: interact to plant/place, staged growth over time, harvest yields a resource, resource spendable on one visible upgrade. Add a test proving a full cycle.",
+      "acceptance": [
+        "full cycle works in PIE",
+        "growth stages visibly distinct in captures",
+        "cycle test green via editor_run_tests"
+      ],
+      "deps": ["design", "world"]
+    },
+    {
+      "id": "life",
+      "title": "NPC and ambience",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Add the NPC (wander + 3-line interaction per design.md) and ambience: day/night light cycle or weather, idle motion (sway, particles, critters).",
+      "acceptance": [
+        "NPC wanders and interaction triggers in PIE",
+        "light/ambience changes over time in PIE",
+        ">=2 idle-motion elements present"
+      ],
+      "deps": ["loop"]
+    },
+    {
+      "id": "warmth",
+      "title": "Warmth pass",
+      "kind": "build",
+      "role": "artist",
+      "instructions": "Cozy pass: warm palette, soft contrast, rounded silhouettes, deliberate prop clutter, framing. Retake captures at the golden-hour light state.",
+      "acceptance": [
+        "cohesive warm palette across entities",
+        "every entity has deliberate material values",
+        "fresh golden-hour capture taken"
+      ],
+      "deps": ["world", "life"]
+    },
+    {
+      "id": "judge",
+      "title": "Cozy judge",
+      "kind": "judge",
+      "role": "critic",
+      "reference": "Stardew Valley / Animal Crossing: New Horizons town scene",
+      "threshold": 90,
+      "instructions": "Score the slice for: loop satisfaction, world warmth and readability, ambient liveliness, cohesion vs reference. Blind side-by-side: unlabeled next to the reference, which would a player call cozier, and why.",
+      "acceptance": [
+        "PIE runs clean",
+        "cycle test green",
+        "scene reads warm and alive vs reference"
+      ],
+      "deps": ["loop", "life", "warmth"]
+    }
+  ]
+}

@@ -61,13 +61,13 @@ pub const SAMPLE_PROJECT: &str = r##"{
   "tests": [
     {
       "id": "test-floor",
-      "name": "Floor exists",
-      "script": "assert(scene.entities.some(e => e.name === 'Floor'), 'Floor is missing');"
+      "name": "Playable surface exists",
+      "script": "await assert(scene.entities.some(e => e.kind === 'plane'), 'Playable surface exists');"
     },
     {
       "id": "test-hero",
       "name": "Hero moves",
-      "script": "const before = entityFor('Hero Cube').rotation.y; await step(30); assert(Math.abs(entityFor('Hero Cube').rotation.y - before) > 0.1, 'Hero did not rotate');"
+      "script": "const before = entityFor('Hero Cube').rotation.y; await step(30); await assert(Math.abs(entityFor('Hero Cube').rotation.y - before) > 0.1, 'Hero moves during PIE');"
     }
   ],
   "settings": { "pie": { "captureEvery": 3, "fixedStepHz": 60 } }
@@ -360,7 +360,7 @@ pub fn project_location(root: &Path, slug: &str) -> Result<PathBuf> {
             return Ok(workspace);
         }
     }
-    Ok(project_dir(root, slug)?)
+    project_dir(root, slug)
 }
 
 /// Create a durable git worktree next to the projects directory, then attach
@@ -430,6 +430,288 @@ pub fn create_permanent_worktree(root: &Path, slug: &str) -> Result<Value> {
     }))
 }
 
+/// Create an isolated worktree for one session without changing the project's
+/// default workspace. Non-git folders remain valid session workspaces; they
+/// are shared because git has no isolation primitive to offer there.
+pub fn create_session_workspace(root: &Path, slug: &str, session_id: &str) -> Result<Value> {
+    let project = read_project(root, slug)?;
+    let source = project
+        .get("workspaceRoot")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or(project_dir(root, slug)?);
+    if !source.is_dir() {
+        anyhow::bail!("workspace {} is unavailable", source.display());
+    }
+
+    let Ok(repo_text) = git_stdout(&source, &["rev-parse", "--show-toplevel"]) else {
+        return Ok(json!({
+            "path": source.to_string_lossy(),
+            "worktreeId": Value::Null,
+            "branch": Value::Null,
+            "created": false,
+            "isolated": false,
+        }));
+    };
+    let repo = PathBuf::from(repo_text.trim());
+    if git_stdout(&source, &["rev-parse", "--verify", "HEAD"]).is_err() {
+        return Ok(json!({
+            "path": source.to_string_lossy(),
+            "worktreeId": Value::Null,
+            "branch": Value::Null,
+            "created": false,
+            "isolated": false,
+        }));
+    }
+    let suffix: String = session_id
+        .trim_start_matches("session-")
+        .chars()
+        .take(12)
+        .collect();
+    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
+        anyhow::bail!("invalid session id");
+    }
+    let worktree_id = format!("{slug}-{suffix}");
+    let destination = root
+        .parent()
+        .unwrap_or(root)
+        .join("worktrees")
+        .join(sanitize_slug(slug)?)
+        .join(&suffix);
+    let branch = format!("calicode/{slug}/{suffix}");
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let created = if destination.exists() {
+        let existing = git_stdout(&destination, &["rev-parse", "--show-toplevel"])
+            .context("session worktree destination is not a git worktree")?;
+        if PathBuf::from(existing.trim()).canonicalize()? != destination.canonicalize()? {
+            anyhow::bail!("session worktree destination belongs to another repository");
+        }
+        false
+    } else {
+        let output = match Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["worktree", "add", "-b"])
+            .arg(&branch)
+            .arg(&destination)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) => {
+                prune_empty_session_dirs(&destination);
+                return Err(error).context("failed to run git worktree add");
+            }
+        };
+        if !output.status.success() {
+            let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            // `create_dir_all` above is required for git's destination
+            // parent, but a failed add must not leave a chain of empty
+            // session directories behind. `remove_dir` is intentionally
+            // non-recursive: any partial checkout or user file is preserved.
+            prune_empty_session_dirs(&destination);
+            anyhow::bail!("could not create session worktree: {detail}");
+        }
+        true
+    };
+
+    Ok(json!({
+        "path": destination.to_string_lossy(),
+        "worktreeId": worktree_id,
+        "branch": branch,
+        "created": created,
+        "isolated": true,
+    }))
+}
+
+fn prune_empty_session_dirs(destination: &Path) {
+    let Some(project_root) = destination.parent() else {
+        return;
+    };
+    let _ = std::fs::remove_dir(destination);
+    let _ = std::fs::remove_dir(project_root);
+    if let Some(worktrees_root) = project_root.parent() {
+        let _ = std::fs::remove_dir(worktrees_root);
+    }
+}
+
+/// Remove a session-owned worktree without touching a shared or permanent
+/// workspace.
+///
+/// Session worktrees are intentionally disposable, but the path and branch
+/// are persisted in a user-editable session JSON file. Treat that metadata as
+/// untrusted: only the exact `worktrees/<slug>/<suffix>` layout produced by
+/// [`create_session_workspace`] is eligible. A dirty worktree is preserved so
+/// deleting a chat can never discard edits or untracked files the user may
+/// want to recover.
+pub fn cleanup_session_workspace(
+    root: &Path,
+    slug: &str,
+    workspace_root: Option<&str>,
+    worktree_id: Option<&str>,
+    branch: Option<&str>,
+) -> Result<Value> {
+    let clean_slug = sanitize_slug(slug)?;
+    let Some(workspace_root) = workspace_root
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+    else {
+        return Ok(json!({
+            "deleted": false,
+            "isolated": false,
+            "preserved": false,
+            "reason": "session has no workspace",
+        }));
+    };
+    let Some(worktree_id) = worktree_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(json!({
+            "path": workspace_root,
+            "deleted": false,
+            "isolated": false,
+            "preserved": false,
+            "reason": "workspace is shared",
+        }));
+    };
+
+    let prefix = format!("{clean_slug}-");
+    let Some(suffix) = worktree_id.strip_prefix(&prefix) else {
+        return Ok(json!({
+            "path": workspace_root,
+            "deleted": false,
+            "isolated": true,
+            "preserved": true,
+            "reason": "worktree id does not match the project",
+        }));
+    };
+    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return Ok(json!({
+            "path": workspace_root,
+            "deleted": false,
+            "isolated": true,
+            "preserved": true,
+            "reason": "invalid session worktree id",
+        }));
+    }
+    let expected_branch = format!("calicode/{clean_slug}/{suffix}");
+    if branch
+        .map(str::trim)
+        .is_some_and(|value| value != expected_branch)
+    {
+        return Ok(json!({
+            "path": workspace_root,
+            "deleted": false,
+            "isolated": true,
+            "preserved": true,
+            "reason": "session branch does not match the project",
+        }));
+    }
+
+    let expected = root
+        .parent()
+        .unwrap_or(root)
+        .join("worktrees")
+        .join(&clean_slug)
+        .join(suffix);
+    let requested = PathBuf::from(workspace_root);
+    let expected_cmp = expected.canonicalize().unwrap_or_else(|_| expected.clone());
+    let requested_cmp = requested
+        .canonicalize()
+        .unwrap_or_else(|_| requested.clone());
+    if requested_cmp != expected_cmp {
+        return Ok(json!({
+            "path": workspace_root,
+            "deleted": false,
+            "isolated": true,
+            "preserved": true,
+            "reason": "workspace path is outside the session worktree root",
+        }));
+    }
+
+    let metadata = match std::fs::symlink_metadata(&requested) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(json!({
+                "path": workspace_root,
+                "deleted": false,
+                "isolated": true,
+                "preserved": false,
+                "reason": "worktree is already absent",
+            }));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(json!({
+            "path": workspace_root,
+            "deleted": false,
+            "isolated": true,
+            "preserved": true,
+            "reason": "worktree path is not a real directory",
+        }));
+    }
+
+    // Refuse to remove user edits. This includes untracked files: a model may
+    // have generated a new asset that is not committed yet, and `git
+    // worktree remove --force` would destroy it with no recovery path.
+    let status = git_stdout(
+        &requested,
+        &["status", "--porcelain", "--untracked-files=all"],
+    )?;
+    if !status.trim().is_empty() {
+        return Ok(json!({
+            "path": workspace_root,
+            "deleted": false,
+            "isolated": true,
+            "preserved": true,
+            "reason": "worktree has uncommitted changes",
+        }));
+    }
+
+    let common_dir = git_stdout(&requested, &["rev-parse", "--git-common-dir"])?;
+    let common_dir = PathBuf::from(common_dir.trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        requested.join(common_dir)
+    };
+    let repo = common_dir
+        .parent()
+        .context("session worktree git directory has no repository parent")?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "remove"])
+        .arg(&requested)
+        .output()
+        .context("failed to remove session worktree")?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Ok(json!({
+            "path": workspace_root,
+            "deleted": false,
+            "isolated": true,
+            "preserved": true,
+            "reason": if detail.is_empty() {
+                "git refused to remove the worktree".to_string()
+            } else {
+                detail
+            },
+        }));
+    }
+
+    Ok(json!({
+        "path": workspace_root,
+        "deleted": true,
+        "isolated": true,
+        "preserved": false,
+        "branch": expected_branch,
+    }))
+}
+
 fn git_stdout(directory: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
@@ -445,7 +727,7 @@ fn git_stdout(directory: &Path, args: &[&str]) -> Result<String> {
             detail
         });
     }
-    Ok(String::from_utf8(output.stdout).context("git returned non-UTF-8 output")?)
+    String::from_utf8(output.stdout).context("git returned non-UTF-8 output")
 }
 
 /// Permanently remove one explicitly named project. Refuse to remove the last
@@ -685,6 +967,25 @@ mod tests {
     }
 
     #[test]
+    fn starter_template_checks_survive_scene_renames_and_await_assertions() {
+        let project: Value = serde_json::from_str(SAMPLE_PROJECT).unwrap();
+        let tests = project["tests"].as_array().unwrap();
+        assert!(tests.iter().any(|test| {
+            test["id"] == "test-floor"
+                && test["name"] == "Playable surface exists"
+                && test["script"].as_str().is_some_and(|script| {
+                    script.contains("e.kind === 'plane'") && script.contains("await assert")
+                })
+        }));
+        assert!(tests.iter().any(|test| {
+            test["id"] == "test-hero"
+                && test["script"].as_str().is_some_and(|script| {
+                    script.contains("await assert") && script.contains("Hero moves during PIE")
+                })
+        }));
+    }
+
+    #[test]
     fn rejects_unknown_project_templates_without_writing_a_project() {
         let root = tempfile::tempdir().unwrap();
 
@@ -823,6 +1124,140 @@ mod tests {
             read_project(&projects, "demo").unwrap()["workspaceRoot"],
             destination.to_string_lossy().as_ref()
         );
+    }
+
+    #[test]
+    fn sessions_get_distinct_worktrees_without_rebinding_the_project() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join("projects");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init"]).unwrap();
+        run_git(&repo, &["config", "user.email", "tests@example.com"]).unwrap();
+        run_git(&repo, &["config", "user.name", "CaliCode Tests"]).unwrap();
+        std::fs::write(repo.join("README.md"), "demo").unwrap();
+        run_git(&repo, &["add", "README.md"]).unwrap();
+        run_git(&repo, &["commit", "-m", "initial"]).unwrap();
+
+        create_project(&projects, "demo", "Demo").unwrap();
+        set_workspace_root(&projects, "demo", repo.to_str()).unwrap();
+        let a = create_session_workspace(&projects, "demo", "session-aaaaaaaaaaaa1111").unwrap();
+        let b = create_session_workspace(&projects, "demo", "session-bbbbbbbbbbbb2222").unwrap();
+
+        assert_ne!(a["path"], b["path"]);
+        assert_eq!(a["branch"], "calicode/demo/aaaaaaaaaaaa");
+        assert_eq!(b["branch"], "calicode/demo/bbbbbbbbbbbb");
+        assert!(Path::new(a["path"].as_str().unwrap())
+            .join("README.md")
+            .exists());
+        assert_eq!(
+            read_project(&projects, "demo").unwrap()["workspaceRoot"],
+            repo.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn cleanup_removes_only_a_clean_session_worktree() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join("projects");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init"]).unwrap();
+        run_git(&repo, &["config", "user.email", "tests@example.com"]).unwrap();
+        run_git(&repo, &["config", "user.name", "CaliCode Tests"]).unwrap();
+        std::fs::write(repo.join("README.md"), "demo").unwrap();
+        run_git(&repo, &["add", "README.md"]).unwrap();
+        run_git(&repo, &["commit", "-m", "initial"]).unwrap();
+
+        create_project(&projects, "demo", "Demo").unwrap();
+        set_workspace_root(&projects, "demo", repo.to_str()).unwrap();
+        let workspace =
+            create_session_workspace(&projects, "demo", "session-aaaaaaaaaaaa1111").unwrap();
+        let path = workspace["path"].as_str().unwrap();
+        let result = cleanup_session_workspace(
+            &projects,
+            "demo",
+            Some(path),
+            workspace["worktreeId"].as_str(),
+            workspace["branch"].as_str(),
+        )
+        .unwrap();
+
+        assert_eq!(result["deleted"], true);
+        assert!(!Path::new(path).exists());
+        assert_eq!(
+            read_project(&projects, "demo").unwrap()["workspaceRoot"],
+            repo.to_string_lossy().as_ref(),
+            "cleaning a session must not rebind the project"
+        );
+        assert!(
+            git_stdout(
+                &repo,
+                &[
+                    "show-ref",
+                    "--verify",
+                    "refs/heads/calicode/demo/aaaaaaaaaaaa"
+                ]
+            )
+            .is_ok(),
+            "cleanup must not delete the branch that may contain user work"
+        );
+    }
+
+    #[test]
+    fn cleanup_preserves_dirty_session_worktree_and_shared_workspace() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join("projects");
+        let repo = home.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        run_git(&repo, &["init"]).unwrap();
+        run_git(&repo, &["config", "user.email", "tests@example.com"]).unwrap();
+        run_git(&repo, &["config", "user.name", "CaliCode Tests"]).unwrap();
+        std::fs::write(repo.join("README.md"), "demo").unwrap();
+        run_git(&repo, &["add", "README.md"]).unwrap();
+        run_git(&repo, &["commit", "-m", "initial"]).unwrap();
+
+        create_project(&projects, "demo", "Demo").unwrap();
+        set_workspace_root(&projects, "demo", repo.to_str()).unwrap();
+        let workspace =
+            create_session_workspace(&projects, "demo", "session-bbbbbbbbbbbb2222").unwrap();
+        let path = workspace["path"].as_str().unwrap();
+        std::fs::write(Path::new(path).join("keep-me.txt"), "user work").unwrap();
+        let dirty = cleanup_session_workspace(
+            &projects,
+            "demo",
+            Some(path),
+            workspace["worktreeId"].as_str(),
+            workspace["branch"].as_str(),
+        )
+        .unwrap();
+        assert_eq!(dirty["deleted"], false);
+        assert_eq!(dirty["preserved"], true);
+        assert!(Path::new(path).join("keep-me.txt").exists());
+
+        let shared =
+            cleanup_session_workspace(&projects, "demo", Some(repo.to_str().unwrap()), None, None)
+                .unwrap();
+        assert_eq!(shared["deleted"], false);
+        assert_eq!(shared["isolated"], false);
+        assert!(repo.join("README.md").exists());
+    }
+
+    #[test]
+    fn cleanup_rejects_a_session_path_outside_the_generated_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let result = cleanup_session_workspace(
+            root.path(),
+            "demo",
+            Some(outside.path().to_str().unwrap()),
+            Some("demo-aaaaaaaaaaaa"),
+            Some("calicode/demo/aaaaaaaaaaaa"),
+        )
+        .unwrap();
+        assert_eq!(result["deleted"], false);
+        assert_eq!(result["preserved"], true);
+        assert!(outside.path().exists());
     }
 
     fn run_git(directory: &Path, args: &[&str]) -> Result<()> {

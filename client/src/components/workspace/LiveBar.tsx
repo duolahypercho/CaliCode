@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { LogEntry } from "../editor/ConsolePanel";
 import type { PieState } from "../../lib/pie";
 
@@ -24,6 +24,18 @@ interface LiveBarProps {
  */
 export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
   const [open, setOpen] = useState(false);
+  const [backgrounded, setBackgrounded] = useState(() => document.visibilityState === "hidden");
+
+  useEffect(() => {
+    const updateVisibility = () => setBackgrounded(document.visibilityState === "hidden");
+    document.addEventListener("visibilitychange", updateVisibility);
+    return () => document.removeEventListener("visibilitychange", updateVisibility);
+  }, []);
+
+  // Browsers intentionally throttle requestAnimationFrame in background tabs.
+  // Calling the resulting zero sample "RUNNING" looked like a game stall even
+  // though the runtime resumed normally as soon as the editor was foregrounded.
+  const signal = pieState === "running" && backgrounded ? "BACKGROUND" : pieState.toUpperCase();
 
   const chips = [
     // Labelled LOAD, not BUILD. This is the duration of the initial
@@ -31,7 +43,7 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
     // pipeline that does not exist.
     { k: "LOAD", v: stats.loadMs === null ? "pending" : `${(stats.loadMs / 1000).toFixed(1)}s` },
     { k: "FPS", v: String(stats.fps) },
-    { k: "SIG", v: pieState.toUpperCase() },
+    { k: "SIG", v: signal },
   ];
 
   const statCells = [
@@ -42,7 +54,7 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
   ];
 
   return (
-    <div className="shrink-0 border-t border-white/[0.06] bg-[#0a0a0a]">
+    <div className="shrink-0 border-t border-line bg-surface-0">
       <div className="flex h-10 items-center gap-2.5 px-3.5">
         <span className="calicode-label shrink-0">Live</span>
         {/* data-live-stats: masked in visual snapshots. fps, frame time and
@@ -51,9 +63,9 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
           {chips.map((chip) => (
             <span
               key={chip.k}
-              className="shrink-0 rounded border border-white/[0.07] px-2.5 py-[3px] text-[10.5px] text-[#7a7a7a]"
+              className="shrink-0 rounded border border-line px-2.5 py-[3px] text-[10.5px] text-ink-faint"
             >
-              <span className="font-bold text-[#a6a6a6]">{chip.k}</span> {chip.v}
+              <span className="font-bold text-ink-subtle">{chip.k}</span> {chip.v}
             </span>
           ))}
         </div>
@@ -61,27 +73,27 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
           type="button"
           onClick={() => setOpen((current) => !current)}
           aria-expanded={open}
-          className="ml-auto inline-flex min-h-[28px] shrink-0 items-center rounded-md border border-white/10 px-2.5 py-[5px] text-[10px] tracking-[0.14em] text-[#8f8f8f] transition-colors hover:border-white/25 hover:text-[#c0c0c0] active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
+          className="ml-auto inline-flex min-h-[28px] shrink-0 items-center rounded-md border border-line px-2.5 py-[5px] text-[10px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink active:bg-surface-3 focus-visible:outline-none"
         >
           CONSOLE {open ? "▾" : "▸"}
         </button>
       </div>
       {open ? (
-        <div className="flex h-[88px] gap-6 overflow-hidden border-t border-white/[0.06] px-3.5 py-2.5">
+        <div className="flex h-[88px] gap-6 overflow-hidden border-t border-line px-3.5 py-2.5">
           <div data-live-stats className="flex shrink-0 flex-wrap gap-5">
             {statCells.map((cell) => (
               <span key={cell.k} className="inline-flex flex-col gap-[3px]">
-                <span className="text-[9px] tracking-[0.16em] text-[#8a8a8a]">{cell.k}</span>
-                <span className="text-sm text-[#c0c0c0]">{cell.v}</span>
+                <span className="text-[9px] tracking-[0.16em] text-ink-subtle">{cell.k}</span>
+                <span className="text-sm text-ink">{cell.v}</span>
               </span>
             ))}
           </div>
-          <div className="min-w-0 flex-1 overflow-y-auto border-l border-white/[0.06] pl-5 text-[11px] leading-[1.7]">
+          <div className="min-w-0 flex-1 overflow-y-auto border-l border-line pl-5 text-[11px] leading-[1.7]">
             {logs.length === 0 ? (
-              <p className="text-[#8a8a8a]">No output yet.</p>
+              <p className="text-ink-subtle">No output yet.</p>
             ) : (
               logs.slice(-40).reverse().map((log) => (
-                <div key={log.id} className={log.level === "error" ? "text-[#c98b8b]" : "text-[#949494]"}>
+                <div key={log.id} className={log.level === "error" ? "text-danger-soft" : "text-ink-subtle"}>
                   ▸ {log.message}
                 </div>
               ))

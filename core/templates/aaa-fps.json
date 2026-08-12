@@ -1,0 +1,87 @@
+{
+  "id": "aaa-fps",
+  "name": "AAA FPS",
+  "description": "First-person shooter vertical slice judged against a named AAA reference.",
+  "defaultThreshold": 90,
+  "nodes": [
+    {
+      "id": "design",
+      "title": "Design doc",
+      "kind": "build",
+      "role": "planner",
+      "instructions": "Write the design for: {{goal}}. Define player movement (speed, jump, air control), one weapon (fire rate, damage, feel), one enemy archetype, one arena layout, and the win/lose condition. Save it with file_write as design.md.",
+      "acceptance": [
+        "design.md exists in the project",
+        "movement, weapon, enemy, arena, win/lose all specified with concrete numbers"
+      ],
+      "deps": []
+    },
+    {
+      "id": "blockout",
+      "title": "Arena blockout",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Build the arena from design.md as entities: floor, cover, spawn points, landmarks. Use editor_object_add / editor_update_transform. Distinct silhouettes, readable sightlines.",
+      "acceptance": [
+        "arena entities exist and are named",
+        "player spawn and at least 4 cover pieces placed",
+        "editor_capture_frame taken"
+      ],
+      "deps": ["design"]
+    },
+    {
+      "id": "player",
+      "title": "Player controller",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Implement player movement + camera per design.md as entity scripts (editor_script_write). Verify with editor_run_pie for 120 frames and capture a frame.",
+      "acceptance": [
+        "player entity moves under script control in PIE",
+        "no script errors in logs",
+        "frame captured during motion"
+      ],
+      "deps": ["design", "blockout"]
+    },
+    {
+      "id": "combat",
+      "title": "Weapon + enemy",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Implement the weapon and the enemy archetype per design.md: fire, hit, enemy reacts, death removes it. Add a test with editor_test_add proving a shot kills an enemy.",
+      "acceptance": [
+        "shooting works in PIE",
+        "enemy dies and is removed",
+        "editor_run_tests passes the combat test"
+      ],
+      "deps": ["player"]
+    },
+    {
+      "id": "polish",
+      "title": "Feel + readability pass",
+      "kind": "build",
+      "role": "artist",
+      "instructions": "Materials, lighting entities, scale, contrast: make the arena read like a shipped FPS screenshot. Adjust entity materials (color/metalness/roughness), add lights, retake captures.",
+      "acceptance": [
+        "every entity has deliberate material values",
+        "at least one light entity beyond defaults",
+        "fresh captures taken"
+      ],
+      "deps": ["blockout", "combat"]
+    },
+    {
+      "id": "judge",
+      "title": "AAA verdict",
+      "kind": "judge",
+      "role": "critic",
+      "reference": "DOOM (2016) arena combat slice",
+      "threshold": 90,
+      "instructions": "Score the playable slice for: movement feel, combat loop clarity, arena readability, visual cohesion, test coverage.",
+      "acceptance": [
+        "PIE runs clean",
+        "combat test green",
+        "scene visually cohesive vs reference"
+      ],
+      "deps": ["player", "combat", "polish"]
+    }
+  ]
+}

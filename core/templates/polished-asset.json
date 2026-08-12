@@ -1,0 +1,63 @@
+{
+  "id": "polished-asset",
+  "name": "Polished Asset",
+  "description": "A single 3D asset taken from spec to AAA polish in the asset builder and judged against a named reference.",
+  "defaultThreshold": 90,
+  "nodes": [
+    {
+      "id": "spec",
+      "title": "Asset spec",
+      "kind": "build",
+      "role": "planner",
+      "instructions": "Author the spec for: {{goal}}. Write a concrete component breakdown — every primitive named with its geometry kind, dimensions, transform, and material values (color, metalness, roughness), plus overall proportions and the silhouette the asset should read as. No placeholders. Save the final spec with file_write as asset-spec.json.",
+      "acceptance": [
+        "asset-spec.json exists in the project",
+        "every component names a geometry kind with dimensions and a transform",
+        "every material specifies color, metalness, and roughness values"
+      ],
+      "deps": []
+    },
+    {
+      "id": "build",
+      "title": "Build the asset",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Build the asset from asset-spec.json: open a new asset with editor_asset_builder_open, then translate the spec into editor_asset_builder_apply ops (add_component, set_transform, add_material, assign_material) until editor_asset_builder_state matches the spec's component list. Fix every op error the builder reports, save with editor_asset_builder_save, place it in the scene with editor_promote_asset, take an editor_capture_frame of it, and record the asset id in your report.",
+      "acceptance": [
+        "the built asset exists in the asset library with a recorded id",
+        "editor_asset_builder_apply completed with no unresolved op errors",
+        "editor_asset_builder_state shows every component from asset-spec.json",
+        "the asset is placed in the scene and a frame was captured"
+      ],
+      "deps": ["spec"]
+    },
+    {
+      "id": "refine",
+      "title": "Material + silhouette pass",
+      "kind": "build",
+      "role": "artist",
+      "instructions": "Refine the asset until it reads at AAA quality. Loop: retake an editor_capture_frame, judge the capture against asset-spec.json for silhouette, proportions, and material read, then correct with editor_asset_builder_apply (update_material, update_component, set_transform) — deliberate color/metalness/roughness values, never defaults. Save with editor_asset_builder_save after each round so the final capture shows the finished, persisted asset.",
+      "acceptance": [
+        "material values are deliberate, not defaults",
+        "silhouette and proportions match asset-spec.json in the capture",
+        "the asset was saved and a fresh capture was taken after the final change"
+      ],
+      "deps": ["build"]
+    },
+    {
+      "id": "judge",
+      "title": "Asset verdict",
+      "kind": "judge",
+      "role": "critic",
+      "reference": "Fortnite prop quality bar",
+      "threshold": 90,
+      "instructions": "Score the finished asset for: silhouette readability, material quality, and proportion accuracy against asset-spec.json, using editor_asset_builder_state and a fresh editor_capture_frame as evidence.",
+      "acceptance": [
+        "the asset is present in the library and renders in the scene",
+        "editor_asset_builder_state matches asset-spec.json",
+        "visual quality is coherent against the reference"
+      ],
+      "deps": ["build", "refine"]
+    }
+  ]
+}

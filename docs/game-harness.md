@@ -29,8 +29,8 @@ never looks at its own output will happily ship a grey box farm.
 | 2 | **Generate assets** | `editor_asset_generate`, `editor_asset_preview`, `editor_asset_import_file` | Every asset in the spec exists in the library with a thumbnail |
 | 3 | **Place** | `editor_promote_asset`, `editor_object_add`, `editor_update_transform` | `editor_scene_inspect` shows the expected entity count and no entity at the origin by accident |
 | 4 | **Script** | `editor_script_write` | Behaviour compiles and moves something; no `script <name>:` lines in the console |
-| 5 | **Playtest** | `editor_run_pie`, `editor_console_log` | N frames stepped with zero script errors |
-| 6 | **Capture baseline** | `editor_capture_frame`, `editor_test_add`, `editor_run_tests` | A frame exists to judge, and the suite is green |
+| 5 | **Frame + playtest** | `editor_camera_frame`, `editor_run_pie`, `editor_console_history` | The authored camera shows the gameplay foreground, N frames stepped, and the readable console has zero errors |
+| 6 | **Persist visual evidence** | `editor_persist_capture`, `editor_analyze_motion`, `editor_test_add`, `editor_run_tests` | Three chronological frames plus a contact sheet/manifest exist, and the suite is green |
 | 7 | **Iterate** | critic pass → back to 2/3/4 | Rubric (§7) scores ≥ threshold on every row |
 
 Two properties make this loop work rather than spin:
@@ -38,9 +38,12 @@ Two properties make this loop work rather than spin:
 - **Step 1 produces a written artifact.** If the goal is not written down with a
   falsifiable DONE condition, the loop in §5 cannot terminate correctly — it
   terminates when the model *feels* finished, which is early.
-- **Step 6 produces an image.** A captured frame is the only evidence a critic
-  can argue with. Text self-assessment ("the city now looks vibrant") is not
-  evidence.
+- **Step 6 produces durable images.** Use `editor_persist_capture(path)` for
+  at least three different moments and `editor_analyze_motion` for a labelled
+  contact sheet. A model result containing a screenshot data URL is transient;
+  a verified project-relative PNG/manifest is evidence a critic and the
+  Reports tab can revisit. Text self-assessment ("the city now looks vibrant")
+  is not evidence.
 
 ### Checkpoint discipline
 
@@ -66,8 +69,11 @@ downstream.
 | `editor_object_remove` | `id` | `{removed}` | Cleaning up a mistake; always inspect first to get the id |
 | `editor_update_transform` | `id`, `position?`, `rotation?`, `scale?` | `{updated}` | Layout passes, alignment fixes, scale corrections |
 | `editor_script_write` | `name`, `code`, `id?` | `{saved}` | Behaviour. Omit `id` to create, pass it to update |
+| `editor_camera_frame` | `entityIds?`, `excludeEntityIds?`, `viewDirection?`, `padding?`, `reset?` | camera pose + fit bounds | Author a persistent evidence camera around gameplay entities before captures; exclude sky/backdrop geometry from composition |
 | `editor_run_pie` | `frames?` (default 12) | `{frames, captures}` | Playtest. Starts PIE, steps N frames, pauses |
 | `editor_capture_frame` | — | `{dataUrl}` PNG | Before any visual judgement, and before saving a baseline |
+| `editor_persist_capture` | `path` | `{path, bytes, mime, sha256, frame, timeMs}` | Capture and atomically save a PNG/JPEG without copying its data URL through model context |
+| `editor_analyze_motion` | `frames?`, `label?`, `maxCaptures?` | `{pngPath, manifestPath, frames}` | Persist a chronological contact sheet, timestamps, and motion metrics |
 | `editor_run_tests` | — | `TestResult[]` | Regression gate after every behaviour change |
 | `editor_asset_generate` | `name`, `kind`, `color?`, `metalness?`, `roughness?` | the asset | Building the palette of reusable pieces |
 | `editor_asset_preview` | `id` | `{thumbnail}` | Confirming an asset looks right *before* 200 copies of it exist |
@@ -76,6 +82,7 @@ downstream.
 | `editor_project_checkpoint` | — | `{id}` | Start of every destructive phase |
 | `editor_select_entity` | `id?` | `{selected}` | Focusing the human's inspector on what you just changed |
 | `editor_console_log` | `message`, `level?` | `{logged}` | Narrating a long phase so the human can follow without reading chat |
+| `editor_console_history` | `limit?`, `level?` | `{logs, count, available}` | Reading the actual console back; use `level: "error"` as the runtime-error gate |
 | `editor_test_add` | `name`, `script` | the test | Locking in an invariant you just fixed |
 | `editor_asset_import_file` | `name`, `data` (base64), `mime`, `tags?` | import result | Bringing in an image or 3D file; images route through image-to-3D |
 | `editor_model_switch` | `provider`, `model` | `{switched, …}` | Dropping to a cheap model for bulk placement, back up for design |
@@ -97,10 +104,9 @@ that ignore them produce tool errors and wasted turns.
   as a *directional* light at intensity 2. The viewport already provides a
   hemisphere fill (0.9) and a key directional (2.4) at `(5, 8, 5)`; scene
   lights add to that, they do not replace it.
-- **The default camera is short-range:** `PerspectiveCamera(50, …, 0.1, 100)`
-  with `Fog(0x080808, 18, 42)`. Anything past ~42 units is fog and anything past
-  100 is clipped. A large world needs the far plane and fog range changed in
-  `Viewport.tsx` — outside the tool surface, so ask the human.
+- **Evidence framing is explicit:** call `editor_camera_frame` with the hero,
+  opponent, goals, and arena IDs before capturing. The exact pose persists;
+  decorative sky/backdrop entities stay drawable but no longer control the fit.
 - **`editor_run_pie` always pauses when it returns.** Call it again to keep
   simulating; it is a step-N-frames tool, not a play button.
 
@@ -110,9 +116,9 @@ that ignore them produce tool errors and wasted turns.
 (`client/src/lib/scriptSandbox.worker.ts`). Write an `update` function:
 
 ```js
-// state.time is the sim clock in ms; delta is the fixed step in ms (1000/60).
+// state.time is the simulation clock in seconds; delta is the fixed step in seconds.
 function update(entity, state, delta) {
-  entity.rotation.y += 0.0015 * delta;
+  entity.rotation.y += 0.8 * delta;
   return state;
 }
 ```
@@ -120,12 +126,19 @@ function update(entity, state, delta) {
 | Available | Not available |
 |---|---|
 | `entity.position/rotation/scale` as plain `{x,y,z}` | live three.js objects, materials, the renderer |
-| `state.time` (ms), `state.entities` (names) | `fetch`, `WebSocket`, `XMLHttpRequest`, `importScripts`, `postMessage`, `Worker`, `indexedDB`, `caches`, `navigator`, `globalThis` |
-| ordinary JS, `Math`, closures over module scope | DOM, `window`, `document` |
+| `state.time` (seconds), `delta` (seconds), `state.entities` (names) | global `scene` or `input` objects |
+| frozen `state.scene` snapshots, `state.find(nameOrId)` | `fetch`, `WebSocket`, `XMLHttpRequest`, `importScripts`, `postMessage`, `Worker`, `indexedDB`, `caches`, `navigator`, `globalThis` |
+| `state.patch(nameOrId, {position?, rotation?, scale?})` with finite partial `{x,y,z}` values | materials, visibility, assets, scripts, entity creation/deletion |
+| persistent JSON-safe `state.self` and shared `state.world` | DOM, `window`, `document`, live objects |
+| ordinary JS and `Math` | timers, storage, external modules |
 
 Only the transform is patched back. A script cannot change colour, spawn an
 entity, or delete one — structural change is the agent's job through tool
-calls. A script that exceeds **2000 ms** in one frame gets its worker
+calls. `state.patch` returns `true` when at least one component was accepted;
+unknown targets, malformed vectors, non-finite components, and non-transform
+fields are ignored with an actionable script log. `state.scene` and
+`state.find` remain frozen snapshots for the entire step. A script that exceeds
+**2000 ms** in one frame gets its worker
 terminated and the frame reported; the sandbox restarts clean.
 
 ### The test contract
@@ -135,6 +148,9 @@ channel to the host. Globals: `scene` (slug + `{id,name,kind}` list),
 `entityFor(name)` (synchronous, returns `{position, rotation}` or `null`),
 `assert(cond, message)`, `log(text)`, `await step(frames)`,
 `await baseline(name, dataUrl, threshold = 8)`. Default timeout 15 s.
+The runner drains all outstanding capability calls before marking a test done,
+so an unawaited `assert(false, ...)` still fails the test. Await calls for clear
+ordering and fresh `entityFor` / `state.world` snapshots.
 
 ```js
 const before = entityFor("Patrol Car").position.x;

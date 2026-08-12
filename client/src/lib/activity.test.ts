@@ -7,6 +7,7 @@ import {
   durationForTurn,
   formatDuration,
   isSafeActivityPath,
+  repairLegacyActivitySummary,
   sessionWorkedMs,
 } from "./activity";
 
@@ -32,6 +33,8 @@ describe("activity operations and file changes", () => {
     expect(classifyActivityOperation("file_edit")).toBe("edit");
     expect(classifyActivityOperation("file_write")).toBe("write");
     expect(classifyActivityOperation("shell_exec")).toBe("command");
+    expect(classifyActivityOperation("editor_scene_inspect")).toBe("tool");
+    expect(classifyActivityOperation("editor_object_update")).toBe("edit");
   });
 
   it("stores only a bounded collapsed diff", () => {
@@ -71,6 +74,33 @@ describe("activity operations and file changes", () => {
     expect(activitySummary("file_write", "write", undefined, change)).toContain("partial");
   });
 
+  it("scales truncated edit snippets by the replacement count", () => {
+    const change = buildActivityFileChange(
+      {
+        operation: "edit",
+        path: "game.ts",
+        beforeSnippet: "old",
+        afterSnippet: "new",
+        truncated: true,
+        replacements: 3,
+      },
+      { tool: "file_edit", turnId: "turn-1" },
+    );
+    expect(change).toMatchObject({ additions: 3, deletions: 3, truncated: true });
+  });
+
+  it("does not persist transient snapshots in tool detail", async () => {
+    const { activityDetail } = await import("./activity");
+    const detail = activityDetail({
+      ok: true,
+      __cali_internal_activity: { before: "secret", after: "secret" },
+      before: "secret",
+      after: "secret",
+    });
+    expect(detail).toBe('{\n  "ok": true\n}');
+    expect(detail).not.toContain("secret");
+  });
+
   it("summarises reads, searches, edits, and commands", () => {
     expect(activitySummary("file_read", "read", { path: "src/App.tsx" })).toBe("Read App.tsx");
     expect(activitySummary("file_grep", "search", { pattern: "openProject" })).toBe("Searched for openProject");
@@ -84,6 +114,18 @@ describe("activity operations and file changes", () => {
       }),
     ).toBe("Edited App.tsx +11 -0");
     expect(activitySummary("shell_exec", "command", { command: "pnpm test" })).toBe("Ran pnpm test");
+    expect(activitySummary("editor_scene_inspect", "tool", {})).toBe("Used editor_scene_inspect");
+    expect(activitySummary("editor_object_update", "edit", {})).toBe("Used editor_object_update");
+  });
+
+  it("repairs only the known pre-token-classifier activity labels", () => {
+    expect(repairLegacyActivitySummary("editor_scene_inspect", "Edited file")).toBe(
+      "Used editor_scene_inspect",
+    );
+    expect(repairLegacyActivitySummary("file_edit", "Edited README.md +2 -1")).toBe(
+      "Edited README.md +2 -1",
+    );
+    expect(repairLegacyActivitySummary(undefined, "Edited file")).toBe("Edited file");
   });
 });
 
@@ -116,4 +158,3 @@ describe("turn timing", () => {
     expect(sessionWorkedMs(messages, 10_000)).toBe(4_000);
   });
 });
-
