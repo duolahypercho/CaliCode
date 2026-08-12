@@ -69,6 +69,21 @@ export async function listMcpServers(): Promise<McpServerReport[]> {
   return result?.servers ?? [];
 }
 
+/**
+ * Servers plus the fingerprint of the open project's MCP config, which
+ * `approveProjectMcp` echoes back so consent can only apply to the config the
+ * user was actually shown.
+ */
+export async function listMcpServersWithFingerprint(): Promise<{
+  servers: McpServerReport[];
+  projectFingerprint: string | null;
+}> {
+  const result = await rpc<{ servers?: McpServerReport[]; projectFingerprint?: string | null }>(
+    "mcp_list",
+  );
+  return { servers: result?.servers ?? [], projectFingerprint: result?.projectFingerprint ?? null };
+}
+
 export async function setMcpEnabled(id: string, enabled: boolean): Promise<McpServerReport[]> {
   const result = await rpc<{ servers?: McpServerReport[] }>("mcp_set_enabled", { id, enabled });
   return result?.servers ?? [];
@@ -80,8 +95,16 @@ export async function setMcpEnabled(id: string, enabled: boolean): Promise<McpSe
  * always approves the config as it is on disk right now; editing that file
  * blocks its servers again.
  */
-export async function approveProjectMcp(base: string, approve = true): Promise<McpServerReport[]> {
-  const result = await rpc<{ servers?: McpServerReport[] }>("mcp_approve_project", { base, approve });
+export async function approveProjectMcp(
+  base: string,
+  approve = true,
+  fingerprint?: string | null,
+): Promise<McpServerReport[]> {
+  const result = await rpc<{ servers?: McpServerReport[] }>("mcp_approve_project", {
+    base,
+    approve,
+    ...(fingerprint ? { fingerprint } : {}),
+  });
   return result?.servers ?? [];
 }
 

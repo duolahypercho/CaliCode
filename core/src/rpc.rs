@@ -493,7 +493,24 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             };
             Ok(json!({ "disabled": disabled }))
         }
-        "mcp_list" => Ok(json!({ "servers": state.mcp.status().await })),
+        // `projectFingerprint` identifies the project's MCP config exactly as
+        // listed here; the client echoes it back when approving so consent
+        // can only ever apply to what was actually on screen.
+        "mcp_list" => {
+            let fingerprint = match state.mcp.project_scope_base().await {
+                Some(base) => {
+                    let global = { state.config.read().await.mcp_servers.clone() };
+                    let project = crate::config::load_project_config(&base);
+                    let merged = crate::config::merge_mcp_servers(&global, &project.mcp_servers);
+                    Some(crate::config::project_mcp_fingerprint(&merged))
+                }
+                None => None,
+            };
+            Ok(json!({
+                "servers": state.mcp.status().await,
+                "projectFingerprint": fingerprint,
+            }))
+        }
         "mcp_reload" => {
             // Clone-then-drop: the config lock must not be held across the
             // reload's process spawns.
@@ -524,6 +541,20 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             let project = crate::config::load_project_config(&base);
             let merged = crate::config::merge_mcp_servers(&global, &project.mcp_servers);
             let fingerprint = crate::config::project_mcp_fingerprint(&merged);
+            // Close the gap between what the user was shown and what is on
+            // disk now. A repository can rewrite its own `.cali/config.yaml`
+            // at any moment — a dev server running out of that very repo is
+            // enough — so a client that tells us which fingerprint it
+            // displayed gets a hard refusal if the file moved underneath it,
+            // rather than silently approving servers nobody reviewed.
+            if let Some(seen) = params.get("fingerprint").and_then(Value::as_str) {
+                if approve && seen != fingerprint {
+                    anyhow::bail!(
+                        "the project's MCP config changed since it was displayed; \
+                         review it again before approving"
+                    );
+                }
+            }
             {
                 let mut config = state.config.write().await;
                 let key = base.display().to_string();

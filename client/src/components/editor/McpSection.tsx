@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   approveProjectMcp,
-  listMcpServers,
+  listMcpServersWithFingerprint,
   reloadMcp,
   setMcpEnabled,
   type McpServerReport,
@@ -30,6 +30,9 @@ const BADGE =
 export function McpSection({ headingLevel = 3 }: { headingLevel?: 2 | 3 } = {}) {
   const Heading = headingLevel === 2 ? "h2" : "h3";
   const [servers, setServers] = useState<McpServerReport[] | null>(null);
+  // Fingerprint of the project MCP config these rows describe, echoed back on
+  // approve so consent cannot land on a config the user never saw.
+  const [fingerprint, setFingerprint] = useState<string | null>(null);
   // Global config entries, for the scope badge + tool-filter display. Null
   // until loaded (or on failure) — badges simply stay off then.
   const [globalEntries, setGlobalEntries] = useState<McpServerConfigEntry[] | null>(null);
@@ -39,9 +42,11 @@ export function McpSection({ headingLevel = 3 }: { headingLevel?: 2 | 3 } = {}) 
 
   useEffect(() => {
     let cancelled = false;
-    listMcpServers()
-      .then((reports) => {
-        if (!cancelled) setServers(reports);
+    listMcpServersWithFingerprint()
+      .then(({ servers: reports, projectFingerprint }) => {
+        if (cancelled) return;
+        setServers(reports);
+        setFingerprint(projectFingerprint);
       })
       .catch((cause) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : "Failed to list MCP servers.");
@@ -182,7 +187,10 @@ export function McpSection({ headingLevel = 3 }: { headingLevel?: 2 | 3 } = {}) 
                       type="button"
                       disabled={busy}
                       onClick={() =>
-                        void run(() => approveProjectMcp(""), `Failed to approve ${server.id}.`)
+                        void run(
+                          () => approveProjectMcp("", true, fingerprint),
+                          `Failed to approve ${server.id}.`,
+                        )
                       }
                       className="shrink-0 rounded border border-line px-2 py-[3px] text-[10px] uppercase tracking-[0.08em] text-ink-subtle transition-colors hover:text-ink-strong disabled:cursor-not-allowed disabled:opacity-50"
                     >

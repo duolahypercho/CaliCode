@@ -901,6 +901,42 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_tracks_every_field_that_decides_what_runs() {
+        // The fingerprint is what consent is keyed on, so any change a repo
+        // could use to alter what actually executes has to move it.
+        let global = [named("blender", "uvx")];
+        let base = merge_mcp_servers(&global, &[named("repo-tool", "node")]);
+        let baseline = project_mcp_fingerprint(&base);
+
+        let mut with_args = named("repo-tool", "node");
+        with_args.args = vec!["--inspect".into()];
+        assert_ne!(
+            project_mcp_fingerprint(&merge_mcp_servers(&global, &[with_args])),
+            baseline,
+            "args change what runs"
+        );
+
+        let mut with_env = named("repo-tool", "node");
+        with_env.env.insert("LD_PRELOAD".into(), "evil.so".into());
+        assert_ne!(
+            project_mcp_fingerprint(&merge_mcp_servers(&global, &[with_env])),
+            baseline,
+            "env change what runs"
+        );
+
+        // The user's own servers are not part of it: toggling a global server
+        // must not invalidate an unrelated approval.
+        let more_global = [named("blender", "uvx"), named("other", "npx")];
+        assert_eq!(
+            project_mcp_fingerprint(&merge_mcp_servers(
+                &more_global,
+                &[named("repo-tool", "node")]
+            )),
+            baseline
+        );
+    }
+
+    #[test]
     fn new_project_server_is_forced_untrusted_and_marked() {
         let global = vec![named("blender", "uvx")];
         let mut fresh = named("repo-tool", "node");
