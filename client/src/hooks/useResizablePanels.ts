@@ -13,6 +13,11 @@ export interface ResizablePanelOptions {
   minWidth: number;
   maxWidth: number;
   step?: number;
+  /**
+   * Set for a panel that sits to the *right* of its handle: the width then
+   * grows as the pointer moves left, and ArrowRight narrows it.
+   */
+  invert?: boolean;
 }
 
 export interface ResizablePanel {
@@ -84,7 +89,8 @@ interface DragOrigin {
  * would re-layout the whole editor several times per frame.
  */
 export function useResizablePanels(options: ResizablePanelOptions): ResizablePanel {
-  const { storageKey, defaultWidth, minWidth, maxWidth, step = DEFAULT_STEP_PX } = options;
+  const { storageKey, defaultWidth, minWidth, maxWidth, step = DEFAULT_STEP_PX, invert = false } = options;
+  const direction = invert ? -1 : 1;
 
   const [width, setWidth] = useState(() => readStoredWidth(storageKey, { defaultWidth, minWidth, maxWidth }));
   const [isDragging, setIsDragging] = useState(false);
@@ -93,6 +99,14 @@ export function useResizablePanels(options: ResizablePanelOptions): ResizablePan
   const widthRef = useRef(width);
   widthRef.current = width;
   const originRef = useRef<DragOrigin | null>(null);
+
+  // Bounds can move while mounted — the window shrinks, or a neighbouring
+  // panel grows and lowers this panel's ceiling. Re-clamp the live width so
+  // the layout always fits, but leave storage alone: the remembered width is
+  // the user's preference for when the room comes back.
+  useEffect(() => {
+    setWidth((current) => clampWidth(current, minWidth, maxWidth));
+  }, [minWidth, maxWidth]);
 
   const commit = useCallback(
     (next: number) => {
@@ -125,7 +139,7 @@ export function useResizablePanels(options: ResizablePanelOptions): ResizablePan
     const onPointerMove = (event: PointerEvent) => {
       const origin = originRef.current;
       if (!origin) return;
-      pending = origin.startWidth + (event.clientX - origin.startX);
+      pending = origin.startWidth + direction * (event.clientX - origin.startX);
       if (frame === null) frame = window.requestAnimationFrame(flush);
     };
 
@@ -158,16 +172,16 @@ export function useResizablePanels(options: ResizablePanelOptions): ResizablePan
       document.body.style.cursor = previousCursor;
       document.body.style.userSelect = previousSelect;
     };
-  }, [commit, isDragging, maxWidth, minWidth]);
+  }, [commit, direction, isDragging, maxWidth, minWidth]);
 
   const onKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLElement>) => {
       if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
       event.preventDefault();
-      const delta = event.key === "ArrowRight" ? step : -step;
+      const delta = (event.key === "ArrowRight" ? step : -step) * direction;
       commit(widthRef.current + delta);
     },
-    [commit, step],
+    [commit, direction, step],
   );
 
   const reset = useCallback(() => commit(defaultWidth), [commit, defaultWidth]);

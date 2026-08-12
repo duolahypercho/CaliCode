@@ -22,7 +22,7 @@ async function probe(page: Page, expr: string): Promise<number> {
         delta: 0.016,
         time: 0,
         entities: [
-          module.toSandboxEntity("e1", "Probe", ["s1"], {
+          module.toSandboxEntity("e1", "Probe", "box", true, ["s1"], {
             position: { x: 9, y: 0, z: 0 },
             rotation: { x: 0, y: 0, z: 0 },
             scale: { x: 1, y: 1, z: 1 },
@@ -47,6 +47,43 @@ test.describe("script sandbox isolation", () => {
   test("scripts still run", async ({ page }) => {
     await page.goto("/");
     expect(await probe(page, "true")).toBe(1);
+  });
+
+  test("state.patch applies bounded cross-entity transforms in the CSP sandbox", async ({ page }) => {
+    await page.goto("/");
+
+    const outcome = await page.evaluate(async () => {
+      const module = await import("/src/lib/scriptSandbox.ts");
+      const sandbox = module.createScriptSandbox();
+      const make = (id: string, name: string, scripts: string[], x: number) =>
+        module.toSandboxEntity(id, name, "box", true, scripts, {
+          position: { x, y: 0, z: 0 },
+          rotation: { x: 0, y: 0, z: 0 },
+          scale: { x: 1, y: 1, z: 1 },
+        });
+      try {
+        const result = await sandbox.step({
+          delta: 0.016,
+          time: 0,
+          entities: [make("hero", "Hero", ["s1"], 0), make("coin", "Coin", [], 3)],
+          scripts: [{
+            id: "s1",
+            name: "hero",
+            code: `function update(entity, state) {
+              state.patch("Coin", { position: { x: 7, y: NaN }, material: { color: "red" } });
+              if (state.find("Coin").position.x !== 3) throw new Error("snapshot mutated");
+            }`,
+          }],
+        });
+        return { coin: result.patches.find((item: { id: string }) => item.id === "coin"), logs: result.logs };
+      } finally {
+        sandbox.dispose();
+      }
+    });
+
+    expect(outcome.coin.position).toEqual({ x: 7, y: 0, z: 0 });
+    expect(outcome.logs.join("\n")).toContain("position.y must be finite; ignored");
+    expect(outcome.logs.join("\n")).toContain("ignored material");
   });
 
   test("network capability is unreachable, including via the prototype chain", async ({ page }) => {
@@ -93,7 +130,7 @@ test.describe("script sandbox isolation", () => {
       const module = await import("/src/lib/scriptSandbox.ts");
       const sandbox = module.createScriptSandbox();
       const entity = () =>
-        module.toSandboxEntity("e1", "P", ["s1"], {
+        module.toSandboxEntity("e1", "P", "box", true, ["s1"], {
           position: { x: 0, y: 0, z: 0 },
           rotation: { x: 0, y: 0, z: 0 },
           scale: { x: 1, y: 1, z: 1 },
@@ -140,7 +177,7 @@ test.describe("script sandbox isolation", () => {
       const module = await import("/src/lib/scriptSandbox.ts");
       const sandbox = module.createScriptSandbox();
       const entity = () =>
-        module.toSandboxEntity("e1", "P", ["s1"], {
+        module.toSandboxEntity("e1", "P", "box", true, ["s1"], {
           position: { x: 0, y: 0, z: 0 },
           rotation: { x: 0, y: 0, z: 0 },
           scale: { x: 1, y: 1, z: 1 },
@@ -176,7 +213,7 @@ test.describe("script sandbox isolation", () => {
       const module = await import("/src/lib/scriptSandbox.ts");
       const sandbox = module.createScriptSandbox();
       const entity = () =>
-        module.toSandboxEntity("e1", "Probe", ["s1"], {
+        module.toSandboxEntity("e1", "Probe", "box", true, ["s1"], {
           position: { x: 0, y: 0, z: 0 },
           rotation: { x: 0, y: 0, z: 0 },
           scale: { x: 1, y: 1, z: 1 },
@@ -207,6 +244,7 @@ test.describe("script sandbox isolation", () => {
 test.describe("test sandbox isolation", () => {
   test("network capability is unreachable from a scripted test", async ({ page }) => {
     await page.goto("/");
+    await expect(page.getByLabel("Agent prompt")).toBeVisible();
 
     const leaks = await page.evaluate(async () => {
       const module = await import("/src/lib/testSandbox.ts");
@@ -214,6 +252,7 @@ test.describe("test sandbox isolation", () => {
       const seen: string[] = [];
       const host = {
         snapshot: () => ({}),
+        worldSnapshot: async () => ({}),
         assert: () => undefined,
         log: (message: string) => seen.push(message),
         step: async () => undefined,
@@ -252,6 +291,7 @@ test.describe("test sandbox isolation", () => {
       const seen: string[] = [];
       const host = {
         snapshot: () => ({}),
+        worldSnapshot: async () => ({}),
         assert: () => undefined,
         log: (message: string) => seen.push(message),
         step: async () => undefined,
@@ -286,5 +326,82 @@ test.describe("test sandbox isolation", () => {
     // listener confirmed zero requests leave the sandbox.
     expect(outcome).toMatch(/import:/);
     expect(outcome).not.toContain("import:resolved");
+  });
+
+  test("state.world is immutable and refreshes after step in the CSP sandbox", async ({ page }) => {
+    await page.goto("/");
+
+    const outcome = await page.evaluate(async () => {
+      const module = await import("/src/lib/testSandbox.ts");
+      const sandbox = module.createTestSandbox();
+      let frame = 0;
+      const passed: string[] = [];
+      const host = {
+        snapshot: () => ({}),
+        worldSnapshot: async () => ({ frame, nested: { score: 7 } }),
+        assert: (condition: boolean, message: string) => {
+          if (!condition) throw new Error(message);
+          passed.push(message);
+        },
+        log: () => undefined,
+        step: async (frames: number) => {
+          frame += frames;
+        },
+        baseline: async () => ({ pass: true, distance: 0, threshold: 8 }),
+      };
+      const script = [
+        "await assert(state.world.frame === 0, 'initial');",
+        "let immutable = false;",
+        "try { state.world.nested.score = 99; } catch { immutable = true; }",
+        "await assert(immutable, 'immutable');",
+        "await step(6);",
+        "await assert(state.world.frame === 6, 'refreshed');",
+        "await assert(state.world.nested.score === 7, 'isolated');",
+      ].join("\n");
+
+      try {
+        await sandbox.run("world", script, { slug: "s", entities: [] }, host, 5000);
+      } finally {
+        sandbox.dispose();
+      }
+      return passed;
+    });
+
+    expect(outcome).toEqual(["initial", "immutable", "refreshed", "isolated"]);
+  });
+
+  test("an unawaited assertion failure fails in the CSP sandbox", async ({ page }) => {
+    await page.goto("/");
+
+    const outcome = await page.evaluate(async () => {
+      const module = await import("/src/lib/testSandbox.ts");
+      const sandbox = module.createTestSandbox();
+      const host = {
+        snapshot: () => ({}),
+        worldSnapshot: async () => ({}),
+        assert: (condition: boolean, message: string) => {
+          if (!condition) throw new Error(message);
+        },
+        log: () => undefined,
+        step: async () => undefined,
+        baseline: async () => ({ pass: true, distance: 0, threshold: 8 }),
+      };
+      try {
+        await sandbox.run(
+          "unawaited",
+          "step(1).then(() => assert(false, 'csp unawaited failure'));",
+          { slug: "s", entities: [] },
+          host,
+          5000,
+        );
+        return "passed";
+      } catch (error) {
+        return String(error instanceof Error ? error.message : error);
+      } finally {
+        sandbox.dispose();
+      }
+    });
+
+    expect(outcome).toContain("csp unawaited failure");
   });
 });

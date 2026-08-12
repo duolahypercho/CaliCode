@@ -64,19 +64,19 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-black">
-      <div className="flex h-11 shrink-0 items-center gap-2.5 border-b border-white/[0.06] bg-[#0b0b0b] px-3.5">
+      <div className="flex h-11 shrink-0 items-center gap-2.5 border-b border-line bg-surface-0 px-3.5">
         <span
           aria-hidden
           className={`h-1.5 w-1.5 shrink-0 ${
             status.status === "ready"
-              ? "animate-pulse bg-[#bdbdbd]"
+              ? "animate-pulse bg-ink"
               : status.status === "crashed"
-                ? "bg-[#c98b8b]"
-                : "bg-[#8a8a8a]"
+                ? "bg-danger-soft"
+                : "bg-ink-subtle"
           }`}
         />
-        <span className="text-[10.5px] tracking-[0.14em] text-[#c0c0c0]">{status.status.toUpperCase()}</span>
-        <span className="min-w-0 truncate text-[11px] text-[#8a8a8a]">
+        <span className="text-[10.5px] tracking-[0.14em] text-ink">{status.status.toUpperCase()}</span>
+        <span className="min-w-0 truncate text-[11px] text-ink-subtle">
           {status.url ?? `${workspaceName} · ${script}`}
         </span>
         <div className="ml-auto flex shrink-0 gap-1.5">
@@ -85,7 +85,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
               <button
                 type="button"
                 onClick={() => setNonce((n) => n + 1)}
-                className="inline-flex min-h-[28px] items-center rounded border border-white/[0.12] px-2.5 py-1 text-[10px] tracking-[0.12em] text-[#d4d4d4] transition-colors hover:border-white/30 active:border-white/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
+                className="inline-flex min-h-[28px] items-center rounded border border-line-strong px-2.5 py-1 text-[10px] tracking-[0.12em] text-ink-strong transition-colors active:border-ink-subtle focus-visible:outline-none"
               >
                 RELOAD
               </button>
@@ -93,7 +93,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
                 href={status.url}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex min-h-[28px] items-center rounded border border-white/[0.12] px-2.5 py-1 text-[10px] tracking-[0.12em] text-[#d4d4d4] transition-colors hover:border-white/30 active:border-white/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
+                className="inline-flex min-h-[28px] items-center rounded border border-line-strong px-2.5 py-1 text-[10px] tracking-[0.12em] text-ink-strong transition-colors active:border-ink-subtle focus-visible:outline-none"
               >
                 POP OUT
               </a>
@@ -103,8 +103,8 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
             type="button"
             onClick={() => void (running ? stop() : start())}
             disabled={busy}
-            className={`inline-flex min-h-[28px] items-center rounded border border-white/[0.12] bg-[#2a2a2a] px-3 py-1 text-[10px] font-bold tracking-[0.12em] text-[#dcdcdc] transition-colors enabled:hover:bg-[#333] active:bg-[#3a3a3a] focus-visible:outline-none focus-visible:ring-1 disabled:cursor-not-allowed disabled:opacity-40 ${
-              running ? "focus-visible:ring-[#c06060]/50" : "focus-visible:ring-white/30"
+            className={`inline-flex min-h-[28px] items-center rounded border border-line-strong bg-secondary px-3 py-1 text-[10px] font-bold tracking-[0.12em] text-ink-strong transition-colors enabled:hover:bg-secondary/80 active:bg-secondary/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 ${
+              running ? "" : ""
             }`}
           >
             {running ? "STOP" : "START"}

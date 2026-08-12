@@ -1,11 +1,14 @@
 import { canUseCspFrame } from "./cspFrameWorker";
 import { FrameTestSandbox } from "./frameTestSandbox";
+import { deepFreeze } from "./scriptSandboxState";
 import type { EntitySnapshot, HostCall, HostResult, RunRequest, RunResult } from "./testSandbox.worker";
 
 /** Capabilities a test body may reach, answered on the main thread. */
 export interface TestHost {
   /** Live transforms for every named object; re-read after each host call. */
   snapshot: () => Record<string, EntitySnapshot>;
+  /** Fresh structured clone of scripts' shared state. */
+  worldSnapshot: () => Promise<Record<string, unknown>>;
   assert: (condition: boolean, message: string) => void;
   log: (message: string) => void;
   step: (frames: number) => Promise<void>;
@@ -33,7 +36,7 @@ export interface TestSandbox {
 class WorkerTestSandbox implements TestSandbox {
   private worker: Worker | null = null;
 
-  run(
+  async run(
     testId: string,
     script: string,
     scene: RunRequest["scene"],
@@ -43,6 +46,7 @@ class WorkerTestSandbox implements TestSandbox {
     this.dispose();
     const worker = new Worker(new URL("./testSandbox.worker.ts", import.meta.url), { type: "module" });
     this.worker = worker;
+    const world = await host.worldSnapshot();
 
     return new Promise<void>((resolve, reject) => {
       // A test that loops forever must not wedge the suite. Terminating the
@@ -70,7 +74,7 @@ class WorkerTestSandbox implements TestSandbox {
         void answer(worker, message, host);
       };
 
-      worker.postMessage({ type: "run", testId, script, scene, snapshot: host.snapshot() } satisfies RunRequest);
+      worker.postMessage({ type: "run", testId, script, scene, snapshot: host.snapshot(), world } satisfies RunRequest);
     });
   }
 
@@ -83,37 +87,38 @@ class WorkerTestSandbox implements TestSandbox {
 async function answer(worker: Worker, call: HostCall, host: TestHost): Promise<void> {
   // Every reply carries the post-call scene state so the worker can serve
   // entityFor synchronously.
-  const reply = (result: Omit<HostResult, "type" | "callId" | "snapshot">) =>
+  const reply = async (result: Omit<HostResult, "type" | "callId" | "snapshot" | "world">) =>
     worker.postMessage({
       type: "callResult",
       callId: call.callId,
       snapshot: host.snapshot(),
+      world: await host.worldSnapshot(),
       ...result,
     } satisfies HostResult);
   try {
     switch (call.method) {
       case "assert":
         host.assert(Boolean(call.args[0]), String(call.args[1] ?? "assertion failed"));
-        return reply({ value: true });
+        return void (await reply({ value: true }));
       case "log":
         host.log(String(call.args[0]));
-        return reply({ value: true });
+        return void (await reply({ value: true }));
       case "step":
         await host.step(Number(call.args[0]));
-        return reply({ value: true });
+        return void (await reply({ value: true }));
       case "baseline":
-        return reply({
+        return void (await reply({
           value: await host.baseline(
             String(call.args[0]),
             String(call.args[1]),
             call.args[2] === undefined ? undefined : Number(call.args[2]),
           ),
-        });
+        }));
       default:
-        return reply({ error: `unknown host call ${String(call.method)}` });
+        return void (await reply({ error: `unknown host call ${String(call.method)}` }));
     }
   } catch (error) {
-    reply({ error: error instanceof Error ? error.message : String(error) });
+    await reply({ error: error instanceof Error ? error.message : String(error) });
   }
 }
 
@@ -128,8 +133,43 @@ class InlineTestSandbox implements TestSandbox {
     // Matches the worker's synchronous entityFor exactly, so the fallback
     // cannot mask an API difference the way an async version did.
     const entityFor = (name: string) => host.snapshot()[name] ?? null;
+    let world = deepFreeze(await host.worldSnapshot());
+    const state = Object.freeze({ get world() { return world; } });
+    const outstanding: Promise<void>[] = [];
+    let capabilityError: Error | null = null;
+    const track = <T>(operation: () => T | Promise<T>): Promise<T> => {
+      const raw = Promise.resolve().then(operation);
+      const promise = raw.then(
+        (value) => value,
+        (error) => {
+          capabilityError ??= error instanceof Error ? error : new Error(String(error));
+          return undefined as T;
+        },
+      );
+      outstanding.push(promise.then(() => undefined));
+      return promise;
+    };
+    const assert = (condition: boolean, message = "assertion failed") =>
+      track(() => host.assert(condition, message));
+    const log = (message: string) => track(() => host.log(message));
+    const step = (frames: number) => track(async () => {
+      await host.step(frames);
+      world = deepFreeze(await host.worldSnapshot());
+    });
+    const baseline = (name: string, dataUrl: string, threshold?: number) =>
+      track(() => host.baseline(name, dataUrl, threshold));
+    const drainCalls = async () => {
+      let cursor = 0;
+      while (cursor < outstanding.length) {
+        const batch = outstanding.slice(cursor);
+        cursor = outstanding.length;
+        await Promise.all(batch);
+      }
+      if (capabilityError) throw capabilityError;
+    };
     const body = [
       "const scene = context.scene;",
+      "const state = context.state;",
       "const entityFor = context.entityFor;",
       "const assert = context.assert;",
       "const log = context.log;",
@@ -147,7 +187,10 @@ class InlineTestSandbox implements TestSandbox {
       timer = window.setTimeout(() => reject(new Error(`test timed out after ${timeoutMs}ms`)), timeoutMs);
     });
     try {
-      await Promise.race([run({ scene, entityFor, ...host }), guard]);
+      await Promise.race([
+        run({ scene, state, entityFor, assert, log, step, baseline }).then(drainCalls),
+        guard,
+      ]);
     } finally {
       window.clearTimeout(timer);
     }

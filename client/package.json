@@ -12,17 +12,21 @@
     "desktop:build": "bash ../scripts/desktop.sh build",
     "desktop:install": "bash ../scripts/desktop.sh install",
     "test": "vitest run",
-    "test:e2e": "playwright test",
-    "pretest:e2e": "node -e \"const fs=require('node:fs');fs.rmSync('.e2e-projects',{recursive:true,force:true});fs.rmSync('.e2e-config.yaml',{force:true})\""
+    "test:e2e": "playwright test --grep-invert @live",
+    "test:e2e:live": "playwright test --grep @live",
+    "pretest:e2e": "node -e \"const fs=require('node:fs');for(const path of ['.e2e-state','.e2e-projects','.e2e-config.yaml'])fs.rmSync(path,{recursive:true,force:true})\"",
+    "pretest:e2e:live": "pnpm pretest:e2e"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
+    "@opencode-ai/models": "^0.0.40",
     "@radix-ui/react-dialog": "^1.1.2",
     "@radix-ui/react-dropdown-menu": "^2.1.2",
     "@radix-ui/react-select": "^2.1.2",
     "@radix-ui/react-tabs": "^1.1.1",
     "@radix-ui/react-tooltip": "^1.1.4",
     "@tauri-apps/api": "^2.11.1",
+    "@tauri-apps/plugin-dialog": "^2.4.2",
     "class-variance-authority": "^0.7.0",
     "clsx": "^2.1.1",
     "lucide-react": "^0.468.0",

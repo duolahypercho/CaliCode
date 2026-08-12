@@ -11,6 +11,7 @@ export interface TestRunContext {
   log: (message: string) => void;
   step: (frames: number) => Promise<void>;
   baseline: (name: string, dataUrl: string, threshold?: number) => Promise<{ pass: boolean; distance: number; threshold: number }>;
+  state: { world: Record<string, unknown> };
 }
 
 export async function runTests(
@@ -56,6 +57,7 @@ export async function runTests(
                 : [];
             }),
           ),
+        worldSnapshot: () => runtime.getWorldState(),
         assert: (condition, message) => {
           if (!condition) throw new Error(message);
           logs.push(`assert passed: ${message}`);

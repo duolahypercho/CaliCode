@@ -13,8 +13,10 @@ export interface SlashContext {
   switchModel: (raw: string) => Promise<void>;
   /** Run the autonomous loop toward a goal until the agent reports done. */
   runLoop: (goal: string) => Promise<void>;
-  /** Summarize the transcript to reclaim context. */
+  /** Compact the core session in place (session_compact RPC). */
   compact: () => Promise<void>;
+  /** Print session token totals and context occupancy. */
+  usage: () => void | Promise<void>;
   /** List the files the agent changed this session. */
   diff: () => Promise<void>;
   /** Resume the most recent saved session. */
@@ -23,7 +25,16 @@ export interface SlashContext {
   fork: () => Promise<void>;
   /** Print the saved session list into the transcript. */
   listSessions: () => Promise<void>;
+  /** Spawn a scoped subagent: a role plus a one-line task. */
+  spawnSubagent: (role: string, task: string) => Promise<void>;
+  /** Plan a task graph for a goal and run it (optionally from a template). */
+  runGraphGoal: (goal: string, template?: string) => Promise<void>;
+  /** Cancel the active task graph, if any. */
+  stopGraph: () => void | Promise<void>;
 }
+
+/** Roles core's subagent_spawn understands. */
+export const SUBAGENT_ROLES = ["planner", "coder", "tester", "critic"] as const;
 
 export interface SlashCommand {
   name: string;
@@ -71,9 +82,58 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
     },
   },
   {
+    name: "spawn",
+    summary: "Run a subagent (planner, coder, tester, critic)",
+    usage: "<role> <task>",
+    run: (args, ctx) => {
+      const match = /^(\S+)\s+([\s\S]+)$/.exec(args.trim());
+      const role = match?.[1].toLowerCase();
+      if (!match || !SUBAGENT_ROLES.includes(role as (typeof SUBAGENT_ROLES)[number])) {
+        ctx.say(`Usage: /spawn <${SUBAGENT_ROLES.join("|")}> <task>`);
+        return;
+      }
+      return ctx.spawnSubagent(role as string, match[2].trim());
+    },
+  },
+  {
+    name: "graph",
+    summary: "Plan a task graph for a goal and run it",
+    usage: "<goal>",
+    run: (args, ctx) => {
+      if (!args.trim()) {
+        ctx.say("Usage: /graph <goal> — plans a task DAG and runs it node by node.");
+        return;
+      }
+      return ctx.runGraphGoal(args.trim());
+    },
+  },
+  {
+    name: "graph-template",
+    summary: "Run a goal through a graph template (aaa-fps, polished-asset, …)",
+    usage: "<template> <goal>",
+    run: (args, ctx) => {
+      const match = /^(\S+)\s+([\s\S]+)$/.exec(args.trim());
+      if (!match) {
+        ctx.say("Usage: /graph-template <template-id> <goal>");
+        return;
+      }
+      return ctx.runGraphGoal(match[2].trim(), match[1]);
+    },
+  },
+  {
+    name: "graph-stop",
+    summary: "Cancel the running task graph",
+    run: (_args, ctx) => ctx.stopGraph(),
+  },
+  {
     name: "compact",
-    summary: "Summarize the conversation to reclaim context",
+    summary: "Compact the session: summarize old turns, keep head and tail",
     run: (_args, ctx) => ctx.compact(),
+  },
+  {
+    name: "usage",
+    summary: "Show token usage and context occupancy",
+    run: (_args, ctx) => ctx.usage(),
   },
   {
     name: "diff",

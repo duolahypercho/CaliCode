@@ -67,6 +67,28 @@ test.describe("games sidebar", () => {
       await expectWidth(page, 240);
     });
 
+    test("header shows a static wordmark and the Assets Library nav row", async ({ page }) => {
+      await page.goto("/");
+
+      const sidebar = page.getByRole("complementary", { name: "Games sidebar" });
+
+      // The wordmark is a static logo lockup now — the old "CaliCode ⌄"
+      // dropdown trigger is gone and nothing in the header opens a menu.
+      await expect(page.getByRole("button", { name: "CaliCode menu" })).toHaveCount(0);
+      await expect(sidebar.getByText("cali", { exact: true })).toBeVisible();
+      await expect(sidebar.getByText("code", { exact: true })).toBeVisible();
+
+      // The bottom repo "Assets" section is gone; an "Assets Library" nav row
+      // sits in the nav block instead. "Open folder" is gone too — the New
+      // game dialog's source-folder picker covers existing projects.
+      await expect(sidebar.getByRole("region", { name: "Asset library" })).toHaveCount(0);
+      await expect(sidebar.getByRole("button", { name: "Assets Library" })).toBeVisible();
+      await expect(sidebar.getByRole("button", { name: "Open folder" })).toHaveCount(0);
+
+      // The search toggle still lives in the header.
+      await expect(sidebar.getByRole("button", { name: "Toggle search" })).toBeVisible();
+    });
+
     test("project actions appear on hover and open from left or right click", async ({ page }) => {
       await page.goto("/");
 
@@ -288,13 +310,15 @@ test.describe("games sidebar", () => {
       await page.goto("/");
       await page.getByRole("button", SIDEBAR_TOGGLE).click();
 
-      // Two "NEW GAME" buttons exist (sidebar + main toolbar). Scope to the sidebar.
-      await expect(page.locator("aside").first().getByRole("button", { name: "NEW GAME" })).toBeVisible();
-      await expect(page.getByLabel("Search games")).toBeVisible();
+      await expect(page.locator("aside").first().getByRole("button", { name: "New game" })).toBeVisible();
+      await expect(page.locator("aside").first().getByRole("button", { name: "Assets Library" })).toBeVisible();
 
-      // Type in the search box
-      await page.getByLabel("Search games").fill("starter");
-      await expect(page.getByLabel("Search games")).toHaveValue("starter");
+      // The search field lives in the spotlight dialog behind the header icon.
+      await page.getByRole("button", { name: "Toggle search" }).click();
+      const searchBox = page.getByRole("textbox", { name: "Search games" });
+      await expect(searchBox).toBeVisible();
+      await searchBox.fill("starter");
+      await expect(searchBox).toHaveValue("starter");
     });
 
     test("no resize handle on mobile", async ({ page }) => {

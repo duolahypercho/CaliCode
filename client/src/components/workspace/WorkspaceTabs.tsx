@@ -1,4 +1,6 @@
-export const WORKSPACE_TABS = ["play", "code", "art", "scene", "test"] as const;
+import { Boxes, Code2, FileChartColumn, FlaskConical, Hammer, Image, Play } from "lucide-react";
+
+export const WORKSPACE_TABS = ["play", "code", "art", "build", "scene", "test", "reports"] as const;
 
 export type WorkspaceTab = (typeof WORKSPACE_TABS)[number];
 
@@ -6,38 +8,39 @@ interface WorkspaceTabsProps {
   active: WorkspaceTab;
   onChange: (tab: WorkspaceTab) => void;
   badges: Partial<Record<WorkspaceTab, number>>;
-  previewUrl: string;
-  onNewGame: () => void;
-  onExport: () => void;
-  exporting: boolean;
 }
 
+const TAB_META = {
+  play: { label: "Play", icon: Play },
+  code: { label: "Code", icon: Code2 },
+  art: { label: "Assets", icon: Image },
+  build: { label: "Build", icon: Hammer },
+  scene: { label: "Scene", icon: Boxes },
+  test: { label: "Test", icon: FlaskConical },
+  reports: { label: "Reports", icon: FileChartColumn },
+} satisfies Record<WorkspaceTab, { label: string; icon: typeof Play }>;
+
 /**
- * Workspace header: the PLAY/CODE/ART/SCENE/TEST segmented control,
- * the live preview URL, and the new-game / export actions.
+ * Workspace header for the game-specific tools dock.
+ * There is no SAVE button — the project document autosaves on edit.
  */
-export function WorkspaceTabs({
-  active,
-  onChange,
-  badges,
-  previewUrl,
-  onNewGame,
-  onExport,
-  exporting,
-}: WorkspaceTabsProps) {
+export function WorkspaceTabs({ active, onChange, badges }: WorkspaceTabsProps) {
   return (
-    <div className="flex h-[52px] shrink-0 items-center gap-3.5 border-b border-white/[0.06] bg-[#0b0b0b] px-3.5">
-      {/* shrink-0: NEW GAME and EXPORT were shrink-0 while the tablist was not,
-          so from ~1512px down the tab strip was clipped and TEST — the tab
-          carrying the failure badge — could not be seen or clicked. */}
+    <div data-tauri-drag-region="deep" className="@container flex h-[52px] shrink-0 select-none items-center border-b border-line bg-surface-0 px-2.5">
+      {/* The tab cells stay equal-width and hide their labels below the
+          container threshold, so every tab — including TEST's failure badge —
+          remains a one-click target even in the narrow drawer. */}
       <div
         role="tablist"
         aria-label="Workspace"
-        className="flex shrink-0 overflow-x-auto rounded-md border border-white/[0.09]"
+        aria-orientation="horizontal"
+        className="grid min-w-0 flex-1 grid-cols-7 overflow-hidden rounded-md border border-line"
       >
         {WORKSPACE_TABS.map((tab) => {
           const selected = tab === active;
           const badge = badges[tab];
+          const meta = TAB_META[tab];
+          const Icon = meta.icon;
           return (
             <button
               key={tab}
@@ -51,26 +54,38 @@ export function WorkspaceTabs({
               // the role promised a pattern that was not implemented.
               tabIndex={selected ? 0 : -1}
               onKeyDown={(event) => {
-                const delta = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
-                if (delta === 0) return;
-                event.preventDefault();
                 const index = WORKSPACE_TABS.indexOf(tab);
-                const next = WORKSPACE_TABS[(index + delta + WORKSPACE_TABS.length) % WORKSPACE_TABS.length];
+                const nextIndex =
+                  event.key === "Home"
+                    ? 0
+                    : event.key === "End"
+                      ? WORKSPACE_TABS.length - 1
+                      : event.key === "ArrowRight"
+                        ? (index + 1) % WORKSPACE_TABS.length
+                        : event.key === "ArrowLeft"
+                          ? (index - 1 + WORKSPACE_TABS.length) % WORKSPACE_TABS.length
+                          : -1;
+                if (nextIndex < 0) return;
+                event.preventDefault();
+                const next = WORKSPACE_TABS[nextIndex];
                 onChange(next);
                 document.getElementById(`workspace-tab-${next}`)?.focus();
               }}
               onClick={() => onChange(tab)}
-              className={`shrink-0 border-r border-white/[0.08] px-[15px] py-2 text-[11px] font-bold uppercase tracking-[0.14em] transition-colors last:border-r-0 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30 ${
+              aria-label={tab}
+              title={meta.label}
+              className={`relative inline-flex min-w-0 items-center justify-center gap-0.5 border-r border-line px-1 py-2 text-[10px] font-medium transition-colors last:border-r-0 focus-visible:outline-none ${
                 selected
-                  ? "bg-[#1c1c1c] text-[#e0e0e0] shadow-[inset_0_0_0_1px_rgba(255,255,255,0.08)] active:bg-[#232323]"
-                  : "text-[#9c9c9c] hover:bg-white/[0.03] hover:text-[#b0b0b0] active:bg-white/[0.06]"
+                  ? "bg-surface-3 text-ink-strong shadow-[inset_0_0_0_1px_var(--line-strong)] active:bg-surface-3"
+                  : "text-ink-subtle hover:bg-surface-2 hover:text-ink active:bg-surface-3"
               }`}
             >
-              {tab}
+              <Icon aria-hidden className="h-3.5 w-3.5 shrink-0" strokeWidth={1.7} />
+              <span className="hidden truncate @[520px]:inline">{meta.label}</span>
               {badge ? (
                 <span
-                  className={`ml-[7px] rounded-lg px-[5px] py-px text-[9px] font-bold text-[#0a0a0a] ${
-                    selected ? "bg-[#c0c0c0]" : "bg-[#7a7a7a]"
+                  className={`absolute right-1 top-1 rounded-lg px-1 py-px text-[8px] font-bold leading-none text-surface-0 @[520px]:static @[520px]:ml-0.5 ${
+                    selected ? "bg-ink" : "bg-ink-faint"
                   }`}
                 >
                   {badge}
@@ -80,22 +95,6 @@ export function WorkspaceTabs({
           );
         })}
       </div>
-      <span className="ml-auto hidden truncate text-[11px] text-[#8a8a8a] xl:inline">{previewUrl}</span>
-      <button
-        type="button"
-        onClick={onNewGame}
-        className="shrink-0 rounded-md border border-white/[0.12] px-3 py-[7px] text-[11px] tracking-[0.12em] text-[#c0c0c0] transition-colors hover:border-white/30 active:bg-white/[0.06] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
-      >
-        NEW GAME
-      </button>
-      <button
-        type="button"
-        onClick={onExport}
-        disabled={exporting}
-        className="shrink-0 rounded-md border border-white/[0.12] bg-[#2a2a2a] px-[15px] py-[7px] text-[11px] font-bold tracking-[0.12em] text-[#dcdcdc] transition-colors hover:bg-[#333] active:bg-[#3a3a3a] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-[#2a2a2a]"
-      >
-        {exporting ? "SAVING…" : "SAVE"}
-      </button>
     </div>
   );
 }

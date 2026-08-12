@@ -164,6 +164,60 @@ pub fn roots(registry: &Registry) -> Vec<crate::config::WorkspaceEntry> {
     entries
 }
 
+/// Lists the sub-directories of `path` (default: the home directory) so the
+/// client can offer a folder picker without a native dialog. Directory names
+/// only — no file contents. Hidden folders and generated trees are skipped;
+/// `isProject` marks folders `workspace_open` would accept.
+pub fn browse(path: Option<&str>) -> Result<Value> {
+    let requested = match path {
+        Some(p) if !p.trim().is_empty() => PathBuf::from(shellexpand(p)),
+        _ => PathBuf::from(std::env::var_os("HOME").context("no home directory")?),
+    };
+    let root = requested
+        .canonicalize()
+        .with_context(|| format!("{} is not a readable directory", requested.display()))?;
+    if !root.is_dir() {
+        anyhow::bail!("{} is not a directory", root.display());
+    }
+
+    let mut dirs: Vec<Value> = Vec::new();
+    for entry in std::fs::read_dir(&root)
+        .with_context(|| format!("cannot read {}", root.display()))?
+        .filter_map(Result::ok)
+    {
+        if dirs.len() >= MAX_TREE_ENTRIES {
+            break;
+        }
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || SKIP_DIRS.contains(&name.as_str()) {
+            continue;
+        }
+        let dir_path = entry.path();
+        let is_project = dir_path.join("package.json").exists() || dir_path.join(".git").exists();
+        dirs.push(json!({
+            "name": name,
+            "path": dir_path.display().to_string(),
+            "isProject": is_project,
+        }));
+    }
+    dirs.sort_by(|a, b| {
+        a["name"]
+            .as_str()
+            .unwrap_or("")
+            .to_lowercase()
+            .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
+    });
+
+    Ok(json!({
+        "path": root.display().to_string(),
+        "parent": root.parent().map(|p| p.display().to_string()),
+        "dirs": dirs,
+    }))
+}
+
 pub fn list(registry: &Registry) -> Value {
     let mut items: Vec<Value> = registry.values().map(describe).collect();
     items.sort_by(|a, b| {
@@ -369,7 +423,7 @@ pub fn write_file(
     }))
 }
 
-fn shellexpand(path: &str) -> String {
+pub(crate) fn shellexpand(path: &str) -> String {
     match path.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
             Some(home) => format!("{}/{}", home.to_string_lossy(), rest),
@@ -400,6 +454,25 @@ mod tests {
             root,
         };
         (dir, workspace)
+    }
+
+    #[test]
+    fn browse_lists_directories_and_flags_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("my-game")).unwrap();
+        std::fs::write(dir.path().join("my-game/package.json"), "{}").unwrap();
+        std::fs::create_dir_all(dir.path().join("notes")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".hidden")).unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules")).unwrap();
+        std::fs::write(dir.path().join("loose.txt"), "x").unwrap();
+
+        let listing = browse(Some(dir.path().to_str().unwrap())).unwrap();
+        let dirs = listing["dirs"].as_array().unwrap();
+        let names: Vec<&str> = dirs.iter().map(|d| d["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["my-game", "notes"]);
+        assert_eq!(dirs[0]["isProject"], true);
+        assert_eq!(dirs[1]["isProject"], false);
+        assert!(listing["parent"].as_str().is_some());
     }
 
     #[test]

@@ -2,6 +2,17 @@ import { describe, expect, it } from "vitest";
 import { addEntity, addScript, removeEntity, starterProject, updateEntity } from "./store";
 
 describe("project store", () => {
+  it("ships awaited, evolution-safe starter checks with positive messages", () => {
+    const tests = starterProject().tests;
+    expect(tests.find((test) => test.id === "test-floor")).toMatchObject({
+      name: "Playable surface exists",
+      script: expect.stringContaining("await assert(scene.entities.some((e) => e.kind === 'plane')"),
+    });
+    expect(tests.find((test) => test.id === "test-hero")?.script).toContain(
+      "await assert(Math.abs(entityFor('Hero Cube').rotation.y - before) > 0.1, 'Hero moves during PIE')",
+    );
+  });
+
   it("serializes to stable JSON", () => {
     const project = starterProject();
     const roundtrip = JSON.parse(JSON.stringify(project));
@@ -24,4 +35,3 @@ describe("project store", () => {
     expect(project.scripts.at(-1)?.name).toBe("logic");
   });
 });
-

@@ -17,6 +17,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_TAURI="$ROOT/client/src-tauri"
 BUILT_APP="$SRC_TAURI/target/release/bundle/macos/CaliCode.app"
 INSTALLED_APP="/Applications/CaliCode.app"
+SIGNING_IDENTITY="${CODESIGN_IDENTITY:-${APPLE_SIGNING_IDENTITY:--}}"
 
 case "$MODE" in
   build|dev|install) ;;
@@ -29,6 +30,19 @@ esac
 # Host target triple (e.g. aarch64-apple-darwin) — the suffix Tauri expects on
 # an externalBin, and what the shell's dev-mode resolver looks for.
 TRIPLE="$(rustc -vV | awk '/^host:/ {print $2}')"
+
+sign_and_verify_app() {
+  if [ "$(uname -s)" != "Darwin" ]; then
+    return 0
+  fi
+  if [ ! -d "$1" ]; then
+    echo "Built app not found at $1" >&2
+    return 1
+  fi
+  echo "==> Signing and verifying $1"
+  /usr/bin/codesign --force --deep --sign "$SIGNING_IDENTITY" "$1"
+  /usr/bin/codesign --verify --deep --strict "$1"
+}
 
 echo "==> Building client bundle"
 (cd "$ROOT/client" && pnpm build)
@@ -49,7 +63,18 @@ if [ "$MODE" = "dev" ]; then
   (cd "$ROOT/client" && pnpm tauri dev)
 else
   echo "==> tauri build"
-  (cd "$ROOT/client" && pnpm tauri build)
+  if ! (cd "$ROOT/client" && pnpm tauri build); then
+    # create-dmg uses Finder AppleEvents only to position icons. Fresh shells,
+    # CI runners, and locked-down Macs may deny that cosmetic automation even
+    # though the signed app and disk image contents are valid. Preserve the
+    # styled path when permission exists, then retry without Finder scripting.
+    echo "==> Finder layout automation unavailable; retrying CI-safe DMG packaging" >&2
+    (cd "$ROOT/client" && CI=true pnpm tauri build)
+  fi
+  # Tauri's ad-hoc linker signature does not seal Info.plist or resources.
+  # Re-sign the exact built bundle so a plain desktop:build leaves a strict
+  # verifiable app. A configured identity is preserved; '-' is for local dev.
+  sign_and_verify_app "$BUILT_APP"
 
   if [ "$MODE" = "install" ]; then
     if [ "$(uname -s)" != "Darwin" ]; then
@@ -83,12 +108,7 @@ else
     echo "==> Updating $INSTALLED_APP"
     /usr/bin/ditto "$BUILT_APP" "$INSTALLED_APP"
 
-    # Development builds do not have a distribution certificate. An ad-hoc
-    # bundle signature still seals Info.plist and all resources, preventing
-    # macOS from rejecting an app whose files were copied incompletely.
-    echo "==> Signing and verifying the installed app"
-    /usr/bin/codesign --force --deep --sign - "$INSTALLED_APP"
-    /usr/bin/codesign --verify --deep --strict "$INSTALLED_APP"
+    sign_and_verify_app "$INSTALLED_APP"
 
     echo "==> Opening CaliCode"
     /usr/bin/open "$INSTALLED_APP"

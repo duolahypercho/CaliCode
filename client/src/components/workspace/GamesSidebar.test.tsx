@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ComponentProps } from "react";
 import { GamesSidebar } from "./GamesSidebar";
 import type { Project } from "../../lib/types";
+import type { SessionSummary } from "../../lib/sessions";
 
 const project: Project = {
   schemaVersion: 1,
@@ -16,7 +18,7 @@ const project: Project = {
 
 afterEach(cleanup);
 
-function renderSidebar(onProjectAction = vi.fn()) {
+function renderSidebar(overrides: Partial<ComponentProps<typeof GamesSidebar>> = {}) {
   window.PointerEvent = MouseEvent as typeof PointerEvent;
   return render(
     <GamesSidebar
@@ -28,9 +30,8 @@ function renderSidebar(onProjectAction = vi.fn()) {
       onSelectSession={() => {}}
       onNewSession={() => {}}
       onNewGame={() => {}}
-      onProjectAction={onProjectAction}
-      workspace={null}
-      onOpenFolder={() => {}}
+      onOpenAssetsLibrary={() => {}}
+      {...overrides}
     />,
   );
 }
@@ -39,7 +40,7 @@ describe("GamesSidebar project actions", () => {
   it("opens the reference menu with a left click", async () => {
     // jsdom does not provide PointerEvent; Radix deliberately opens mouse
     // menus on pointer-down so a click can immediately move into the menu.
-    renderSidebar();
+    renderSidebar({ onProjectAction: vi.fn() });
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open actions for CaliCode Starter" }), {
       button: 0,
@@ -48,6 +49,7 @@ describe("GamesSidebar project actions", () => {
 
     expect(await screen.findByRole("menuitem", { name: "Pin project" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Reveal in Finder" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Attach folder" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Create permanent worktree" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Edit project" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Archive chats" })).toBeTruthy();
@@ -57,7 +59,7 @@ describe("GamesSidebar project actions", () => {
   it("opens the same menu when the project row is right-clicked", async () => {
     renderSidebar();
 
-    fireEvent.contextMenu(screen.getByRole("button", { name: "CaliCode Starter 0" }));
+    fireEvent.contextMenu(screen.getByRole("button", { name: "CaliCode Starter" }));
 
     expect(await screen.findByRole("menuitem", { name: "Pin project" })).toBeTruthy();
     expect(screen.getByRole("menuitem", { name: "Remove" })).toBeTruthy();
@@ -74,7 +76,7 @@ describe("GamesSidebar project actions", () => {
 
   it("dispatches each selected action for the project", async () => {
     const onProjectAction = vi.fn();
-    renderSidebar(onProjectAction);
+    renderSidebar({ onProjectAction });
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open actions for CaliCode Starter" }), {
       button: 0,
@@ -85,28 +87,245 @@ describe("GamesSidebar project actions", () => {
     expect(onProjectAction).toHaveBeenCalledWith(project, "edit");
   });
 
+  it("labels the folder action Change folder once a folder is attached", async () => {
+    const attached: Project = { ...project, workspaceRoot: "/Users/dev/code/my-game" };
+    const onProjectAction = vi.fn();
+    renderSidebar({ projects: [attached], activeSlug: attached.slug, onProjectAction });
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "CaliCode Starter" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Change folder" }));
+    expect(onProjectAction).toHaveBeenCalledWith(attached, "attach");
+  });
+
   it("shows unpin for a pinned project and dispatches the pin toggle", async () => {
     const onProjectAction = vi.fn();
-    window.PointerEvent = MouseEvent as typeof PointerEvent;
-    render(
+    renderSidebar({ pinnedProjectSlugs: [project.slug], onProjectAction });
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: "CaliCode Starter" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Unpin project" }));
+    expect(onProjectAction).toHaveBeenCalledWith(project, "pin");
+  });
+});
+
+describe("GamesSidebar header", () => {
+  it("renders the wordmark as a static two-tone lockup, not a menu button", () => {
+    renderSidebar();
+
+    // The old "CaliCode ⌄" dropdown trigger is gone.
+    expect(screen.queryByRole("button", { name: "CaliCode menu" })).toBeNull();
+
+    // Two-tone wordmark: "cali" faint, "code" strong, with the brand icon.
+    const sidebar = screen.getByRole("complementary", { name: "Games sidebar" });
+    const cali = screen.getByText("cali");
+    const code = screen.getByText("code");
+    expect(sidebar.contains(cali)).toBe(true);
+    expect(cali.className).toContain("text-ink-faint");
+    expect(code.className).toContain("text-ink-strong");
+    // Static text — no button wraps the lockup.
+    expect(cali.closest("button")).toBeNull();
+
+    // The search toggle stays to the right of the lockup.
+    expect(screen.getByRole("button", { name: "Toggle search" })).toBeTruthy();
+  });
+});
+
+describe("GamesSidebar rows", () => {
+  it("renders game rows without a session count", () => {
+    renderSidebar();
+
+    const row = screen.getByRole("button", { name: "CaliCode Starter" });
+    expect(row.getAttribute("aria-expanded")).toBe("true");
+    expect(row.textContent).toBe("CaliCode Starter");
+  });
+
+  it("highlights the active game row while no session is selected", () => {
+    renderSidebar();
+
+    const row = screen.getByRole("button", { name: "CaliCode Starter" });
+    expect(row.classList.contains("bg-surface-3")).toBe(true);
+  });
+
+  it("moves the highlight to the session row when a session is active", () => {
+    const session: SessionSummary = {
+      id: "sess-1",
+      title: "Tune jump physics",
+      projectSlug: "starter",
+      provider: null,
+      model: null,
+      workspaceRoot: null,
+      worktreeId: null,
+      branch: null,
+      createdAt: Math.floor(Date.now() / 1000) - 600,
+      updatedAt: Math.floor(Date.now() / 1000) - 120,
+      messageCount: 4,
+    };
+    renderSidebar({ sessions: { starter: [session] }, activeSessionId: "sess-1" });
+
+    // Only the session row is gray — the parent game row drops the highlight.
+    const gameRow = screen.getByRole("button", { name: "CaliCode Starter" });
+    expect(gameRow.classList.contains("bg-surface-3")).toBe(false);
+
+    const sessionRow = screen.getByRole("button", { name: /Tune jump physics/ });
+    expect(sessionRow.classList.contains("bg-surface-3")).toBe(true);
+  });
+});
+
+describe("GamesSidebar nav block", () => {
+  it("has no Open folder row — the New game dialog covers existing folders", () => {
+    renderSidebar();
+
+    expect(screen.queryByRole("button", { name: "Open folder" })).toBeNull();
+    expect(screen.getByRole("button", { name: "New game" })).toBeTruthy();
+  });
+
+  it("exposes an Assets Library row that calls its handler", () => {
+    const onOpenAssetsLibrary = vi.fn();
+    renderSidebar({ onOpenAssetsLibrary });
+
+    fireEvent.click(screen.getByRole("button", { name: "Assets Library" }));
+    expect(onOpenAssetsLibrary).toHaveBeenCalledTimes(1);
+  });
+
+  it("marks the Assets Library row selected when the library view is active", () => {
+    renderSidebar({ assetsLibraryActive: true });
+
+    const row = screen.getByRole("button", { name: "Assets Library" });
+    expect(row.classList.contains("bg-surface-3")).toBe(true);
+  });
+
+  it("no longer renders the Assets repo section at the bottom", () => {
+    renderSidebar();
+
+    expect(screen.queryByRole("region", { name: "Asset library" })).toBeNull();
+    expect(screen.queryByText("Assets")).toBeNull();
+  });
+});
+
+describe("GamesSidebar search dialog", () => {
+  const session: SessionSummary = {
+    id: "sess-1",
+    title: "Tune jump physics",
+    projectSlug: "starter",
+    provider: null,
+    model: null,
+    workspaceRoot: null,
+    worktreeId: null,
+    branch: null,
+    createdAt: Math.floor(Date.now() / 1000) - 600,
+    updatedAt: Math.floor(Date.now() / 1000) - 120,
+    messageCount: 4,
+  };
+
+  function renderWithSessions(onSelectSession = vi.fn()) {
+    return renderSidebar({ sessions: { starter: [session] }, onSelectSession });
+  }
+
+  it("opens from the header icon with a focusable search input", async () => {
+    renderWithSessions();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle search" }));
+
+    const input = await screen.findByLabelText<HTMLInputElement>("Search games");
+    fireEvent.change(input, { target: { value: "cali" } });
+    expect(input.value).toBe("cali");
+  });
+
+  it("matches session titles and selects a session, then closes", async () => {
+    const onSelectSession = vi.fn();
+    renderWithSessions(onSelectSession);
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle search" }));
+    const input = await screen.findByLabelText("Search games");
+    fireEvent.change(input, { target: { value: "jump" } });
+
+    fireEvent.click(await screen.findByRole("button", { name: /Tune jump physics/ }));
+    expect(onSelectSession).toHaveBeenCalledWith("starter", "sess-1");
+    expect(screen.queryByLabelText("Search games")).toBeNull();
+  });
+
+  it("closes on Escape", async () => {
+    renderWithSessions();
+
+    fireEvent.click(screen.getByRole("button", { name: "Toggle search" }));
+    const input = await screen.findByLabelText("Search games");
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByLabelText("Search games")).toBeNull();
+  });
+});
+
+describe("GamesSidebar running indicator", () => {
+  const sessionRunning: SessionSummary = {
+    id: "sess-running",
+    title: "Running chat",
+    projectSlug: "starter",
+    provider: null,
+    model: null,
+    workspaceRoot: null,
+    worktreeId: null,
+    branch: null,
+    createdAt: Math.floor(Date.now() / 1000) - 600,
+    updatedAt: Math.floor(Date.now() / 1000) - 30,
+    messageCount: 4,
+  };
+  const sessionIdle: SessionSummary = {
+    ...sessionRunning,
+    id: "sess-idle",
+    title: "Idle chat",
+  };
+
+  it("renders a spinner on the row whose session id is in the running set", () => {
+    renderSidebar({
+      sessions: { starter: [sessionRunning, sessionIdle] },
+      runningSessionIds: new Set([sessionRunning.id]),
+    });
+
+    const [spinner] = screen.getAllByTestId("session-running-spinner");
+    expect(spinner).toBeTruthy();
+    const row = screen.getByRole("button", { name: "Running chat (agent running)" });
+    expect(row.contains(spinner)).toBe(true);
+    expect(screen.getByText("Agent is running on this chat")).toBeTruthy();
+  });
+
+  it("does not render the spinner on rows whose session id is not running", () => {
+    renderSidebar({
+      sessions: { starter: [sessionRunning, sessionIdle] },
+      runningSessionIds: new Set([sessionRunning.id]),
+    });
+
+    const idleRow = screen.getByRole("button", { name: /Idle chat/ });
+    expect(idleRow.querySelector('[data-testid="session-running-spinner"]')).toBeNull();
+  });
+
+  it("clears the spinner when the running set no longer contains the session id", () => {
+    const { rerender } = renderSidebar({
+      sessions: { starter: [sessionRunning] },
+      runningSessionIds: new Set([sessionRunning.id]),
+    });
+    expect(screen.getByTestId("session-running-spinner")).toBeTruthy();
+
+    rerender(
       <GamesSidebar
         projects={[project]}
         activeSlug={project.slug}
-        sessions={{}}
+        sessions={{ starter: [sessionRunning] }}
         activeSessionId={null}
+        runningSessionIds={new Set()}
         onOpenProject={() => {}}
         onSelectSession={() => {}}
         onNewSession={() => {}}
         onNewGame={() => {}}
-        pinnedProjectSlugs={[project.slug]}
-        onProjectAction={onProjectAction}
-        workspace={null}
-        onOpenFolder={() => {}}
+        onOpenAssetsLibrary={() => {}}
       />,
     );
+    expect(screen.queryByTestId("session-running-spinner")).toBeNull();
+    expect(screen.queryByText("Agent is running on this chat")).toBeNull();
+  });
 
-    fireEvent.contextMenu(screen.getByRole("button", { name: "CaliCode Starter 0" }));
-    fireEvent.click(await screen.findByRole("menuitem", { name: "Unpin project" }));
-    expect(onProjectAction).toHaveBeenCalledWith(project, "pin");
+  it("does not show the spinner on any row when the running set is empty", () => {
+    renderSidebar({
+      sessions: { starter: [sessionRunning, sessionIdle] },
+      runningSessionIds: new Set(),
+    });
+    expect(screen.queryByTestId("session-running-spinner")).toBeNull();
   });
 });

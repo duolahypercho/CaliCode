@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { Viewport } from "./components/editor/Viewport";
 import type { LogEntry } from "./components/editor/ConsolePanel";
 import { AgentPanel } from "./components/editor/AgentPanel";
-import { TitleBar } from "./components/workspace/TitleBar";
-import {
-  GamesSidebar,
-  type GameSession,
-  type ProjectMenuAction,
-} from "./components/workspace/GamesSidebar";
+import { ArrowLeft, ArrowRight, ChevronDown, PanelLeft, PanelRight } from "lucide-react";
+import blenderLogo from "./assets/blender-logo.svg";
+import { hasOverlayWindowControls } from "./lib/desktop";
+import { GamesSidebar, type ProjectMenuAction } from "./components/workspace/GamesSidebar";
+import { AssetsLibraryPage } from "./components/library/AssetsLibraryPage";
+import { SettingsPage } from "./components/settings/SettingsPage";
+import { createSession, listSessions, type SessionSummary } from "./lib/sessions";
 import { WORKSPACE_TABS, WorkspaceTabs, type WorkspaceTab } from "./components/workspace/WorkspaceTabs";
 import { PlayOverlay, type TweakPin } from "./components/workspace/PlayOverlay";
 import { TweakPanel, entityTweakControls, type TweakControl } from "./components/workspace/TweakPanel";
@@ -16,8 +17,20 @@ import { Button } from "./components/ui/button";
 import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } from "./components/ui/dialog";
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
-import { rpc } from "./lib/rpc";
-import { addAsset, removeEntity, slugify, starterProject, uid, updateEntity, updateScript } from "./lib/store";
+import { currentCoreStatus, rpc, subscribeCoreStatus, type CoreConnectionState } from "./lib/rpc";
+import {
+  attachRepo,
+  attachedRepos,
+  catalogSnapshot,
+  detachRepo,
+  getRepo,
+  setRepoSetting,
+  type RepoSettingValue,
+} from "./lib/assetLibrary";
+import { addAsset, removeEntity, slugify, starterProject, uid, updateAsset, updateEntity, updateScript } from "./lib/store";
+import { applyOps, emptySpec, specFromProcedural, type ApplyResult, type BuilderOp } from "./lib/assetBuilderOps";
+import { AssetBuilder, projectAssetWrite } from "./components/editor/AssetBuilder";
+import type { CaliSpec } from "./lib/assetPipeline";
 import { runTests } from "./lib/testRunner";
 import { useBrowserTools } from "./lib/useBrowserTools";
 import { useFrameStats } from "./lib/useFrameStats";
@@ -25,11 +38,20 @@ import { CodeTab } from "./components/workspace/CodeTab";
 import { ArtTab } from "./components/workspace/ArtTab";
 import { SceneGraphCanvas } from "./components/workspace/SceneGraphCanvas";
 import { TestTab, toIssues } from "./components/workspace/TestTab";
+import { ReportsTab } from "./components/workspace/ReportsTab";
 import { FileTree } from "./components/workspace/FileTree";
 import { FileEditor } from "./components/workspace/FileEditor";
 import { LivePreview } from "./components/workspace/LivePreview";
 import { NewProjectDialog } from "./components/workspace/NewProjectDialog";
-import { openWorkspace, setProjectWorkspace, type WorkspaceInfo } from "./lib/workspace";
+import { FolderPicker } from "./components/workspace/FolderPicker";
+import {
+  chooseNativeWorkspace,
+  openWorkspace,
+  readWorkspaceFile,
+  setProjectWorkspace,
+  type WorkspaceInfo,
+} from "./lib/workspace";
+import { isSafeActivityPath, type ActivityFileChange } from "./lib/activity";
 import {
   useResizablePanels,
   type ResizablePanel,
@@ -38,19 +60,45 @@ import {
 import type { PieRuntime, PieState } from "./lib/pie";
 import type { Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
 import type { ProjectTemplate } from "./lib/projectTemplates";
+import { importMime, isBlenderAsset } from "./lib/blender";
 
 const snapshotScripts = (p: Project): Record<string, string> => Object.fromEntries(p.scripts.map((x) => [x.id, x.code]));
 
-const SESSIONS_KEY = "calicode-sessions";
 const VIEW_KEY = "calicode-view";
-const PINNED_PROJECTS_KEY = "calicode-pinned-projects";
 
-type DialogProjectAction = Exclude<ProjectMenuAction, "pin" | "reveal">;
+/** Small icon button used in the collapsed-sidebar chrome strip. */
+const CHROME_ICON_BUTTON =
+  "inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink-strong focus-visible:outline-none disabled:opacity-35";
+const PINNED_PROJECTS_KEY = "calicode-pinned-projects";
+const THEME_KEY = "calicode-theme";
+
+type Theme = "dark" | "light";
+
+function readTheme(): Theme {
+  const stored = localStorage.getItem(THEME_KEY);
+  if (stored === "light" || stored === "dark") return stored;
+  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+type DialogProjectAction = Exclude<ProjectMenuAction, "pin" | "reveal" | "attach">;
 
 interface PendingProjectAction {
   action: DialogProjectAction;
   project: Project;
 }
+
+/**
+ * The chat column (transcript + composer) never yields more than this to the
+ * side panels: wide enough for the composer's permission/model row and the
+ * empty-state wordmark. The static maxWidths below are ceilings for a roomy
+ * window; the App body lowers them per-render so sidebar + chat + tools always
+ * fit the actual viewport instead of the dragged panel overflowing the chat.
+ */
+const MIN_CHAT_WIDTH = 360;
+/** Matches ResizeHandle's w-[5px]. */
+const RESIZE_HANDLE_WIDTH = 5;
+/** Tailwind lg — below this the tools dock leaves the row and overlays. */
+const TOOLS_DOCK_BREAKPOINT = 1024;
 
 /** Panel bounds are shared by the hook and the handle's aria value range. */
 const GAMES_SIDEBAR: ResizablePanelOptions = {
@@ -60,11 +108,12 @@ const GAMES_SIDEBAR: ResizablePanelOptions = {
   maxWidth: 420,
 };
 
-const AGENT_PANEL: ResizablePanelOptions = {
-  storageKey: "calicode-agent-width",
-  defaultWidth: 384,
-  minWidth: 280,
-  maxWidth: 720,
+const TOOLS_PANEL: ResizablePanelOptions = {
+  storageKey: "calicode-tools-width",
+  defaultWidth: 560,
+  minWidth: 360,
+  maxWidth: 960,
+  invert: true,
 };
 
 const FILE_TREE_PANEL: ResizablePanelOptions = {
@@ -97,8 +146,16 @@ function readView(): ViewState {
   }
 }
 
+function sameWorkspaceRoot(left: string | null | undefined, right: string | null | undefined): boolean {
+  if (!left || !right) return left === right;
+  const normalize = (value: string) => value.trim().replace(/[\\/]+$/, "");
+  return normalize(left) === normalize(right);
+}
+
 export default function App() {
   const [project, setProject] = useState<Project>(starterProject);
+  const [coreStatus, setCoreStatus] = useState<CoreConnectionState>(currentCoreStatus);
+  const [coreRetry, setCoreRetry] = useState(0);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedEntityId, setSelectedEntityId] = useState<string | null>(null);
   const [selectedScriptId, setSelectedScriptId] = useState<string | null>("spin");
@@ -106,19 +163,31 @@ export default function App() {
   const [pieState, setPieState] = useState<PieState>("idle");
   const [frames, setFrames] = useState<CapturedFrame[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const logsRef = useRef<LogEntry[]>(logs);
+  logsRef.current = logs;
   const [testResults, setTestResults] = useState<TestResult[]>([]);
   const [modelList, setModelList] = useState<ModelList | null>(null);
   const [captureEvery, setCaptureEvery] = useState(3);
   const [assetSearch, setAssetSearch] = useState("");
   const [tab, setTab] = useState<WorkspaceTab>(() => readView().tab);
+  // Asset open in the 3D builder (BUILD tab); null shows the picker.
+  const [builderAssetId, setBuilderAssetId] = useState<string | null>(null);
+  const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
   const [activePin, setActivePin] = useState<string | null>(null);
   const [loadMs, setLoadMs] = useState<number | null>(null);
-  const [exporting, setExporting] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [newProjectBusy, setNewProjectBusy] = useState(false);
   const [newProjectError, setNewProjectError] = useState("");
-  const [sessions, setSessions] = useState<Record<string, GameSession[]>>(readSessions);
+  // The saved transcripts core keeps under ~/.cali/sessions — the sidebar's
+  // recents. AgentPanel refreshes this list whenever it saves or deletes one.
+  const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  // Per-session "is the agent running" flag. The panel remounts on selection
+  // change, so its internal busy state dies with it — but a turn that is in
+  // flight in another browser window, or a panel we just navigated away
+  // from, still needs a spinner on its sidebar row. AgentPanel reports each
+  // transition (start/stop, plus a null on unmount) into this set.
+  const [runningSessionIds, setRunningSessionIds] = useState<ReadonlySet<string>>(() => new Set());
   const [pinnedProjectSlugs, setPinnedProjectSlugs] = useState<string[]>(readPinnedProjects);
   const [pendingProjectAction, setPendingProjectAction] = useState<PendingProjectAction | null>(null);
   const [projectActionTitle, setProjectActionTitle] = useState("");
@@ -130,27 +199,130 @@ export default function App() {
   const [testing, setTesting] = useState(false);
   const [workspace, setWorkspace] = useState<WorkspaceInfo | null>(null);
   const [workspaceFile, setWorkspaceFile] = useState<string | null>(() => readView().workspaceFile);
+  const [workspaceOpenError, setWorkspaceOpenError] = useState<string | null>(null);
+  // Agent activity can arrive while the selected session's workspace is still
+  // opening. Keep only a validated, project-scoped selection until the
+  // matching root is loaded; never let a stale/foreign path jump the editor.
+  const [activityFile, setActivityFile] = useState<ActivityFileChange | null>(null);
+  const [pendingActivityFile, setPendingActivityFile] = useState<ActivityFileChange | null>(null);
   // Below lg/md these panes leave the layout entirely; the toggles open them
   // as overlays so the agent and the games list stay reachable on a narrow
   // window rather than simply disappearing.
-  const [agentOpen, setAgentOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
+  // From lg up the dock is a real column; the chat header's panel button
+  // hides/shows it there, and below lg the same button drives the overlay.
+  // What the main column shows: the agent chat, or the Assets Library page.
+  const [mainView, setMainView] = useState<"chat" | "library">("chat");
+  const [toolsVisible, setToolsVisible] = useState<boolean>(
+    () => localStorage.getItem("calicode-tools-visible") !== "0",
+  );
+  const [toolsAnimating, setToolsAnimating] = useState(false);
+  const toolsAnimTimer = useRef<number | null>(null);
   const [sidebarVisible, setSidebarVisible] = useState(true);
-  const gamesSidebar = useResizablePanels(GAMES_SIDEBAR);
-  const agentPanel = useResizablePanels(AGENT_PANEL);
+  const [sidebarAnimating, setSidebarAnimating] = useState(false);
+  const sidebarAnimTimer = useRef<number | null>(null);
+  useEffect(
+    () => () => {
+      if (toolsAnimTimer.current) window.clearTimeout(toolsAnimTimer.current);
+      if (sidebarAnimTimer.current) window.clearTimeout(sidebarAnimTimer.current);
+    },
+    [],
+  );
+  const [viewportWidth, setViewportWidth] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setViewportWidth(window.innerWidth);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+  // From lg up the tools dock occupies the row, so the sidebar must also leave
+  // room for it at its narrowest; below lg the dock is an overlay drawer.
+  const toolsDocked = mainView === "chat" && toolsVisible && viewportWidth >= TOOLS_DOCK_BREAKPOINT;
+  const sidebarBounds: ResizablePanelOptions = {
+    ...GAMES_SIDEBAR,
+    maxWidth: Math.min(
+      GAMES_SIDEBAR.maxWidth,
+      viewportWidth -
+        MIN_CHAT_WIDTH -
+        RESIZE_HANDLE_WIDTH -
+        (toolsDocked ? TOOLS_PANEL.minWidth + RESIZE_HANDLE_WIDTH : 0),
+    ),
+  };
+  const gamesSidebar = useResizablePanels(sidebarBounds);
+  // Clamp against at least the lg width: below the breakpoint the dock is an
+  // overlay whose width var is unused, and clamping to a phone-sized viewport
+  // would needlessly throw away the docked width.
+  const toolsBounds: ResizablePanelOptions = {
+    ...TOOLS_PANEL,
+    maxWidth: Math.min(
+      TOOLS_PANEL.maxWidth,
+      Math.max(viewportWidth, TOOLS_DOCK_BREAKPOINT) -
+        MIN_CHAT_WIDTH -
+        RESIZE_HANDLE_WIDTH -
+        (sidebarVisible ? gamesSidebar.width + RESIZE_HANDLE_WIDTH : 0),
+    ),
+  };
+  const toolsPanel = useResizablePanels(toolsBounds);
   const fileTreePanel = useResizablePanels(FILE_TREE_PANEL);
-  const [openFolderOpen, setOpenFolderOpen] = useState(false);
-  const [folderPath, setFolderPath] = useState("");
+  // Which game the attach-folder dialog binds to; the dialog is open while
+  // this is non-null. Opening a folder as a brand-new game lives in the
+  // "New game" dialog instead (NewProjectDialog's source-folder path).
+  const [folderTarget, setFolderTarget] = useState<Project | null>(null);
+  const [attachPath, setAttachPath] = useState<string | null>(null);
+  const [folderBusy, setFolderBusy] = useState(false);
+  const [folderError, setFolderError] = useState("");
+  const [theme, setTheme] = useState<Theme>(readTheme);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const workbenchRef = useRef<HTMLDivElement>(null);
+  // Where you have been: every game/chat selection pushes an entry, and the
+  // sidebar's back/forward arrows walk the stack browser-style.
+  const [nav, setNav] = useState<{ stack: { slug: string; sessionId: string | null }[]; index: number }>({
+    stack: [{ slug: "starter", sessionId: null }],
+    index: 0,
+  });
 
   const runtimeRef = useRef<PieRuntime | null>(null);
   runtimeRef.current = runtime;
+  // Keep the active slug stable for a recovery load without making the
+  // startup effect rerun on every local edit or project switch.
+  const projectSlugRef = useRef(project.slug);
+  projectSlugRef.current = project.slug;
+  const coreHydratedRef = useRef(false);
+  const previousCoreStatusRef = useRef<CoreConnectionState>(currentCoreStatus());
+
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    window.requestAnimationFrame(() => {
+      const visibleButton = (selector: string) =>
+        Array.from(document.querySelectorAll<HTMLButtonElement>(selector)).find(
+          (button) => button.getClientRects().length > 0,
+        );
+      (visibleButton('button[aria-label="Studio menu"]') ??
+        visibleButton('button[aria-label="Toggle games sidebar"]'))?.focus();
+    });
+  }, []);
+
+  useEffect(() => {
+    const workbench = workbenchRef.current;
+    if (!workbench) return;
+    if (settingsOpen) workbench.setAttribute("inert", "");
+    else workbench.removeAttribute("inert");
+    return () => workbench.removeAttribute("inert");
+  }, [settingsOpen]);
 
   const pushLog = useCallback((text: string, level: "info" | "error" = "info") => {
-    setLogs((current) => [
-      ...current.slice(-199),
+    // Browser tool calls can arrive back-to-back before React renders. Build
+    // from and update the synchronous mirror before scheduling state so an
+    // immediate editor_console_log -> editor_console_history sequence sees
+    // the entry that was actually appended, not the preceding render.
+    const next = [
+      ...logsRef.current.slice(-199),
       { id: uid("log"), level, message: text, time: new Date().toLocaleTimeString() },
-    ]);
+    ];
+    logsRef.current = next;
+    setLogs(next);
   }, []);
+  const getLogs = useCallback(() => logsRef.current, []);
 
   // Stable identities for the workspace panes. FileTree and FileEditor read
   // these inside effects; an inline arrow here means a fresh identity every
@@ -161,12 +333,13 @@ export default function App() {
   const handleWorkspaceSaved = useCallback((path: string) => pushLog(`saved ${path}`), [pushLog]);
 
   useEffect(() => {
-    document.documentElement.classList.add("dark");
-  }, []);
+    document.documentElement.classList.toggle("dark", theme === "dark");
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
 
   useEffect(() => {
-    localStorage.setItem(SESSIONS_KEY, JSON.stringify(sessions));
-  }, [sessions]);
+    void listSessions().then(setSessions).catch(() => {});
+  }, []);
 
   useEffect(() => {
     localStorage.setItem(PINNED_PROJECTS_KEY, JSON.stringify(pinnedProjectSlugs));
@@ -176,62 +349,295 @@ export default function App() {
     localStorage.setItem(VIEW_KEY, JSON.stringify({ tab, workspaceFile } satisfies ViewState));
   }, [tab, workspaceFile]);
 
+  useEffect(() => subscribeCoreStatus(setCoreStatus), []);
+
+  // If core is started after the browser, probe it periodically. This only
+  // retries hydration when the app never loaded a real project; a hydrated
+  // project stays visible across a restart instead of being replaced by
+  // Starter or by a partially restored document.
+  useEffect(() => {
+    if (coreStatus !== "offline") return;
+    const timer = window.setInterval(() => {
+      void rpc("ping").catch(() => {});
+    }, 2_000);
+    return () => window.clearInterval(timer);
+  }, [coreStatus]);
+
+  useEffect(() => {
+    const previous = previousCoreStatusRef.current;
+    previousCoreStatusRef.current = coreStatus;
+    if (previous !== "offline" || coreStatus !== "ready") return;
+    if (!coreHydratedRef.current) {
+      setCoreRetry((current) => current + 1);
+      return;
+    }
+    // A restart can restore projects created by another window while this
+    // browser stayed open. Refresh the list without reopening the active
+    // document, which preserves unsaved local edits across the reconnect.
+    void rpc<Project[]>("project_list", {})
+      .then(setProjects)
+      .catch((error) => pushLog(`project list refresh failed: ${reason(error)}`, "error"));
+  }, [coreStatus, pushLog]);
+
   useEffect(() => {
     const started = performance.now();
+    let cancelled = false;
     void (async () => {
       try {
-        const loaded = await rpc<Project>("project_open", { slug: "starter" });
-        setProject(loaded);
+        if (coreRetry > 0) setCoreStatus("unknown");
+        const loaded = await rpc<Project>("project_open", { slug: projectSlugRef.current || "starter" });
+        if (cancelled) return;
+        setProject(adoptSaved(loaded));
+        coreHydratedRef.current = true;
         setScriptBaseline(snapshotScripts(loaded));
         setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
-        setProjects(await rpc<Project[]>("project_list", {}));
+        const listed = await rpc<Project[]>("project_list", {});
+        if (cancelled) return;
+        setProjects(listed);
         setLoadMs(performance.now() - started);
       } catch {
-        pushLog("core unavailable; using local starter project", "error");
+        if (cancelled) return;
+        pushLog(
+          coreHydratedRef.current
+            ? `core unavailable; keeping ${projectSlugRef.current} visible until it reconnects`
+            : "core unavailable; using local starter preview",
+          "error",
+        );
       }
       try {
-        setModelList(await rpc("model_list", {}));
+        const models = await rpc<ModelList>("model_list", {});
+        if (!cancelled) setModelList(models);
       } catch (error) {
-        pushLog(`model list failed: ${reason(error)}`);
+        if (!cancelled) pushLog(`model list failed: ${reason(error)}`);
       }
       // The attached folder now comes from the selected game's workspaceRoot
       // (see the effect below), not from whatever core happened to have open —
       // with several games that global pick was arbitrary.
     })();
-  }, [pushLog]);
+    return () => {
+      cancelled = true;
+    };
+  }, [coreRetry, pushLog]);
 
+  const closeAttachDialog = () => {
+    setFolderTarget(null);
+    setAttachPath(null);
+    setFolderError("");
+  };
+
+  /** Bind the picked folder to the attach dialog's target game. */
   const attachFolder = async () => {
-    const path = folderPath.trim();
-    if (!path) return;
+    const path = attachPath?.trim();
+    if (!path || !folderTarget || folderBusy) return;
+    setFolderBusy(true);
+    setFolderError("");
     try {
       const info = await openWorkspace(path);
-      setWorkspace(info);
-      setWorkspaceFile(null);
-      setOpenFolderOpen(false);
-      setFolderPath("");
-      // The folder belongs to this game, not to the app — so a second game can
-      // point at a different repo and switching games switches folders.
-      if (project) {
-        await setProjectWorkspace(project.slug, info.root);
-        setProject((current) => (current ? { ...current, workspaceRoot: info.root } : current));
+      // The folder belongs to this game, not to the app — so a second game
+      // can point at a different repo and switching games switches folders.
+      // The workspaceRoot effect below opens the folder when the game is the
+      // active one.
+      await setProjectWorkspace(folderTarget.slug, info.root);
+      setProjects((current) =>
+        current.map((item) => (item.slug === folderTarget.slug ? { ...item, workspaceRoot: info.root } : item)),
+      );
+      if (project.slug === folderTarget.slug) {
+        setProject((current) => ({ ...current, workspaceRoot: info.root }));
       }
-      pushLog(`attached ${info.name} to ${project?.title ?? "this game"} (${info.root})`);
+      closeAttachDialog();
+      pushLog(`attached ${info.name} to ${folderTarget.title} (${info.root})`);
     } catch (error) {
-      pushLog(`open folder failed: ${reason(error)}`, "error");
+      setFolderError(reason(error));
+      pushLog(`attach folder failed: ${reason(error)}`, "error");
+    } finally {
+      setFolderBusy(false);
     }
   };
 
-  // Each game owns its folder, so switching games switches the attached
-  // workspace. A game with no folder shows none rather than inheriting the
-  // previous game's — that inheritance is what made the old single global
-  // workspace confusing once more than one game existed.
+  /**
+   * The "New game" dialog's source-folder path: the folder becomes a new game
+   * (named after itself, or `title` when given) so it shows up as its own row
+   * in the sidebar. Picking a folder that is already a game just opens it.
+   */
+  const openFolderAsGame = async (path: string, title?: string) => {
+    if (newProjectBusy) return;
+    setNewProjectBusy(true);
+    setNewProjectError("");
+    try {
+      const info = await openWorkspace(path, title);
+      const existing = projects.find((item) => item.workspaceRoot === info.root);
+      if (existing) {
+        setNewProjectOpen(false);
+        setActiveSessionId(null);
+        setSessionRevision((current) => current + 1);
+        await openProject(existing.slug);
+        return;
+      }
+      const slug = slugify(info.name);
+      if (projects.some((item) => item.slug === slug)) {
+        setNewProjectError(
+          `A game called "${info.name}" already exists. Use "Attach folder" in that game's menu instead.`,
+        );
+        return;
+      }
+      const created = await rpc<Project>("project_create", { slug, title: info.name, template: "blank" });
+      await setProjectWorkspace(slug, info.root);
+      const bound = { ...created, workspaceRoot: info.root };
+      setProjects((current) => [...current.filter((item) => item.slug !== slug), bound]);
+      setProject(adoptSaved(bound));
+      setActiveSessionId(null);
+      setSessionRevision((current) => current + 1);
+      setScriptBaseline(snapshotScripts(bound));
+      setSelectedEntityId(null);
+      setSelectedScriptId(bound.scripts[0]?.id ?? null);
+      setFrames([]);
+      setTestResults([]);
+      setNewProjectOpen(false);
+      pushLog(`opened ${info.root} as ${bound.title}`);
+    } catch (error) {
+      setNewProjectError(reason(error));
+      pushLog(`open folder failed: ${reason(error)}`, "error");
+    } finally {
+      setNewProjectBusy(false);
+    }
+  };
+  // The panel reports its own session id, then transitions into/out of the
+  // running state. We keep both signals at the App level so the sidebar's
+  // per-row spinner survives navigating to a different chat (and clears on
+  // the original chat once the turn finishes or the panel unmounts).
+  const handleActiveSessionChange = useCallback((_next: string | null) => {
+    // The id is purely informational here — `activeSessionId` is owned by
+    // the sidebar selection flow. The running reporter below already pairs
+    // each transition with the session id, so we do not need to mirror it.
+  }, []);
+  const handleSessionRunningChange = useCallback((running: boolean, sessionId: string | null) => {
+    setRunningSessionIds((previous) => {
+      if (running) {
+        if (!sessionId || previous.has(sessionId)) return previous;
+        const next = new Set(previous);
+        next.add(sessionId);
+        return next;
+      }
+      if (sessionId) {
+        if (!previous.has(sessionId)) return previous;
+        const next = new Set(previous);
+        next.delete(sessionId);
+        return next;
+      }
+      // A null sessionId on a "stop" signal (the panel never owned a
+      // session, or the unmount cleanup arrived after the id was cleared)
+      // is a no-op: the per-id transitions above already cover the
+      // observable cases, and we deliberately avoid mass-clearing because
+      // it would clobber other panels' running rows.
+      return previous;
+    });
+  }, []);
+  // The active session owns the editor attachment. Legacy/new unsaved chats
+  // fall back to the project's default folder until their durable session is
+  // allocated; once allocated, switching chats switches worktrees as well.
   const projectSlug = project?.slug ?? null;
-  const projectWorkspaceRoot = project?.workspaceRoot ?? null;
+  const activeSession = sessions.find(
+    (session) => session.id === activeSessionId && session.projectSlug === projectSlug,
+  );
+  const editorWorkspaceRoot =
+    (activeSession?.worktreeId || project?.workspaceRoot ? activeSession?.workspaceRoot : null) ??
+    project?.workspaceRoot ??
+    null;
+
+  const revealActivityEditor = useCallback(() => {
+    setMainView("chat");
+    setTab("code");
+    // The dock can be hidden persistently on desktop, or must be opened as an
+    // overlay on narrow windows. A file activity click is an explicit request
+    // to reveal it in either layout.
+    setToolsVisible(true);
+    localStorage.setItem("calicode-tools-visible", "1");
+    if (window.matchMedia?.("(min-width: 1024px)").matches) setToolsOpen(false);
+    else setToolsOpen(true);
+  }, []);
+
+  const openActivityFile = useCallback(
+    (change: ActivityFileChange) => {
+      const expectedRoot = editorWorkspaceRoot;
+      if (change.projectSlug && change.projectSlug !== project.slug) {
+        pushLog(`ignored activity for another game: ${change.path}`, "error");
+        return;
+      }
+      if (!expectedRoot) {
+        pushLog(`cannot open ${change.path}: the active game has no workspace`, "error");
+        return;
+      }
+      const validationRoot = change.workspaceRoot ?? expectedRoot;
+      if (!isSafeActivityPath(change.path, validationRoot)) {
+        pushLog(`ignored unsafe activity path: ${change.path}`, "error");
+        return;
+      }
+
+      // A root mismatch is only queueable while the active session's expected
+      // workspace is still opening. Once another root is fully loaded, this is
+      // a foreign/stale event and must not leak into the editor.
+      const expectedRootLoaded = Boolean(workspace && sameWorkspaceRoot(workspace.root, expectedRoot));
+      if (change.workspaceRoot && !sameWorkspaceRoot(change.workspaceRoot, expectedRoot)) {
+        if (!expectedRootLoaded) {
+          setPendingActivityFile(change);
+          revealActivityEditor();
+        } else {
+          pushLog(`ignored activity from another workspace: ${change.path}`, "error");
+        }
+        return;
+      }
+      if (!expectedRootLoaded) {
+        setPendingActivityFile(change);
+        revealActivityEditor();
+        if (workspaceOpenError) {
+          void (async () => {
+            try {
+              const selected = await chooseNativeWorkspace(expectedRoot);
+              if (!selected) return;
+              if (!sameWorkspaceRoot(selected, expectedRoot)) {
+                pushLog(`choose ${expectedRoot} to open ${change.path}`, "error");
+                return;
+              }
+              const info = await openWorkspace(selected);
+              setWorkspace(info);
+              setWorkspaceOpenError(null);
+              setPendingActivityFile(null);
+              setActivityFile(change);
+              setWorkspaceFile(change.path);
+            } catch (error) {
+              pushLog(`could not grant access to ${expectedRoot}: ${reason(error)}`, "error");
+            }
+          })();
+        }
+        return;
+      }
+
+      setPendingActivityFile(null);
+      setActivityFile(change);
+      setWorkspaceFile(change.path);
+      revealActivityEditor();
+    },
+    [editorWorkspaceRoot, project.slug, pushLog, revealActivityEditor, workspace, workspaceOpenError],
+  );
+
+  const activityContextRef = useRef<{ slug: string; root: string | null }>({
+    slug: project.slug,
+    root: editorWorkspaceRoot,
+  });
+  useEffect(() => {
+    const previous = activityContextRef.current;
+    if (previous.slug !== project.slug || !sameWorkspaceRoot(previous.root, editorWorkspaceRoot)) {
+      setActivityFile(null);
+      setPendingActivityFile(null);
+    }
+    activityContextRef.current = { slug: project.slug, root: editorWorkspaceRoot };
+  }, [editorWorkspaceRoot, project.slug]);
+
   useEffect(() => {
     if (!projectSlug) return;
     let cancelled = false;
     void (async () => {
-      if (!projectWorkspaceRoot) {
+      if (!editorWorkspaceRoot) {
         if (!cancelled) {
           setWorkspace(null);
           setWorkspaceFile(null);
@@ -239,29 +645,140 @@ export default function App() {
         return;
       }
       try {
-        const info = await openWorkspace(projectWorkspaceRoot);
+        setWorkspaceOpenError(null);
+        const info = await openWorkspace(editorWorkspaceRoot);
         if (cancelled) return;
         setWorkspace(info);
         setWorkspaceFile(null);
       } catch (error) {
         if (cancelled) return;
         setWorkspace(null);
-        pushLog(`could not open ${projectWorkspaceRoot}: ${reason(error)}`, "error");
+        setWorkspaceOpenError(reason(error));
+        pushLog(`could not open ${editorWorkspaceRoot}: ${reason(error)}`, "error");
       }
     })();
     return () => {
       cancelled = true;
     };
-  }, [projectSlug, projectWorkspaceRoot, pushLog]);
+  }, [projectSlug, editorWorkspaceRoot, pushLog]);
+
+  // Finish a validated click once the matching active-session workspace has
+  // completed its async `workspace_open`. The pending selection is dropped if
+  // the user has switched projects or roots before that response arrives.
+  useEffect(() => {
+    if (!pendingActivityFile || !editorWorkspaceRoot || !workspace) return;
+    if (pendingActivityFile.projectSlug && pendingActivityFile.projectSlug !== project.slug) {
+      setPendingActivityFile(null);
+      return;
+    }
+    if (!sameWorkspaceRoot(workspace.root, editorWorkspaceRoot)) return;
+    if (
+      pendingActivityFile.workspaceRoot &&
+      !sameWorkspaceRoot(pendingActivityFile.workspaceRoot, editorWorkspaceRoot)
+    ) {
+      setPendingActivityFile(null);
+      pushLog(`ignored stale activity from another workspace: ${pendingActivityFile.path}`, "error");
+      return;
+    }
+    setActivityFile(pendingActivityFile);
+    setWorkspaceFile(pendingActivityFile.path);
+    setPendingActivityFile(null);
+  }, [editorWorkspaceRoot, pendingActivityFile, project.slug, pushLog, workspace]);
+
+  // There is no SAVE button: the project document persists itself. Any edit
+  // to `project` is written back ~800ms after the last change. `lastSavedRef`
+  // mirrors the serialization core already has, so loading or switching
+  // projects never triggers a write — only real edits do — and the initial
+  // placeholder (before hydration) is never saved over the stored project.
+  const lastSavedRef = useRef<string | null>(null);
+  const adoptSaved = useCallback((loaded: Project): Project => {
+    lastSavedRef.current = JSON.stringify(loaded);
+    return loaded;
+  }, []);
+
+  // --- 3D asset builder wiring -------------------------------------------
+  // One mutation path shared by the panel's gizmo, the agent's
+  // editor_asset_builder_apply, and undo/redo. Computed from the render-time
+  // `project` (not inside the setProject updater) because the ApplyResult must
+  // be returned synchronously to whichever caller batched the ops.
+  const applyBuilderOps = useCallback(
+    (assetId: string, ops: BuilderOp[]): ApplyResult => {
+      const asset = project.assets.find((item) => item.id === assetId);
+      const spec = (asset?.metadata?.cali as CaliSpec | undefined) ?? emptySpec(asset?.name ?? "Asset");
+      const result = applyOps(spec, ops);
+      setProject((current) => {
+        const target = current.assets.find((item) => item.id === assetId);
+        if (!target) return current;
+        return updateAsset(current, assetId, { metadata: { ...(target.metadata ?? {}), cali: result.spec } });
+      });
+      return result;
+    },
+    [project],
+  );
+
+  /** Undo/redo and open-time conversion: replace the spec wholesale, no reducer. */
+  const replaceBuilderSpec = useCallback((assetId: string, spec: CaliSpec) => {
+    setProject((current) => {
+      const target = current.assets.find((item) => item.id === assetId);
+      if (!target) return current;
+      return updateAsset(current, assetId, { metadata: { ...(target.metadata ?? {}), cali: spec } });
+    });
+  }, []);
+
+  /** Persist the project, then sync the on-disk `.cali.json` with the spec. */
+  const saveBuilderAsset = useCallback(
+    async (assetId: string) => {
+      const asset = project.assets.find((item) => item.id === assetId);
+      const spec = asset?.metadata?.cali as CaliSpec | undefined;
+      if (!asset || !spec) throw new Error(`asset ${assetId} has no cali spec to save`);
+      await rpc("project_save", { project });
+      lastSavedRef.current = JSON.stringify(project);
+      await projectAssetWrite(project.slug, assetId, JSON.stringify(spec, null, 2));
+      pushLog(`saved ${asset.name} (.cali.json synced)`);
+    },
+    [project, pushLog],
+  );
+
+  /** UI entry (ArtTab EDIT, BUILD-tab picker): convert if needed, open, focus. */
+  const openInBuilder = useCallback(
+    (assetId: string) => {
+      const asset = project.assets.find((item) => item.id === assetId);
+      if (!asset) return;
+      if (!asset.metadata?.cali) {
+        const spec = asset.type === "procedural" ? specFromProcedural(asset) : emptySpec(asset.name);
+        setProject((current) => {
+          const target = current.assets.find((item) => item.id === assetId);
+          if (!target) return current;
+          return updateAsset(current, assetId, {
+            type: "cali",
+            source: `${assetId}.cali.json`,
+            metadata: { ...(target.metadata ?? {}), cali: spec },
+          });
+        });
+      }
+      setBuilderAssetId(assetId);
+      setTab("build");
+    },
+    [project],
+  );
+
+  const focusBuilderTab = useCallback(() => setTab("build"), []);
 
   const browserTools = useBrowserTools({
     project,
     setProject,
+    adoptSaved,
     runtimeRef,
-    setModelList,
     setTestResults,
     setSelectedEntityId,
     pushLog,
+    getLogs,
+    builderAssetId,
+    setBuilderAssetId,
+    focusBuilderTab,
+    applyBuilderOps,
+    replaceBuilderSpec,
+    saveBuilderAsset,
   });
 
   useEffect(() => {
@@ -274,24 +791,76 @@ export default function App() {
     }).catch((error) => pushLog(`tool registration failed: ${reason(error)}`));
   }, [browserTools, pushLog]);
 
-  const saveProject = useCallback(async () => {
-    setExporting(true);
-    try {
-      await rpc("project_save", { project });
-      setScriptBaseline(snapshotScripts(project));
-      pushLog(`saved ${project.slug}`);
-    } catch (error) {
-      pushLog(`save failed: ${reason(error)}`, "error");
-    } finally {
-      setExporting(false);
+  // Publish the client-bundled asset-repo registry to core so the agent's
+  // asset_search "library" source can see it. The registry glob is build-time,
+  // so startup is the only moment the set can change.
+  useEffect(() => {
+    void rpc("asset_catalog_publish", { entries: catalogSnapshot() }).catch((error) =>
+      pushLog(`asset catalog publish failed: ${reason(error)}`),
+    );
+  }, [pushLog]);
+
+  useEffect(() => {
+    if (lastSavedRef.current === null) return;
+    const serialized = JSON.stringify(project);
+    if (serialized === lastSavedRef.current) return;
+    const timer = window.setTimeout(() => {
+      void rpc("project_save", { project })
+        .then(() => {
+          // Keep the dirty marker when core is unavailable so the same edit
+          // retries after recovery instead of being reported as saved.
+          lastSavedRef.current = serialized;
+          pushLog(`saved ${project.slug}`);
+        })
+        .catch((error) => pushLog(`save failed: ${reason(error)}`, "error"));
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [coreStatus, project, pushLog]);
+
+  const toggleTools = useCallback(() => {
+    if (window.matchMedia("(min-width: 1024px)").matches) {
+      setToolsAnimating(true);
+      if (toolsAnimTimer.current) window.clearTimeout(toolsAnimTimer.current);
+      toolsAnimTimer.current = window.setTimeout(() => setToolsAnimating(false), 360);
+      setToolsVisible((current) => {
+        localStorage.setItem("calicode-tools-visible", current ? "0" : "1");
+        return !current;
+      });
+    } else {
+      setToolsOpen((open) => !open);
     }
-  }, [project, pushLog]);
+  }, []);
+
+  // Repo attach/settings edits go through here; autosave does the writing.
+  const persistProject = useCallback((next: Project) => {
+    setProject(next);
+    setProjects((current) => current.map((item) => (item.slug === next.slug ? next : item)));
+  }, []);
+
+  const handleToggleRepo = useCallback(
+    (repoId: string, attach: boolean) => {
+      const next = attach ? attachRepo(project, repoId) : detachRepo(project, repoId);
+      if (next === project) return;
+      persistProject(next);
+      const name = getRepo(repoId)?.name ?? repoId;
+      pushLog(attach ? `added ${name} to ${project.title}` : `removed ${name} from ${project.title}`);
+    },
+    [project, persistProject, pushLog],
+  );
+
+  const handleRepoSetting = useCallback(
+    (repoId: string, key: string, value: RepoSettingValue) => {
+      const next = setRepoSetting(project, repoId, key, value);
+      if (next !== project) persistProject(next);
+    },
+    [project, persistProject],
+  );
 
   const openProject = useCallback(
     async (slug: string) => {
       try {
         const loaded = await rpc<Project>("project_open", { slug });
-        setProject(loaded);
+        setProject(adoptSaved(loaded));
         setScriptBaseline(snapshotScripts(loaded));
         setSelectedEntityId(null);
         setSelectedScriptId(loaded.scripts[0]?.id ?? null);
@@ -319,7 +888,12 @@ export default function App() {
     try {
       const created = await rpc<Project>("project_create", { slug, title, template: templateId });
       setProjects((current) => [...current.filter((item) => item.slug !== slug), created]);
-      setProject(created);
+      setProject(adoptSaved(created));
+      // A task belongs to exactly one game/worktree. Carrying the previously
+      // selected task into a newly created game makes AgentPanel attempt to
+      // resume it against the wrong project before the user has done anything.
+      setActiveSessionId(null);
+      setSessionRevision((current) => current + 1);
       setScriptBaseline(snapshotScripts(created));
       setSelectedEntityId(null);
       setSelectedScriptId(created.scripts[0]?.id ?? null);
@@ -342,6 +916,77 @@ export default function App() {
     return [...source].sort((left, right) => Number(pinned.has(right.slug)) - Number(pinned.has(left.slug)));
   }, [pinnedProjectSlugs, project, projects]);
 
+  // Saved transcripts grouped per game for the sidebar, newest first.
+  // Sessions with no project slug land under the currently selected game so
+  // they stay reachable.
+  const sessionsBySlug = useMemo(() => {
+    const map: Record<string, SessionSummary[]> = {};
+    for (const session of sessions) {
+      const slug = session.projectSlug ?? project.slug;
+      (map[slug] ??= []).push(session);
+    }
+    for (const list of Object.values(map)) list.sort((left, right) => right.updatedAt - left.updatedAt);
+    return map;
+  }, [project.slug, sessions]);
+
+  // Platform is fixed for the lifetime of the document.
+  const overlayControls = useMemo(hasOverlayWindowControls, []);
+
+  const toggleSidebar = () => {
+    if (window.matchMedia("(min-width: 768px)").matches) {
+      // Animate only the toggle: the same width property is also driven by
+      // the resize handle, which must track the pointer with no easing.
+      setSidebarAnimating(true);
+      if (sidebarAnimTimer.current) window.clearTimeout(sidebarAnimTimer.current);
+      sidebarAnimTimer.current = window.setTimeout(() => setSidebarAnimating(false), 360);
+      setSidebarVisible((visible) => !visible);
+    } else {
+      setSidebarDrawerOpen((open) => !open);
+    }
+  };
+
+  const pushNav = (entry: { slug: string; sessionId: string | null }) => {
+    setMainView("chat");
+    setNav((current) => {
+      const top = current.stack[current.index];
+      if (top && top.slug === entry.slug && top.sessionId === entry.sessionId) return current;
+      const stack = [...current.stack.slice(0, current.index + 1), entry];
+      return { stack, index: stack.length - 1 };
+    });
+  };
+
+  const startSession = async (slug: string) => {
+    try {
+      const created = await createSession(slug);
+      setSessions((current) => [created, ...current.filter((session) => session.id !== created.id)]);
+      pushNav({ slug, sessionId: created.id });
+      setActiveSessionId(created.id);
+      setSessionRevision((current) => current + 1);
+      if (slug !== project.slug) await openProject(slug);
+    } catch (error) {
+      pushLog(`could not create task: ${reason(error)}`, "error");
+    }
+  };
+
+  const applyNavEntry = (entry: { slug: string; sessionId: string | null }) => {
+    setMainView("chat");
+    setActiveSessionId(entry.sessionId);
+    setSessionRevision((current) => current + 1);
+    if (entry.slug !== project.slug) void openProject(entry.slug);
+  };
+
+  const goBack = () => {
+    if (nav.index <= 0) return;
+    applyNavEntry(nav.stack[nav.index - 1]);
+    setNav((current) => ({ ...current, index: current.index - 1 }));
+  };
+
+  const goForward = () => {
+    if (nav.index >= nav.stack.length - 1) return;
+    applyNavEntry(nav.stack[nav.index + 1]);
+    setNav((current) => ({ ...current, index: current.index + 1 }));
+  };
+
   const handleProjectAction = useCallback(
     (target: Project, action: ProjectMenuAction) => {
       if (action === "pin") {
@@ -356,6 +1001,12 @@ export default function App() {
         void rpc<{ path: string }>("project_reveal", { slug: target.slug })
           .then((result) => pushLog(`revealed ${result.path}`))
           .catch((error) => pushLog(`reveal failed: ${reason(error)}`, "error"));
+        return;
+      }
+      if (action === "attach") {
+        setFolderTarget(target);
+        setAttachPath(target.workspaceRoot ?? null);
+        setFolderError("");
         return;
       }
       setProjectActionError("");
@@ -378,7 +1029,7 @@ export default function App() {
           title: projectActionTitle.trim(),
         });
         setProjects((current) => current.map((item) => (item.slug === target.slug ? renamed : item)));
-        if (project.slug === target.slug) setProject(renamed);
+        if (project.slug === target.slug) setProject(adoptSaved(renamed));
         pushLog(`renamed ${target.title} to ${renamed.title}`);
       } else if (pending.action === "worktree") {
         const result = await rpc<{ project: Project; path: string; branch: string; created: boolean }>(
@@ -386,11 +1037,11 @@ export default function App() {
           { slug: target.slug },
         );
         setProjects((current) => current.map((item) => (item.slug === target.slug ? result.project : item)));
-        if (project.slug === target.slug) setProject(result.project);
+        if (project.slug === target.slug) setProject(adoptSaved(result.project));
         pushLog(`${result.created ? "created" : "reused"} ${result.branch} at ${result.path}`);
       } else if (pending.action === "archive") {
         const result = await rpc<{ deleted: number }>("session_archive_project", { slug: target.slug });
-        setSessions((current) => ({ ...current, [target.slug]: [] }));
+        setSessions((current) => current.filter((session) => session.projectSlug !== target.slug));
         if (project.slug === target.slug) {
           setActiveSessionId(null);
           setSessionRevision((current) => current + 1);
@@ -406,11 +1057,7 @@ export default function App() {
         const remaining = projects.filter((item) => item.slug !== target.slug);
         setProjects(remaining);
         setPinnedProjectSlugs((current) => current.filter((slug) => slug !== target.slug));
-        setSessions((current) => {
-          const next = { ...current };
-          delete next[target.slug];
-          return next;
-        });
+        setSessions((current) => current.filter((session) => session.projectSlug !== target.slug));
         if (project.slug === target.slug && remaining[0]) {
           setActiveSessionId(null);
           await openProject(remaining[0].slug);
@@ -463,15 +1110,31 @@ export default function App() {
     setSelectedEntityId(entity.id);
   }, []);
 
-  const handleImportImage = async (file: File) => {
+  const handleImportImage = async (file: File): Promise<Asset | null> => {
     const data = await readFileBase64(file);
-    const mime = file.type || "application/octet-stream";
+    const mime = importMime(file);
     try {
-      await rpc("asset_import_file", { slug: project.slug, name: file.name, data, mime, tags: ["imported"] });
+      if (file.name.toLowerCase().endsWith(".blend")) {
+        const imported = await rpc<Asset>("blender_asset_import", {
+          slug: project.slug,
+          name: file.name,
+          data,
+        });
+        setProject(adoptSaved(await rpc<Project>("project_open", { slug: project.slug })));
+        pushLog(`imported ${file.name}; open it in Blender to start live export`);
+        return imported;
+      }
+      const imported = await rpc<Asset>("asset_import_file", {
+        slug: project.slug,
+        name: file.name,
+        data,
+        mime,
+        tags: ["imported"],
+      });
       if (!mime.startsWith("image/")) {
-        setProject(await rpc<Project>("project_open", { slug: project.slug }));
+        setProject(adoptSaved(await rpc<Project>("project_open", { slug: project.slug })));
         pushLog(`imported ${file.name}`);
-        return;
+        return imported;
       }
       const ingest = await rpc<{ sourceHash: string; width: number; height: number }>("image3d_ingest", {
         slug: project.slug,
@@ -485,28 +1148,34 @@ export default function App() {
         height: ingest.height,
       });
       const generated = await rpc<{ assetId: string }>("image3d_generate", { slug: project.slug, spec });
-      const caliFile = await rpc<{ content: string }>("file_read", {
-        slug: project.slug,
-        path: `assets/${generated.assetId}.cali.json`,
-      });
       const loaded = await rpc<Project>("project_open", { slug: project.slug });
-      const withCali: Project = {
-        ...loaded,
-        assets: loaded.assets.map((asset) =>
-          asset.id === generated.assetId
-            ? { ...asset, metadata: { ...(asset.metadata ?? {}), cali: JSON.parse(caliFile.content) } }
-            : asset,
-        ),
-      };
-      await rpc("project_save", { project: withCali });
-      setProject(withCali);
+      const generatedAsset = loaded.assets.find((asset) => asset.id === generated.assetId);
+      if (!generatedAsset?.metadata?.cali) {
+        throw new Error(`generated asset ${generated.assetId} reopened without metadata.cali`);
+      }
+      setProject(adoptSaved(loaded));
       pushLog(`imported ${file.name} and generated image-to-3D spec`);
+      return generatedAsset;
     } catch (error) {
       pushLog(`import failed: ${reason(error)}`, "error");
+      return null;
     }
   };
 
   const selectedEntity = project.entities.find((entity) => entity.id === selectedEntityId) ?? null;
+  // Derived rather than stored so removing the asset closes the builder.
+  const builderAsset = project.assets.find((asset) => asset.id === builderAssetId) ?? null;
+  const blenderAsset = project.assets.find((asset) => asset.id === previewAssetId && isBlenderAsset(asset)) ?? null;
+
+  const openInBlender = async () => {
+    if (!blenderAsset) return;
+    try {
+      await rpc("blender_asset_open", { slug: project.slug, assetId: blenderAsset.id });
+      pushLog(`opened ${blenderAsset.name} in Blender`);
+    } catch (error) {
+      pushLog(`Blender launch failed: ${reason(error)}`, "error");
+    }
+  };
 
   const promoteAsset = (assetId: string) => {
     void browserTools.find((tool) => tool.name === "editor_promote_asset")?.handler({ id: assetId });
@@ -563,102 +1232,274 @@ export default function App() {
 
   return (
     <div className="flex h-dvh flex-col">
-      <TitleBar
-        projectTitle={project.title}
-        modelList={modelList}
-        onToggleSidebar={() => {
-          if (window.matchMedia("(min-width: 768px)").matches) {
-            setSidebarVisible((visible) => !visible);
-          } else {
-            setSidebarDrawerOpen((open) => !open);
-          }
-        }}
-        onToggleAgent={() => setAgentOpen((open) => !open)}
-      />
-
-      <div className="flex min-h-0 flex-1">
+      <div
+        ref={workbenchRef}
+        className="flex min-h-0 flex-1"
+        aria-hidden={settingsOpen || undefined}
+      >
         <GamesSidebar
           projects={displayedProjects}
           activeSlug={project.slug}
-          sessions={sessions}
+          sessions={sessionsBySlug}
           activeSessionId={activeSessionId}
-          onOpenProject={(slug) => void openProject(slug)}
+          runningSessionIds={runningSessionIds}
+          onOpenProject={(slug) => {
+            pushNav({ slug, sessionId: null });
+            setActiveSessionId(null);
+            setSessionRevision((current) => current + 1);
+            void openProject(slug);
+          }}
           onSelectSession={(slug, sessionId) => {
+            // Already viewing this transcript — reloading it would only
+            // remount AgentPanel and drop in-flight UI state. The library is
+            // a separate view, so the selected session still needs to take
+            // the user back to chat.
+            if (slug === project.slug && sessionId === activeSessionId && mainView === "chat") return;
+            pushNav({ slug, sessionId });
             setActiveSessionId(sessionId);
+            setSidebarDrawerOpen(false);
+            // Remount AgentPanel so it resumes the picked transcript.
+            setSessionRevision((current) => current + 1);
             if (slug !== project.slug) void openProject(slug);
           }}
           onNewSession={(slug) => {
-            const session: GameSession = { id: uid("session"), name: `Session ${(sessions[slug]?.length ?? 0) + 1}` };
-            setSessions((current) => ({ ...current, [slug]: [...(current[slug] ?? []), session] }));
-            setActiveSessionId(session.id);
+            void startSession(slug);
           }}
           onNewGame={() => setNewProjectOpen(true)}
           pinnedProjectSlugs={pinnedProjectSlugs}
           onProjectAction={handleProjectAction}
+          onOpenAssetsLibrary={() => {
+            setMainView("library");
+            setToolsOpen(false);
+            setSidebarDrawerOpen(false);
+          }}
+          assetsLibraryActive={mainView === "library"}
           overlay={sidebarDrawerOpen}
           width={gamesSidebar.width}
           desktopVisible={sidebarVisible}
-          workspace={workspace ? { name: workspace.name, root: workspace.root } : null}
-          onOpenFolder={() => setOpenFolderOpen(true)}
+          theme={theme}
+          onToggleTheme={() => setTheme((current) => (current === "dark" ? "light" : "dark"))}
+          onOpenSettings={() => {
+            setToolsOpen(false);
+            setSidebarDrawerOpen(false);
+            setSettingsOpen(true);
+          }}
+          onToggleSidebar={toggleSidebar}
+          canBack={nav.index > 0}
+          canForward={nav.index < nav.stack.length - 1}
+          onBack={goBack}
+          onForward={goForward}
+          animating={sidebarAnimating}
         />
 
         {sidebarVisible ? (
           <ResizeHandle
             panel={gamesSidebar}
-            bounds={GAMES_SIDEBAR}
+            bounds={sidebarBounds}
             label="Resize games sidebar"
             className="hidden md:block"
           />
         ) : null}
 
         {/* Overlay backdrop for the narrow-window drawers. */}
-        {(agentOpen || sidebarDrawerOpen) && (
+        {(toolsOpen || sidebarDrawerOpen) && (
           <button
             type="button"
             aria-label="Close panel"
             onClick={() => {
-              setAgentOpen(false);
+              setToolsOpen(false);
               setSidebarDrawerOpen(false);
             }}
             className="fixed inset-0 z-30 bg-black/60 lg:hidden"
           />
         )}
 
-        {/* The drag width applies only from lg up, where the panel is a real
-            column; below that it is an overlay drawer with its own sizing. */}
-        <aside
-          style={{ "--agent-width": `${agentPanel.width}px` } as CSSProperties}
-          className={`${
-            agentOpen ? "fixed inset-y-0 right-0 z-40 block w-[min(384px,92vw)] shadow-2xl" : "hidden"
-          } shrink-0 border-l border-white/[0.06] bg-[#0a0a0a] lg:static lg:block lg:w-[var(--agent-width)] lg:border-l-0 lg:border-r lg:shadow-none`}
-        >
-          <AgentPanel
-            key={`${project.slug}:${sessionRevision}`}
-            projectSlug={project.slug}
-            modelList={modelList}
-            browserTools={browserTools}
-            onModelChange={() =>
-              void rpc<ModelList>("model_list", {})
-                .then(setModelList)
-                .catch(() => undefined)
-            }
-            onLog={pushLog}
+        {/* Center: the agent conversation is the primary column. The hard
+            min-width is the CSS backstop for the JS panel clamps: even if a
+            stale stored width or a missed clamp over-grows a side panel, the
+            chat column (and its composer) refuses to collapse below the floor
+            the clamps aim for. */}
+        <main className="flex min-w-[360px] flex-1 flex-col bg-surface-0">
+          {/* The chat column's single header line: always present because it
+              is the window's drag surface, never more than one row tall. The
+              sidebar controls inside it only appear while the rail is out of
+              the layout (the rail carries its own set otherwise); the title
+              and the tools-dock toggle live here in both states. */}
+          <div
+            data-tauri-drag-region="deep"
+            className={`${sidebarDrawerOpen ? "hidden" : "flex"} h-10 shrink-0 select-none items-center gap-0.5 border-b border-line ${
+              overlayControls && !sidebarVisible ? "pl-[80px]" : "pl-1.5"
+            } pr-1.5`}
+          >
+            <div className={`${sidebarVisible ? "md:hidden" : ""} flex items-center gap-0.5`}>
+              <button
+                type="button"
+                aria-label="Toggle games sidebar"
+                onClick={toggleSidebar}
+                className={CHROME_ICON_BUTTON}
+              >
+                <PanelLeft aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.7} />
+              </button>
+              <button
+                type="button"
+                aria-label="Back"
+                onClick={goBack}
+                disabled={nav.index <= 0}
+                className={CHROME_ICON_BUTTON}
+              >
+                <ArrowLeft aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.7} />
+              </button>
+              <button
+                type="button"
+                aria-label="Forward"
+                onClick={goForward}
+                disabled={nav.index >= nav.stack.length - 1}
+                className={CHROME_ICON_BUTTON}
+              >
+                <ArrowRight aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.7} />
+              </button>
+            </div>
+            <span className="ml-2 min-w-0 truncate text-[13px] font-semibold text-ink-strong">
+              {mainView === "library"
+                ? "Assets Library"
+                : sessions.find((session) => session.id === activeSessionId)?.title ?? project.title}
+            </span>
+            {mainView === "chat" ? (
+              <>
+                <button
+                  type="button"
+                  aria-label="Open in Blender"
+                  title={blenderAsset ? `Open ${blenderAsset.name} in Blender` : "Preview an imported .blend asset first"}
+                  disabled={!blenderAsset}
+                  onClick={() => void openInBlender()}
+                  className={`${CHROME_ICON_BUTTON} ml-auto w-auto gap-1.5 rounded-lg border border-line bg-raised pl-1.5 pr-2.5`}
+                >
+                  <span className="inline-flex h-[18px] w-[18px] shrink-0 items-center justify-center rounded bg-primary">
+                    <img data-blender-logo aria-hidden alt="" src={blenderLogo} className="h-3.5 w-3.5" />
+                  </span>
+                  <span className="whitespace-nowrap text-[12px] font-medium text-ink-strong">Open in</span>
+                  <ChevronDown aria-hidden className="h-[14px] w-[14px] text-ink-subtle" strokeWidth={1.7} />
+                </button>
+                <button
+                  type="button"
+                  aria-label="Toggle tools panel"
+                  onClick={toggleTools}
+                  className={CHROME_ICON_BUTTON}
+                >
+                  <PanelRight aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.7} />
+                </button>
+              </>
+            ) : null}
+          </div>
+
+          {coreStatus !== "ready" ? (
+            <div
+              data-core-status={coreStatus}
+              role={coreStatus === "offline" ? "alert" : "status"}
+              className="flex shrink-0 items-center justify-between gap-3 border-b border-line bg-surface-1 px-3 py-2 text-xs text-ink-subtle"
+            >
+              <span>
+                {coreStatus === "offline"
+                  ? coreHydratedRef.current
+                    ? "Core is offline. Your current game remains visible; saves will retry when it reconnects."
+                    : "Core is offline. This is a local Starter preview; saved games and edits are not connected."
+                  : "Connecting to CaliCode core…"}
+              </span>
+              {coreStatus === "offline" ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (coreHydratedRef.current) {
+                      // A hydrated game may contain edits newer than core's
+                      // disk copy. Reconnect transport only; the ready
+                      // transition retries dirty autosave without reopening
+                      // and replacing the active document.
+                      void rpc("ping").catch(() => {});
+                    } else {
+                      setCoreRetry((current) => current + 1);
+                    }
+                  }}
+                  className="shrink-0 rounded px-2 py-1 font-medium text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong focus-visible:outline-none"
+                >
+                  Retry
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
+          {mainView === "library" ? (
+            <AssetsLibraryPage
+              installedRepoIds={Object.keys(attachedRepos(project))}
+              onInstall={(repoId) => handleToggleRepo(repoId, true)}
+              onUninstall={(repoId) => handleToggleRepo(repoId, false)}
+              projectTitle={project.title}
+            />
+          ) : (
+            <AgentPanel
+              key={`${project.slug}:${sessionRevision}`}
+              projectSlug={project.slug}
+              workspaceRoot={editorWorkspaceRoot}
+              modelList={modelList}
+              browserTools={browserTools}
+              initialSessionId={activeSessionId}
+              onSessionsChanged={setSessions}
+              onSessionActivated={(created) => {
+                setSessions((current) => [created, ...current.filter((session) => session.id !== created.id)]);
+                setActiveSessionId(created.id);
+                setNav((current) => {
+                  const stack = [...current.stack];
+                  stack[current.index] = { slug: created.projectSlug ?? project.slug, sessionId: created.id };
+                  return { ...current, stack };
+                });
+              }}
+              onModelChange={() =>
+                void rpc<ModelList>("model_list", {})
+                  .then(setModelList)
+                  .catch(() => undefined)
+              }
+              onLog={pushLog}
+              onOpenActivityFile={openActivityFile}
+              onActiveSessionChange={handleActiveSessionChange}
+              onSessionRunningChange={handleSessionRunningChange}
+            />
+          )}
+        </main>
+
+        {mainView === "chat" ? (
+          <ResizeHandle
+            panel={toolsPanel}
+            bounds={toolsBounds}
+            label="Resize tools panel"
+            className={toolsVisible ? "hidden lg:block" : "hidden"}
           />
-        </aside>
+        ) : null}
 
-        <ResizeHandle panel={agentPanel} bounds={AGENT_PANEL} label="Resize agent panel" className="hidden lg:block" />
-
-        <main className="flex min-w-0 flex-1 flex-col bg-[#080808]">
+        {/* Right: the game tools dock — PLAY/CODE/ART/SCENE/TEST over the
+            always-mounted viewport. The drag width applies only from lg up,
+            where the dock is a real column; below that it is an overlay
+            drawer with its own sizing. */}
+        {mainView === "chat" ? (
+          <aside
+            data-tools-panel
+            style={{ "--tools-width": `${toolsPanel.width}px` } as CSSProperties}
+            className={`${
+              toolsOpen ? "fixed inset-y-0 right-0 z-40 flex w-[min(720px,94vw)] shadow-2xl" : "hidden"
+            } max-w-[960px] shrink-0 flex-col overflow-hidden bg-surface-0 lg:static lg:flex lg:shadow-none ${
+              toolsVisible
+                ? "lg:visible lg:w-[var(--tools-width)] lg:min-w-[360px] lg:border-l lg:border-line"
+                : "lg:invisible lg:w-0 lg:min-w-0 lg:border-l-0"
+            } ${
+              toolsAnimating
+                ? "lg:[transition:width_300ms_ease,min-width_300ms_ease,border-width_300ms_ease,visibility_300ms]"
+                : ""
+            }`}
+          >
           <WorkspaceTabs
             active={tab}
             onChange={setTab}
             badges={{ test: failing || undefined }}
             // Without a workspace there is no preview server; core serves no
             // /play route, and the old label hardcoded port 5199.
-            previewUrl={workspace ? workspace.root : `project · ${project.slug}`}
-            onNewGame={() => setNewProjectOpen(true)}
-            onExport={() => void saveProject()}
-            exporting={exporting}
           />
 
           <div className="relative min-h-0 flex-1">
@@ -719,11 +1560,18 @@ export default function App() {
 
             {tab === "code" && workspace ? (
               <div role="tabpanel" id="workspace-panel-code" aria-labelledby="workspace-tab-code" className="absolute inset-0 flex min-h-0">
-                <div className="min-h-0 shrink-0 border-r border-white/[0.06]" style={{ width: fileTreePanel.width }}>
+                <div className="min-h-0 shrink-0 border-r border-line" style={{ width: fileTreePanel.width }}>
                   <FileTree
                     workspaceId={workspace.id}
                     activePath={workspaceFile}
-                    onOpenFile={setWorkspaceFile}
+                    onOpenFile={(path) => {
+                      // A direct tree click intentionally leaves activity
+                      // mode; otherwise an old agent diff would snap back
+                      // over the file the user just selected.
+                      setActivityFile(null);
+                      setPendingActivityFile(null);
+                      setWorkspaceFile(path);
+                    }}
                     onError={handleWorkspaceError}
                   />
                 </div>
@@ -732,6 +1580,7 @@ export default function App() {
                   <FileEditor
                     workspaceId={workspace.id}
                     path={workspaceFile}
+                    activityFile={activityFile}
                     onSaved={handleWorkspaceSaved}
                     onError={handleWorkspaceError}
                   />
@@ -763,6 +1612,8 @@ export default function App() {
             {tab === "art" ? (
               <div role="tabpanel" id="workspace-panel-art" aria-labelledby="workspace-tab-art" className="absolute inset-0">
                 <ArtTab
+                  slug={project.slug}
+                  theme={theme}
                   assets={project.assets}
                   entities={project.entities}
                   onGenerate={(created) =>
@@ -775,9 +1626,54 @@ export default function App() {
                       assets: current.assets.filter((asset) => asset.id !== assetId),
                     }))
                   }
-                  onImportImage={(file) => void handleImportImage(file)}
+                  onImportImage={handleImportImage}
                   onLog={pushLog}
+                  onPreviewAssetChange={(asset) => setPreviewAssetId(asset?.id ?? null)}
+                  onEdit={openInBuilder}
                 />
+              </div>
+            ) : null}
+
+            {tab === "build" ? (
+              <div role="tabpanel" id="workspace-panel-build" aria-labelledby="workspace-tab-build" className="absolute inset-0">
+                {builderAsset ? (
+                  <AssetBuilder
+                    asset={builderAsset}
+                    entities={project.entities}
+                    slug={project.slug}
+                    onApply={applyBuilderOps}
+                    onReplaceSpec={replaceBuilderSpec}
+                    onSave={saveBuilderAsset}
+                    onClose={() => setBuilderAssetId(null)}
+                  />
+                ) : (
+                  <div className="flex h-full min-h-0 flex-col overflow-y-auto px-[22px] py-[18px]">
+                    <span className="font-display text-[15px] font-bold text-ink-strong">Asset builder</span>
+                    <p className="mt-1 text-xs text-ink-subtle">
+                      Pick an asset to edit, or ask the agent to open one for you.
+                    </p>
+                    {project.assets.length === 0 ? (
+                      <p className="mt-4 text-xs text-ink-subtle">No assets yet — generate some in ART first.</p>
+                    ) : (
+                      <ul className="mt-4 space-y-1.5">
+                        {project.assets.map((asset) => (
+                          <li key={asset.id}>
+                            <button
+                              type="button"
+                              onClick={() => openInBuilder(asset.id)}
+                              className="flex w-full items-center gap-2 rounded-md border border-line bg-surface-1 px-3 py-2 text-left text-xs text-ink transition-colors hover:border-ink-faint focus-visible:outline-none"
+                            >
+                              <span className="min-w-0 flex-1 truncate">{asset.name}</span>
+                              <span className="shrink-0 text-[10px] uppercase tracking-[0.08em] text-ink-faint">
+                                {asset.type}
+                              </span>
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                )}
               </div>
             ) : null}
 
@@ -825,15 +1721,63 @@ export default function App() {
                 />
               </div>
             ) : null}
+
+            {tab === "reports" ? (
+              <div
+                role="tabpanel"
+                id="workspace-panel-reports"
+                aria-labelledby="workspace-tab-reports"
+                className="@container absolute inset-0"
+              >
+                <ReportsTab
+                  projectSlug={project.slug}
+                  coreStatus={coreStatus}
+                  canOpenFiles={Boolean(workspace)}
+                  workspaceRoot={workspace?.root}
+                  onOpenFile={(path) => {
+                    if (!workspace || !isSafeActivityPath(path, workspace.root)) return;
+                    void readWorkspaceFile(workspace.id, path)
+                      .then(() => {
+                        setActivityFile(null);
+                        setPendingActivityFile(null);
+                        setWorkspaceFile(path);
+                        setTab("code");
+                      })
+                      .catch((error) => pushLog(`cannot open ${path}: ${reason(error)}`, "error"));
+                  }}
+                />
+              </div>
+            ) : null}
           </div>
 
           <LiveBar stats={stats} pieState={pieState} logs={logs} />
-        </main>
+          </aside>
+        ) : null}
       </div>
 
-      <Dialog open={openFolderOpen} onOpenChange={setOpenFolderOpen}>
+      <SettingsPage
+        open={settingsOpen}
+        onClose={closeSettings}
+        modelList={modelList}
+        projectSlug={project.slug}
+        theme={theme}
+        onThemeChange={setTheme}
+        onChanged={() =>
+          void rpc<ModelList>("model_list", {})
+            .then(setModelList)
+            .catch(() => undefined)
+        }
+      />
+
+      <Dialog
+        open={folderTarget !== null}
+        onOpenChange={(open) => {
+          if (folderBusy) return;
+          if (!open) closeAttachDialog();
+        }}
+      >
         <DialogContent className="max-w-lg">
-          <DialogTitle>Open folder as a live project</DialogTitle>
+          <DialogTitle>{folderTarget ? `Attach a folder to ${folderTarget.title}` : ""}</DialogTitle>
           <DialogDescription>
             CaliCode edits this folder in place and runs its own dev server. It must contain a package.json or a
             .git directory.
@@ -845,23 +1789,27 @@ export default function App() {
               void attachFolder();
             }}
           >
-            <Label htmlFor="workspace-path">Absolute path</Label>
-            <Input
-              id="workspace-path"
-              className="mt-1"
-              value={folderPath}
-              onChange={(event) => setFolderPath(event.target.value)}
-              autoFocus
-              placeholder="/Users/you/code/my-game"
+            <FolderPicker
+              value={attachPath}
+              onChange={(path) => {
+                setFolderError("");
+                setAttachPath(path);
+              }}
+              disabled={folderBusy}
             />
+            {folderError ? (
+              <p role="alert" className="mt-2 text-xs text-danger-soft">
+                {folderError}
+              </p>
+            ) : null}
             <div className="mt-3 flex justify-end gap-2">
               <DialogClose asChild>
-                <Button type="button" variant="ghost" size="sm">
+                <Button type="button" variant="ghost" size="sm" disabled={folderBusy}>
                   Cancel
                 </Button>
               </DialogClose>
-              <Button type="submit" size="sm" disabled={!folderPath.trim()}>
-                Open
+              <Button type="submit" size="sm" disabled={!attachPath || folderBusy}>
+                {folderBusy ? "Attaching..." : "Attach"}
               </Button>
             </div>
           </form>
@@ -877,6 +1825,7 @@ export default function App() {
           if (open) setNewProjectError("");
         }}
         onCreate={createProject}
+        onOpenFolder={openFolderAsGame}
       />
 
       <Dialog
@@ -888,11 +1837,11 @@ export default function App() {
           }
         }}
       >
-        <DialogContent className="max-w-sm border-white/[0.1] bg-[#1d1d1c] text-[#eceae7] shadow-[0_24px_80px_rgba(0,0,0,0.6)]">
+        <DialogContent className="max-w-sm border-line bg-popover text-ink-strong shadow-[0_24px_80px_rgba(0,0,0,0.6)]">
           {pendingProjectAction ? (
             <>
               <DialogTitle>{projectActionDialogTitle(pendingProjectAction.action)}</DialogTitle>
-              <DialogDescription className="mt-1 leading-relaxed text-[#aaa7a1]">
+              <DialogDescription className="mt-1 leading-relaxed text-ink-subtle">
                 {projectActionDialogDescription(pendingProjectAction)}
               </DialogDescription>
 
@@ -907,12 +1856,12 @@ export default function App() {
                   <Label htmlFor="edit-project-title">Project name</Label>
                   <Input
                     id="edit-project-title"
-                    className="mt-1 border-white/[0.12] bg-[#111110]"
+                    className="mt-1 border-line-strong bg-surface-1"
                     value={projectActionTitle}
                     onChange={(event) => setProjectActionTitle(event.target.value)}
                     autoFocus
                   />
-                  {projectActionError ? <p className="mt-2 text-xs text-[#f0a29b]">{projectActionError}</p> : null}
+                  {projectActionError ? <p className="mt-2 text-xs text-danger-soft">{projectActionError}</p> : null}
                   <ProjectActionButtons
                     busy={projectActionBusy}
                     disabled={!projectActionTitle.trim()}
@@ -922,11 +1871,11 @@ export default function App() {
               ) : (
                 <div className="mt-4">
                   {pendingProjectAction.action === "worktree" && !pendingProjectAction.project.workspaceRoot ? (
-                    <p className="rounded-md border border-[#b6803c]/30 bg-[#8b5e25]/10 px-3 py-2 text-xs leading-relaxed text-[#d8b47f]">
+                    <p className="rounded-md border border-[#b6803c]/40 bg-[#8b5e25]/10 px-3 py-2 text-xs leading-relaxed text-[#8a5c22] dark:text-[#d8b47f]">
                       Attach a Git project folder first, then run this action again.
                     </p>
                   ) : null}
-                  {projectActionError ? <p className="mt-2 text-xs text-[#f0a29b]">{projectActionError}</p> : null}
+                  {projectActionError ? <p className="mt-2 text-xs text-danger-soft">{projectActionError}</p> : null}
                   <ProjectActionButtons
                     busy={projectActionBusy}
                     disabled={pendingProjectAction.action === "worktree" && !pendingProjectAction.project.workspaceRoot}
@@ -969,7 +1918,7 @@ function ProjectActionButtons({
         size="sm"
         disabled={busy || disabled}
         onClick={onConfirm}
-        className={destructive ? "bg-[#a83d35] text-white hover:bg-[#bd4b42]" : ""}
+        className={destructive ? "bg-destructive text-destructive-foreground hover:bg-destructive/90" : ""}
       >
         {busy ? "Working..." : confirmLabel}
       </Button>
@@ -1031,8 +1980,8 @@ function ResizeHandle({ panel, bounds, label, className = "" }: ResizeHandleProp
       onPointerDown={panel.onDragStart}
       onKeyDown={panel.onKeyDown}
       onDoubleClick={panel.reset}
-      className={`w-[5px] shrink-0 cursor-col-resize transition-colors hover:bg-white/15 active:bg-white/25 focus-visible:bg-white/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/40 ${
-        panel.isDragging ? "bg-white/25" : "bg-transparent"
+      className={`w-[5px] shrink-0 cursor-col-resize transition-colors hover:bg-surface-3 active:bg-line-strong focus-visible:bg-surface-3 focus-visible:outline-none ${
+        panel.isDragging ? "bg-line-strong" : "bg-transparent"
       } ${className}`}
     />
   );
@@ -1043,34 +1992,9 @@ function reason(error: unknown): string {
 }
 
 /**
- * Sessions, validated on read.
- *
- * This used to JSON.parse without checking the shape, so a corrupted value —
- * `"null"`, or any slug mapped to a non-array — threw inside GamesSidebar and
- * white-screened the editor with no error boundary. The bad value persisted,
- * so every reload crashed again and only clearing localStorage recovered.
- * readView already validated; this now matches it.
+ * Pinned slugs, validated on read — a corrupted localStorage value must not
+ * white-screen the editor (readView validates for the same reason).
  */
-function readSessions(): Record<string, GameSession[]> {
-  try {
-    const raw = localStorage.getItem(SESSIONS_KEY);
-    const parsed: unknown = raw ? JSON.parse(raw) : {};
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
-
-    const clean: Record<string, GameSession[]> = {};
-    for (const [slug, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (!Array.isArray(value)) continue;
-      clean[slug] = value.filter(
-        (item): item is GameSession =>
-          typeof item === "object" && item !== null && typeof (item as GameSession).id === "string",
-      );
-    }
-    return clean;
-  } catch {
-    return {};
-  }
-}
-
 function readPinnedProjects(): string[] {
   try {
     const raw = localStorage.getItem(PINNED_PROJECTS_KEY);
@@ -1086,6 +2010,11 @@ function readPinnedProjects(): string[] {
 async function readFileBase64(file: File): Promise<string> {
   const bytes = new Uint8Array(await file.arrayBuffer());
   let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
+  // Blender sources can be large. Chunking avoids one string append per byte
+  // and stays under JavaScript engines' argument-count limit.
+  const chunkSize = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunkSize));
+  }
   return btoa(binary);
 }

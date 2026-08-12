@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { Entity, Vec3 } from "../../lib/types";
 
 interface EntityPropertiesProps {
@@ -19,7 +19,7 @@ interface EntityPropertiesProps {
 export function EntityProperties({ entity, onChange, onRemove }: EntityPropertiesProps) {
   if (!entity) {
     return (
-      <div className="flex h-full items-center justify-center px-4 text-center text-xs text-[#8f8f8f]">
+      <div className="flex h-full items-center justify-center px-4 text-center text-xs text-ink-subtle">
         Select a node to edit its transform and material.
       </div>
     );
@@ -45,7 +45,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
     <div className="flex h-full min-h-0 flex-col overflow-y-auto p-3.5">
       <div className="calicode-label mb-2.5">Properties</div>
 
-      <label className="mb-1 block text-[10.5px] text-[#8f8f8f]" htmlFor="entity-name">
+      <label className="mb-1 block text-[10.5px] text-ink-subtle" htmlFor="entity-name">
         Name
       </label>
       <input
@@ -56,7 +56,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
         onKeyDown={(event) => {
           if (event.key === "Enter") event.currentTarget.blur();
         }}
-        className="mb-3.5 w-full rounded-md border border-white/10 bg-[#101010] px-2.5 py-1.5 text-xs text-[#d0d0d0] outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
+        className="mb-3.5 w-full rounded-md border border-line bg-surface-1 px-2.5 py-1.5 text-xs text-ink-strong outline-none transition-colors"
       />
 
       {(
@@ -67,61 +67,157 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
         ] as const
       ).map(([key, label, step]) => (
         <div key={key} className="mb-3">
-          <div className="mb-1 text-[10.5px] text-[#8f8f8f]">{label}</div>
+          <div className="mb-1 text-[10.5px] text-ink-subtle">{label}</div>
           <div className="grid grid-cols-3 gap-1.5">
             {(["X", "Y", "Z"] as const).map((axisLabel, axis) => (
-              <input
+              <NumericField
                 key={axisLabel}
-                type="number"
                 step={step}
                 aria-label={`${label} ${axisLabel}`}
                 value={entity.transform[key][axis as 0 | 1 | 2]}
-                onChange={(event) => setVec(key, axis as 0 | 1 | 2, Number(event.target.value))}
-                className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
+                onCommit={(value) => setVec(key, axis as 0 | 1 | 2, value)}
+                className="w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong outline-none transition-colors"
               />
             ))}
           </div>
         </div>
       ))}
 
-      <div className="mb-1 text-[10.5px] text-[#8f8f8f]">Material</div>
+      <div className="mb-1 text-[10.5px] text-ink-subtle">Material</div>
       <div className="mb-3.5 grid grid-cols-3 gap-1.5">
         <input
           type="color"
           aria-label="Colour"
           value={color}
           onChange={(event) => onChange({ material: { ...material, color: event.target.value } })}
-          className="h-[30px] w-full rounded-md border border-white/10 bg-[#101010] p-1 outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
+          className="h-[30px] w-full rounded-md border border-line bg-surface-1 p-1 outline-none transition-colors"
         />
-        <input
-          type="number"
+        <NumericField
           step={0.05}
           min={0}
           max={1}
           aria-label="Metalness"
           value={metalness}
-          onChange={(event) => onChange({ material: { ...material, metalness: Number(event.target.value) } })}
-          className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
+          onCommit={(value) => onChange({ material: { ...material, metalness: value } })}
+          className="w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong outline-none transition-colors"
         />
-        <input
-          type="number"
+        <NumericField
           step={0.05}
           min={0}
           max={1}
           aria-label="Roughness"
           value={roughness}
-          onChange={(event) => onChange({ material: { ...material, roughness: Number(event.target.value) } })}
-          className="w-full rounded-md border border-white/10 bg-[#101010] px-2 py-1.5 text-xs text-[#d0d0d0] outline-none transition-colors focus-visible:border-white/30 focus-visible:ring-1 focus-visible:ring-white/30"
+          onCommit={(value) => onChange({ material: { ...material, roughness: value } })}
+          className="w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong outline-none transition-colors"
         />
       </div>
 
       <button
         type="button"
         onClick={() => onRemove(entity.id)}
-        className="mt-auto rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#8f8f8f] transition-colors hover:border-[#c98b8b]/50 hover:text-[#c98b8b] active:border-[#c98b8b]/70 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-[#c06060]/50"
+        className="mt-auto rounded-md border border-line py-2 text-[11px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-danger-soft active:border-danger-soft focus-visible:outline-none"
       >
         DELETE ENTITY
       </button>
     </div>
   );
+}
+
+interface NumericFieldProps {
+  value: number;
+  step: number;
+  min?: number;
+  max?: number;
+  "aria-label": string;
+  className: string;
+  onCommit: (value: number) => void;
+}
+
+/**
+ * Keep the text the user is typing separate from the project number.
+ *
+ * A controlled `type="number"` input cannot represent intermediate values such
+ * as `-` or `1.`: the browser sanitizes them, and converting every change with
+ * `Number()` commits `NaN` or collapses the decimal before the next keystroke.
+ * Text input plus decimal keyboard hints preserves those states until blur or
+ * until a complete finite number is available.
+ */
+function NumericField({ value, step, min, max, onCommit, ...props }: NumericFieldProps) {
+  const [draft, setDraft] = useState(() => formatNumber(value));
+  const [dirty, setDirty] = useState(false);
+  const lastCommittedDraft = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!dirty) {
+      setDraft(formatNumber(value));
+      lastCommittedDraft.current = null;
+    }
+  }, [value]);
+
+  const clamp = (next: number) => {
+    if (min !== undefined && next < min) return min;
+    if (max !== undefined && next > max) return max;
+    return next;
+  };
+
+  const parse = (raw: string): number | null => {
+    const trimmed = raw.trim();
+    // Accept decimal/exponent forms but leave a lone sign, trailing exponent,
+    // or empty string as an editable intermediate state.
+    if (!/^[+-]?(?:(?:\d+(?:\.\d+)?)|(?:\.\d+))(?:e[+-]?\d+)?$/i.test(trimmed)) return null;
+    const parsed = Number(trimmed);
+    return Number.isFinite(parsed) ? clamp(parsed) : null;
+  };
+
+  const commit = (raw: string): number | null => {
+    const parsed = parse(raw);
+    if (parsed === null) return null;
+    if (raw === lastCommittedDraft.current) return parsed;
+    lastCommittedDraft.current = raw;
+    onCommit(parsed);
+    return parsed;
+  };
+
+  return (
+    <input
+      {...props}
+      type="text"
+      inputMode="decimal"
+      autoComplete="off"
+      data-numeric-input
+      data-step={step}
+      value={draft}
+      onChange={(event) => {
+        const next = event.target.value;
+        setDraft(next);
+        setDirty(true);
+        commit(next);
+      }}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          const committed = commit(draft);
+          setDraft(formatNumber(committed ?? value));
+          setDirty(false);
+          event.currentTarget.blur();
+          return;
+        }
+        if (event.key !== "ArrowUp" && event.key !== "ArrowDown") return;
+        event.preventDefault();
+        const current = parse(draft) ?? value;
+        const next = clamp(current + (event.key === "ArrowUp" ? step : -step));
+        setDraft(formatNumber(next));
+        setDirty(true);
+        commit(formatNumber(next));
+      }}
+      onBlur={() => {
+        const committed = commit(draft);
+        setDraft(formatNumber(committed ?? value));
+        setDirty(false);
+      }}
+    />
+  );
+}
+
+function formatNumber(value: number): string {
+  return Number.isFinite(value) ? String(value) : "";
 }

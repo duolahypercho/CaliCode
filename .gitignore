@@ -15,3 +15,17 @@ client/.e2e-projects/
 
 # e2e scratch config
 client/.e2e-config.yaml
+
+# isolated projects, sessions, worktrees, and config for Playwright
+client/.e2e-state/
+
+# local agent sessions and vite's dep cache
+client/sessions/
+.vite/
+
+# screenshots captured while verifying UI work by hand
+.verify-*.png
+.verify-*.jpg
+
+# playwright scratch worktrees (embedded git repos)
+client/worktrees/

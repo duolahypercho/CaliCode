@@ -96,13 +96,13 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
             aria-expanded={node.kind === "dir" ? open : undefined}
             style={{ paddingLeft: `${depth * 12 + 8}px` }}
             aria-busy={pending.has(node.path) || undefined}
-            className={`flex min-h-[28px] w-full items-center gap-1.5 rounded py-[5px] pr-2 text-left text-[12px] transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 focus-visible:ring-inset ${
+            className={`flex min-h-[28px] w-full items-center gap-1.5 rounded py-[5px] pr-2 text-left text-[12px] transition-colors focus-visible:outline-none ${
               active
-                ? "bg-white/[0.08] text-[#dcdcdc] active:bg-white/[0.1]"
-                : "text-[#8f8f8f] hover:bg-white/[0.03] hover:text-[#c6c6c6] active:bg-white/[0.05]"
+                ? "bg-surface-3 text-ink-strong active:bg-surface-3"
+                : "text-ink-subtle hover:bg-surface-2 hover:text-ink active:bg-surface-3"
             }`}
           >
-            <span aria-hidden className="w-2.5 shrink-0 text-[9px] text-[#8f8f8f]">
+            <span aria-hidden className="w-2.5 shrink-0 text-[9px] text-ink-subtle">
               {node.kind === "dir" ? (pending.has(node.path) ? "◌" : open ? "▾" : "▸") : ""}
             </span>
             <span className="min-w-0 flex-1 truncate">{node.name}</span>
@@ -116,20 +116,20 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
     <div className="h-full overflow-y-auto py-2">
       <div className="calicode-label px-3 pb-2">Files</div>
       {loading ? (
-        <p className="px-3 text-xs text-[#8f8f8f]">Loading…</p>
+        <p className="px-3 text-xs text-ink-subtle">Loading…</p>
       ) : failure ? (
-        <div role="alert" className="px-3 text-xs text-[#c98b8b]">
+        <div role="alert" className="px-3 text-xs text-danger-soft">
           <p className="leading-[1.5]">Could not read the file tree. {failure}</p>
           <button
             type="button"
             onClick={() => setAttempt((current) => current + 1)}
-            className="mt-2 rounded border border-white/[0.12] px-2.5 py-1 text-[10px] tracking-[0.12em] text-[#d4d4d4] hover:border-white/30"
+            className="mt-2 rounded border border-line-strong px-2.5 py-1 text-[10px] tracking-[0.12em] text-ink-strong"
           >
             RETRY
           </button>
         </div>
       ) : roots.length === 0 ? (
-        <p className="px-3 text-xs text-[#8f8f8f]">Nothing to show.</p>
+        <p className="px-3 text-xs text-ink-subtle">Nothing to show.</p>
       ) : (
         renderNodes(roots, 0)
       )}

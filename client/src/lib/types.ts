@@ -89,7 +89,23 @@ export interface AgentMessage {
   role: "user" | "assistant" | "tool";
   content: string;
   tool?: string;
+  /** Tool rows only: lifecycle of the execution. Absent = informational line. */
+  status?: "running" | "done" | "error";
+  /** Tool rows only: full output, shown when the row is expanded. */
+  detail?: string;
+  /** Provider tool-call identity; pairing must not rely on tool names. */
+  toolCallId?: string;
+  /** Client-owned Enter-level activity grouping identity. */
+  turnId?: string;
+  /** Activity marker/tool start timestamp (epoch milliseconds). */
+  startedAtMs?: number;
+  /** Activity marker/tool completion timestamp (epoch milliseconds). */
+  completedAtMs?: number;
+  /** Bounded file change metadata; raw before/after snapshots are omitted. */
+  activity?: import("./activity").ActivityFileChange;
 }
+
+export type { ActivityFileChange } from "./activity";
 
 export interface BrowserTool {
   name: string;

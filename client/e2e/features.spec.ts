@@ -6,6 +6,26 @@ const PNG_1PX =
 const openTab = (page: import("@playwright/test").Page, name: string) =>
   page.getByRole("tab", { name, exact: true }).click();
 
+async function callRpc(
+  page: import("@playwright/test").Page,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<unknown> {
+  return page.evaluate(
+    async ({ rpcMethod, rpcParams }) => {
+      const response = await fetch("/rpc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method: rpcMethod, params: rpcParams }),
+      });
+      const envelope = (await response.json()) as { result?: unknown; error?: { message?: string } };
+      if (!response.ok || envelope.error) throw new Error(envelope.error?.message ?? `RPC ${rpcMethod} failed`);
+      return envelope.result;
+    },
+    { rpcMethod: method, rpcParams: params },
+  );
+}
+
 test("art tab generates a batch of real assets and promotes one", async ({ page }) => {
   await page.goto("/");
   await openTab(page, "art");
@@ -29,11 +49,16 @@ test("art tab generates a batch of real assets and promotes one", async ({ page 
 test("new game creates a project and switches the workspace to it", async ({ page }) => {
   const title = `E2E ${Date.now()}`;
   await page.goto("/");
-  await page.locator("main").getByRole("button", { name: "NEW GAME" }).click();
-  await page.getByLabel("Name").fill(title);
-  await page.getByRole("button", { name: "Create & open" }).click();
+  await page.locator("aside").first().getByRole("button", { name: "New game" }).click();
+  // The dialog is two-step: name the game, then pick a template.
+  await page.getByPlaceholder("Project name").fill(title);
+  await page.getByRole("button", { name: "Continue" }).click();
+  await page.getByRole("group", { name: "Templates" }).getByRole("button").first().click();
+  await page.getByRole("button", { name: "Create game" }).click();
 
-  await expect(page.locator("header").getByText(title, { exact: false })).toBeVisible();
+  // The new game becomes the selected row in the sidebar and the agent
+  // panel's header names it.
+  await expect(page.locator("aside").first().getByRole("button", { name: new RegExp(title) }).first()).toBeVisible();
 });
 
 test("scene tab graphs entities, scripts and their edges", async ({ page }) => {
@@ -99,11 +124,22 @@ test("generated cali asset promotes into the scene", async ({ page }) => {
   await expect(page.getByRole("button", { name: /cali\.png/i }).first()).toBeVisible();
 });
 
-test("save persists the project and the test tab runs the suite", async ({ page }) => {
+test("edits autosave the project and the test tab runs the suite", async ({ page }) => {
   await page.goto("/");
-  await page.getByRole("button", { name: "SAVE", exact: true }).click();
+  // There is no SAVE button: renaming an entity should persist on its own.
+  // Key Light is the one entity no playtest script asserts on by name, and
+  // the rename flips a marker suffix so the test is stateless across runs —
+  // the autosave debounce can outlive the page, so a restore step would be
+  // racy.
+  await openTab(page, "scene");
+  const scenePanel = page.locator("#workspace-panel-scene");
+  await scenePanel.getByRole("button", { name: /Key Light/ }).first().click();
+  const nameField = scenePanel.getByLabel("Name");
+  const current = await nameField.inputValue();
+  await nameField.fill(current.endsWith(" *") ? current.slice(0, -2) : `${current} *`);
+  await nameField.press("Enter");
   await page.getByRole("button", { name: /CONSOLE/ }).click();
-  await expect(page.getByText(/saved starter/i)).toBeVisible();
+  await expect(page.getByText(/saved starter/i).first()).toBeVisible({ timeout: 10_000 });
 
   await openTab(page, "test");
   await page.getByRole("button", { name: "Run playtest" }).click();
@@ -113,17 +149,17 @@ test("save persists the project and the test tab runs the suite", async ({ page 
   await expect(page.getByRole("button", { name: "NOTHING TO FIX" })).toBeVisible();
 });
 
-test("games sidebar nests agent sessions under each game", async ({ page }) => {
+test("each game row can start a fresh chat scoped to that game", async ({ page }) => {
   await page.goto("/");
   const sidebar = page.locator("aside").first();
   const game = sidebar.getByRole("button", { name: /Starter/i }).first();
+  await game.hover();
 
-  // The active game starts expanded, so an unconditional click closes it.
-  if ((await game.getAttribute("aria-expanded")) !== "true") await game.click();
-  await expect(game).toHaveAttribute("aria-expanded", "true");
+  await sidebar.getByRole("button", { name: /New chat in.*Starter/i }).click();
 
-  await sidebar.getByRole("button", { name: "+ new session" }).click();
-  await expect(sidebar.getByRole("button", { name: /Session 1/ })).toBeVisible();
+  // A fresh chat opens over an empty transcript, naming the game it lives in.
+  await expect(page.locator("[data-empty-game-hint]")).toBeVisible();
+  await expect(page.locator("[data-empty-game-hint]")).toContainText("starter");
 });
 
 test("agent panel exposes model and subagent controls", async ({ page }) => {
@@ -134,17 +170,78 @@ test("agent panel exposes model and subagent controls", async ({ page }) => {
   await expect(page.getByLabel("Permission mode")).toBeVisible();
   await expect(page.getByLabel("Active model")).toBeVisible();
   await expect(page.getByRole("button", { name: "Send message" })).toBeVisible();
+  const openInBlender = page.getByLabel("Open in Blender");
+  await expect(openInBlender).toBeVisible();
+  await expect(openInBlender).toContainText("Open in");
+  await expect(openInBlender).not.toContainText("Blender");
+  await expect(openInBlender.locator("[data-blender-logo]")).toBeVisible();
 
   const composerRadius = await page.locator("[data-agent-composer]").evaluate((element) =>
     Number.parseFloat(getComputedStyle(element).borderRadius),
   );
   expect(composerRadius).toBeGreaterThanOrEqual(20);
 
-  await page.getByLabel("Session settings").click();
-  await expect(page.getByLabel("Model provider")).toBeVisible();
-  await expect(page.getByLabel("Target model")).toBeVisible();
-  await expect(page.getByLabel("Switch model")).toBeVisible();
-  await expect(page.getByLabel("Spawn subagent")).toBeVisible();
+  // The old ··· session menu is gone; subagents run via /spawn instead.
+  await page.getByLabel("Agent prompt").fill("/spawn");
+  await page.keyboard.press("Enter");
+  await expect(page.getByText(/Usage: \/spawn/)).toBeVisible();
+
+  // The header toggle hides and restores the tools dock.
+  const dock = page.getByRole("tablist", { name: "Workspace" });
+  await expect(dock).toBeVisible();
+  await page.getByLabel("Toggle tools panel").click();
+  await expect(dock).toBeHidden();
+  await page.getByLabel("Toggle tools panel").click();
+  await expect(dock).toBeVisible();
+});
+
+test("assets library opens from the sidebar, shows detail, installs, and yields back to chat", async ({ page }) => {
+  const sessionId = `e2e-assets-${Date.now()}`;
+  const sessionTitle = `Previous asset session ${Date.now()}`;
+  await page.goto("/");
+  await callRpc(page, "session_save", {
+    id: sessionId,
+    title: sessionTitle,
+    projectSlug: "starter",
+    messages: [{ role: "user", content: "Keep the asset library session reachable." }],
+  });
+
+  try {
+    // Reload so the app's initial session listing includes this transcript,
+    // then make it the active session before leaving chat.
+    await page.reload();
+    const previousSession = page.getByRole("button", { name: new RegExp(sessionTitle) });
+    await expect(previousSession).toBeVisible();
+    await previousSession.click();
+    await expect(page.getByText("Keep the asset library session reachable.")).toBeVisible();
+
+    await page.getByRole("button", { name: "Assets Library" }).click();
+    await expect(page.getByRole("heading", { name: "Assets Library" })).toBeVisible();
+    // The library owns the main workspace: chat, editor dock, resize handle,
+    // and editor-only header actions all leave the page.
+    await expect(page.getByLabel("Agent prompt")).toBeHidden();
+    await expect(page.getByRole("tablist", { name: "Workspace" })).toBeHidden();
+    await expect(page.getByRole("separator", { name: "Resize tools panel" })).toHaveCount(0);
+    await expect(page.getByLabel("Toggle tools panel")).toHaveCount(0);
+    await expect(page.getByLabel("Open in Blender")).toHaveCount(0);
+
+    await page.locator("[data-asset-card='linear-ability-casting']").click();
+    const dialog = page.getByRole("dialog");
+    await expect(dialog).toBeVisible();
+    // Credit links to the source repo.
+    await expect(dialog.locator("a[target='_blank']")).toHaveAttribute("href", /github|https:\/\//);
+    await dialog.getByRole("button", { name: /Install to/ }).click();
+    await expect(dialog.getByRole("button", { name: "Remove" })).toBeVisible();
+    await page.keyboard.press("Escape");
+
+    // Clicking the already-selected session must still leave the library and
+    // restore its transcript without creating a duplicate history entry.
+    await previousSession.click();
+    await expect(page.getByLabel("Agent prompt")).toBeVisible();
+    await expect(page.getByText("Keep the asset library session reachable.")).toBeVisible();
+  } finally {
+    await callRpc(page, "session_delete", { id: sessionId });
+  }
 });
 
 test("agent panel sends commands and surfaces errors", async ({ page }) => {

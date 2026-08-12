@@ -1,8 +1,7 @@
 import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
-import { buildScene } from "../../lib/procedural";
-import { PieRuntime, PROJECT_GROUP, disposeTree, type PieState } from "../../lib/pie";
+import { PieRuntime, type PieState } from "../../lib/pie";
 import type { CapturedFrame, Project } from "../../lib/types";
 
 interface ViewportProps {
@@ -31,13 +30,10 @@ export function Viewport({
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
   const runtimeRef = useRef<PieRuntime | null>(null);
-  const projectRef = useRef(project);
-  projectRef.current = project;
   const selectedRef = useRef(selectedEntityId);
   selectedRef.current = selectedEntityId;
   const handlersRef = useRef({ onSelect, onCapture, onLog, onStateChange, onRuntimeReady });
   handlersRef.current = { onSelect, onCapture, onLog, onStateChange, onRuntimeReady };
-  const rebuildRef = useRef<() => void>(() => undefined);
 
   useEffect(() => {
     const container = containerRef.current;
@@ -65,46 +61,53 @@ export function Viewport({
     scene.fog = new THREE.Fog(0x080808, 18, 42);
     sceneRef.current = scene;
     const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 100);
-    camera.position.set(5, 4, 6);
-    camera.lookAt(0, 0.5, 0);
+    // Closer than the old (5, 4, 6) framing so a default-sized project
+    // fills more of the viewport on first paint. The target is raised
+    // slightly to (0, 0.6, 0) because most scene origins sit on the
+    // grid plane; looking at 0.5 put the horizon a touch low.
+    camera.position.set(3.5, 2.6, 4.2);
+    camera.lookAt(0, 0.6, 0);
     cameraRef.current = camera;
 
     const controls = new OrbitControls(camera, renderer.domElement);
     controls.enableDamping = true;
-    controls.target.set(0, 0.5, 0);
+    controls.target.set(0, 0.6, 0);
     controlsRef.current = controls;
 
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 0.9);
+    // 3-light studio rig: hemi fill + warm key + cool back-rim. Matches the
+    // AssetBuilder / AssetPreview rigs (procedural preview surfaces had the
+    // better lighting all along; the main PIE viewport was the hold-out).
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x2a2a2a, 0.85);
     scene.add(hemi);
-    const key = new THREE.DirectionalLight(0xffffff, 2.4);
+    const key = new THREE.DirectionalLight(0xffffff, 2.2);
     key.position.set(5, 8, 5);
     scene.add(key);
-    const grid = new THREE.GridHelper(16, 16, 0x3a3a3a, 0x1c1c1c);
+    const fill = new THREE.DirectionalLight(0xc8d4ff, 0.6);
+    fill.position.set(-5, 2, -3);
+    scene.add(fill);
+    // Brighter grid so it actually reads against the dark background; the
+    // old (0x3a3a3a, 0x1c1c1c) palette against 0x080808 was nearly
+    // invisible. The lines are still subdued so the project reads first.
+    const grid = new THREE.GridHelper(20, 20, 0x6a6a6a, 0x363636);
     grid.position.y = -0.01;
     scene.add(grid);
 
-    // Same group name and disposal path the runtime uses, so editor rebuilds
-    // and PIE rebuilds never end up with two copies of the scene. Removing
-    // without disposing leaked geometry, materials and textures on every
-    // Inspector apply, script save, and agent tool call.
-    const rebuild = () => {
-      const old = scene.getObjectByName(PROJECT_GROUP);
-      if (old) {
-        scene.remove(old);
-        disposeTree(old);
-      }
-      const group = buildScene(projectRef.current);
-      group.name = PROJECT_GROUP;
-      scene.add(group);
-    };
-    rebuildRef.current = rebuild;
-    rebuild();
-
-    const runtime = new PieRuntime(projectRef.current, renderer, scene, camera, {
+    // PieRuntime exclusively owns the project group. Building it here as well
+    // allocated and immediately disposed a duplicate scene on every mount.
+    const runtime = new PieRuntime(project, renderer, scene, camera, {
       onFrame: () => undefined,
       onCapture: (frame) => handlersRef.current.onCapture(frame),
       onLog: (message) => handlersRef.current.onLog(message),
       onStateChange: (state) => handlersRef.current.onStateChange(state),
+      onFrameCamera: (center) => {
+        // frameProject computed a new look-at; mirror it onto OrbitControls
+        // so the user's next drag does not snap the view back to the
+        // (0, 0.5, 0) target the editor was set up with on first mount.
+        const controls = controlsRef.current;
+        if (!controls) return;
+        controls.target.copy(center);
+        controls.update();
+      },
     });
     runtimeRef.current = runtime;
     handlersRef.current.onRuntimeReady(runtime);
@@ -129,6 +132,10 @@ export function Viewport({
       // camera.aspect NaN and blank the render target until a full remount.
       if (width === 0 || height === 0) return;
       renderer.setSize(width, height, false);
+      // Resize the composer's offscreen targets to match. RenderPass and
+      // UnrealBloomPass allocate render textures sized to the canvas; if
+      // they fall out of sync the viewport goes fuzzy at the next resize.
+      runtime.setPostprocessSize(width, height);
       camera.aspect = width / height;
       camera.updateProjectionMatrix();
     };
@@ -138,8 +145,27 @@ export function Viewport({
     let frame = 0;
     const animate = () => {
       frame = requestAnimationFrame(animate);
-      controls.update();
-      renderer.render(scene, camera);
+      // Damping keeps easing the camera after pointer-up, so update() runs
+      // every tick whether or not we draw. It reports whether the camera
+      // actually moved, which is one of the things that dirties the frame.
+      if (controls.update()) runtime.invalidate();
+      // While PIE is running the runtime drives its own rAF loop and draws
+      // every simulated frame; drawing again here was a second full pass
+      // through the composer for the identical picture.
+      if (runtime.state === "running") return;
+      // Otherwise draw only what changed. Rendering unconditionally at 60Hz
+      // was cheap while this was a bare `renderer.render`, and stopped being
+      // cheap once every draw became an ACES + bloom composite: profiling
+      // the starter project's scripted `step(30)` found 128 redundant
+      // composites costing 1.28s of the run's 1.51s, against 0.13s for the
+      // 10 frames the test actually captures. That is what pushed the suite
+      // past its per-test timeout on CI's software rasteriser.
+      //
+      // renderIfNeeded routes through the runtime's render path, so a frame
+      // that is drawn shares the ACES + bloom curve the captured PNGs go
+      // through — falling back to a direct render when the postprocess
+      // factory failed to build (jsdom stubs, headless contexts).
+      runtime.renderIfNeeded();
     };
     animate();
 
@@ -166,7 +192,6 @@ export function Viewport({
     // "TWEAK LIVE" not tweak live: every slider was inert during PLAY and you
     // had to pause to see any change.
     runtimeRef.current.setProject(project);
-    rebuildRef.current();
   }, [project]);
 
   return (

@@ -17,15 +17,44 @@ const WORKER_SOURCE =
   HARDEN_PRELUDE +
   String.raw`
 var snapshot = {};
+var world = {};
 var nextCallId = 1;
 var pending = new Map();
+var outstanding = [];
+var capabilityError = null;
+
+function deepFreeze(value) {
+  if (!value || typeof value !== "object" || Object.isFrozen(value)) return value;
+  Object.freeze(value);
+  Object.keys(value).forEach(function (key) { deepFreeze(value[key]); });
+  return value;
+}
 
 function callHost(method, args) {
   var callId = nextCallId++;
-  return new Promise(function (resolve, reject) {
+  var raw = new Promise(function (resolve, reject) {
     pending.set(callId, { resolve: resolve, reject: reject });
     __reply({ type: "call", callId: callId, method: method, args: args });
   });
+  var promise = raw.then(
+    function (value) { return value; },
+    function (error) {
+      if (!capabilityError) capabilityError = error instanceof Error ? error : new Error(String(error));
+      return undefined;
+    }
+  );
+  outstanding.push(promise.then(function () {}));
+  return promise;
+}
+
+async function drainCalls() {
+  var cursor = 0;
+  while (cursor < outstanding.length) {
+    var batch = outstanding.slice(cursor);
+    cursor = outstanding.length;
+    await Promise.all(batch);
+  }
+  if (capabilityError) throw capabilityError;
 }
 
 self.onmessage = function (event) {
@@ -37,6 +66,7 @@ self.onmessage = function (event) {
     if (!entry) return;
     pending.delete(message.callId);
     if (message.snapshot) snapshot = message.snapshot;
+    if (message.world) world = deepFreeze(message.world);
     if (message.error) entry.reject(new Error(message.error));
     else entry.resolve(message.value);
     return;
@@ -44,9 +74,14 @@ self.onmessage = function (event) {
 
   if (message.type !== "run") return;
   snapshot = message.snapshot || {};
+  world = deepFreeze(message.world || {});
+  outstanding = [];
+  capabilityError = null;
 
+  var state = Object.freeze({ get world() { return world; } });
   var context = {
     scene: message.scene,
+    state: state,
     // Synchronous, served from a snapshot the host refreshes on every reply.
     // entityFor('Hero Cube').rotation.y is the documented shape and the
     // starter project uses it; making it async silently broke every script.
@@ -61,6 +96,7 @@ self.onmessage = function (event) {
     try {
       var body = [
         "const scene = context.scene;",
+        "const state = context.state;",
         "const entityFor = context.entityFor;",
         "const assert = context.assert;",
         "const log = context.log;",
@@ -70,6 +106,7 @@ self.onmessage = function (event) {
       ].join("\n");
       var run = new Function("context", '"use strict"; return (async () => { ' + body + ' })();');
       await run(context);
+      await drainCalls();
       __reply({ type: "done", testId: message.testId });
     } catch (error) {
       __reply({ type: "done", testId: message.testId, error: String((error && error.message) || error) });
@@ -102,11 +139,12 @@ export class FrameTestSandbox implements TestSandbox {
     const host = this.testHost;
     if (!host || !this.host) return;
     // Every reply carries post-call scene state so entityFor stays synchronous.
-    const reply = (result: Omit<HostResult, "type" | "callId" | "snapshot">) =>
+    const reply = async (result: Omit<HostResult, "type" | "callId" | "snapshot" | "world">) =>
       void this.host?.post({
         type: "callResult",
         callId: call.callId,
         snapshot: host.snapshot(),
+        world: await host.worldSnapshot(),
         ...result,
       } satisfies HostResult);
 
@@ -114,26 +152,26 @@ export class FrameTestSandbox implements TestSandbox {
       switch (call.method) {
         case "assert":
           host.assert(Boolean(call.args[0]), String(call.args[1] ?? "assertion failed"));
-          return reply({ value: true });
+          return void (await reply({ value: true }));
         case "log":
           host.log(String(call.args[0]));
-          return reply({ value: true });
+          return void (await reply({ value: true }));
         case "step":
           await host.step(Number(call.args[0]));
-          return reply({ value: true });
+          return void (await reply({ value: true }));
         case "baseline":
-          return reply({
+          return void (await reply({
             value: await host.baseline(
               String(call.args[0]),
               String(call.args[1]),
               call.args[2] === undefined ? undefined : Number(call.args[2]),
             ),
-          });
+          }));
         default:
-          return reply({ error: `unknown host call ${String(call.method)}` });
+          return void (await reply({ error: `unknown host call ${String(call.method)}` }));
       }
     } catch (error) {
-      reply({ error: error instanceof Error ? error.message : String(error) });
+      await reply({ error: error instanceof Error ? error.message : String(error) });
     }
   }
 
@@ -146,6 +184,7 @@ export class FrameTestSandbox implements TestSandbox {
   ): Promise<void> {
     const frame = this.ensure();
     this.testHost = host;
+    const world = await host.worldSnapshot();
 
     return new Promise<void>((resolve, reject) => {
       const timer = window.setTimeout(() => {
@@ -168,6 +207,7 @@ export class FrameTestSandbox implements TestSandbox {
         script,
         scene,
         snapshot: host.snapshot() as Record<string, EntitySnapshot>,
+        world,
       } satisfies RunRequest);
     });
   }

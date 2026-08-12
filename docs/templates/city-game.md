@@ -285,23 +285,21 @@ with their own colours; the active one scales to `1.0` and the others to `0.35`.
 The eye reads size + colour together, and the change is visible in a captured
 frame, which makes it critic-checkable.
 
-**Motion must be a pure function of `state.time`.** Scripts get a fresh `state`
-object every frame (`{time, entities}`), so there is no per-entity persistence.
-Deriving position from `state.time` is not a workaround — it makes PIE
-deterministic, so frame N of a run is always the same frame N, which is exactly
-what baselines need.
+**Prefer deterministic motion from `state.time` (seconds).** `state.self`
+persists per script/entity and `state.world` is shared across scripts, but a
+pure time-based path makes frame N repeatable for baselines.
 
 ```js
 // Signal cycle: 8s green, 2s amber, 8s red, per approach. Lamp identity is in
 // the entity name, so one script drives every lamp in the scene.
-const CYCLE_MS = 18000;
+const CYCLE_SECONDS = 18;
 const ON = 1.0;
 const OFF = 0.35;
 
-function phaseFor(timeMs) {
-  const t = timeMs % CYCLE_MS;
-  if (t < 8000) return "green";
-  if (t < 10000) return "amber";
+function phaseFor(timeSeconds) {
+  const t = timeSeconds % CYCLE_SECONDS;
+  if (t < 8) return "green";
+  if (t < 10) return "amber";
   return "red";
 }
 
@@ -341,7 +339,7 @@ const TOTAL = LENGTHS.reduce((sum, length) => sum + length, 0);
 function update(entity, state) {
   const index = Number(entity.name.split("_")[2]) || 0;
   // Phase-offset per vehicle so the eight cars do not travel as one clump.
-  let s = ((state.time / 1000) * SPEED_M_S + (index * TOTAL) / VEHICLE_COUNT) % TOTAL;
+  let s = (state.time * SPEED_M_S + (index * TOTAL) / VEHICLE_COUNT) % TOTAL;
 
   for (let i = 0; i < LEGS.length; i += 1) {
     if (s > LENGTHS[i]) {
@@ -515,8 +513,7 @@ Constraints:
   roughness 0.32, metalness 0.25.
 - 12 pedestrians: ped_<n>, cylinder 0.5 diameter x 1.8 tall, colour #8a7f9c,
   standing on the plinth (y = 0.15 + 0.9).
-- Motion is a pure function of state.time — no per-frame accumulation, since the
-  sandbox hands scripts a fresh state each frame. Vehicles follow a closed route
+- Motion is a pure function of `state.time` in seconds. Vehicles follow a closed route
   whose waypoints the phase-1 adapter emits from segment endpoints (so the route
   inherits the map's ~21-degree rotation) at 8 m/s, evenly phase-offset.
   Pedestrians walk plinth perimeters at 1.4 m/s.

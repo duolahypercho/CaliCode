@@ -1,0 +1,89 @@
+{
+  "id": "arcade-racer",
+  "name": "Arcade Racer Slice",
+  "description": "Arcade racing vertical slice judged against the genre's speed-feel and track-readability bar.",
+  "defaultThreshold": 90,
+  "nodes": [
+    {
+      "id": "design",
+      "title": "Design doc",
+      "kind": "build",
+      "role": "planner",
+      "instructions": "Design for: {{goal}}. Define handling (accel, top speed, steer rate, drift/boost rule), a lap track layout (>=3 named corners, one straight, one hazard or shortcut), lap/win logic, and the speed-feel plan (FOV kick, camera lag, particles). Concrete numbers. Save as design.md.",
+      "acceptance": [
+        "design.md exists",
+        "handling numbers, track layout with named corners, lap/win logic, speed-feel plan all specified"
+      ],
+      "deps": []
+    },
+    {
+      "id": "track",
+      "title": "Circuit blockout",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Build the closed circuit from design.md: road surface, barriers, corner landmarks with distinct silhouettes, start/finish gate, checkpoint entities for lap logic.",
+      "acceptance": [
+        "closed drivable circuit exists",
+        "start gate + >=3 checkpoints placed",
+        "each named corner has a distinct landmark",
+        "frame captured"
+      ],
+      "deps": ["design"]
+    },
+    {
+      "id": "handling",
+      "title": "Kart handling and camera",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Implement kart controller + chase camera per design.md numbers: accel/brake/steer, drift or boost per the rule, camera lag + FOV kick with speed. Verify 300 frames in PIE, capture during a drift/boost.",
+      "acceptance": [
+        "kart drives the circuit in PIE with no script errors",
+        "drift/boost observably changes speed or trajectory",
+        "FOV/camera responds to speed in captures"
+      ],
+      "deps": ["design", "track"]
+    },
+    {
+      "id": "race",
+      "title": "Lap and race logic",
+      "kind": "build",
+      "role": "coder",
+      "instructions": "Lap logic: ordered checkpoints, lap counter, 3-lap win state, on-screen position/lap UI, plus a wrong-way or reset rule. Add a test proving checkpoint order -> lap increment -> win.",
+      "acceptance": [
+        "laps count only via ordered checkpoints in PIE",
+        "win state triggers at lap 3",
+        "race-logic test green"
+      ],
+      "deps": ["handling"]
+    },
+    {
+      "id": "speedfeel",
+      "title": "Speed-feel pass",
+      "kind": "build",
+      "role": "artist",
+      "instructions": "Speed-feel and readability pass: high-contrast track-edge marking, motion cues (speed lines/particles, boost VFX), saturated cohesive palette, horizon interest. Retake captures at top speed.",
+      "acceptance": [
+        "track edges readable at speed in captures",
+        ">=2 motion-feedback effects active when fast",
+        "every entity has deliberate material values",
+        "fresh top-speed capture taken"
+      ],
+      "deps": ["track", "race"]
+    },
+    {
+      "id": "judge",
+      "title": "Speed judge",
+      "kind": "judge",
+      "role": "critic",
+      "reference": "Mario Kart 8 track slice",
+      "threshold": 90,
+      "instructions": "Score the slice for: sense of speed, handling feel, track readability at speed, lap-race clarity, visual energy vs reference. Blind side-by-side: unlabeled next to the reference, which looks faster and more fun, and why.",
+      "acceptance": [
+        "PIE runs clean",
+        "race-logic test green",
+        "reads fast and legible vs reference"
+      ],
+      "deps": ["handling", "race", "speedfeel"]
+    }
+  ]
+}

@@ -1,5 +1,6 @@
 import { rpc } from "./rpc";
 import type { Project } from "./types";
+import { isDesktopShell } from "./desktop";
 
 export interface WorkspaceInfo {
   id: string;
@@ -37,8 +38,72 @@ export interface DevServerStatus {
   port?: number;
 }
 
-export const openWorkspace = (path: string, name?: string) =>
-  rpc<WorkspaceInfo>("workspace_open", { path, name });
+export interface FolderEntry {
+  name: string;
+  path: string;
+  /** True when the folder has a package.json or .git, so `workspace_open` accepts it. */
+  isProject: boolean;
+}
+
+export interface FolderListing {
+  path: string;
+  parent: string | null;
+  dirs: FolderEntry[];
+}
+
+/** The bundled core is a separate process and may not inherit macOS TCC scope. */
+export const NATIVE_WORKSPACE_OPEN_TIMEOUT_MS = 1_200;
+
+function nativeWorkspaceAccessError(path: string): Error {
+  return new Error(
+    `CaliCode's bundled core could not access "${path}" within ${NATIVE_WORKSPACE_OPEN_TIMEOUT_MS}ms. ` +
+      "Grant CaliCode access in System Settings > Privacy & Security > Files and Folders, " +
+      "then try again, or choose a folder the app can already read.",
+  );
+}
+
+/** Directory names only — backs the in-app folder picker. */
+export const browseFolders = (path?: string) =>
+  rpc<FolderListing>("workspace_browse", path ? { path } : {});
+
+export async function openWorkspace(path: string, name?: string): Promise<WorkspaceInfo> {
+  const request = rpc<WorkspaceInfo>("workspace_open", { path, name });
+  if (!isDesktopShell()) return request;
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      request,
+      new Promise<WorkspaceInfo>((_, reject) => {
+        timer = setTimeout(() => reject(nativeWorkspaceAccessError(path)), NATIVE_WORKSPACE_OPEN_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+/**
+ * Ask the native shell for a directory selection. Browsers keep using the
+ * core folder browser; a packaged macOS app must go through NSOpenPanel for
+ * Desktop, Documents, external volumes, and other TCC-protected roots. The
+ * bundled core is a separate process, so `openWorkspace` still verifies that
+ * it can use the selected path and fails fast when the scope did not carry.
+ */
+export async function chooseNativeWorkspace(defaultPath?: string): Promise<string | null> {
+  if (!isDesktopShell()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    recursive: true,
+    fileAccessMode: "scoped",
+    canCreateDirectories: false,
+    defaultPath,
+    title: "Choose a game folder",
+  });
+  return typeof selected === "string" ? selected : null;
+}
 
 export const listWorkspaces = () => rpc<WorkspaceInfo[]>("workspace_list", {});
 

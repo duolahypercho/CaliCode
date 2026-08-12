@@ -41,26 +41,26 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
       <div className="flex min-h-0 min-w-0 flex-1 flex-col p-5">
         <div className="mb-3">
           <div className="calicode-label mb-1.5">CaliCode Playtest</div>
-          <p className="text-[13px] text-[#c8c8c8]">
+          <p className="text-[13px] text-ink">
             {results.length === 0
               ? "No runs yet — run the suite to collect frames and issues."
               : `${passed}/${results.length} passing · ${frames.length} frames captured.`}
           </p>
         </div>
 
-        <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[10px] border border-white/[0.07] bg-[repeating-linear-gradient(115deg,#0d0d0d,#0d0d0d_12px,#111_12px,#111_24px)]">
+        <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden rounded-[10px] border border-line bg-[repeating-linear-gradient(115deg,var(--surface-1),var(--surface-1)_12px,var(--surface-2)_12px,var(--surface-2)_24px)]">
           {frames.length === 0 ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-3">
               <button
                 type="button"
                 onClick={onRun}
                 disabled={!canRun || running}
-                className="flex h-[52px] w-[52px] items-center justify-center rounded-full border border-white/20 text-lg text-[#c0c0c0] transition-colors enabled:hover:border-white/40 active:border-white/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/40 disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex h-[52px] w-[52px] items-center justify-center rounded-full border border-line-strong text-lg text-ink transition-colors active:border-ink-subtle focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
                 aria-label="Run playtest"
               >
                 ▶
               </button>
-              <span className="text-[11px] tracking-[0.06em] text-[#949494]">
+              <span className="text-[11px] tracking-[0.06em] text-ink-subtle">
                 {running ? "RUNNING PLAYTEST…" : canRun ? "RUN A PLAYTEST" : "RUNTIME NOT READY"}
               </span>
             </div>
@@ -69,30 +69,30 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
               <Filmstrip frames={frames} />
             </div>
           )}
-          <div className="h-1 shrink-0 bg-white/[0.07]">
+          <div className="h-1 shrink-0 bg-surface-3">
             <div
-              className="h-full w-full origin-left bg-[#9a9a9a] transition-transform duration-300"
+              className="h-full w-full origin-left bg-ink-subtle transition-transform duration-300"
               style={{ transform: `scaleX(${results.length === 0 ? 0 : passed / results.length})` }}
             />
           </div>
         </div>
       </div>
 
-      <div className="flex min-h-0 w-[388px] shrink-0 flex-col border-l border-white/[0.06] bg-[#0a0a0a]">
-        <div className="flex shrink-0 items-center gap-2 border-b border-white/5 px-[18px] py-[15px]">
-          <span className="text-[11px] font-bold tracking-[0.16em] text-[#dadada]">ISSUES FOUND</span>
+      <div className="flex min-h-0 w-[388px] shrink-0 flex-col border-l border-line bg-surface-0">
+        <div className="flex shrink-0 items-center gap-2 border-b border-line px-[18px] py-[15px]">
+          <span className="text-[11px] font-bold tracking-[0.16em] text-ink-strong">ISSUES FOUND</span>
           <button
             type="button"
             onClick={() => onFixAll(issues)}
             disabled={issues.length === 0}
-            className="ml-auto inline-flex min-h-[28px] items-center rounded-md border border-white/[0.12] bg-[#2a2a2a] px-3 py-1.5 text-[11px] font-bold tracking-[0.1em] text-[#dcdcdc] transition-colors enabled:hover:bg-[#333] active:bg-[#3a3a3a] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30 disabled:cursor-not-allowed disabled:opacity-40"
+            className="ml-auto inline-flex min-h-[28px] items-center rounded-md border border-line-strong bg-secondary px-3 py-1.5 text-[11px] font-bold tracking-[0.1em] text-ink-strong transition-colors enabled:hover:bg-secondary/80 active:bg-secondary/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
           >
             {issues.length === 0 ? "NOTHING TO FIX" : `FIX ALL ${issues.length}`}
           </button>
         </div>
         <div className="flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto p-3.5">
           {issues.length === 0 ? (
-            <p className="text-xs text-[#8f8f8f]">
+            <p className="text-xs text-ink-subtle">
               {results.length === 0 ? "Run a playtest to surface issues." : "All tests passed."}
             </p>
           ) : (
@@ -100,7 +100,7 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
               <div
                 key={issue.id}
                 style={{ borderLeftColor: SEVERITY_TINT[issue.severity] }}
-                className="rounded-lg border border-l-2 border-white/[0.07] bg-[#0e0e0e] px-3.5 py-3"
+                className="rounded-lg border border-l-2 border-line bg-surface-1 px-3.5 py-3"
               >
                 <div className="mb-1.5 flex items-center gap-2">
                   <span
@@ -109,10 +109,10 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
                   >
                     {issue.severity}
                   </span>
-                  <span className="min-w-0 flex-1 truncate text-[12.5px] font-bold text-[#dadada]">{issue.title}</span>
+                  <span className="min-w-0 flex-1 truncate text-[12.5px] font-bold text-ink-strong">{issue.title}</span>
                 </div>
-                <p className="mb-2 whitespace-pre-wrap text-xs leading-[1.55] text-[#8f8f8f]">{issue.description}</p>
-                <p className="rounded-[5px] border border-white/[0.06] px-2.5 py-1.5 text-[11px] text-[#8f8f8f]">
+                <p className="mb-2 whitespace-pre-wrap text-xs leading-[1.55] text-ink-subtle">{issue.description}</p>
+                <p className="rounded-[5px] border border-line px-2.5 py-1.5 text-[11px] text-ink-subtle">
                   {issue.repro}
                 </p>
               </div>

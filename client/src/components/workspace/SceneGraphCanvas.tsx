@@ -42,7 +42,15 @@ export function SceneGraphCanvas({
   onRemoveEntity,
 }: SceneGraphCanvasProps) {
   const [offsets, setOffsets] = useState<Record<string, { dx: number; dy: number }>>({});
-  const dragRef = useRef<{ id: string; startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+  const dragRef = useRef<{
+    id: string;
+    startX: number;
+    startY: number;
+    baseX: number;
+    baseY: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
 
   const { nodes, edges } = useMemo(() => {
     const nodes: GraphNode[] = [];
@@ -110,7 +118,9 @@ export function SceneGraphCanvas({
         startY: event.clientY,
         baseX: offset.dx,
         baseY: offset.dy,
+        moved: false,
       };
+      suppressClickRef.current = false;
     },
     [offsets],
   );
@@ -118,6 +128,10 @@ export function SceneGraphCanvas({
   const onPointerMove = useCallback((event: React.PointerEvent) => {
     const drag = dragRef.current;
     if (!drag) return;
+    if (Math.abs(event.clientX - drag.startX) > 3 || Math.abs(event.clientY - drag.startY) > 3) {
+      drag.moved = true;
+      suppressClickRef.current = true;
+    }
     setOffsets((current) => ({
       ...current,
       [drag.id]: { dx: drag.baseX + (event.clientX - drag.startX), dy: drag.baseY + (event.clientY - drag.startY) },
@@ -129,8 +143,8 @@ export function SceneGraphCanvas({
   }, []);
 
   return (
-    <div className="flex h-full min-h-0">
-      <div className="flex min-h-0 w-[186px] shrink-0 flex-col border-r border-white/5 bg-[#0a0a0a] p-2.5">
+    <div className="flex h-full min-h-0 flex-col md:flex-row">
+      <div className="flex min-h-0 w-full shrink-0 flex-col border-b border-line bg-surface-0 p-2.5 md:h-full md:w-[186px] md:border-b-0 md:border-r">
         <div className="calicode-label px-1.5 pb-2.5">Nodes</div>
         {(
           [
@@ -141,28 +155,28 @@ export function SceneGraphCanvas({
         ).map(([kind, label, count]) => (
           <div
             key={kind}
-            className="mb-1.5 flex items-center gap-2.5 rounded-[7px] border border-white/[0.06] px-2.5 py-2 text-xs text-[#a0a0a0]"
+            className="mb-1.5 flex items-center gap-2.5 rounded-[7px] border border-line px-2.5 py-2 text-xs text-ink-subtle"
           >
-            <span aria-hidden className="h-2 w-2 shrink-0 border border-[#6a6a6a]" />
+            <span aria-hidden className="h-2 w-2 shrink-0 border border-ink-faint" />
             <span className="min-w-0 flex-1 truncate">{label}</span>
-            <span className="shrink-0 text-[10px] text-[#8f8f8f]">{count}</span>
+            <span className="shrink-0 text-[10px] text-ink-subtle">{count}</span>
           </div>
         ))}
         <button
           type="button"
           onClick={onAddEntity}
-          className="mt-1.5 rounded-md border border-white/10 py-2 text-[11px] tracking-[0.14em] text-[#a0a0a0] transition-colors hover:border-white/25 hover:text-[#d0d0d0] active:border-white/40 active:bg-white/[0.03] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-white/30"
+          className="mt-1.5 rounded-md border border-line py-2 text-[11px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong active:border-ink-subtle active:bg-surface-2 focus-visible:outline-none"
         >
           ADD ENTITY
         </button>
-        <p className="mt-3.5 rounded-lg border border-white/[0.08] p-2.5 text-[11px] leading-[1.55] text-[#8f8f8f]">
+        <p className="mt-3.5 rounded-lg border border-line p-2.5 text-[11px] leading-[1.55] text-ink-subtle">
           Edges follow the project: an entity links to every script it runs and the asset it draws from. Drag a node
           to rearrange.
         </p>
       </div>
 
       <div
-        className="relative min-w-0 flex-1 overflow-hidden bg-[radial-gradient(#161616_1px,transparent_1px)] [background-size:22px_22px]"
+        className="relative min-h-0 min-w-0 flex-1 overflow-auto bg-[radial-gradient(var(--line-strong)_1px,transparent_1px)] [background-size:22px_22px] md:overflow-hidden"
         onPointerMove={onPointerMove}
         onPointerUp={endDrag}
         onPointerCancel={endDrag}
@@ -182,7 +196,7 @@ export function SceneGraphCanvas({
                 key={edge.id}
                 d={`M ${x1} ${y1} C ${mid} ${y1}, ${mid} ${y2}, ${x2} ${y2}`}
                 fill="none"
-                stroke="#5a5a5a"
+                stroke="var(--ink-faint)"
                 strokeWidth={1.5}
               />
             );
@@ -197,32 +211,47 @@ export function SceneGraphCanvas({
               key={node.id}
               style={{ left: node.x, top: node.y, width: NODE_WIDTH }}
               onPointerDown={(event) => onPointerDown(event, node)}
-              className={`absolute cursor-grab rounded-[9px] border bg-[#111] transition-colors active:cursor-grabbing ${
-                selected ? "border-white/40 bg-white/[0.06]" : "border-white/[0.12]"
+              className={`absolute cursor-grab rounded-[9px] border bg-surface-1 transition-colors active:cursor-grabbing ${
+                selected ? "border-ink-subtle bg-surface-2" : "border-line-strong"
               }`}
             >
               <button
                 type="button"
+                // Keep the title row out of the drag: the container's
+                // pointerdown captures the pointer, which retargets the click
+                // to the container and the selection handler never fires.
+                onPointerDown={(event) => event.stopPropagation()}
                 onClick={() => entityId && onSelect(selected ? null : entityId)}
                 disabled={!entityId}
-                className="flex w-full items-center gap-2 border-b border-white/[0.07] px-2.5 py-2 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-white/30 enabled:hover:bg-white/[0.03] enabled:active:bg-white/[0.05] disabled:cursor-grab"
+                className="flex w-full items-center gap-2 border-b border-line px-2.5 py-2 text-left transition-colors focus-visible:outline-none enabled:hover:bg-surface-2 enabled:active:bg-surface-3 disabled:cursor-grab"
               >
-                <span aria-hidden className="h-[7px] w-[7px] shrink-0 border border-[#808080]" />
-                <span className="min-w-0 flex-1 truncate text-xs font-bold text-[#dadada]">{node.title}</span>
+                <span aria-hidden className="h-[7px] w-[7px] shrink-0 border border-ink-subtle" />
+                <span className="min-w-0 flex-1 truncate text-xs font-bold text-ink-strong">{node.title}</span>
               </button>
-              <div className="whitespace-pre px-2.5 py-2 text-[11px] leading-[1.6] text-[#8a8a8a]">{node.body}</div>
+              <div
+                className="whitespace-pre px-2.5 py-2 text-[11px] leading-[1.6] text-ink-subtle"
+                onClick={() => {
+                  if (suppressClickRef.current) {
+                    suppressClickRef.current = false;
+                    return;
+                  }
+                  if (entityId) onSelect(selected ? null : entityId);
+                }}
+              >
+                {node.body}
+              </div>
             </div>
           );
         })}
 
         {positioned.length === 0 ? (
-          <p className="absolute inset-0 flex items-center justify-center text-xs text-[#8f8f8f]">
+          <p className="absolute inset-0 flex items-center justify-center text-xs text-ink-subtle">
             Nothing in this scene yet.
           </p>
         ) : null}
       </div>
 
-      <div className="hidden min-h-0 w-[248px] shrink-0 border-l border-white/[0.06] bg-[#0a0a0a] xl:block">
+      <div className="flex min-h-[220px] max-h-[40%] w-full shrink-0 flex-col border-t border-line bg-surface-0 md:min-h-0 md:max-h-none md:w-[248px] md:border-l md:border-t-0">
         <EntityProperties
           entity={project.entities.find((entity) => entity.id === selectedEntityId) ?? null}
           onChange={(patch) => selectedEntityId && onPatchEntity(selectedEntityId, patch)}

@@ -10,9 +10,9 @@ export interface LogEntry {
 export function ConsolePanel({ logs }: { logs: LogEntry[] }) {
   return (
     <div className="flex h-full flex-col">
-      <div className="flex items-center gap-2 border-b border-white/5 px-3 py-2">
+      <div className="flex items-center gap-2 border-b border-line px-3 py-2">
         <Terminal className="h-4 w-4 text-muted-foreground" />
-        <span className="text-[11px] font-bold tracking-[0.16em] text-[#dcdcdc]">Console</span>
+        <span className="text-[11px] font-bold tracking-[0.16em] text-ink-strong">Console</span>
       </div>
       <div className="min-h-0 flex-1 overflow-y-auto p-2 font-mono text-xs">
         {logs.length === 0 ? (

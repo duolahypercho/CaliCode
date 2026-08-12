@@ -39,22 +39,23 @@ CaliCode), adapt (belongs but game-editor-shaped), skip (out of scope).
 
 | Capability | codex | opencode | t3-code | CaliCode | Fit |
 |---|---|---|---|---|---|
-| **Slash-command system** (registry + autocomplete) | ✅ 40+ | ✅ | 🟡 quick-actions | ❌ (only `/model`) | **core** |
-| `/loop` autonomous continuous run | 🟡 goal+background | 🟡 run/serve | 🟡 full-access | ❌ | **core** ⭐ |
-| `/help` | ✅ | ✅ | — | ❌ | core |
-| `/clear` · `/new` | ✅ | ✅ | ✅ | ❌ | core |
-| `/compact` (summarize context) | ✅ | ✅ | ✅ | ❌ | core |
-| `/diff` (show changed files) | ✅ | 🟡 viewer | ✅ viewer | ❌ | core |
+| **Slash-command system** (registry + autocomplete) | ✅ 40+ | ✅ | 🟡 quick-actions | ✅ | done |
+| `/loop` autonomous continuous run | 🟡 goal+background | 🟡 run/serve | 🟡 full-access | ✅ | done ⭐ |
+| `/help` | ✅ | ✅ | — | ✅ | done |
+| `/clear` · `/new` | ✅ | ✅ | ✅ | ✅ | done |
+| `/compact` (summarize context) | ✅ | ✅ | ✅ | ✅ real core compaction + auto-trigger | done |
+| `/diff` (show changed files) | ✅ | 🟡 viewer | ✅ viewer | ✅ | done |
 | `/model` picker | ✅ | ✅ | ✅ | ✅ | done |
-| **Approval / permission modes** | ✅ | ✅ granular | ✅ 3 | 🟡 4 modes, no enforcement doc | adapt |
-| **Session resume** | ✅ | ✅ | ✅ | ❌ | core |
-| **Session fork** | ✅ | ✅ | 🟡 | ❌ | adapt |
-| **Session list / history** | ✅ | ✅ | ✅ threads | ❌ | core |
+| **Token usage / context meter** (`/usage`) | ✅ | ✅ | 🟡 | ✅ per-session totals + composer meter | done |
+| **Approval / permission modes** | ✅ | ✅ granular | ✅ 3 | ✅ 5 modes + `permissions:` glob rules | done |
+| **Session resume** | ✅ | ✅ | ✅ | ✅ | done |
+| **Session fork** | ✅ | ✅ | 🟡 | ✅ | done |
+| **Session list / history** | ✅ | ✅ | ✅ threads | ✅ | done |
 | **Undo / redo** (checkpoint rewind) | 🟡 fork | ✅ snapshots | ✅ git-ref | 🟡 `project_checkpoint` tool only | adapt |
 | **Custom commands** (markdown files) | ✅ `~/.codex/prompts` | ✅ `.opencode/commands` | 🟡 quick-actions | ❌ | core |
-| **Plan mode** | ✅ | ✅ | ✅ | ❌ | adapt |
-| **Subagents** | ✅ | ✅ | 🟡 | ✅ 4 roles | done |
-| **MCP servers** | ✅ | ✅ | via adapters | ❌ | adapt |
+| **Plan mode** | ✅ | ✅ | ✅ | ✅ read-only tool whitelist in core | done |
+| **Subagents** | ✅ | ✅ | 🟡 | ✅ 4 roles, inherit permissions, depth-capped | done |
+| **MCP servers** | ✅ | ✅ | via adapters | ✅ stdio+http, project scope, tool filters | done |
 | **Hooks** (lifecycle) | ✅ | 🟡 plugins | — | ❌ | adapt |
 | **Skills** (on-demand) | ✅ | ✅ | — | ❌ | adapt |
 | **@-file mention / context insert** | ✅ | ✅ | ✅ | ❌ | core |
@@ -112,8 +113,36 @@ Themes, keybind remap, OS sandbox presets, share URLs — noted for completeness
   disabled gating, ≥28px hit targets, keyboard reachability, compositor-friendly
   meters) across 21 components; an adversarial judge scored it **PASS** against
   10 promotion criteria (2 rounds).
-- ⏭ Next candidates: undo/redo rewind on `project_checkpoint`; then Tier 3
-  (custom commands, plan mode, MCP, @-mention). Plus the hermes function pass
+- ✅ **Harness gap batch, Tier 0** (docs/plans/harness-gaps.md): MCP child
+  processes get a scrubbed env (no `CALI_*` keys); subagents inherit the
+  parent's permission mode/rules with a depth cap instead of always running
+  full-access; bounded model retry with backoff + `fallback_providers`;
+  atomic `session_fork` writes.
+- ✅ **Harness gap batch, Tier 1** — core: per-session token accounting from
+  provider `usage` (emitted as `agent.usage` events); real context compaction
+  (`session_compact` RPC + auto-trigger at `compaction.threshold`, old tool
+  results pruned, middle summarized, replaced turns soft-archived in the
+  session file); MCP per-project servers (`<game>/.cali/config.yaml` merged by
+  id over global), per-server `tools: {include, exclude}` filters, and
+  `transport: http`; `permissions:` glob rules (allow/ask/deny, last match
+  wins, deny hides the tool) evaluated before mode logic; a real `plan`
+  permission mode restricted to a read-only tool whitelist; `file_edit` /
+  `file_grep` / `file_glob` repo-surgery tools; parallel tool-call execution
+  and parallel graph nodes (cap 3).
+- ✅ **Harness gap batch, Tier 1 — client:** context meter beside the composer
+  + `/usage` (driven by `agent.usage`, window from `compaction.context_length`
+  via `config.read`); `/compact` now calls `session_compact` (the old
+  client-side transcript-nuking summary is gone) and both manual and
+  auto-compaction render a transcript notice from `agent.compacted`; archived
+  turns render as a collapsed row on resume; the composer's Plan option maps
+  to core's real `plan` mode; MCP settings show per-server transport,
+  global/project scope badge, and the read-only tool include/exclude filter;
+  turns now send only the new user message when a live core session exists
+  (full history only seeds new/lost sessions), so compaction actually shrinks
+  the working context.
+- ⏭ Next candidates: undo/redo rewind on `project_checkpoint`; then Tier 2 of
+  the gap plan (context-file chain, @-mention, custom commands, hooks,
+  shadow-git checkpoints, agent memory). Plus the hermes function pass
   (harness-relevant subset: goals, fanout, skills, hooks, mcp, dashboard,
   projects, chat, activity).
 

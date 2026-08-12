@@ -3,12 +3,16 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PROJECTS_DIR = resolve(HERE, ".e2e-projects");
+// Keep every core-owned E2E resource under one disposable root. Core derives
+// sessions/ and worktrees/ beside the projects directory, so putting projects
+// directly under client/ leaked those resources into watched source paths.
+const E2E_STATE_DIR = resolve(HERE, ".e2e-state");
+const PROJECTS_DIR = resolve(E2E_STATE_DIR, "projects");
 // Core reads ~/.cali/config.yaml by default, which now carries the developer's
 // attached workspaces — and a restored workspace changes the editor's default
 // view, so the suite silently started testing a different app. Isolating the
 // projects directory alone was not enough.
-const CONFIG_PATH = resolve(HERE, ".e2e-config.yaml");
+const CONFIG_PATH = resolve(E2E_STATE_DIR, "config.yaml");
 
 /**
  * The suite writes real projects through core, so it gets its own projects
