@@ -145,12 +145,27 @@ export function Viewport({
     let frame = 0;
     const animate = () => {
       frame = requestAnimationFrame(animate);
-      controls.update();
-      // Route through the runtime's render path so the live frame shares
-      // the ACES + bloom curve the captured PNGs go through. The runtime
-      // falls back to a direct render when the postprocess factory failed
-      // to build (jsdom stubs, headless contexts).
-      runtime.renderScene();
+      // Damping keeps easing the camera after pointer-up, so update() runs
+      // every tick whether or not we draw. It reports whether the camera
+      // actually moved, which is one of the things that dirties the frame.
+      if (controls.update()) runtime.invalidate();
+      // While PIE is running the runtime drives its own rAF loop and draws
+      // every simulated frame; drawing again here was a second full pass
+      // through the composer for the identical picture.
+      if (runtime.state === "running") return;
+      // Otherwise draw only what changed. Rendering unconditionally at 60Hz
+      // was cheap while this was a bare `renderer.render`, and stopped being
+      // cheap once every draw became an ACES + bloom composite: profiling
+      // the starter project's scripted `step(30)` found 128 redundant
+      // composites costing 1.28s of the run's 1.51s, against 0.13s for the
+      // 10 frames the test actually captures. That is what pushed the suite
+      // past its per-test timeout on CI's software rasteriser.
+      //
+      // renderIfNeeded routes through the runtime's render path, so a frame
+      // that is drawn shares the ACES + bloom curve the captured PNGs go
+      // through — falling back to a direct render when the postprocess
+      // factory failed to build (jsdom stubs, headless contexts).
+      runtime.renderIfNeeded();
     };
     animate();
 

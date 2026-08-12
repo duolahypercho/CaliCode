@@ -1,5 +1,11 @@
 import * as THREE from "three";
-import { buildScene, collectAnimationMixers, getGltfAssetInstance, waitForAssetReadiness } from "./procedural";
+import {
+  buildScene,
+  collectAnimationMixers,
+  getGltfAssetInstance,
+  onAssetAttached,
+  waitForAssetReadiness,
+} from "./procedural";
 import {
   restoreCameraPose,
   snapshotCameraPose,
@@ -136,6 +142,20 @@ export class PieRuntime {
    * jsdom tests; `renderScene()` falls back to direct rendering when null.
    */
   private postprocess: PostprocessPipeline | null = null;
+  /**
+   * Set when something changed the picture — a rebuild, a camera framing, a
+   * late-arriving asset, a host resize — and cleared by the next draw.
+   *
+   * Every draw is a full ACES + bloom composite: a RenderPass, the bloom
+   * pass's five-level mip blur chain, and an OutputPass, which measured ~10ms
+   * per frame on a software rasteriser (~25ms at 1280x720) against ~2-6ms for
+   * a bare `renderer.render`. Repeating that for a scene nobody changed is
+   * pure cost, so the editor viewport polls this flag instead of redrawing
+   * unconditionally on every animation frame.
+   */
+  private needsRender = true;
+  /** Detaches the asset-attach subscription at dispose. */
+  private unsubscribeAssetAttach: () => void = () => undefined;
 
   constructor(
     project: Project,
@@ -166,6 +186,29 @@ export class PieRuntime {
       }
       this.postprocess = null;
     }
+    // glTF scenes and textures attach to an already-built group when their
+    // loads resolve. Without this the viewport would keep showing the
+    // placeholder until something else happened to dirty the frame.
+    this.unsubscribeAssetAttach = onAssetAttached(() => this.invalidate());
+  }
+
+  /**
+   * Marks the current picture stale so the next host animation tick draws it.
+   *
+   * Call this from anything that changes what the scene looks like without
+   * drawing it itself. The simulation deliberately does NOT call it: a batch
+   * of stepped frames is only ever observed at its capture frames and at its
+   * end, and `advanceFrame`/`waitFrames` already draw exactly those.
+   */
+  invalidate(): void {
+    this.needsRender = true;
+  }
+
+  /** Draws only when something invalidated the frame. Reports whether it did. */
+  renderIfNeeded(): boolean {
+    if (!this.needsRender) return false;
+    this.renderScene();
+    return true;
   }
 
   get state(): PieState {
@@ -432,6 +475,7 @@ export class PieRuntime {
    */
   renderScene(): void {
     if (this.disposed) return;
+    this.needsRender = false;
     if (this.postprocess) {
       this.postprocess.render();
     } else {
@@ -446,6 +490,9 @@ export class PieRuntime {
    */
   setPostprocessSize(width: number, height: number): void {
     this.postprocess?.setSize(width, height);
+    // Fresh render targets come up empty; the canvas has to be redrawn at
+    // the new size or the viewport keeps the pre-resize picture.
+    this.invalidate();
   }
 
   /** Exposed for inspection; useful for tests verifying bloom is wired. */
@@ -618,6 +665,9 @@ export class PieRuntime {
       this.applyPoseSetting(saved, project);
       this.lastValidCameraPose = snapshotCameraPose(this.camera);
     }
+    // A rebuild replaces every object in the scene; nothing on screen is
+    // valid any more.
+    this.invalidate();
   }
 
   /**
@@ -897,6 +947,9 @@ export class PieRuntime {
   private failWithRestore(reason: string): CameraFrameResult {
     if (this.lastValidCameraPose) {
       restoreCameraPose(this.camera, this.lastValidCameraPose);
+      // Unlike the success paths this one does not draw, so the restored
+      // pose has to be marked stale for the host's next tick.
+      this.invalidate();
     }
     return { ok: false, reason, restored: !!this.lastValidCameraPose };
   }
@@ -908,6 +961,7 @@ export class PieRuntime {
     this.disposed = true;
     this.pause();
     this.rejectWaiters("PIE runtime disposed");
+    this.unsubscribeAssetAttach();
     this.sandbox.dispose();
     // Free the composer's render targets before the renderer goes away;
     // without this the GPU holds the offscreen bloom targets for the next

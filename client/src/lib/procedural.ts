@@ -428,6 +428,7 @@ export function assetObject(asset: Asset, slug?: string): THREE.Object3D {
         }
         group.add(clone);
         instance.settle();
+        notifyAssetAttached();
       })
       .catch((error: unknown) => {
         instance.error =
@@ -471,6 +472,34 @@ export function collectAnimationMixers(
     }
   });
   return mixers;
+}
+
+type AssetAttachListener = () => void;
+
+const assetAttachListeners = new Set<AssetAttachListener>();
+
+/**
+ * Subscribe to "an asynchronously loaded asset just changed a built scene".
+ *
+ * `buildScene` is synchronous and returns placeholders: glTF scenes attach
+ * themselves when the loader resolves, and textures upload when the image
+ * decodes. A host that redraws every animation frame never needed to know —
+ * it would catch the change on the next tick. A host that only redraws when
+ * something changed has no other way to learn its picture went stale, and
+ * would leave a model invisible or a surface untextured until the user
+ * happened to move the camera.
+ *
+ * Returns an unsubscribe function.
+ */
+export function onAssetAttached(listener: AssetAttachListener): () => void {
+  assetAttachListeners.add(listener);
+  return () => {
+    assetAttachListeners.delete(listener);
+  };
+}
+
+function notifyAssetAttached(): void {
+  for (const listener of [...assetAttachListeners]) listener();
 }
 
 /**
@@ -622,7 +651,7 @@ function loadCachedTexture(url: string): THREE.Texture {
   // error. The flag also covers loaders that report failure synchronously,
   // before the texture is cached below.
   let failed = false;
-  const texture = sharedTextureLoader.load(url, undefined, undefined, () => {
+  const texture = sharedTextureLoader.load(url, notifyAssetAttached, undefined, () => {
     failed = true;
     textureCache.delete(url);
   });

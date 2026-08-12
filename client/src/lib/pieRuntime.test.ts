@@ -33,13 +33,16 @@ function makeRuntime(project: Project) {
 
   const camera = new THREE.PerspectiveCamera(50, 1, 0.1, 100);
   const logs: string[] = [];
-  const runtime = new PieRuntime(project, fakeRenderer(), scene, camera, {
+  // Returned so tests can count draws: with no WebGL the postprocess factory
+  // throws and renderScene() falls through to renderer.render.
+  const renderer = fakeRenderer();
+  const runtime = new PieRuntime(project, renderer, scene, camera, {
     onFrame: () => undefined,
     onCapture: () => undefined,
     onLog: (message) => logs.push(message),
     onStateChange: () => undefined,
   });
-  return { runtime, scene, camera, logs };
+  return { runtime, renderer, scene, camera, logs };
 }
 
 /** A project whose single entity is driven by one editable script. */
@@ -387,6 +390,75 @@ describe("PieRuntime project synchronization and evidence framing", () => {
     const horizontalMagnitude = Math.sqrt(offset.x * offset.x + offset.z * offset.z);
     expect(horizontalMagnitude).toBeGreaterThan(0.01);
     expect(offset.y / horizontalMagnitude).toBeLessThan(0.75);
+  });
+
+  it("only redraws when something invalidated the frame", async () => {
+    // The editor viewport used to redraw every animation frame. Once every
+    // draw became an ACES + bloom composite that cost ~10ms on a software
+    // rasteriser, an idle editor was spending the whole main thread
+    // recomposing an unchanged picture — and a scripted `step(30)` ran
+    // 128 of those redundant composites, which is what pushed the starter
+    // suite past DEFAULT_TEST_TIMEOUT_MS on CI.
+    const { runtime, renderer } = makeRuntime(scriptedProject("function update(){}"));
+    const draws = () => (renderer.render as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    // Construction rebuilt the scene, so the first poll owes a draw.
+    expect(runtime.renderIfNeeded()).toBe(true);
+    const afterFirst = draws();
+    // Nothing changed since: every later poll must be free.
+    expect(runtime.renderIfNeeded()).toBe(false);
+    expect(runtime.renderIfNeeded()).toBe(false);
+    expect(draws()).toBe(afterFirst);
+
+    runtime.invalidate();
+    expect(runtime.renderIfNeeded()).toBe(true);
+    expect(draws()).toBe(afterFirst + 1);
+    expect(runtime.renderIfNeeded()).toBe(false);
+  });
+
+  it("presents a stepped batch itself rather than leaving the host to poll per frame", async () => {
+    // captureEvery is 3, so a 30-frame batch is observed at its 10 capture
+    // frames and nowhere else. Those draw themselves; the host must not be
+    // owed a further draw afterwards, or the batch costs 40 composites
+    // instead of 10.
+    const { runtime, renderer } = makeRuntime(scriptedProject("function update(){}"));
+    runtime.renderIfNeeded();
+    const before = (renderer.render as ReturnType<typeof vi.fn>).mock.calls.length;
+
+    await runtime.waitFrames(30);
+
+    const drawn = (renderer.render as ReturnType<typeof vi.fn>).mock.calls.length - before;
+    expect(drawn).toBe(10);
+    expect(runtime.renderIfNeeded()).toBe(false);
+  });
+
+  it("invalidates when a rebuild replaces the scene", () => {
+    const { runtime } = makeRuntime(scriptedProject("function update(){}"));
+    runtime.renderIfNeeded();
+    expect(runtime.renderIfNeeded()).toBe(false);
+
+    runtime.setProject(scriptedProject("function update(){ return {}; }"));
+    expect(runtime.renderIfNeeded()).toBe(true);
+  });
+
+  it("invalidates when an asynchronously loaded asset attaches itself", async () => {
+    // buildScene returns a glTF placeholder synchronously and fills it in
+    // when the loader resolves. A viewport that only draws on demand would
+    // otherwise keep showing the empty placeholder.
+    const loadAsync = vi.spyOn(GLTFLoader.prototype, "loadAsync").mockResolvedValue({
+      scene: new THREE.Group(),
+      animations: [],
+    } as never);
+    try {
+      const { runtime } = makeRuntime(animatedProject("animated/invalidate.gltf"));
+      runtime.renderIfNeeded();
+      expect(runtime.renderIfNeeded()).toBe(false);
+
+      await runtime.waitForAssets();
+      expect(runtime.renderIfNeeded()).toBe(true);
+    } finally {
+      loadAsync.mockRestore();
+    }
   });
 
   it("exposes the postprocess pipeline through getPostprocess() and falls back when the factory failed", () => {
