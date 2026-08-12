@@ -334,26 +334,49 @@ export class PieRuntime {
 
   async stepOnce(): Promise<void> {
     if (this.disposed) return;
+    // capture() draws the same frame it encodes, so re-drawing after it is
+    // a second full pass through the bloom composer for a picture that is
+    // already on screen.
+    if (!(await this.advanceFrame())) this.renderScene();
+  }
+
+  /**
+   * Simulate exactly one fixed step, capturing it when it is a capture
+   * frame. Returns whether the frame reached the canvas — the caller owns
+   * presentation, because a batch of steps is only ever observed at its
+   * captures and at its end.
+   */
+  private async advanceFrame(): Promise<boolean> {
+    if (this.disposed) return false;
     const delta = 1000 / this.fixedHz;
     await this.step(delta);
-    if (this.disposed) return;
+    if (this.disposed) return false;
     this.frameIndex += 1;
     this.simTimeMs += delta;
     this.resolveWaiters();
     this.callbacks.onFrame(this.frameIndex, this.simTimeMs);
-    if (shouldCaptureFrame(this.frameIndex, this.captureEvery)) {
-      this.capture();
-    }
-    this.renderScene();
+    if (!shouldCaptureFrame(this.frameIndex, this.captureEvery)) return false;
+    this.capture();
+    return true;
   }
 
   async waitFrames(count: number): Promise<void> {
     if (count <= 0) return;
     const target = this.frameIndex + count;
     if (!this.running) {
+      // Stepping by hand: every intermediate frame used to be drawn through
+      // the full tone-map + bloom composer, then thrown away when the next
+      // step overwrote it. Nothing observes those frames — the filmstrip
+      // sees only capture frames (which draw themselves) and the viewport
+      // sees only the last one — but the wasted passes are what pushed the
+      // starter project's `step(30)` past the scripted-test timeout on a
+      // software rasterizer.
+      let presented = false;
       for (let i = 0; i < count; i += 1) {
-        await this.stepOnce();
+        if (this.disposed) return;
+        presented = await this.advanceFrame();
       }
+      if (!presented && !this.disposed) this.renderScene();
       return;
     }
     await new Promise<void>((resolve, reject) => {

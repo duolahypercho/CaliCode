@@ -104,6 +104,16 @@ test.describe("agent visual runtime", () => {
   test.use({ viewport: VIEWPORT });
 
   test("synchronously rebuilds and frames rapid editor mutations before PIE evidence", async ({ page }, testInfo) => {
+    // One test carrying a whole agent workflow: three full app boots (goto
+    // plus two reloads), a PIE run, the project test suite (the starter's
+    // "Hero moves" alone simulates 30 fixed steps), six WebGL captures, and a
+    // motion contact sheet composed by core. ~12s on a dev machine, ~65s on
+    // CI, where WebGL falls back to SwiftShader, core runs as a debug build,
+    // and two Playwright workers share four vCPUs. The config-wide 60s
+    // default is sized for single-interaction specs; here it expired during
+    // the final reload with every assertion before it already green. This
+    // buys wall clock only — nothing below is retried or polled into passing.
+    test.setTimeout(180_000);
     const suffix = `${testInfo.workerIndex}-${testInfo.repeatEachIndex}-${Math.random().toString(36).slice(2, 8)}`;
     const projectTitle = `Visual runtime ${suffix}`;
     const projectSlug = slugify(projectTitle);
