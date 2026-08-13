@@ -74,6 +74,13 @@ describe("WorkspaceTabs", () => {
     expect(onClose).toHaveBeenCalledWith("play");
   });
 
+  it("offers the close control on the active tab only", () => {
+    renderTabs({ openTabs: ["play", "code"], active: "play" });
+
+    expect(screen.getByRole("button", { name: "Close Play tab" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Close Code tab" })).toBeNull();
+  });
+
   it("hides the close control when one tab is left, so the dock cannot be emptied", () => {
     renderTabs({ openTabs: ["play"], active: "play" });
 

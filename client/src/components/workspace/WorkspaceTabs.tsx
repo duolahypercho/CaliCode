@@ -81,10 +81,14 @@ export function WorkspaceTabs({
         role="tablist"
         aria-label="Workspace"
         aria-orientation="horizontal"
-        className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+        className="scrollbar-none flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
       >
-        {openTabs.map((tab) => {
+        {openTabs.map((tab, index) => {
           const selected = tab === active;
+          // A hairline divides plain tabs. It is suppressed either side of the
+          // selected pill, where the fill already separates them and a rule
+          // would read as a stray mark against the rounded edge.
+          const divided = index > 0 && !selected && openTabs[index - 1] !== active;
           const badge = badges[tab];
           const meta = TAB_META[tab];
           const Icon = meta.icon;
@@ -92,8 +96,8 @@ export function WorkspaceTabs({
             <div
               key={tab}
               className={`group relative flex shrink-0 items-center rounded-md transition-colors ${
-                selected ? "bg-surface-2 shadow-[inset_0_0_0_1px_var(--line-strong)]" : "hover:bg-surface-2"
-              }`}
+                divided ? "before:mr-1 before:h-3.5 before:w-px before:bg-line-strong before:content-['']" : ""
+              } ${selected ? "bg-surface-2 shadow-[inset_0_0_0_1px_var(--line-strong)]" : "hover:bg-surface-2"}`}
             >
               <button
                 id={`workspace-tab-${tab}`}
@@ -128,11 +132,11 @@ export function WorkspaceTabs({
                 aria-label={tab}
                 title={meta.label}
                 className={`inline-flex min-w-0 items-center gap-1.5 rounded-md py-1.5 pl-2.5 text-[11.5px] font-medium transition-colors ${
-                  closable ? "pr-1" : "pr-2.5"
+                  closable && selected ? "pr-1" : "pr-2.5"
                 } ${selected ? "text-ink-strong" : "text-ink-subtle group-hover:text-ink"}`}
               >
                 <Icon aria-hidden className="h-3.5 w-3.5 shrink-0" strokeWidth={1.7} />
-                <span className="truncate">{meta.label}</span>
+                <span className="max-w-[84px] truncate">{meta.label}</span>
                 {badge ? (
                   <span
                     className={`ml-0.5 shrink-0 rounded-full px-1.5 py-px text-[9px] font-bold text-surface-0 ${
@@ -143,14 +147,12 @@ export function WorkspaceTabs({
                   </span>
                 ) : null}
               </button>
-              {closable ? (
+              {closable && selected ? (
                 <button
                   type="button"
                   aria-label={`Close ${meta.label} tab`}
                   onClick={() => onClose(tab)}
-                  className={`mr-1 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-ink-faint transition-colors hover:bg-surface-3 hover:text-ink-strong ${
-                    selected ? "opacity-100" : "opacity-0 group-hover:opacity-100"
-                  }`}
+                  className="mr-1 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-ink-faint transition-colors hover:bg-surface-3 hover:text-ink-strong"
                 >
                   <X aria-hidden className="h-3 w-3" strokeWidth={2.2} />
                 </button>

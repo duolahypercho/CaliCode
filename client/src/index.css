@@ -199,6 +199,19 @@ select {
   letter-spacing: 0.04em;
 }
 
+/* Strips that scroll horizontally inside chrome — the editor tab bar — keep
+   the scrolling and drop the bar: an 8px track inside a 52px header reads as a
+   broken layout. Trackpad, shift-wheel and keyboard navigation are unaffected,
+   and the roving tabindex scrolls the focused tab into view, so nothing is
+   reachable only by dragging the bar that is now hidden. */
+.scrollbar-none {
+  scrollbar-width: none;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+
 ::-webkit-scrollbar {
   width: 8px;
   height: 8px;
