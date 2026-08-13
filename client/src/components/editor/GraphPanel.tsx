@@ -106,7 +106,7 @@ export function GraphPanel({ graph, onCancel, onRerun, onSelectNode, tickers }: 
           <button
             type="button"
             onClick={() => onCancel(graph.graphId)}
-            className="shrink-0 rounded border border-red-500/40 px-2 py-[3px] text-[10px] tracking-[0.14em] text-red-400 transition-colors hover:bg-red-500/10 focus-visible:outline-none"
+            className="shrink-0 rounded border border-red-500/40 px-2 py-[3px] text-[10px] tracking-[0.14em] text-red-400 transition-colors hover:bg-red-500/10"
           >
             STOP
           </button>
@@ -115,7 +115,7 @@ export function GraphPanel({ graph, onCancel, onRerun, onSelectNode, tickers }: 
           <button
             type="button"
             onClick={() => onRerun(graph.graphId)}
-            className="shrink-0 rounded border border-line px-2 py-[3px] text-[10px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong focus-visible:outline-none"
+            className="shrink-0 rounded border border-line px-2 py-[3px] text-[10px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong"
           >
             RE-RUN
           </button>
@@ -157,7 +157,7 @@ export function GraphPanel({ graph, onCancel, onRerun, onSelectNode, tickers }: 
                   setSelectedId((current) => (current === node.id ? null : node.id));
                   onSelectNode?.(node);
                 }}
-                className={`absolute flex flex-col overflow-hidden rounded-[9px] border bg-surface-1 text-left transition-colors focus-visible:outline-none ${
+                className={`absolute flex flex-col overflow-hidden rounded-[9px] border bg-surface-1 text-left transition-colors ${
                   selectedId === node.id ? "border-ink-subtle bg-surface-2" : "border-line-strong hover:bg-surface-2"
                 }`}
               >
@@ -220,7 +220,7 @@ export function GraphPanel({ graph, onCancel, onRerun, onSelectNode, tickers }: 
               type="button"
               aria-label="Close node details"
               onClick={() => setSelectedId(null)}
-              className="shrink-0 rounded border border-line px-1.5 py-[2px] text-[10px] text-ink-subtle transition-colors hover:text-ink-strong focus-visible:outline-none"
+              className="shrink-0 rounded border border-line px-1.5 py-[2px] text-[10px] text-ink-subtle transition-colors hover:text-ink-strong"
             >
               CLOSE
             </button>

@@ -1,12 +1,12 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { assetObject, renderThumbnail } from "../../lib/procedural";
 import { slugify, uid } from "../../lib/store";
 import type { Asset, Entity } from "../../lib/types";
 import { AssetPreview } from "./AssetPreview";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface ArtTabProps {
   slug: string;
-  theme: "dark" | "light";
   assets: Asset[];
   entities: Entity[];
   onGenerate: (assets: Asset[]) => void;
@@ -33,7 +33,6 @@ const BATCH = 4;
  */
 export function ArtTab({
   slug,
-  theme,
   assets,
   entities,
   onGenerate,
@@ -49,6 +48,11 @@ export function ArtTab({
   const [busy, setBusy] = useState(false);
   const [importing, setImporting] = useState(false);
   const [previewId, setPreviewId] = useState<string | null>(null);
+  const [removeId, setRemoveId] = useState<string | null>(null);
+  // Removing an asset unmounts its ✕ button, so Radix has no trigger left to
+  // hand focus back to. The panel itself outlives the removal and still holds
+  // the remaining cards, so focus returns here rather than to <body>.
+  const panelRef = useRef<HTMLDivElement>(null);
 
   const generate = () => {
     const text = prompt.trim();
@@ -92,13 +96,21 @@ export function ArtTab({
   // Derived rather than stored, so removing the previewed asset closes the
   // panel instead of leaving it rendering a deleted spec.
   const previewAsset = assets.find((asset) => asset.id === previewId) ?? null;
+  // Same reasoning for the pending removal: if the asset disappears underneath
+  // the dialog, the dialog closes rather than confirming against nothing.
+  const removeAsset = assets.find((asset) => asset.id === removeId) ?? null;
+  const removeUsedBy = removeAsset ? entities.filter((entity) => entity.assetId === removeAsset.id) : [];
 
   useEffect(() => {
     onPreviewAssetChange?.(previewAsset);
   }, [onPreviewAssetChange, previewAsset]);
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-y-auto px-[22px] py-[18px]">
+    <div
+      ref={panelRef}
+      tabIndex={-1}
+      className="focus-ring-inset flex h-full min-h-0 flex-col overflow-y-auto px-[22px] py-[18px]"
+    >
       <div className="mb-1.5 flex flex-wrap items-center gap-3">
         <span className="font-display text-[15px] font-bold text-ink-strong">Sprite generator</span>
         <span className="text-[11px] tracking-[0.06em] text-ink-subtle">PROCEDURAL · SEEDED · MONOCHROME</span>
@@ -121,7 +133,7 @@ export function ArtTab({
           type="button"
           onClick={generate}
           disabled={busy || !prompt.trim()}
-          className="shrink-0 rounded-lg border border-line-strong bg-secondary px-[18px] text-[11px] font-bold tracking-[0.12em] text-ink-strong transition-colors hover:bg-secondary/80 active:bg-secondary/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-secondary"
+          className="shrink-0 rounded-lg border border-line-strong bg-secondary px-[18px] text-[11px] font-bold tracking-[0.12em] text-ink-strong transition-colors hover:bg-secondary/80 active:bg-secondary/70 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-secondary"
         >
           {busy ? "GENERATING…" : `GENERATE ${BATCH}`}
         </button>
@@ -163,7 +175,7 @@ export function ArtTab({
       </div>
 
       {previewAsset ? (
-        <AssetPreview asset={previewAsset} slug={slug} theme={theme} onClose={() => setPreviewId(null)} />
+        <AssetPreview asset={previewAsset} slug={slug} onClose={() => setPreviewId(null)} />
       ) : null}
 
       {visible.length === 0 ? (
@@ -184,7 +196,11 @@ export function ArtTab({
                   onClick={() => setPreviewId((current) => (current === asset.id ? null : asset.id))}
                   aria-pressed={previewId === asset.id}
                   aria-label={`Preview ${asset.name}`}
-                  className="flex h-[118px] w-full items-center justify-center bg-[repeating-linear-gradient(45deg,#141414,#141414_8px,#1c1c1c_8px,#1c1c1c_16px)] text-[#8f8f8f] transition-colors hover:text-[#dcdcdc] focus-visible:outline-none aria-pressed:ring-1 aria-pressed:ring-inset aria-pressed:ring-white/40"
+                  /* The transparency checkerboard and its label were hardcoded
+                     dark: on a light-mode Mac this was a near-black tile with
+                     a hover that turned "NO PREVIEW" almost white-on-white.
+                     The tokens carry the same dark values they replaced. */
+                  className="flex h-[118px] w-full items-center justify-center bg-[repeating-linear-gradient(45deg,var(--surface-2),var(--surface-2)_8px,var(--surface-3)_8px,var(--surface-3)_16px)] text-ink-subtle transition-colors hover:text-ink-strong aria-pressed:ring-1 aria-pressed:ring-inset aria-pressed:ring-line-strong"
                 >
                   {asset.thumbnail ? (
                     <img src={asset.thumbnail} alt="" className="h-full w-full object-contain" />
@@ -207,7 +223,7 @@ export function ArtTab({
                     type="button"
                     onClick={() => onPromote(asset.id)}
                     aria-label={`Promote ${asset.name}`}
-                    className="inline-flex min-h-[28px] flex-1 items-center justify-center rounded border border-line py-1 text-[10px] tracking-[0.1em] text-ink transition-colors active:border-ink-subtle focus-visible:outline-none"
+                    className="inline-flex min-h-[28px] flex-1 items-center justify-center rounded border border-line py-1 text-[10px] tracking-[0.1em] text-ink transition-colors active:border-ink-subtle"
                   >
                     PROMOTE
                   </button>
@@ -216,16 +232,18 @@ export function ArtTab({
                       type="button"
                       onClick={() => onEdit(asset.id)}
                       aria-label={`Edit ${asset.name} in the builder`}
-                      className="inline-flex min-h-[28px] items-center justify-center rounded border border-line px-2 py-1 text-[10px] tracking-[0.1em] text-ink transition-colors active:border-ink-subtle focus-visible:outline-none"
+                      className="inline-flex min-h-[28px] items-center justify-center rounded border border-line px-2 py-1 text-[10px] tracking-[0.1em] text-ink transition-colors active:border-ink-subtle"
                     >
                       EDIT
                     </button>
                   ) : null}
+                  {/* Demoted against PROMOTE and EDIT: it is the only control
+                      here that destroys something, and there is no undo. */}
                   <button
                     type="button"
-                    onClick={() => onRemove(asset.id)}
+                    onClick={() => setRemoveId(asset.id)}
                     aria-label={`Remove ${asset.name}`}
-                    className="inline-flex min-h-[28px] items-center justify-center rounded border border-line px-2 py-1 text-[10px] text-ink-subtle transition-colors hover:text-ink active:border-ink-subtle focus-visible:outline-none"
+                    className="inline-flex min-h-[28px] items-center justify-center rounded border border-line px-2 py-1 text-[10px] text-ink-faint transition-colors hover:text-danger-soft active:border-danger-soft"
                   >
                     ✕
                   </button>
@@ -235,8 +253,33 @@ export function ArtTab({
           })}
         </div>
       )}
+
+      <ConfirmDialog
+        open={removeAsset !== null}
+        title={removeAsset ? `Remove ${removeAsset.name}?` : ""}
+        description={removeAsset ? describeAssetRemoval(removeUsedBy) : ""}
+        confirmLabel="Remove asset"
+        onConfirm={() => {
+          if (removeAsset) onRemove(removeAsset.id);
+          setRemoveId(null);
+        }}
+        onOpenChange={(open) => {
+          if (!open) setRemoveId(null);
+        }}
+        returnFocusRef={panelRef}
+      />
     </div>
   );
+}
+
+/** Names what the removal costs: an orphaned `assetId` is invisible otherwise. */
+function describeAssetRemoval(usedBy: Entity[]): string {
+  if (usedBy.length === 0) return "Nothing in the scene uses it. This cannot be undone.";
+  const names = usedBy.slice(0, 3).map((entity) => entity.name);
+  const rest = usedBy.length - names.length;
+  const list = rest > 0 ? `${names.join(", ")} and ${rest} more` : names.join(", ");
+  const subject = usedBy.length === 1 ? "1 entity in the scene uses" : `${usedBy.length} entities in the scene use`;
+  return `${subject} it and will lose their mesh: ${list}. This cannot be undone.`;
 }
 
 /** Thumbnails need WebGL; a headless or context-exhausted browser must not break generation. */

@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import type { Entity, Vec3 } from "../../lib/types";
+import { ConfirmDialog } from "./ConfirmDialog";
 
 interface EntityPropertiesProps {
   entity: Entity | null;
@@ -17,18 +18,43 @@ interface EntityPropertiesProps {
  * hydration window at all.
  */
 export function EntityProperties({ entity, onChange, onRemove }: EntityPropertiesProps) {
+  // Deleting the selected entity unmounts the whole form, DELETE button
+  // included, so there is nothing left for Radix to return focus to. The empty
+  // state is the one node that survives the removal and it is already the
+  // panel's new content — send focus there so the keyboard stays in the
+  // inspector and a screen reader hears why the form went away.
+  const emptyStateRef = useRef<HTMLDivElement>(null);
+
   if (!entity) {
     return (
-      <div className="flex h-full items-center justify-center px-4 text-center text-xs text-ink-subtle">
+      <div
+        ref={emptyStateRef}
+        tabIndex={-1}
+        className="focus-ring-inset flex h-full items-center justify-center px-4 text-center text-xs text-ink-subtle"
+      >
         Select a node to edit its transform and material.
       </div>
     );
   }
-  return <PropertiesForm key={entity.id} entity={entity} onChange={onChange} onRemove={onRemove} />;
+  return (
+    <PropertiesForm
+      key={entity.id}
+      entity={entity}
+      onChange={onChange}
+      onRemove={onRemove}
+      returnFocusRef={emptyStateRef}
+    />
+  );
 }
 
-function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & { entity: Entity }) {
+function PropertiesForm({
+  entity,
+  onChange,
+  onRemove,
+  returnFocusRef,
+}: EntityPropertiesProps & { entity: Entity; returnFocusRef: RefObject<HTMLDivElement | null> }) {
   const [name, setName] = useState(entity.name);
+  const [confirmingRemove, setConfirmingRemove] = useState(false);
 
   const material = entity.material as Record<string, unknown>;
   const color = String(material.color ?? "#6b7280");
@@ -56,7 +82,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
         onKeyDown={(event) => {
           if (event.key === "Enter") event.currentTarget.blur();
         }}
-        className="mb-3.5 w-full rounded-md border border-line bg-surface-1 px-2.5 py-1.5 text-xs text-ink-strong outline-none transition-colors"
+        className="focus-ring-inset mb-3.5 w-full rounded-md border border-line bg-surface-1 px-2.5 py-1.5 text-xs text-ink-strong transition-colors focus:border-ink-faint"
       />
 
       {(
@@ -76,7 +102,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
                 aria-label={`${label} ${axisLabel}`}
                 value={entity.transform[key][axis as 0 | 1 | 2]}
                 onCommit={(value) => setVec(key, axis as 0 | 1 | 2, value)}
-                className="w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong outline-none transition-colors"
+                className="focus-ring-inset w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong transition-colors focus:border-ink-faint"
               />
             ))}
           </div>
@@ -90,7 +116,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
           aria-label="Colour"
           value={color}
           onChange={(event) => onChange({ material: { ...material, color: event.target.value } })}
-          className="h-[30px] w-full rounded-md border border-line bg-surface-1 p-1 outline-none transition-colors"
+          className="focus-ring-inset h-[30px] w-full rounded-md border border-line bg-surface-1 p-1 transition-colors focus:border-ink-faint"
         />
         <NumericField
           step={0.05}
@@ -99,7 +125,7 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
           aria-label="Metalness"
           value={metalness}
           onCommit={(value) => onChange({ material: { ...material, metalness: value } })}
-          className="w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong outline-none transition-colors"
+          className="focus-ring-inset w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong transition-colors focus:border-ink-faint"
         />
         <NumericField
           step={0.05}
@@ -108,19 +134,45 @@ function PropertiesForm({ entity, onChange, onRemove }: EntityPropertiesProps & 
           aria-label="Roughness"
           value={roughness}
           onCommit={(value) => onChange({ material: { ...material, roughness: value } })}
-          className="w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong outline-none transition-colors"
+          className="focus-ring-inset w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong transition-colors focus:border-ink-faint"
         />
       </div>
 
       <button
         type="button"
-        onClick={() => onRemove(entity.id)}
-        className="mt-auto rounded-md border border-line py-2 text-[11px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-danger-soft active:border-danger-soft focus-visible:outline-none"
+        onClick={() => setConfirmingRemove(true)}
+        className="mt-auto rounded-md border border-line py-2 text-[11px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-danger-soft active:border-danger-soft"
       >
         DELETE ENTITY
       </button>
+
+      {/* The scene document has no undo, so the node's scripts and material
+          are gone the moment this lands — say so first. */}
+      <ConfirmDialog
+        open={confirmingRemove}
+        title={`Delete ${entity.name}?`}
+        description={describeEntityRemoval(entity)}
+        confirmLabel="Delete entity"
+        onConfirm={() => {
+          setConfirmingRemove(false);
+          onRemove(entity.id);
+        }}
+        onOpenChange={setConfirmingRemove}
+        returnFocusRef={returnFocusRef}
+      />
     </div>
   );
+}
+
+function describeEntityRemoval(entity: Entity): string {
+  const scripts = entity.scriptIds.length;
+  const attached =
+    scripts === 0
+      ? ""
+      : scripts === 1
+        ? " Its script stays in the game but stops running."
+        : ` Its ${scripts} scripts stay in the game but stop running.`;
+  return `It leaves the scene with its transform and material.${attached} This cannot be undone.`;
 }
 
 interface NumericFieldProps {

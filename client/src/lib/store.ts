@@ -145,6 +145,24 @@ export function updateAsset(project: Project, id: string, patch: Partial<Asset>)
   };
 }
 
+/**
+ * Drop an asset and release every entity that referenced it.
+ *
+ * The reference has to be cleared in the same step: an entity left pointing at
+ * a deleted asset id renders nothing and reports no error, and the project
+ * autosaves ~800ms later with no project-level undo anywhere in the app. `null`
+ * is the same value an entity that never had an asset carries, so the affected
+ * entities keep their transform and material and simply lose their mesh —
+ * which is what the removal confirmation promises.
+ */
+export function removeAsset(project: Project, id: string): Project {
+  return {
+    ...project,
+    assets: project.assets.filter((asset) => asset.id !== id),
+    entities: project.entities.map((entity) => (entity.assetId === id ? { ...entity, assetId: null } : entity)),
+  };
+}
+
 export function addTest(project: Project, test: Partial<GameTest>): Project {
   const id = test.id ?? uid("test");
   const next: GameTest = {

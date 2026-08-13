@@ -27,7 +27,7 @@ import {
   setRepoSetting,
   type RepoSettingValue,
 } from "./lib/assetLibrary";
-import { addAsset, removeEntity, slugify, starterProject, uid, updateAsset, updateEntity, updateScript } from "./lib/store";
+import { addAsset, removeAsset, removeEntity, slugify, starterProject, uid, updateAsset, updateEntity, updateScript } from "./lib/store";
 import { applyOps, emptySpec, specFromProcedural, type ApplyResult, type BuilderOp } from "./lib/assetBuilderOps";
 import { AssetBuilder, projectAssetWrite } from "./components/editor/AssetBuilder";
 import type { CaliSpec } from "./lib/assetPipeline";
@@ -68,11 +68,22 @@ const VIEW_KEY = "calicode-view";
 
 /** Small icon button used in the collapsed-sidebar chrome strip. */
 const CHROME_ICON_BUTTON =
-  "inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink-strong focus-visible:outline-none disabled:opacity-35";
+  "inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink-strong disabled:opacity-35";
 const PINNED_PROJECTS_KEY = "calicode-pinned-projects";
 const THEME_KEY = "calicode-theme";
 
 type Theme = "dark" | "light";
+
+/** Autosave, as the header reports it. There is no SAVE button to fall back on. */
+type SaveState = { status: "saved" | "saving" } | { status: "error"; message: string };
+
+/**
+ * An unsaved workspace-file buffer. `verified` is true when the file's on-disk
+ * contents were read and the text is known to differ from them; false when the
+ * read failed, which keeps the text but withholds the claim that it modifies
+ * anything, since nobody knows what it would be modifying.
+ */
+type DraftBuffer = { text: string; verified: boolean };
 
 function readTheme(): Theme {
   const stored = localStorage.getItem(THEME_KEY);
@@ -205,6 +216,16 @@ export default function App() {
   // matching root is loaded; never let a stale/foreign path jump the editor.
   const [activityFile, setActivityFile] = useState<ActivityFileChange | null>(null);
   const [pendingActivityFile, setPendingActivityFile] = useState<ActivityFileChange | null>(null);
+  // Unsaved workspace-file buffers, keyed by path. FileEditor unmounts on
+  // every tab change and used to reset its draft whenever the path changed,
+  // so typed work only survives if it is held above both of those events.
+  // `verified` is false while the file's read failed: the text is kept exactly
+  // like any other buffer, but its disk state is unknown, so it is not a known
+  // modification and must not be advertised as one.
+  const [dirtyFiles, setDirtyFiles] = useState<Record<string, DraftBuffer>>({});
+  const [saveState, setSaveState] = useState<SaveState>({ status: "saved" });
+  // The most recent error log, raised where the user is actually looking.
+  const [errorToast, setErrorToast] = useState<{ id: string; message: string } | null>(null);
   // Below lg/md these panes leave the layout entirely; the toggles open them
   // as overlays so the agent and the games list stay reachable on a narrow
   // window rather than simply disappearing.
@@ -315,14 +336,22 @@ export default function App() {
     // from and update the synchronous mirror before scheduling state so an
     // immediate editor_console_log -> editor_console_history sequence sees
     // the entry that was actually appended, not the preceding render.
-    const next = [
-      ...logsRef.current.slice(-199),
-      { id: uid("log"), level, message: text, time: new Date().toLocaleTimeString() },
-    ];
+    const entry = { id: uid("log"), level, message: text, time: new Date().toLocaleTimeString() };
+    const next = [...logsRef.current.slice(-199), entry];
     logsRef.current = next;
     setLogs(next);
+    // Failures used to land only in LiveBar's console, which is collapsed by
+    // default inside a dock that can be closed or off-screen entirely.
+    if (level === "error") setErrorToast({ id: entry.id, message: text });
   }, []);
   const getLogs = useCallback(() => logsRef.current, []);
+
+  // Long enough to read, then gone — the console keeps the permanent copy.
+  useEffect(() => {
+    if (!errorToast) return;
+    const timer = window.setTimeout(() => setErrorToast(null), 8000);
+    return () => window.clearTimeout(timer);
+  }, [errorToast]);
 
   // Stable identities for the workspace panes. FileTree and FileEditor read
   // these inside effects; an inline arrow here means a fresh identity every
@@ -330,7 +359,53 @@ export default function App() {
   // ten seconds. They hold the callback in a ref too — this keeps the prop
   // honest so that defence never has to carry it alone.
   const handleWorkspaceError = useCallback((text: string) => pushLog(text, "error"), [pushLog]);
-  const handleWorkspaceSaved = useCallback((path: string) => pushLog(`saved ${path}`), [pushLog]);
+  const dropDirtyFile = useCallback((path: string) => {
+    setDirtyFiles((current) => {
+      if (!(path in current)) return current;
+      const next = { ...current };
+      delete next[path];
+      return next;
+    });
+  }, []);
+  const handleWorkspaceSaved = useCallback(
+    (path: string) => {
+      // The buffer is on disk now. The editor retires its own entry, but only
+      // while it is mounted for that path — prune here too so a save followed
+      // by a tab or file switch can never leave a buffer behind to be seeded
+      // back into the file later.
+      dropDirtyFile(path);
+      pushLog(`saved ${path}`);
+    },
+    [dropDirtyFile, pushLog],
+  );
+  const handleDraftChange = useCallback(
+    (path: string, draft: string | null, verified: boolean) => {
+      if (draft === null) {
+        dropDirtyFile(path);
+        return;
+      }
+      setDirtyFiles((current) => {
+        const existing = current[path];
+        if (existing && existing.text === draft && existing.verified === verified) return current;
+        return { ...current, [path]: { text: draft, verified } };
+      });
+    },
+    [dropDirtyFile],
+  );
+  // A different folder means different paths; a stale buffer must never be
+  // offered as the contents of a same-named file in another workspace.
+  const workspaceId = workspace?.id ?? null;
+  useEffect(() => {
+    setDirtyFiles((current) => (Object.keys(current).length === 0 ? current : {}));
+  }, [workspaceId]);
+  // The tree's MODIFIED marker is a claim about disk: this file differs from
+  // what is stored. A buffer whose file could not be read supports no such
+  // claim, so it is held but left out of this set; the editor shows that state
+  // in its own words instead.
+  const dirtyPaths = useMemo(
+    () => new Set(Object.entries(dirtyFiles).filter(([, buffer]) => buffer.verified).map(([path]) => path)),
+    [dirtyFiles],
+  );
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
@@ -800,22 +875,38 @@ export default function App() {
     );
   }, [pushLog]);
 
+  /**
+   * The one write path for the project document, shared by the debounce below
+   * and by the header's Retry. It reports into `saveState` because the console
+   * line it used to write alone is collapsed by default, inside a dock that is
+   * hidden under 1024px — so a failed save looked exactly like a good one.
+   */
+  const persistProjectNow = useCallback(async () => {
+    const serialized = JSON.stringify(project);
+    setSaveState({ status: "saving" });
+    try {
+      await rpc("project_save", { project });
+      // Keep the dirty marker when core is unavailable so the same edit
+      // retries after recovery instead of being reported as saved.
+      lastSavedRef.current = serialized;
+      setSaveState({ status: "saved" });
+      pushLog(`saved ${project.slug}`);
+    } catch (error) {
+      const message = reason(error);
+      setSaveState({ status: "error", message });
+      pushLog(`save failed: ${message}`, "error");
+    }
+  }, [project, pushLog]);
+
   useEffect(() => {
     if (lastSavedRef.current === null) return;
-    const serialized = JSON.stringify(project);
-    if (serialized === lastSavedRef.current) return;
-    const timer = window.setTimeout(() => {
-      void rpc("project_save", { project })
-        .then(() => {
-          // Keep the dirty marker when core is unavailable so the same edit
-          // retries after recovery instead of being reported as saved.
-          lastSavedRef.current = serialized;
-          pushLog(`saved ${project.slug}`);
-        })
-        .catch((error) => pushLog(`save failed: ${reason(error)}`, "error"));
-    }, 800);
+    if (JSON.stringify(project) === lastSavedRef.current) return;
+    // Announced at the start of the debounce, not when the RPC leaves: the
+    // edit is unsaved for those 800ms and the indicator should say so.
+    setSaveState((current) => (current.status === "saving" ? current : { status: "saving" }));
+    const timer = window.setTimeout(() => void persistProjectNow(), 800);
     return () => window.clearTimeout(timer);
-  }, [coreStatus, project, pushLog]);
+  }, [coreStatus, project, persistProjectNow]);
 
   const toggleTools = useCallback(() => {
     if (window.matchMedia("(min-width: 1024px)").matches) {
@@ -910,11 +1001,15 @@ export default function App() {
     }
   };
 
+  // No fallback to `[project]`: with the core offline or nothing on disk, the
+  // in-memory starter used to be listed as if it were a saved game — it is
+  // expandable, right-clickable and renameable, and none of it persists.
+  // Passing the real (possibly empty) list through lets the sidebar show its
+  // empty state, which explains the situation instead of faking a game.
   const displayedProjects = useMemo(() => {
-    const source = projects.length > 0 ? projects : [project];
     const pinned = new Set(pinnedProjectSlugs);
-    return [...source].sort((left, right) => Number(pinned.has(right.slug)) - Number(pinned.has(left.slug)));
-  }, [pinnedProjectSlugs, project, projects]);
+    return [...projects].sort((left, right) => Number(pinned.has(right.slug)) - Number(pinned.has(left.slug)));
+  }, [pinnedProjectSlugs, projects]);
 
   // Saved transcripts grouped per game for the sidebar, newest first.
   // Sessions with no project slug land under the currently selected game so
@@ -1239,6 +1334,7 @@ export default function App() {
       >
         <GamesSidebar
           projects={displayedProjects}
+          coreStatus={coreStatus}
           activeSlug={project.slug}
           sessions={sessionsBySlug}
           activeSessionId={activeSessionId}
@@ -1364,6 +1460,7 @@ export default function App() {
                 ? "Assets Library"
                 : sessions.find((session) => session.id === activeSessionId)?.title ?? project.title}
             </span>
+            <SaveIndicator state={saveState} onRetry={() => void persistProjectNow()} />
             {mainView === "chat" ? (
               <>
                 <button
@@ -1419,7 +1516,7 @@ export default function App() {
                       setCoreRetry((current) => current + 1);
                     }
                   }}
-                  className="shrink-0 rounded px-2 py-1 font-medium text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong focus-visible:outline-none"
+                  className="shrink-0 rounded px-2 py-1 font-medium text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong"
                 >
                   Retry
                 </button>
@@ -1564,6 +1661,7 @@ export default function App() {
                   <FileTree
                     workspaceId={workspace.id}
                     activePath={workspaceFile}
+                    dirtyPaths={dirtyPaths}
                     onOpenFile={(path) => {
                       // A direct tree click intentionally leaves activity
                       // mode; otherwise an old agent diff would snap back
@@ -1581,6 +1679,8 @@ export default function App() {
                     workspaceId={workspace.id}
                     path={workspaceFile}
                     activityFile={activityFile}
+                    preservedDraft={workspaceFile ? dirtyFiles[workspaceFile]?.text ?? null : null}
+                    onDraftChange={handleDraftChange}
                     onSaved={handleWorkspaceSaved}
                     onError={handleWorkspaceError}
                   />
@@ -1613,19 +1713,13 @@ export default function App() {
               <div role="tabpanel" id="workspace-panel-art" aria-labelledby="workspace-tab-art" className="absolute inset-0">
                 <ArtTab
                   slug={project.slug}
-                  theme={theme}
                   assets={project.assets}
                   entities={project.entities}
                   onGenerate={(created) =>
                     setProject((current) => created.reduce((next, asset) => addAsset(next, asset), current))
                   }
                   onPromote={promoteAsset}
-                  onRemove={(assetId) =>
-                    setProject((current) => ({
-                      ...current,
-                      assets: current.assets.filter((asset) => asset.id !== assetId),
-                    }))
-                  }
+                  onRemove={(assetId) => setProject((current) => removeAsset(current, assetId))}
                   onImportImage={handleImportImage}
                   onLog={pushLog}
                   onPreviewAssetChange={(asset) => setPreviewAssetId(asset?.id ?? null)}
@@ -1661,7 +1755,7 @@ export default function App() {
                             <button
                               type="button"
                               onClick={() => openInBuilder(asset.id)}
-                              className="flex w-full items-center gap-2 rounded-md border border-line bg-surface-1 px-3 py-2 text-left text-xs text-ink transition-colors hover:border-ink-faint focus-visible:outline-none"
+                              className="flex w-full items-center gap-2 rounded-md border border-line bg-surface-1 px-3 py-2 text-left text-xs text-ink transition-colors hover:border-ink-faint"
                             >
                               <span className="min-w-0 flex-1 truncate">{asset.name}</span>
                               <span className="shrink-0 text-[10px] uppercase tracking-[0.08em] text-ink-faint">
@@ -1889,6 +1983,29 @@ export default function App() {
           ) : null}
         </DialogContent>
       </Dialog>
+
+      {/* Errors are raised over the whole workbench, not into the dock: the
+          dock is closable, hidden under 1024px, and its console ships
+          collapsed, so a failed save could pass for a successful one. */}
+      {errorToast ? (
+        <div
+          role="alert"
+          data-error-toast
+          className="pointer-events-none fixed inset-x-0 bottom-6 z-50 flex justify-center px-4"
+        >
+          <div className="pointer-events-auto flex max-w-[520px] items-start gap-3 rounded-lg border border-danger-soft/40 bg-raised px-3.5 py-2.5 shadow-lg">
+            <p className="min-w-0 text-xs leading-[1.5] text-danger-soft">{errorToast.message}</p>
+            <button
+              type="button"
+              aria-label="Dismiss error"
+              onClick={() => setErrorToast(null)}
+              className="-mr-1 shrink-0 rounded px-1.5 py-0.5 text-xs text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink"
+            >
+              Dismiss
+            </button>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1953,6 +2070,47 @@ function projectActionConfirmLabel(action: DialogProjectAction): string {
   }[action];
 }
 
+/**
+ * Autosave, made observable.
+ *
+ * WorkspaceTabs tells users "there is no SAVE button — the project document
+ * autosaves on edit", so they have been instructed to trust a mechanism whose
+ * only failure report used to be one line in a collapsed console. This sits
+ * beside the title, where they already are, and offers the retry.
+ */
+function SaveIndicator({ state, onRetry }: { state: SaveState; onRetry: () => void }) {
+  return (
+    <span
+      role="status"
+      aria-live="polite"
+      data-save-state={state.status}
+      title={state.status === "error" ? state.message : undefined}
+      className={`ml-2 inline-flex shrink-0 items-center gap-1 text-[11px] ${
+        state.status === "error"
+          ? "rounded-md border border-danger-soft/40 bg-danger-soft/10 py-px pl-2 pr-1 text-danger-soft"
+          : "text-ink-subtle"
+      }`}
+    >
+      {state.status === "error" ? (
+        <>
+          Save failed
+          <button
+            type="button"
+            onClick={onRetry}
+            className="rounded px-1.5 py-0.5 font-medium underline underline-offset-2 transition-colors hover:bg-danger-soft/15"
+          >
+            Retry
+          </button>
+        </>
+      ) : state.status === "saving" ? (
+        "Saving…"
+      ) : (
+        "Saved"
+      )}
+    </span>
+  );
+}
+
 interface ResizeHandleProps {
   panel: ResizablePanel;
   bounds: ResizablePanelOptions;
@@ -1980,7 +2138,7 @@ function ResizeHandle({ panel, bounds, label, className = "" }: ResizeHandleProp
       onPointerDown={panel.onDragStart}
       onKeyDown={panel.onKeyDown}
       onDoubleClick={panel.reset}
-      className={`w-[5px] shrink-0 cursor-col-resize transition-colors hover:bg-surface-3 active:bg-line-strong focus-visible:bg-surface-3 focus-visible:outline-none ${
+      className={`w-[5px] shrink-0 cursor-col-resize transition-colors hover:bg-surface-3 active:bg-line-strong focus-visible:bg-surface-3 ${
         panel.isDragging ? "bg-line-strong" : "bg-transparent"
       } ${className}`}
     />

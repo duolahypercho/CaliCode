@@ -13,7 +13,7 @@ export const SelectTrigger = React.forwardRef<
   <SelectPrimitive.Trigger
     ref={ref}
     className={cn(
-      "flex h-8 w-full items-center justify-between rounded-md border border-input bg-transparent px-3 py-1 text-sm transition-colors hover:bg-accent/40 active:bg-accent/60 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent",
+      "flex h-8 w-full items-center justify-between rounded-md border border-input bg-transparent px-3 py-1 text-sm transition-colors hover:bg-accent/40 active:bg-accent/60 focus-ring disabled:cursor-not-allowed disabled:opacity-50 disabled:hover:bg-transparent",
       className,
     )}
     {...props}
@@ -55,7 +55,12 @@ export const SelectItem = React.forwardRef<
   <SelectPrimitive.Item
     ref={ref}
     className={cn(
-      "relative flex min-h-[28px] w-full cursor-default select-none items-center rounded-sm py-1.5 pl-2 pr-8 text-sm outline-none transition-colors focus:bg-surface-3 focus:text-ink-strong data-[state=checked]:bg-surface-3 data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50",
+      // No `outline-none` here: Radix moves real DOM focus onto the highlighted
+      // item, so the app's shared ring is the keyboard affordance and the
+      // `focus:` fill is only the pointer-and-keyboard highlight underneath it.
+      // index.css draws the ring inset for [role="option"] so it hugs the row
+      // instead of bleeding into the viewport's padding.
+      "relative flex min-h-[28px] w-full cursor-default select-none items-center rounded-sm py-1.5 pl-2 pr-8 text-sm transition-colors focus:bg-surface-3 focus:text-ink-strong data-[state=checked]:bg-surface-3 data-[disabled]:cursor-not-allowed data-[disabled]:opacity-50",
       className,
     )}
     {...props}

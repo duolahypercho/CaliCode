@@ -20,29 +20,29 @@ interface TweakPanelProps {
 /** Floating live-tweak inspector shown over the PLAY viewport. */
 export function TweakPanel({ title, controls, onClose }: TweakPanelProps) {
   return (
-    <div className="absolute bottom-3.5 right-3.5 z-10 w-[242px] rounded-lg border border-white/[0.16] bg-[#0c0c0c]/95 p-3.5 backdrop-blur">
+    <div className="absolute bottom-3.5 right-3.5 z-10 w-[242px] rounded-lg border border-line-strong bg-surface-0/95 p-3.5 backdrop-blur">
       <div className="mb-3 flex items-center gap-2">
-        <span className="text-[11px] font-bold uppercase tracking-[0.18em] text-[#dadada]">{title}</span>
+        <span className="text-[11px] font-bold uppercase tracking-[0.18em] text-ink-strong">{title}</span>
         <button
           type="button"
           onClick={onClose}
           aria-label="Close tweak panel"
-          className="ml-auto inline-flex min-h-[28px] min-w-[28px] items-center justify-center rounded border border-white/[0.12] text-[11px] leading-none text-[#828282] transition-colors hover:text-[#d0d0d0] active:border-white/40 focus-visible:outline-none"
+          className="ml-auto inline-flex min-h-[28px] min-w-[28px] items-center justify-center rounded border border-line-strong text-[11px] leading-none text-ink-subtle transition-colors hover:text-ink-strong active:border-ink-faint"
         >
           ✕
         </button>
       </div>
       <div className="flex flex-col gap-3">
         {controls.length === 0 ? (
-          <p className="text-[11px] text-[#8f8f8f]">Nothing to tweak here yet.</p>
+          <p className="text-[11px] text-ink-subtle">Nothing to tweak here yet.</p>
         ) : (
           controls.map((control) => (
             <div key={control.key}>
               <div className="mb-1.5 flex justify-between text-[10.5px]">
-                <label htmlFor={`tweak-${control.key}`} className="text-[#8f8f8f]">
+                <label htmlFor={`tweak-${control.key}`} className="text-ink-subtle">
                   {control.label}
                 </label>
-                <span className="text-[#d4d4d4]">{control.display}</span>
+                <span className="text-ink-strong">{control.display}</span>
               </div>
               <input
                 id={`tweak-${control.key}`}
@@ -52,7 +52,7 @@ export function TweakPanel({ title, controls, onClose }: TweakPanelProps) {
                 step={control.step}
                 value={control.value}
                 onChange={(event) => control.onChange(Number(event.target.value))}
-                className="h-[3px] w-full cursor-pointer rounded-full accent-[#9a9a9a] transition-colors focus-visible:outline-none"
+                className="h-[3px] w-full cursor-pointer rounded-full accent-ink-subtle transition-colors"
               />
             </div>
           ))

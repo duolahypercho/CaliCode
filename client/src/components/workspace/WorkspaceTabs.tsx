@@ -74,7 +74,7 @@ export function WorkspaceTabs({ active, onChange, badges }: WorkspaceTabsProps) 
               onClick={() => onChange(tab)}
               aria-label={tab}
               title={meta.label}
-              className={`relative inline-flex min-w-0 items-center justify-center gap-0.5 border-r border-line px-1 py-2 text-[10px] font-medium transition-colors last:border-r-0 focus-visible:outline-none ${
+              className={`relative inline-flex min-w-0 items-center justify-center gap-0.5 border-r border-line px-1 py-2 text-[10px] font-medium transition-colors last:border-r-0 ${
                 selected
                   ? "bg-surface-3 text-ink-strong shadow-[inset_0_0_0_1px_var(--line-strong)] active:bg-surface-3"
                   : "text-ink-subtle hover:bg-surface-2 hover:text-ink active:bg-surface-3"

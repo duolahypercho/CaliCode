@@ -94,8 +94,12 @@ outside route-level components. Types shared with core live in
 `index.css` (`surface-0..3`, `ink-strong|ink|ink-subtle|ink-faint`,
 `line|line-strong`, `raised`, `danger-soft`), never raw hex, so light and dark
 stay in sync. Chrome uses the system sans; `.font-mono` (Space Mono) is for
-code and the wordmark. **No focus rings and no hover border-colour changes** —
-hover is a background tint, selection is a background fill. Icons are
+code and the wordmark. **No hover border-colour changes** — hover is a
+background tint, selection is a background fill. **Keyboard focus is the one
+exception**: `index.css` draws a single unlayered `--focus-ring` outline for
+every control, so never add a `focus-visible:ring-*` utility beside it and
+never suppress it with `outline-none`; a control inside a clipping scroller
+takes `.focus-ring-inset`. `ui/focusRing.test.tsx` enforces both. Icons are
 `lucide-react` at `strokeWidth` ~1.7.
 
 **Persistence is automatic.** There is no SAVE button: editing `project` state

@@ -86,7 +86,7 @@ export function SessionSearchDialog({
               onChange={(event) => setQuery(event.target.value)}
               placeholder="Search games and chats…"
               aria-label="Search games"
-              className="min-w-0 flex-1 bg-transparent py-3 text-[13px] text-ink-strong outline-none placeholder:text-ink-faint focus-visible:outline-none"
+              className="min-w-0 flex-1 bg-transparent py-3 text-[13px] text-ink-strong placeholder:text-ink-faint"
             />
             <kbd className="hidden shrink-0 rounded border border-line bg-surface-2 px-1.5 py-0.5 font-mono text-[10px] text-ink-faint sm:inline-block">
               esc
@@ -111,7 +111,7 @@ export function SessionSearchDialog({
                           onOpenProject(project.slug);
                           close();
                         }}
-                        className="flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[12.5px] text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong focus-visible:outline-none"
+                        className="flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[12.5px] text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong"
                       >
                         <Folder aria-hidden size={15} strokeWidth={1.7} className="shrink-0 text-ink-subtle" />
                         <span className="min-w-0 flex-1 truncate" title={project.title}>
@@ -135,7 +135,7 @@ export function SessionSearchDialog({
                           onSelectSession(projectSlug, session.id);
                           close();
                         }}
-                        className="flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[12.5px] text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong focus-visible:outline-none"
+                        className="flex min-h-9 w-full items-center gap-2.5 rounded-lg px-2.5 py-1.5 text-left text-[12.5px] text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong"
                       >
                         <MessageSquare aria-hidden size={14} strokeWidth={1.7} className="shrink-0 text-ink-subtle" />
                         <span className="min-w-0 flex-1 truncate" title={session.title}>

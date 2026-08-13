@@ -55,7 +55,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
                 key={entry.script.id}
                 type="button"
                 onClick={() => onSelect(entry.script.id)}
-                className={`mb-0.5 flex min-h-[28px] w-full items-center gap-2 rounded-md px-2 py-[7px] text-left text-xs transition-colors focus-visible:outline-none ${
+                className={`mb-0.5 flex min-h-[28px] w-full items-center gap-2 rounded-md px-2 py-[7px] text-left text-xs transition-colors ${
                   isActive
                     ? "bg-surface-3 text-ink-strong active:bg-surface-3"
                     : "text-ink-subtle hover:bg-surface-2 hover:text-ink active:bg-surface-3"
@@ -77,7 +77,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
         <button
           type="button"
           onClick={onAdd}
-          className="m-2 min-h-[28px] rounded-md border border-line py-2 text-[11px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong active:border-ink-subtle active:bg-surface-2 focus-visible:outline-none"
+          className="m-2 min-h-[28px] rounded-md border border-line py-2 text-[11px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong active:border-ink-subtle active:bg-surface-2"
         >
           NEW SCRIPT
         </button>
@@ -93,7 +93,7 @@ export function CodeTab({ scripts, baseline, selectedId, onSelect, onChange, onA
                 type="button"
                 onClick={() => setMode(option)}
                 aria-pressed={mode === option}
-                className={`inline-flex min-h-[28px] items-center rounded border px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] transition-colors focus-visible:outline-none ${
+                className={`inline-flex min-h-[28px] items-center rounded border px-2.5 py-1 text-[10px] uppercase tracking-[0.12em] transition-colors ${
                   mode === option
                     ? "border-line-strong bg-surface-3 text-ink-strong active:bg-surface-3"
                     : "border-line text-ink-subtle hover:text-ink active:bg-surface-2"

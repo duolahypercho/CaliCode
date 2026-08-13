@@ -2,6 +2,7 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { PieRuntime, type PieState } from "../../lib/pie";
+import { themeToken } from "../../lib/theme";
 import type { CapturedFrame, Project } from "../../lib/types";
 
 interface ViewportProps {
@@ -57,8 +58,19 @@ export function Viewport({
     rendererRef.current = renderer;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x080808);
-    scene.fog = new THREE.Fog(0x080808, 18, 42);
+    // The stage is painted from --viewport-*, which is defined once in :root
+    // and never overridden under .dark — this surface holds the same art
+    // direction in both themes. It is a game viewport, not a UI panel, and
+    // editor_capture_frame photographs it as the agent's visual evidence, so
+    // a human toggling the app theme must not change what the agent sees.
+    // Following --surface-0 (as this file briefly did) rendered a white scene
+    // under white fog in the light theme and captures came back blank.
+    // Whatever this is, background and fog must agree: fog blends geometry
+    // toward its own colour, so a mismatch fades the scene to a colour the
+    // backdrop never shows.
+    const backdrop = themeToken("--viewport-backdrop", "#0a0a0a");
+    scene.background = new THREE.Color(backdrop);
+    scene.fog = new THREE.Fog(backdrop, 18, 42);
     sceneRef.current = scene;
     const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 100);
     // Closer than the old (5, 4, 6) framing so a default-sized project
@@ -85,11 +97,23 @@ export function Viewport({
     const fill = new THREE.DirectionalLight(0xc8d4ff, 0.6);
     fill.position.set(-5, 2, -3);
     scene.add(fill);
-    // Brighter grid so it actually reads against the dark background; the
-    // old (0x3a3a3a, 0x1c1c1c) palette against 0x080808 was nearly
-    // invisible. The lines are still subdued so the project reads first.
-    const grid = new THREE.GridHelper(20, 20, 0x6a6a6a, 0x363636);
+    // Grid tones come off the same stage palette as the backdrop, for the
+    // same reason: tying them to the light/dark ramp would have drawn the
+    // light theme's pale lines over this dark stage. They are brighter than
+    // the old fixed (0x3a3a3a, 0x1c1c1c) pair, which was nearly invisible,
+    // but still subdued so the project reads first.
+    const grid = new THREE.GridHelper(
+      20,
+      20,
+      themeToken("--viewport-grid-axis", "#6a6a6a"),
+      themeToken("--viewport-grid-line", "#2e2e2e"),
+    );
     grid.position.y = -0.01;
+    const disposeGrid = (helper: THREE.GridHelper) => {
+      helper.geometry.dispose();
+      const materials = Array.isArray(helper.material) ? helper.material : [helper.material];
+      materials.forEach((material) => material.dispose());
+    };
     scene.add(grid);
 
     // PieRuntime exclusively owns the project group. Building it here as well
@@ -112,6 +136,12 @@ export function Viewport({
     runtimeRef.current = runtime;
     handlersRef.current.onRuntimeReady(runtime);
 
+    // No theme observer here, unlike AssetBuilder and AssetPreview: every
+    // token this scene reads is theme-independent by construction, so a class
+    // swap on <html> has nothing to repaint. An observer would only spend a
+    // grid rebuild and a redraw to arrive at the identical picture, while
+    // implying this surface tracks the theme when the point is that it does
+    // not.
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
     const onPointerDown = (event: MouseEvent) => {
@@ -173,6 +203,7 @@ export function Viewport({
       cancelAnimationFrame(frame);
       observer.disconnect();
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
+      disposeGrid(grid);
       runtime.dispose();
       handlersRef.current.onRuntimeReady(null);
       controls.dispose();

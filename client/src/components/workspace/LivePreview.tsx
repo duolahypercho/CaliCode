@@ -63,7 +63,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
   const running = status.status === "ready" || status.status === "starting";
 
   return (
-    <div className="flex h-full min-h-0 flex-col bg-black">
+    <div className="flex h-full min-h-0 flex-col bg-surface-0">
       <div className="flex h-11 shrink-0 items-center gap-2.5 border-b border-line bg-surface-0 px-3.5">
         <span
           aria-hidden
@@ -85,7 +85,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
               <button
                 type="button"
                 onClick={() => setNonce((n) => n + 1)}
-                className="inline-flex min-h-[28px] items-center rounded border border-line-strong px-2.5 py-1 text-[10px] tracking-[0.12em] text-ink-strong transition-colors active:border-ink-subtle focus-visible:outline-none"
+                className="inline-flex min-h-[28px] items-center rounded border border-line-strong px-2.5 py-1 text-[10px] tracking-[0.12em] text-ink-strong transition-colors active:border-ink-subtle"
               >
                 RELOAD
               </button>
@@ -93,7 +93,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
                 href={status.url}
                 target="_blank"
                 rel="noreferrer"
-                className="inline-flex min-h-[28px] items-center rounded border border-line-strong px-2.5 py-1 text-[10px] tracking-[0.12em] text-ink-strong transition-colors active:border-ink-subtle focus-visible:outline-none"
+                className="inline-flex min-h-[28px] items-center rounded border border-line-strong px-2.5 py-1 text-[10px] tracking-[0.12em] text-ink-strong transition-colors active:border-ink-subtle"
               >
                 POP OUT
               </a>
@@ -103,7 +103,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
             type="button"
             onClick={() => void (running ? stop() : start())}
             disabled={busy}
-            className={`inline-flex min-h-[28px] items-center rounded border border-line-strong bg-secondary px-3 py-1 text-[10px] font-bold tracking-[0.12em] text-ink-strong transition-colors enabled:hover:bg-secondary/80 active:bg-secondary/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40 ${
+            className={`inline-flex min-h-[28px] items-center rounded border border-line-strong bg-secondary px-3 py-1 text-[10px] font-bold tracking-[0.12em] text-ink-strong transition-colors enabled:hover:bg-secondary/80 active:bg-secondary/70 disabled:cursor-not-allowed disabled:opacity-40 ${
               running ? "" : ""
             }`}
           >
@@ -122,7 +122,7 @@ export function LivePreview({ workspaceId, workspaceName, script, onError }: Liv
             className="h-full w-full border-0"
           />
         ) : (
-          <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-[#8f8f8f]">
+          <div className="flex h-full flex-col items-center justify-center gap-2 text-xs text-ink-subtle">
             <span className="tracking-[0.14em]">
               {status.status === "starting"
                 ? "STARTING THE DEV SERVER…"

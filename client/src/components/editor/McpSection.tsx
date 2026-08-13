@@ -81,7 +81,7 @@ export function McpSection({ headingLevel = 3 }: { headingLevel?: 2 | 3 } = {}) 
           type="button"
           disabled={busy}
           onClick={() => void run(reloadMcp, "Failed to reload MCP servers.")}
-          className="rounded border border-line px-2 py-[3px] text-[10px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
+          className="rounded border border-line px-2 py-[3px] text-[10px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong disabled:cursor-not-allowed disabled:opacity-50"
         >
           RELOAD
         </button>
@@ -150,7 +150,7 @@ export function McpSection({ headingLevel = 3 }: { headingLevel?: 2 | 3 } = {}) 
                       type="button"
                       onClick={() => setExpandedId(expanded ? null : server.id)}
                       aria-expanded={expanded}
-                      className="shrink-0 rounded border border-line px-1.5 py-[2px] text-[10px] text-ink-subtle transition-colors hover:text-ink-strong focus-visible:outline-none"
+                      className="shrink-0 rounded border border-line px-1.5 py-[2px] text-[10px] text-ink-subtle transition-colors hover:text-ink-strong"
                     >
                       {server.tools.length} tool{server.tools.length === 1 ? "" : "s"}
                     </button>

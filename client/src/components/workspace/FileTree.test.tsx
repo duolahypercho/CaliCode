@@ -75,6 +75,34 @@ describe("FileTree", () => {
     expect(screen.getByTestId("count").textContent).toBe("1");
   });
 
+  it("marks files with an unsaved buffer, and the folders that hide them", async () => {
+    vi.spyOn(workspace, "readTree").mockResolvedValue({
+      path: "",
+      entries: [
+        { name: "src", path: "src", kind: "dir", size: 0 },
+        { name: "notes.md", path: "notes.md", kind: "file", size: 12 },
+        { name: "clean.md", path: "clean.md", kind: "file", size: 12 },
+      ],
+    });
+
+    render(
+      <FileTree
+        workspaceId="ws-1"
+        activePath={null}
+        dirtyPaths={new Set(["notes.md", "src/game.ts"])}
+        onOpenFile={() => {}}
+        onError={() => {}}
+      />,
+    );
+
+    const dirty = await screen.findByRole("button", { name: /notes\.md/ });
+    expect(dirty.textContent).toContain("MODIFIED");
+    // src/game.ts is unsaved but the folder is collapsed, so the row itself
+    // has to carry the signal.
+    expect(screen.getByRole("button", { name: /src/ }).textContent).toContain("●");
+    expect(screen.getByRole("button", { name: /clean\.md/ }).textContent).not.toContain("MODIFIED");
+  });
+
   it("retries once per click and recovers", async () => {
     const readTree = vi
       .spyOn(workspace, "readTree")

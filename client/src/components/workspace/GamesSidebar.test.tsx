@@ -329,3 +329,51 @@ describe("GamesSidebar running indicator", () => {
     expect(screen.queryByTestId("session-running-spinner")).toBeNull();
   });
 });
+
+describe("GamesSidebar empty states", () => {
+  it("explains the empty list and offers the action that fills it", () => {
+    const onNewGame = vi.fn();
+    renderSidebar({ projects: [], onNewGame });
+
+    expect(screen.getByText(/A game holds its chats, scene, and assets/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /Create your first game/ }));
+    expect(onNewGame).toHaveBeenCalledTimes(1);
+  });
+
+  it("blames an offline core when that is why the list is empty", () => {
+    renderSidebar({ projects: [], coreStatus: "offline" });
+    expect(screen.getByText(/Core is offline/)).toBeTruthy();
+  });
+
+  it("stays quiet about the core while it is reachable", () => {
+    renderSidebar({ projects: [], coreStatus: "ready" });
+    expect(screen.queryByText(/Core is offline/)).toBeNull();
+  });
+
+  it("offers a first chat inside a game that has none", () => {
+    const onNewSession = vi.fn();
+    renderSidebar({ sessions: {}, onNewSession });
+
+    fireEvent.click(screen.getByRole("button", { name: "Start a chat in CaliCode Starter" }));
+    expect(onNewSession).toHaveBeenCalledWith("starter");
+  });
+
+  it("does not offer the first-chat row once the game has chats", () => {
+    const session: SessionSummary = {
+      id: "sess-1",
+      title: "Tune jump physics",
+      projectSlug: "starter",
+      provider: null,
+      model: null,
+      workspaceRoot: null,
+      worktreeId: null,
+      branch: null,
+      createdAt: Math.floor(Date.now() / 1000) - 600,
+      updatedAt: Math.floor(Date.now() / 1000) - 120,
+      messageCount: 4,
+    };
+    renderSidebar({ sessions: { starter: [session] } });
+
+    expect(screen.queryByRole("button", { name: /Start a chat in/ })).toBeNull();
+  });
+});
