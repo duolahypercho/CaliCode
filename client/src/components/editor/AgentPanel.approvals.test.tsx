@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { AgentPanel } from "./AgentPanel";
+import { AgentPanel, sanitizeRaisedAt } from "./AgentPanel";
 import type { AgentEvent } from "../../lib/rpc";
 
 /**
@@ -234,9 +234,9 @@ describe("the governing invariant", () => {
     renderPanel();
     await act(async () => {});
     await startTurn();
-    // Raised a full TTL ago, so the very next sweep lapses it: one tick, no
-    // dependence on how many the advance happens to fire.
-    await emit(approvalRequest({ raisedAtMs: Date.now() - 5 * 60_000 }));
+    // Raised just inside the TTL, so the very next sweep lapses it: one tick,
+    // no dependence on how many the advance happens to fire.
+    await emit(approvalRequest({ raisedAtMs: Date.now() - (5 * 60_000 - 2_000) }));
     expect(await screen.findByText(/Approve file_write\?/)).toBeTruthy();
 
     await act(async () => {
@@ -582,6 +582,20 @@ describe("defect 5 — the queue", () => {
 
     expect(document.querySelector('[data-approval="approval-1"]')?.getAttribute("data-approval-state")).toBe("lapsed");
     expect(approvalSends()).toEqual([]);
+  });
+});
+
+describe("core's clock is trusted, not obeyed", () => {
+  it("falls back to now for a skewed or missing raisedAtMs", () => {
+    const now = 1_000_000;
+    expect(sanitizeRaisedAt(now - 1_000, now)).toBe(now - 1_000);
+    // A card whose stamp is already past the TTL would vanish the instant it
+    // appeared — a far worse failure than one that lives a few seconds long.
+    expect(sanitizeRaisedAt(now - 10 * 60_000, now)).toBe(now);
+    expect(sanitizeRaisedAt(now + 60_000, now)).toBe(now);
+    expect(sanitizeRaisedAt(undefined, now)).toBe(now);
+    expect(sanitizeRaisedAt("soon", now)).toBe(now);
+    expect(sanitizeRaisedAt(Number.NaN, now)).toBe(now);
   });
 });
 

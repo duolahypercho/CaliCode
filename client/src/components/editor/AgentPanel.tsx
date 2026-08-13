@@ -392,6 +392,21 @@ export function readEditorClientId(): string {
   }
 }
 
+/**
+ * When core says it raised this prompt, sanity-checked.
+ *
+ * Core and the client run on the same machine, so this is normally exact. A
+ * value from the future, or older than the TTL it is about to be measured
+ * against, means something is wrong with a clock rather than with the request —
+ * and a card that vanishes the instant it appears is a far worse failure than
+ * one that lives a few seconds long.
+ */
+export function sanitizeRaisedAt(raisedAtMs: unknown, nowMs = Date.now()): number {
+  if (typeof raisedAtMs !== "number" || !Number.isFinite(raisedAtMs)) return nowMs;
+  if (raisedAtMs > nowMs || nowMs - raisedAtMs >= APPROVAL_TTL_MS) return nowMs;
+  return raisedAtMs;
+}
+
 export function ownsBrowserToolEvent(
   event: BrowserToolOwnershipEvent,
   owner: {
@@ -1094,7 +1109,7 @@ export function AgentPanel({
           tool: event.tool,
           arguments: event.arguments,
           graphLabel: typeof event.ownerGraph === "string" ? event.ownerGraph : null,
-          raisedAtMs: typeof event.raisedAtMs === "number" ? event.raisedAtMs : Date.now(),
+          raisedAtMs: sanitizeRaisedAt(event.raisedAtMs),
         });
       }
       // Core announces every exit from its pending map. This is what turns the
