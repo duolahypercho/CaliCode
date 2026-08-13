@@ -2290,6 +2290,10 @@ export function AgentPanel({
         reportFailure,
       );
     }
+    // Every exit path says its terminal lines (gate messages, ✔/■/cap markers)
+    // after the last pre-agent_chat save; only the blocked path re-saved. Persist
+    // once here so completed, capped, and stopped loops keep their tail on reload.
+    await persistLoopTranscript();
     completeActivityTurn(activityTurnId);
     loopStartedAtRef.current = null;
     loopBaselineAvailableRef.current = false;
