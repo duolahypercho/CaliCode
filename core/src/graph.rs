@@ -7504,6 +7504,54 @@ mod tests {
         assert_eq!(cancelled["cancelled"], false);
     }
 
+    /// Cancel has to mean cancel.
+    ///
+    /// `state.graphs.cancel` only raises a flag the run loop checks between
+    /// waves, and a node parked on an approval never reaches that check — so
+    /// the wave it is joined into would hold the cancellation for up to 300s
+    /// per attempt. Dropping the run's approvals is what closes that, and it is
+    /// core doing it, from the party that knows: the waiter learns the run was
+    /// cancelled, not that anybody denied it.
+    #[tokio::test]
+    async fn cancelling_a_graph_drops_the_approvals_its_run_raised() {
+        let (state, _mock) = test_state(95, 0).await;
+        let approvals = state.agents.approvals().clone();
+        let mut events = state.bus.subscribe();
+
+        let waiter = {
+            let approvals = approvals.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(crate::approvals::ApprovalRequest {
+                        answer_session: "session-graph-owner",
+                        target_client_id: Some("window-a".into()),
+                        owner_session: Some("session-graph-owner".into()),
+                        owner_graph: Some("graph-doomed".into()),
+                        asking_session: "session-node",
+                        tool: "file_write",
+                        arguments: json!({}),
+                    })
+                    .await
+            })
+        };
+        loop {
+            let event = events.recv().await.unwrap();
+            if event["type"] == "agent.approval_request" {
+                break;
+            }
+        }
+
+        cancel_tool(&state, &json!({ "graphId": "graph-doomed" }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            waiter.await.unwrap(),
+            crate::approvals::ApprovalOutcome::Abandoned("run-cancelled"),
+            "a cancelled run's approval must be abandoned, never denied"
+        );
+    }
+
     #[tokio::test]
     async fn plan_tool_prefers_explicit_nodes_over_empty_or_stray_template() {
         let nodes = json!([
