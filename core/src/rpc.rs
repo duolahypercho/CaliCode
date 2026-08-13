@@ -150,7 +150,24 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 &models,
             )?)
         }
-        "subagent_spawn" => crate::tools::spawn_subagent(state, &params).await,
+        // `ownerSession` is the caller's own session: a directly spawned
+        // subagent asks for approval under a fresh session id no panel has
+        // open, so without it the prompt is addressed to nobody and parks
+        // until core's approval timeout. It only names the owner — routing and
+        // permissions are unchanged — and it is read from the RPC params here
+        // rather than from the tool arguments, which a model controls.
+        "subagent_spawn" => {
+            crate::tools::spawn_subagent_for_client(
+                state,
+                &params,
+                params
+                    .get("ownerSession")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|session| !session.is_empty()),
+            )
+            .await
+        }
         "project_create" => {
             let slug = str_param(&params, "slug")?;
             let title = params.get("title").and_then(|v| v.as_str()).unwrap_or(slug);
@@ -590,7 +607,24 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             Ok(json!({ "servers": state.mcp.status().await }))
         }
         "graph_plan" => crate::graph::plan_tool(state, &params).await,
-        "graph_run" => crate::graph::run(state, str_param(&params, "graphId")?).await,
+        // `ownerSession` is the calling panel's own session, and starting a run
+        // moves the graph's ownership onto it: the prompts this run raises are
+        // for work that panel just asked for, and they must be answerable
+        // there rather than in whichever window happened to plan the graph.
+        // Read from the RPC params, never from tool arguments — this path is
+        // the editor's, not the model's.
+        "graph_run" => {
+            crate::graph::run(
+                state,
+                str_param(&params, "graphId")?,
+                params
+                    .get("ownerSession")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|session| !session.is_empty()),
+            )
+            .await
+        }
         "graph_status" => crate::graph::status(state, &params),
         "graph_list" => crate::graph::list_tool(state, &params),
         "graph_cancel" => crate::graph::cancel_tool(state, &params).await,
@@ -956,8 +990,13 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 system,
                 project_slug,
                 workspace_root,
-                // Top-level chat: approvals stay on its own session, depth 0.
+                // Top-level chat: approvals stay on its own session, depth 0,
+                // and the panel watching that session owns them. It is not
+                // graph work, so it names no run — a graph this turn starts
+                // through the `graph_run` tool names itself.
                 approval_session: None,
+                approval_owner: crate::agent::ApprovalOwner::OwnSession,
+                owner_graph: None,
                 subagent_depth: 0,
                 permission_rules,
             };
@@ -974,11 +1013,24 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 params.get("result").cloned().unwrap_or(Value::Null),
             )
             .await?),
+        // Keyed on `requestId` alone: the registry holds the answer address as
+        // data, so a client no longer has to echo back a session id it may
+        // never have learned. `sessionId` is still accepted so a dev client
+        // mid-rebuild does not 400, and is deliberately never read.
+        //
+        // `clientId` is the authorization: the request names the one window
+        // that may answer it, and `respond` refuses every other caller. Without
+        // that refusal the address is decoration.
         "agent_approval_response" => Ok(state
             .agents
-            .submit_approval(
-                str_param(&params, "sessionId")?,
+            .approvals()
+            .respond(
                 str_param(&params, "requestId")?,
+                params
+                    .get("clientId")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|client| !client.is_empty()),
                 params
                     .get("approved")
                     .and_then(|v| v.as_bool())

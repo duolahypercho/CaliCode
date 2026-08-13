@@ -126,9 +126,24 @@ export async function planGraph(args: {
   return unwrapGraph(await rpc<unknown>("graph_plan", params));
 }
 
-/** Resolves only when the graph reaches a terminal state — long-running. */
-export async function runGraph(graphId: string): Promise<GraphRollup> {
-  return rpc<GraphRollup>("graph_run", { graphId });
+/**
+ * Resolves only when the graph reaches a terminal state — long-running.
+ *
+ * `ownerSession` is the calling panel's own session, and core moves the graph
+ * onto it (`core/src/graph.rs::run`). Graphs are listed globally, so this call
+ * is reachable for a graph another window planned; the run's approval prompts
+ * are addressed to the graph's owner, and they have to reach the window that
+ * asked for the run rather than one that is not expecting them. Core refuses
+ * the move — and the run — when that session is bound to a different project
+ * or workspace.
+ */
+export async function runGraph(
+  graphId: string,
+  options: { ownerSession?: string | null } = {},
+): Promise<GraphRollup> {
+  const params: Record<string, unknown> = { graphId };
+  if (options.ownerSession) params.ownerSession = options.ownerSession;
+  return rpc<GraphRollup>("graph_run", params);
 }
 
 export async function graphStatus(graphId: string): Promise<TaskGraph> {

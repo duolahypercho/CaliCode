@@ -1727,6 +1727,7 @@ async fn spawn_bound_attempt(
                 state,
                 args,
                 session_id,
+                &graph.graph_id,
                 graph.owner_session.as_deref(),
                 graph.workspace_root.as_deref(),
                 Some(reasoning_effort),
@@ -1738,6 +1739,7 @@ async fn spawn_bound_attempt(
                 state,
                 args,
                 session_id,
+                &graph.graph_id,
                 graph.owner_session.as_deref(),
                 graph.workspace_root.as_deref(),
             )
@@ -3257,6 +3259,11 @@ async fn spawn_critic_with_frames(
         project_slug: graph.project_slug.clone(),
         workspace_root: graph.workspace_root.clone(),
         approval_session: graph.owner_session.clone(),
+        // The graph's owner panel owns the critic's prompts too — and an
+        // unowned graph says so rather than naming the critic's own session.
+        approval_owner: crate::agent::ApprovalOwner::from_ancestor(graph.owner_session.clone()),
+        // Critic work is this run's work, so a cancelled run takes it with it.
+        owner_graph: Some(graph.graph_id.clone()),
         subagent_depth: 0,
         permission_rules,
     };
@@ -3539,9 +3546,26 @@ fn rollup(graph: &TaskGraph) -> Value {
 /// the caller's tool call awaits the full run; progress streams on the bus).
 /// Returns the final rollup: { graphId, status, passed, failed,
 /// totalAttempts, nodes: [...] }.
-pub async fn run(state: &AppState, graph_id: &str) -> Result<Value> {
+///
+/// `adopt_owner` moves the graph onto the session that asked for this run.
+/// Graphs are listed globally, so a second window can start a run on a graph
+/// the first one planned — and the prompts that run raises are addressed to the
+/// graph's owner. Without the move they would reach a window that is not
+/// expecting them while the window that clicked Run sees nothing. Merely
+/// loading a graph (status, list, check out) leaves the owner on disk exactly
+/// as it was; ownership moves when a run actually starts. Two calls racing here
+/// can both re-stamp their in-memory copy; `begin` then lets exactly one of
+/// them run, and only that one's owner is persisted.
+pub async fn run(state: &AppState, graph_id: &str, adopt_owner: Option<&str>) -> Result<Value> {
     let root = graphs_root(&state.sessions_root);
     let mut graph = load(&root, graph_id)?;
+    if let Some(owner) = adopt_owner
+        .map(str::trim)
+        .filter(|owner| !owner.is_empty())
+        .filter(|owner| graph.owner_session.as_deref() != Some(*owner))
+    {
+        graph.owner_session = Some(owner.to_string());
+    }
     validate_binding(state, &mut graph)?;
     if graph.status == GraphStatus::Cancelled {
         anyhow::bail!(
@@ -3565,6 +3589,14 @@ pub async fn run(state: &AppState, graph_id: &str) -> Result<Value> {
     }
     let result = run_inner(state, &root, &mut graph, &cancel).await;
     state.graphs.end(graph_id).await;
+    // The run is over, so any prompt it raised is asking about work that no
+    // longer exists. Core drops those senders itself — the party that knows —
+    // instead of leaving them to a 300s timer or, worse, to a client guessing
+    // the run is done and answering "denied" on its behalf.
+    let abandoned = state.agents.approvals().cancel_by_graph(graph_id).await;
+    if abandoned > 0 {
+        tracing::info!(graph_id, abandoned, "dropped a finished run's approvals");
+    }
     if let Err(error) = result {
         // A hard engine error still leaves a coherent, persisted graph.
         graph.status = GraphStatus::Blocked;
@@ -3813,6 +3845,7 @@ async fn run_build_wave(
         let owner_session = graph.owner_session.clone();
         let workspace_root = graph.workspace_root.clone();
         let reasoning_effort = graph.reasoning_effort.clone();
+        let graph_id = graph.graph_id.clone();
         broadcast(
             state,
             root,
@@ -3836,6 +3869,7 @@ async fn run_build_wave(
                         state,
                         &args,
                         &session_id,
+                        &graph_id,
                         owner_session.as_deref(),
                         workspace_root.as_deref(),
                         Some(reasoning_effort),
@@ -3847,6 +3881,7 @@ async fn run_build_wave(
                         state,
                         &args,
                         &session_id,
+                        &graph_id,
                         owner_session.as_deref(),
                         workspace_root.as_deref(),
                     )
@@ -4080,6 +4115,11 @@ pub fn list_tool(state: &AppState, args: &Value) -> Result<Value> {
 pub async fn cancel_tool(state: &AppState, args: &Value) -> Result<Value> {
     let graph_id = crate::tools::required_str(args, "graphId")?;
     let was_running = state.graphs.cancel(graph_id).await;
+    // Cancel only raises a flag the run loop checks between waves. A node
+    // parked on an approval never reaches that check, so the wave it is joined
+    // into would hold the cancellation for up to 300s per attempt. Dropping the
+    // run's approvals here is what makes Cancel mean cancel.
+    state.agents.approvals().cancel_by_graph(graph_id).await;
     if !was_running {
         let root = graphs_root(&state.sessions_root);
         if let Ok(mut graph) = load(&root, graph_id) {
@@ -6693,7 +6733,7 @@ mod tests {
         let graph = bound_two_node_graph(&state);
         save(&root, &graph).unwrap();
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         assert_eq!(result["status"], "complete");
         assert_eq!(result["passed"], 2);
         assert_eq!(result["failed"], 0);
@@ -6718,7 +6758,7 @@ mod tests {
         graph.reasoning_effort = Some("max".into());
         save(&root, &graph).unwrap();
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         assert_eq!(result["status"], "complete");
 
         let requests = mock.requests.lock().unwrap();
@@ -6759,7 +6799,7 @@ mod tests {
             panic!("node_started event missing")
         });
 
-        run(&state, &graph_id).await.unwrap();
+        run(&state, &graph_id, None).await.unwrap();
         let session_id = observed.await.unwrap();
         let saved = load(&root, &graph_id).unwrap();
         assert_eq!(
@@ -6854,7 +6894,7 @@ mod tests {
         let graph = bound_two_node_graph(&state);
         save(&root, &graph).unwrap();
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         assert_eq!(result["status"], "complete");
 
         let saved = load(&root, &graph.graph_id).unwrap();
@@ -6927,7 +6967,7 @@ mod tests {
             }
         });
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         injector.await.unwrap();
         assert_eq!(result["status"], "complete");
 
@@ -7134,7 +7174,7 @@ mod tests {
             }
         });
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         injector.await.unwrap();
         assert_eq!(result["status"], "complete");
 
@@ -7159,7 +7199,7 @@ mod tests {
         let graph = bound_two_node_graph(&state);
         save(&root, &graph).unwrap();
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         assert_eq!(result["status"], "complete");
 
         // No capture happened, so every message in every request stays a
@@ -7184,7 +7224,10 @@ mod tests {
         save(&root, &graph).unwrap();
 
         let _flag = state.graphs.begin(&graph.graph_id).await.unwrap();
-        let error = run(&state, &graph.graph_id).await.unwrap_err().to_string();
+        let error = run(&state, &graph.graph_id, None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("already running"), "{error}");
     }
 
@@ -7200,7 +7243,7 @@ mod tests {
         save(&root, &graph).unwrap();
 
         let mut events = state.bus.subscribe();
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         assert_eq!(result["status"], "complete");
 
         let recovered = events.recv().await.unwrap();
@@ -7225,7 +7268,10 @@ mod tests {
         graph.nodes[0].attempts = 1;
         save(&root, &graph).unwrap();
 
-        let error = run(&state, &graph.graph_id).await.unwrap_err().to_string();
+        let error = run(&state, &graph.graph_id, None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("is cancelled"), "{error}");
         let saved = load(&root, &graph.graph_id).unwrap();
         assert_eq!(saved.status, GraphStatus::Cancelled);
@@ -7240,7 +7286,10 @@ mod tests {
         let graph = two_node_graph();
         save(&root, &graph).unwrap();
 
-        let error = run(&state, &graph.graph_id).await.unwrap_err().to_string();
+        let error = run(&state, &graph.graph_id, None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("owner session and workspace"), "{error}");
         assert!(
             !state.graphs.is_running(&graph.graph_id).await,
@@ -7279,7 +7328,7 @@ mod tests {
             }
         });
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         canceller.await.unwrap();
         assert_eq!(result["status"], "cancelled");
 
@@ -7306,7 +7355,7 @@ mod tests {
         bind_test_graph(&state, &mut graph);
         save(&root, &graph).unwrap();
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         assert_eq!(result["status"], "complete");
         assert_eq!(result["passed"], 3);
 
@@ -7336,7 +7385,7 @@ mod tests {
         bind_test_graph(&state, &mut graph);
         save(&root, &graph).unwrap();
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         assert_eq!(result["status"], "complete");
         assert_eq!(result["passed"], 5);
 
@@ -7372,7 +7421,7 @@ mod tests {
             }
         });
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         canceller.await.unwrap();
         assert_eq!(result["status"], "cancelled");
 
@@ -7405,7 +7454,7 @@ mod tests {
         bind_test_graph(&state, &mut graph);
         save(&root, &graph).unwrap();
 
-        let result = run(&state, &graph.graph_id).await.unwrap();
+        let result = run(&state, &graph.graph_id, None).await.unwrap();
         assert_eq!(result["status"], "complete");
         assert_eq!(result["passed"], 3);
 
@@ -7453,6 +7502,54 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(cancelled["cancelled"], false);
+    }
+
+    /// Cancel has to mean cancel.
+    ///
+    /// `state.graphs.cancel` only raises a flag the run loop checks between
+    /// waves, and a node parked on an approval never reaches that check — so
+    /// the wave it is joined into would hold the cancellation for up to 300s
+    /// per attempt. Dropping the run's approvals is what closes that, and it is
+    /// core doing it, from the party that knows: the waiter learns the run was
+    /// cancelled, not that anybody denied it.
+    #[tokio::test]
+    async fn cancelling_a_graph_drops_the_approvals_its_run_raised() {
+        let (state, _mock) = test_state(95, 0).await;
+        let approvals = state.agents.approvals().clone();
+        let mut events = state.bus.subscribe();
+
+        let waiter = {
+            let approvals = approvals.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(crate::approvals::ApprovalRequest {
+                        answer_session: "session-graph-owner",
+                        target_client_id: Some("window-a".into()),
+                        owner_session: Some("session-graph-owner".into()),
+                        owner_graph: Some("graph-doomed".into()),
+                        asking_session: "session-node",
+                        tool: "file_write",
+                        arguments: json!({}),
+                    })
+                    .await
+            })
+        };
+        loop {
+            let event = events.recv().await.unwrap();
+            if event["type"] == "agent.approval_request" {
+                break;
+            }
+        }
+
+        cancel_tool(&state, &json!({ "graphId": "graph-doomed" }))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            waiter.await.unwrap(),
+            crate::approvals::ApprovalOutcome::Abandoned("run-cancelled"),
+            "a cancelled run's approval must be abandoned, never denied"
+        );
     }
 
     #[tokio::test]

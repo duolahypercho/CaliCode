@@ -267,6 +267,15 @@ fn bound_drain_reason(text: &str) -> String {
 pub struct AgentManager {
     sessions: Arc<Mutex<HashMap<String, Arc<Mutex<AgentSession>>>>>,
     events: tokio::sync::broadcast::Sender<Value>,
+    /// Every pending approval, keyed by request id. Deliberately *not* in
+    /// `AgentSession.pending`: an approval and a browser-tool waiter sharing a
+    /// keyspace let one answer the other, and a tool result read as an approval
+    /// answered "denied".
+    ///
+    /// Owned here rather than beside `AgentManager` in `AppState` so there can
+    /// only ever be one registry — two instances would be a split brain in
+    /// which the panel answers a request core is not waiting on.
+    approvals: crate::approvals::Approvals,
 }
 
 pub struct AgentSession {
@@ -327,6 +336,61 @@ fn context_budget_tokens(config: &crate::config::AppConfig) -> u64 {
     budget.saturating_sub(u64::from(compaction.reserved))
 }
 
+/// Which panel's work an agent is doing, published on
+/// `agent.approval_request` as `ownerSession`.
+///
+/// Distinct from [`AgentOptions::approval_session`], which is only the address
+/// the answer travels back on. A directly spawned subagent asks under a session
+/// id no panel ever opened, so without an owner on the wire a panel had to
+/// infer ownership from local state — and inference is what let one window
+/// claim (and deny) another window's work.
+///
+/// [`ApprovalOwner::Unowned`] is deliberately not "this agent's own session": a
+/// parentless spawn has nobody watching, and it must say so rather than name a
+/// session a panel might match.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ApprovalOwner {
+    /// Top-level turn: the human is watching this agent's own session.
+    #[default]
+    OwnSession,
+    /// Spawned work: this ancestor session is the one on screen. Held by
+    /// subagents (their root ancestor), graph nodes (the graph's
+    /// `owner_session`), and client-initiated direct spawns (the calling
+    /// panel's session).
+    Ancestor(String),
+    /// Nobody is watching. A `subagent_spawn` with no calling session, or a
+    /// graph with no owner session, runs unattended; its approvals belong to no
+    /// panel and must never be matched by one.
+    Unowned,
+}
+
+impl ApprovalOwner {
+    /// Build from an ancestor that may not exist. A missing or blank id means
+    /// unattended — never "own session", which would invent an owner.
+    pub fn from_ancestor(session: Option<String>) -> Self {
+        match session
+            .map(|session| session.trim().to_string())
+            .filter(|session| !session.is_empty())
+        {
+            Some(session) => Self::Ancestor(session),
+            None => Self::Unowned,
+        }
+    }
+
+    /// The concrete watched session for an agent running as `session_id`, or
+    /// `None` when this work is unattended.
+    ///
+    /// This is also what a child inherits: resolving *before* the spawn is what
+    /// keeps `OwnSession` from silently re-pointing at the child's session.
+    pub fn resolve<'a>(&'a self, session_id: &'a str) -> Option<&'a str> {
+        match self {
+            Self::OwnSession => Some(session_id),
+            Self::Ancestor(session) => Some(session.as_str()),
+            Self::Unowned => None,
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AgentOptions {
     pub permission_mode: String,
@@ -353,6 +417,21 @@ pub struct AgentOptions {
     /// top-level chats. Subagents get their root ancestor's id here so the
     /// client (which only watches the session it opened) sees the prompt.
     pub approval_session: Option<String>,
+    /// Which panel's work this agent is doing — published on
+    /// `agent.approval_request` as `ownerSession`, and the key core uses to
+    /// look up the window the prompt is addressed to. Distinct from
+    /// `approval_session`, which is only an address for the answer.
+    pub approval_owner: ApprovalOwner,
+    /// The graph run this agent's work belongs to, published on
+    /// `agent.approval_request` as `ownerGraph`. `None` for everything that is
+    /// not a graph.
+    ///
+    /// It is inherited by every descendant, so a node's own subagent still
+    /// names the run — which no `graph.updated` snapshot ever carries, and
+    /// which is why a panel must never have to recognise a session id to know
+    /// whose prompt this is. It is also the key `cancel_by_graph` uses when the
+    /// run ends.
+    pub owner_graph: Option<String>,
     /// How many `subagent_spawn` hops sit above this agent (0 = top level).
     /// Capped by `crate::tools::MAX_SUBAGENT_DEPTH`.
     pub subagent_depth: usize,
@@ -366,8 +445,15 @@ impl AgentManager {
     pub fn new(events: tokio::sync::broadcast::Sender<Value>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
+            approvals: crate::approvals::Approvals::new(events.clone()),
             events,
         }
+    }
+
+    /// The one approval registry. Graph cancellation and the RPC surface reach
+    /// it through here so nothing can construct a second one.
+    pub fn approvals(&self) -> &crate::approvals::Approvals {
+        &self.approvals
     }
 
     /// Pre-allocate the in-memory half of a durable session. The UI uses this
@@ -423,11 +509,18 @@ impl AgentManager {
         let Some(session) = session else {
             return (false, 0);
         };
-        let mut guard = session.lock().await;
-        let pending = std::mem::take(&mut guard.pending);
-        let cancelled = pending.len();
-        drop(pending);
-        (true, cancelled)
+        let cancelled = {
+            let mut guard = session.lock().await;
+            let pending = std::mem::take(&mut guard.pending);
+            let cancelled = pending.len();
+            drop(pending);
+            cancelled
+        };
+        // Approvals live in their own registry now, so dropping `pending` no
+        // longer wakes them. A removed session's prompts are dead work; leaving
+        // them would park the asking agent for the full 300s.
+        let approvals = self.approvals.cancel_by_session(id).await;
+        (true, cancelled + approvals)
     }
 
     async fn record_usage(
@@ -926,22 +1019,6 @@ impl AgentManager {
         }
     }
 
-    pub async fn submit_approval(
-        &self,
-        session_id: &str,
-        request_id: &str,
-        approved: bool,
-    ) -> Result<Value> {
-        let session = self.session(session_id).await?;
-        let mut guard = session.lock().await;
-        if let Some(tx) = guard.pending.remove(request_id) {
-            let _ = tx.send(json!({ "approved": approved }));
-            Ok(json!({ "accepted": true }))
-        } else {
-            anyhow::bail!("no pending approval {}", request_id)
-        }
-    }
-
     /// Compact one session in place: prune stale tool results, summarize the
     /// middle of the transcript with a single model call, and rewrite
     /// `messages` as `[head, summary, tail]` (`compaction::apply`). Replaced
@@ -1067,13 +1144,15 @@ impl AgentManager {
         // full message history, base64 screenshots included.
         if guard.len() >= MAX_SESSIONS {
             // An idle-looking session is not necessarily idle. A session
-            // parked on a browser-tool or approval oneshot holds no lock —
-            // it registered its sender in `pending` and released — so
-            // try_lock alone happily evicts it, after which
-            // agent_tool_result/submit_approval answer "session not found"
-            // and the tool hangs to its 300s timeout. Non-empty `pending`
-            // means somebody is waiting on a reply: never a victim.
-            let victims: Vec<String> = guard
+            // parked on a browser-tool oneshot holds no lock — it registered
+            // its sender in `pending` and released — so try_lock alone happily
+            // evicts it, after which agent_tool_result answers "session not
+            // found" and the tool hangs to its 300s timeout. Non-empty
+            // `pending` means somebody is waiting on a reply: never a victim.
+            //
+            // Approvals are no longer in that map, so they have to be asked
+            // about separately or an approval-parked session looks idle.
+            let mut candidates: Vec<String> = guard
                 .iter()
                 .filter(|(_, session)| {
                     session
@@ -1081,8 +1160,19 @@ impl AgentManager {
                         .is_ok_and(|session| session.pending.is_empty())
                 })
                 .map(|(id, _)| id.clone())
-                .take(guard.len() + 1 - MAX_SESSIONS)
                 .collect();
+            candidates.sort();
+            let wanted = guard.len() + 1 - MAX_SESSIONS;
+            let mut victims: Vec<String> = Vec::with_capacity(wanted);
+            for id in candidates {
+                if victims.len() >= wanted {
+                    break;
+                }
+                if self.approvals.waits_on_session(&id).await {
+                    continue;
+                }
+                victims.push(id);
+            }
             for id in victims {
                 guard.remove(&id);
             }
@@ -1250,6 +1340,10 @@ impl AgentManager {
             .approval_session
             .clone()
             .unwrap_or_else(|| sid.to_string());
+        // Whose panel this work belongs to. Resolved once, here, because
+        // `OwnSession` means *this* agent's session and must not be re-pointed
+        // by anything downstream.
+        let owner_sid = options.approval_owner.resolve(sid);
 
         // Plan mode is a dispatch gate, not an approval question: outside
         // the read-only whitelist nothing runs — not even under an `allow`
@@ -1277,52 +1371,52 @@ impl AgentManager {
             Gate::Run => false,
         };
         if needs_approval {
-            // The pending sender and the event's sessionId must name the same
-            // session, or the client's agent_approval_response finds nothing.
-            let (approval_sid, approval_session) = if root_sid == sid {
-                (sid.to_string(), session.clone())
-            } else {
-                match self.session(&root_sid).await {
-                    Ok(parent) => (root_sid.clone(), parent),
-                    // Root session evicted: fall back to our own so the event
-                    // and the pending entry stay consistent.
-                    Err(_) => (sid.to_string(), session.clone()),
-                }
+            // The one window that may answer. Keyed on the *owner* session, not
+            // the answer address: the owner is the panel that asked for this
+            // work. Deliberately without the browser-tool path's extra
+            // project/workspace re-check — `editor_attach` already refuses to
+            // record an attachment whose session is bound elsewhere
+            // (`rpc.rs`), so a second check here would only add a way for a
+            // graph node whose options spell the workspace differently to
+            // produce `targetClientId: null` and park every node.
+            let target_client_id = match owner_sid {
+                Some(owner) => state
+                    .editor_attachment
+                    .read()
+                    .await
+                    .get(owner)
+                    .map(|attachment| attachment.client_id.clone()),
+                None => None,
             };
-            let request_id = format!("approval-{}", Uuid::new_v4().simple());
-            let (tx, rx) = oneshot::channel();
-            {
-                let mut guard = approval_session.lock().await;
-                guard.pending.insert(request_id.clone(), tx);
-            }
-            let mut event = json!({
-                "type": "agent.approval_request",
-                "sessionId": approval_sid,
-                "requestId": request_id,
-                "tool": def.name,
-                "arguments": call.arguments
-            });
-            if approval_sid != sid {
-                event["subagentSessionId"] = json!(sid);
-            }
-            let _ = self.events.send(event);
-            // On timeout the receiver drops but the sender used to stay in
-            // session.pending forever, so a late agent_tool_result answered
-            // {"accepted": true} to nobody.
-            let response = match tokio::time::timeout(std::time::Duration::from_secs(300), rx).await
-            {
-                Ok(inner) => inner.context("approval channel closed")?,
-                Err(_) => {
-                    approval_session.lock().await.pending.remove(&request_id);
-                    anyhow::bail!("approval timed out for {}", def.name);
+            // The answer address stays the root ancestor's session so an older
+            // client that still keys on it is not misled; the registry holds it
+            // as data, so there is no parent session handle to find.
+            let outcome = self
+                .approvals
+                .request(crate::approvals::ApprovalRequest {
+                    answer_session: &root_sid,
+                    target_client_id,
+                    owner_session: owner_sid.map(str::to_string),
+                    owner_graph: options.owner_graph.clone(),
+                    asking_session: sid,
+                    tool: &def.name,
+                    arguments: call.arguments.clone(),
+                })
+                .await;
+            match outcome {
+                crate::approvals::ApprovalOutcome::Approved => {}
+                // A human clicked Deny. The only sentence in core that may say
+                // "denied".
+                crate::approvals::ApprovalOutcome::Denied => {
+                    anyhow::bail!("approval denied for {}", def.name)
                 }
-            };
-            if !response
-                .get("approved")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                anyhow::bail!("approval denied for {}", def.name);
+                // Nobody answered. Naming the real cause keeps a cancelled run
+                // and a timeout from being reported to the model — and read
+                // back by a human in the transcript — as a decision somebody
+                // made.
+                crate::approvals::ApprovalOutcome::Abandoned(reason) => {
+                    anyhow::bail!("approval for {} was abandoned ({reason})", def.name)
+                }
             }
         }
 
@@ -1336,6 +1430,13 @@ impl AgentManager {
                     permission_mode: options.permission_mode.clone(),
                     reasoning_effort: options.reasoning_effort.clone(),
                     approval_session: root_sid,
+                    // Resolved here, not in the child: `OwnSession` means
+                    // *this* agent's session, and handing the variant down
+                    // would re-point it at the child's own id.
+                    owner_session: owner_sid.map(str::to_string),
+                    // A graph node's own subagent is still the graph's work.
+                    // Without this the grandchild's prompts named no run.
+                    owner_graph: options.owner_graph.clone(),
                     depth: options.subagent_depth,
                     permission_rules: options.permission_rules.clone(),
                     workspace_root: options.workspace_root.clone(),
@@ -2614,15 +2715,34 @@ mod tests {
             asset_catalog: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         };
 
+        // A prompt is addressed to exactly one window, so the test has to be
+        // that window: reserve the session, attach a client id to it, and run
+        // the turn on it. Answering from the event's own `targetClientId` is
+        // what a panel does, and it is the only thing core accepts.
+        let session_id = agents.reserve_session().await.unwrap();
+        state.editor_attachment.write().await.insert(
+            session_id.clone(),
+            crate::editor_bridge::EditorAttachment {
+                client_id: "window-under-test".into(),
+                session_id: session_id.clone(),
+                project_slug: "demo".into(),
+                workspace_root: "/tmp/demo".into(),
+            },
+        );
+
         let responder_agents = agents.clone();
         let responder = tokio::spawn(async move {
             let mut rx = bus.subscribe();
             while let Ok(event) = rx.recv().await {
                 if event["type"] == "agent.approval_request" {
-                    let session_id = event["sessionId"].as_str().unwrap().to_string();
                     let request_id = event["requestId"].as_str().unwrap().to_string();
+                    let client_id = event["targetClientId"]
+                        .as_str()
+                        .expect("core must address the prompt at the attached window")
+                        .to_string();
                     responder_agents
-                        .submit_approval(&session_id, &request_id, true)
+                        .approvals()
+                        .respond(&request_id, Some(&client_id), true)
                         .await
                         .unwrap();
                 }
@@ -2650,7 +2770,7 @@ mod tests {
             .chat(
                 &state,
                 &tools,
-                None,
+                Some(&session_id),
                 &[json!({ "role": "user", "content": "call editor_echo" })],
                 options,
             )
@@ -2899,6 +3019,20 @@ mod tests {
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+        // The parent session is the one on screen, so it is the one with a
+        // window attached. The child's prompts inherit that owner, which is the
+        // property under test: a grandchild session no panel has ever seen
+        // still addresses its prompt at this window.
+        let parent_session = agents.reserve_session().await.unwrap();
+        state.editor_attachment.write().await.insert(
+            parent_session.clone(),
+            crate::editor_bridge::EditorAttachment {
+                client_id: "window-under-test".into(),
+                session_id: parent_session.clone(),
+                project_slug: "demo".into(),
+                workspace_root: "/tmp/demo".into(),
+            },
+        );
 
         let recorded: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
         let recorder = recorded.clone();
@@ -2911,8 +3045,13 @@ mod tests {
                 let sid = event["sessionId"].as_str().unwrap_or("").to_string();
                 let rid = event["requestId"].as_str().unwrap_or("").to_string();
                 if event["type"] == "agent.approval_request" {
+                    let client_id = event["targetClientId"]
+                        .as_str()
+                        .expect("every prompt in this flow is addressed to the parent's window")
+                        .to_string();
                     responder_agents
-                        .submit_approval(&sid, &rid, true)
+                        .approvals()
+                        .respond(&rid, Some(&client_id), true)
                         .await
                         .unwrap();
                 }
@@ -2934,7 +3073,7 @@ mod tests {
             .chat(
                 &state,
                 &tools,
-                None,
+                Some(&parent_session),
                 &[json!({ "role": "user", "content": "delegate the echo" })],
                 options,
             )
@@ -4070,6 +4209,192 @@ mod tests {
             .await
             .expect("pending request must still be answerable");
         assert_eq!(rx.await.unwrap(), json!({ "ok": true }));
+    }
+
+    /// Phase 0's free fix, and a seventh path to a denial nobody asked for.
+    ///
+    /// `submit_tool_result` and the old `submit_approval` indexed the same
+    /// `session.pending` map. An `agent_tool_result` carrying an `approval-`
+    /// request id therefore delivered a tool-result JSON to the approval
+    /// waiter, where `approved` is absent and `unwrap_or(false)` read it as
+    /// **denied** — a file write refused because a browser tool answered the
+    /// wrong question.
+    #[tokio::test]
+    async fn approval_and_tool_request_ids_cannot_answer_each_other() {
+        let (bus, mut rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus);
+        let session = agents.get_or_create(None).await.unwrap();
+        let session_id = session.lock().await.id.clone();
+        agents
+            .approvals()
+            .cancel_by_session(&session_id) // no-op; proves the registry is reachable
+            .await;
+
+        let approvals = agents.approvals().clone();
+        let answer_session = session_id.clone();
+        let waiter = tokio::spawn(async move {
+            approvals
+                .request(crate::approvals::ApprovalRequest {
+                    answer_session: &answer_session,
+                    target_client_id: Some("window-a".into()),
+                    owner_session: Some(answer_session.clone()),
+                    owner_graph: None,
+                    asking_session: &answer_session,
+                    tool: "file_write",
+                    arguments: json!({ "path": "a.txt" }),
+                })
+                .await
+        });
+        let request_id = loop {
+            let event = rx.recv().await.unwrap();
+            if event["type"] == "agent.approval_request" {
+                break event["requestId"].as_str().unwrap().to_string();
+            }
+        };
+
+        // A tool result addressed at the approval's id finds nothing: the two
+        // kinds no longer share a keyspace.
+        let crossed = agents
+            .submit_tool_result(&session_id, &request_id, json!({ "message": "hi" }))
+            .await
+            .expect_err("a tool result must not reach an approval waiter");
+        assert!(
+            crossed.to_string().contains("no pending request"),
+            "unexpected error: {crossed}"
+        );
+
+        // And the approval is still there, still answerable, still not denied.
+        agents
+            .approvals()
+            .respond(&request_id, Some("window-a"), true)
+            .await
+            .expect("the approval survived the crossed submission");
+        assert_eq!(
+            waiter.await.unwrap(),
+            crate::approvals::ApprovalOutcome::Approved
+        );
+    }
+
+    /// Approvals left `session.pending`, so the eviction guard that filtered
+    /// victims on that map being non-empty would now happily evict a session
+    /// parked on an approval — after which the answer address is gone.
+    #[tokio::test]
+    async fn a_session_parked_on_an_approval_is_never_evicted() {
+        let (bus, mut rx) = tokio::sync::broadcast::channel(256);
+        let agents = AgentManager::new(bus);
+        let parked = agents.get_or_create(None).await.unwrap();
+        let parked_id = parked.lock().await.id.clone();
+
+        let approvals = agents.approvals().clone();
+        let answer_session = parked_id.clone();
+        tokio::spawn(async move {
+            approvals
+                .request(crate::approvals::ApprovalRequest {
+                    answer_session: &answer_session,
+                    target_client_id: Some("window-a".into()),
+                    owner_session: Some(answer_session.clone()),
+                    owner_graph: None,
+                    asking_session: &answer_session,
+                    tool: "file_write",
+                    arguments: json!({}),
+                })
+                .await
+        });
+        let request_id = loop {
+            let event = rx.recv().await.unwrap();
+            if event["type"] == "agent.approval_request" {
+                break event["requestId"].as_str().unwrap().to_string();
+            }
+        };
+
+        let mut idle_ids = Vec::new();
+        for _ in 0..MAX_SESSIONS * 2 {
+            idle_ids.push(agents.reserve_session().await.unwrap());
+        }
+
+        let live = agents.sessions.lock().await;
+        assert!(
+            live.contains_key(&parked_id),
+            "a session parked on an approval must never be evicted"
+        );
+        assert!(
+            idle_ids.iter().any(|id| !live.contains_key(id)),
+            "idle sessions must still be evictable"
+        );
+        drop(live);
+
+        agents
+            .approvals()
+            .respond(&request_id, Some("window-a"), true)
+            .await
+            .expect("the parked approval must still be answerable");
+    }
+
+    /// Deleting a session used to wake its waiters by dropping `pending`.
+    /// Approvals are elsewhere now, so the removal has to say so explicitly —
+    /// and it must abandon them, never deny them.
+    #[tokio::test]
+    async fn removing_a_session_wakes_its_parked_approval() {
+        let (bus, mut rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus);
+        let session = agents.get_or_create(None).await.unwrap();
+        let session_id = session.lock().await.id.clone();
+
+        let approvals = agents.approvals().clone();
+        let answer_session = session_id.clone();
+        let waiter = tokio::spawn(async move {
+            approvals
+                .request(crate::approvals::ApprovalRequest {
+                    answer_session: &answer_session,
+                    target_client_id: Some("window-a".into()),
+                    owner_session: Some(answer_session.clone()),
+                    owner_graph: None,
+                    asking_session: &answer_session,
+                    tool: "file_write",
+                    arguments: json!({}),
+                })
+                .await
+        });
+        loop {
+            let event = rx.recv().await.unwrap();
+            if event["type"] == "agent.approval_request" {
+                break;
+            }
+        }
+
+        let (removed, cancelled) = agents.remove_session(&session_id).await;
+        assert!(removed);
+        assert_eq!(cancelled, 1, "the parked approval must be counted");
+        assert!(matches!(
+            waiter.await.unwrap(),
+            crate::approvals::ApprovalOutcome::Abandoned("session-gone")
+        ));
+    }
+
+    #[test]
+    fn approval_owner_resolves_without_inventing_an_owner() {
+        assert_eq!(
+            ApprovalOwner::OwnSession.resolve("session-a"),
+            Some("session-a")
+        );
+        assert_eq!(
+            ApprovalOwner::Ancestor("session-root".into()).resolve("session-a"),
+            Some("session-root")
+        );
+        // The case the whole enum exists for: unattended work names nobody
+        // rather than naming itself, which a panel could then match.
+        assert_eq!(ApprovalOwner::Unowned.resolve("session-a"), None);
+
+        assert_eq!(ApprovalOwner::from_ancestor(None), ApprovalOwner::Unowned);
+        assert_eq!(
+            ApprovalOwner::from_ancestor(Some("   ".into())),
+            ApprovalOwner::Unowned
+        );
+        assert_eq!(
+            ApprovalOwner::from_ancestor(Some(" session-root ".into())),
+            ApprovalOwner::Ancestor("session-root".into())
+        );
+        assert_eq!(ApprovalOwner::default(), ApprovalOwner::OwnSession);
     }
 
     #[tokio::test]
