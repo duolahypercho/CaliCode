@@ -28,6 +28,20 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Textarea } from "../ui/textarea";
 import { Tooltip, TooltipContent, TooltipTrigger } from "../ui/tooltip";
 import { connectEvents, rpc, type AgentEvent, type UsageTotals } from "../../lib/rpc";
+import { classifySendFailure, route } from "../../lib/approvalRouter";
+import {
+  APPROVAL_TTL_MS,
+  emptyStore,
+  headApproval,
+  lapsedExplanation,
+  reduce,
+  visibleApprovals,
+  type ApprovalEntry,
+  type ApprovalEvent,
+  type ApprovalStore,
+  type LapsedReason,
+  type ResolvedOutcome,
+} from "../../lib/approvalStore";
 import { contextWindowOf, formatTokens, readCoreConfig, type CoreConfig } from "../../lib/coreConfig";
 import {
   MAX_LOOP_ITERATIONS,
@@ -72,12 +86,6 @@ import {
 } from "../../lib/activity";
 import { openLoopReport, type LoopReport } from "../../lib/loopReports";
 import type { AgentMessage, BrowserTool, ModelList, SubagentResult } from "../../lib/types";
-
-interface ApprovalRequest {
-  requestId: string;
-  tool: string;
-  arguments: unknown;
-}
 
 type BrowserToolOwnershipEvent = Pick<
   AgentEvent,
@@ -359,6 +367,29 @@ export function validateLoopGraphCompletion(graph: TaskGraph, context: LoopGraph
     return { accepted: false, reason: "no passed build node has at least three persisted visual frames" };
   }
   return { accepted: true, reason: "fresh graph proof passed" };
+}
+
+/**
+ * This window's stable id.
+ *
+ * Per-tab, and deliberately not shared: core addresses each approval at
+ * exactly one client id, and two windows answering to the same id would put
+ * two panels back in one inbox — the condition the address exists to remove.
+ * A reload keeps the id so prompts raised before it are still answerable.
+ */
+export function readEditorClientId(): string {
+  const KEY = "cali.editorClientId";
+  try {
+    const stored = window.sessionStorage.getItem(KEY);
+    if (stored && stored.trim().length > 0) return stored;
+    const fresh = crypto.randomUUID();
+    window.sessionStorage.setItem(KEY, fresh);
+    return fresh;
+  } catch {
+    // Private mode or a locked-down webview: a per-mount id still works, it
+    // just does not survive a reload.
+    return crypto.randomUUID();
+  }
 }
 
 export function ownsBrowserToolEvent(
@@ -755,9 +786,16 @@ export function AgentPanel({
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionWorkspaceRoot, setSessionWorkspaceRoot] = useState<string | null>(workspaceRoot);
   const [busy, setBusy] = useState(false);
-  const [approval, setApproval] = useState<ApprovalRequest | null>(null);
-  const [eventSessionId, setEventSessionId] = useState<string | null>(null);
-  const [permissionMode, setPermissionMode] = useState("full-access");
+  // The approval queue. One map, one reducer, one writer — see
+  // lib/approvalStore.ts. `approvalsRef` is the reducer's authoritative copy
+  // so the mount-once SSE handler can dispatch without re-subscribing; the
+  // state is a render mirror and is never read to make a decision.
+  const approvalsRef = useRef<ApprovalStore>(emptyStore());
+  const [approvals, setApprovals] = useState<ApprovalStore>(approvalsRef.current);
+  // Sandbox by default: safe tools run freely, irreversible writes ask. A
+  // full-access default would silently bypass the permission rules and plan
+  // mode on a newcomer's very first prompt.
+  const [permissionMode, setPermissionMode] = useState("auto");
   // Reasoning effort is remembered per model and forwarded on every agent
   // turn; graph/subagent workers inherit the coordinator's selected value.
   const [effortByModel, setEffortByModel] = useState<Record<string, string>>(readStoredEfforts);
@@ -768,6 +806,9 @@ export function AgentPanel({
   const [providerTarget, setProviderTarget] = useState("openai");
   const [modelInput, setModelInput] = useState("");
   const [looping, setLooping] = useState(false);
+  // Stop is state, not a ref: the old ref-only flag re-rendered nothing, so
+  // the button's disabled/label flipped at whatever unrelated render came next.
+  const [stopping, setStopping] = useState(false);
   const [menuIndex, setMenuIndex] = useState(0);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   // Latest task graph snapshot from `graph.updated` events, and a per-node
@@ -788,12 +829,20 @@ export function AgentPanel({
   // /usage reports the auto-compaction threshold from it.
   const [coreConfig, setCoreConfig] = useState<CoreConfig | null>(null);
   const cancelLoopRef = useRef(false);
+  // The in-flight agent_chat for the current turn (plain or loop iteration).
+  // Stop aborts it so cancellation costs one round-trip instead of the rest of
+  // core's `maxTurns` budget.
+  const turnAbortRef = useRef<AbortController | null>(null);
   const saveTimer = useRef<number | null>(null);
   // Each mounted editor panel is an SSE consumer. Core includes this token
   // on editor/browser tool requests so another CaliCode window cannot answer
   // the request first just because it shares the broadcast event stream.
+  // Backed by sessionStorage so a reload reclaims this window's inbox rather
+  // than orphaning every prompt core addressed at the pre-reload id.
+  // sessionStorage, never localStorage: two windows sharing an id would break
+  // the one-window-one-inbox invariant the whole design rests on.
   const editorClientIdRef = useRef<string | null>(null);
-  if (!editorClientIdRef.current) editorClientIdRef.current = crypto.randomUUID();
+  if (!editorClientIdRef.current) editorClientIdRef.current = readEditorClientId();
   const onSessionsChangedRef = useRef(onSessionsChanged);
   onSessionsChangedRef.current = onSessionsChanged;
   // Stable handles for the activity/running reporters: they always see the
@@ -824,6 +873,25 @@ export function AgentPanel({
     setActiveGraph(graph);
   };
   const activeTurnRef = useRef<{ turnId: string; startedAtMs: number } | null>(null);
+
+  // The single writer. Everything that touches the approval queue goes through
+  // here, and the ref is updated synchronously so the mount-once SSE handler
+  // and a click in the same tick agree on what has already happened.
+  const dispatchApproval = (event: ApprovalEvent): ApprovalStore => {
+    const next = reduce(approvalsRef.current, event);
+    if (next !== approvalsRef.current) {
+      approvalsRef.current = next;
+      setApprovals(next);
+    }
+    return next;
+  };
+
+  // Every card lapses with a stated reason. Note what this is not: it does not
+  // answer anything. A panel going away is not a decision about a request core
+  // is still holding — core's own timer, or the run ending, is what closes it.
+  const discardApprovals = (reason: LapsedReason): void => {
+    dispatchApproval({ kind: "Discarded", reason });
+  };
 
   const targetProvider = modelList?.providers.find((provider) => provider.id === providerTarget);
   const availableModels = [
@@ -966,7 +1034,6 @@ export function AgentPanel({
           activeGraph: activeGraphRef.current,
         });
         if (!owned) return;
-        setEventSessionId(event.sessionId);
         const tool = toolsRef.current.find((candidate) => candidate.name === event.tool);
         void (async () => {
           try {
@@ -1013,8 +1080,33 @@ export function AgentPanel({
         })();
       }
       if (event.type === "agent.approval_request" && event.requestId && event.tool) {
-        setEventSessionId(event.sessionId ?? null);
-        setApproval({ requestId: event.requestId, tool: event.tool, arguments: event.arguments });
+        // Routed at the door. A prompt that is not this window's never enters
+        // the map — there must be no container a foreign request can sit in,
+        // because a container is a button.
+        const owned = route(event, {
+          clientId: editorClientIdRef.current,
+          sessionId: sessionIdRef.current,
+        });
+        if (owned === "not-mine") return;
+        dispatchApproval({
+          kind: "Arrived",
+          requestId: event.requestId,
+          tool: event.tool,
+          arguments: event.arguments,
+          graphLabel: typeof event.ownerGraph === "string" ? event.ownerGraph : null,
+          raisedAtMs: typeof event.raisedAtMs === "number" ? event.raisedAtMs : Date.now(),
+        });
+      }
+      // Core announces every exit from its pending map. This is what turns the
+      // TTL sweep below into a backstop rather than a parallel clock, and it
+      // gives the losing window in any race a truthful card instead of a stale
+      // one. It never produces a denial — it reports one core already has.
+      if (event.type === "agent.approval_resolved" && event.requestId) {
+        dispatchApproval({
+          kind: "Resolved",
+          requestId: event.requestId,
+          outcome: (event.outcome ?? "session-gone") as ResolvedOutcome,
+        });
       }
       if (event.type === "agent.tool_started" && event.tool && eventIsLocalActivity(event)) {
         const turnId = turnForEvent(event);
@@ -1105,8 +1197,29 @@ export function AgentPanel({
           return copy;
         });
       }
+    },
+    // Re-attach on every (re)connection. `editor_attachment` is the map core
+    // reads to address an approval, and an EventSource that silently
+    // reconnected would otherwise leave core addressing prompts at a window
+    // that has not spoken since before the gap. This is the whole of the
+    // reconnect story — no second registry, no claim protocol.
+    () => {
+      const id = sessionIdRef.current;
+      const root = workspaceRootRef.current;
+      if (!id || !root) return;
+      void rpc("editor_attach", {
+        sessionId: id,
+        clientId: editorClientIdRef.current,
+        projectSlug,
+        workspaceRoot: root,
+      }).catch(() => {});
     });
-    return disconnect;
+    return () => {
+      disconnect();
+      // The panel is going away. Cards lapse; nothing is answered.
+      discardApprovals("panel-gone");
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Stick-to-bottom (Hermes-style): follow the stream only while the reader
@@ -1123,6 +1236,26 @@ export function AgentPanel({
     const timer = window.setInterval(() => setThinkingSeconds(Math.floor((Date.now() - started) / 1000)), 1000);
     return () => window.clearInterval(timer);
   }, [busy]);
+  // The TTL sweep. It removes cards and it never sends anything — core's
+  // `agent.approval_resolved` is the primary signal, and this only catches the
+  // case where that announcement was lost (a core restart, an SSE gap). A card
+  // that lapses here says so; the request itself is core's to end.
+  useEffect(() => {
+    const timer = window.setInterval(
+      () => dispatchApproval({ kind: "Tick", nowMs: Date.now() }),
+      Math.max(1_000, Math.floor(APPROVAL_TTL_MS / 30)),
+    );
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Stop only means anything while a turn is running. Retiring it here (rather
+  // than on each exit path) covers every producer of `busy`, including the ones
+  // with no abortable request, so the control can never stick on "Stopping…".
+  useEffect(() => {
+    if (!busy) setStopping(false);
+  }, [busy]);
+
   // Notify the parent whenever the session id this panel owns becomes known,
   // changes (e.g. after a fork or a resumed transcript re-keys us), or
   // clears. A turn that starts before the session is created still reports
@@ -1170,7 +1303,7 @@ export function AgentPanel({
   };
   useEffect(() => {
     if (stickToEndRef.current) transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight });
-  }, [messages, approval]);
+  }, [messages, approvals]);
 
   const refreshSessions = () => {
     void listSessions()
@@ -1276,6 +1409,19 @@ export function AgentPanel({
     appendMessage({ role, content });
   };
 
+  // A stopped turn drops the response core would have replied with, so any tool
+  // row still spinning will never receive its finish event. Settle those rows
+  // and say plainly what the abort could not undo: core may still be running a
+  // tool it already dispatched (there is no `agent_cancel` RPC yet).
+  const noteTurnCancelled = (turnId: string): void => {
+    const settled = settleRunningToolRows(messagesRef.current, turnId, Date.now());
+    if (settled !== messagesRef.current) {
+      messagesRef.current = settled;
+      setMessages(settled);
+    }
+    say("Turn cancelled — tools already dispatched may still finish.", "tool");
+  };
+
   const beginActivityTurn = (turnId = crypto.randomUUID(), startedAtMs = Date.now()): string => {
     activeTurnRef.current = { turnId, startedAtMs };
     setMessages((current) => [...current, createTurnMarker(turnId, startedAtMs)]);
@@ -1306,6 +1452,7 @@ export function AgentPanel({
     session: string | null,
     attachedWorkspaceRoot: string | null,
     activeLoopId?: string,
+    signal?: AbortSignal,
   ): Promise<{ sessionId: string; reply: string; toolCalls: unknown[] }> => {
     const base = {
       projectSlug,
@@ -1320,25 +1467,44 @@ export function AgentPanel({
       finalResponseDrain: Boolean(activeLoopId),
     };
     try {
-      return (await rpc("agent_chat", {
-        ...base,
-        sessionId: session,
-        messages: session ? [userMessage] : [...history, userMessage],
-      })) as { sessionId: string; reply: string; toolCalls: unknown[] };
+      return (await rpc(
+        "agent_chat",
+        {
+          ...base,
+          sessionId: session,
+          messages: session ? [userMessage] : [...history, userMessage],
+        },
+        { signal },
+      )) as { sessionId: string; reply: string; toolCalls: unknown[] };
     } catch (error) {
+      if (signal?.aborted) throw error;
       const notFound = session && error instanceof Error && /session .*not found|not found/i.test(error.message);
       if (!notFound) throw error;
-      return (await rpc("agent_chat", {
-        ...base,
-        sessionId: null,
-        messages: [...history, userMessage],
-      })) as { sessionId: string; reply: string; toolCalls: unknown[] };
+      // Core lost the session. The retry used to send `sessionId: null` and
+      // learn the new id only from the result — so any tool this turn
+      // dispatched raised its approval against a session this panel had not
+      // attached to, and core addressed the prompt at nobody. Create and
+      // attach first, then run: no RPC that can cause a tool call is issued
+      // before the panel knows AND has attached its session.
+      const attached = await ensureEditorSession(true);
+      return (await rpc(
+        "agent_chat",
+        {
+          ...base,
+          sessionId: attached.id,
+          workspaceRoot: attached.workspaceRoot,
+          messages: [...history, userMessage],
+        },
+        { signal },
+      )) as { sessionId: string; reply: string; toolCalls: unknown[] };
     }
   };
 
-  const ensureEditorSession = async (): Promise<{ id: string; workspaceRoot: string }> => {
-    let id = sessionIdRef.current;
-    let root = workspaceRootRef.current;
+  const ensureEditorSession = async (
+    forceFresh = false,
+  ): Promise<{ id: string; workspaceRoot: string }> => {
+    let id = forceFresh ? null : sessionIdRef.current;
+    let root = forceFresh ? null : workspaceRootRef.current;
     if (!id) {
       const created = await createSession(projectSlug);
       id = created.id;
@@ -1369,12 +1535,21 @@ export function AgentPanel({
     setMessages((current) => [...current, userMessage]);
     beginActivityTurn(turnId);
     setBusy(true);
+    const controller = new AbortController();
+    turnAbortRef.current = controller;
     try {
       const attached = await ensureEditorSession();
       const history = messages
         .filter((message) => message.role === "user" || message.role === "assistant")
         .map((message) => ({ role: message.role, content: message.content }));
-      const result = await agentChat(history, userMessage, attached.id, attached.workspaceRoot);
+      const result = await agentChat(
+        history,
+        userMessage,
+        attached.id,
+        attached.workspaceRoot,
+        undefined,
+        controller.signal,
+      );
       setSessionId(result.sessionId);
       const reply = result.reply || "Done.";
       setMessages((current) => {
@@ -1387,11 +1562,19 @@ export function AgentPanel({
       }
       return reply;
     } catch (error) {
+      // The user pressing Stop is not a failure — report it as a cancellation
+      // instead of an "Error:" bubble attributed to the model.
+      if (controller.signal.aborted) {
+        noteTurnCancelled(turnId);
+        onLog("agent turn cancelled by the user");
+        return "";
+      }
       const message = error instanceof Error ? error.message : String(error);
       setMessages((current) => [...current, { role: "assistant", content: `Error: ${message}` }]);
       onLog(`agent error: ${message}`);
       return "";
     } finally {
+      if (turnAbortRef.current === controller) turnAbortRef.current = null;
       completeActivityTurn(turnId);
       setBusy(false);
     }
@@ -1520,6 +1703,8 @@ export function AgentPanel({
     setLooping(true);
     setBusy(true);
     cancelLoopRef.current = false;
+    const controller = new AbortController();
+    turnAbortRef.current = controller;
     const activityTurnId = beginActivityTurn();
     let attached: { id: string; workspaceRoot: string };
     try {
@@ -1527,6 +1712,7 @@ export function AgentPanel({
     } catch (error) {
       say(`Loop error: ${error instanceof Error ? error.message : String(error)}`);
       completeActivityTurn(activityTurnId);
+      if (turnAbortRef.current === controller) turnAbortRef.current = null;
       setLooping(false);
       setBusy(false);
       return;
@@ -1604,6 +1790,8 @@ export function AgentPanel({
           return await invocation();
         } catch (error) {
           lastError = error;
+          // A user Stop must not be retried back into life.
+          if (controller.signal.aborted) throw error;
           if (!isTransientRpcError(error) || attempt === MAX_TRANSIENT_RETRIES) throw error;
           attempt += 1;
           onLog(`loop retry ${attempt}/${MAX_TRANSIENT_RETRIES} after ${error instanceof Error ? error.message : String(error)}`);
@@ -1644,7 +1832,8 @@ export function AgentPanel({
         // loop. Provider/auth errors fall through to the outer catch so the
         // loop still fails closed on those.
         const result = await runChatWithTransientRetry(
-          () => agentChat(historyBeforeMessage, userMessage, localSession, attached.workspaceRoot, loopId),
+          () =>
+            agentChat(historyBeforeMessage, userMessage, localSession, attached.workspaceRoot, loopId, controller.signal),
         );
         localSession = result.sessionId;
         setSessionId(result.sessionId);
@@ -1754,6 +1943,14 @@ export function AgentPanel({
           break;
         }
       } catch (error) {
+        // Stop aborts the in-flight iteration: that is a cancellation, not a
+        // blocked loop, so it takes the same terminal path as the pre-iteration
+        // cancel check rather than being reported as a failure.
+        if (controller.signal.aborted) {
+          noteTurnCancelled(activityTurnId);
+          say(`■ loop stopped after ${iteration - 1} iterations`, "tool");
+          break;
+        }
         const message = error instanceof Error ? error.message : String(error);
         // Any tool row that started via `agent.tool_started` mid-iteration
         // would otherwise stay `status: "running"` forever once the iteration
@@ -1828,18 +2025,39 @@ export function AgentPanel({
     loopBaselineAvailableRef.current = false;
     loopKnownGraphIdsRef.current = new Set();
     loopObservedGraphIdsRef.current = new Set();
+    if (turnAbortRef.current === controller) turnAbortRef.current = null;
     setLooping(false);
     setBusy(false);
   };
 
-  const stopLoop = () => {
+  // Stop has to be legible in the frame it is clicked: `stopping` re-renders
+  // the control, the transcript acknowledges the click immediately, and the
+  // in-flight agent_chat is aborted so the turn ends after one round-trip
+  // instead of running out core's remaining turn budget. Core has no
+  // `agent_cancel` RPC yet, so a tool it already dispatched may still finish —
+  // `noteTurnCancelled` says exactly that once the request unwinds.
+  //
+  // What Stop deliberately does NOT do is answer a pending approval. Stopping
+  // a turn is a statement about this panel's waiting, not a decision about a
+  // request core is holding — and an earlier build that denied "on the way
+  // out" is precisely how stopping one turn destroyed a running graph's work.
+  // Core drops a finished run's approvals itself; a live one's wait out its
+  // own timer.
+  const stopAgent = () => {
+    if (!busy || stopping) return;
     cancelLoopRef.current = true;
+    setStopping(true);
+    say("■ Stopping — finishing the current step, then halting.", "tool");
+    turnAbortRef.current?.abort();
   };
 
   const resumeSession = async (id: string) => {
     if (looping) return;
     try {
       activeTurnRef.current = null;
+      // This chat is moving on. The cards lapse and say so; nothing is
+      // answered on the way out.
+      discardApprovals("session-changed");
       const record = await loadSession(id);
       setSessionId(record.id);
       setSessionWorkspaceRoot(record.workspaceRoot ?? workspaceRoot);
@@ -1910,6 +2128,7 @@ export function AgentPanel({
     }
     try {
       activeTurnRef.current = null;
+      discardApprovals("session-changed");
       const record = await forkSession(sessionId);
       setSessionId(record.id);
       setSessionWorkspaceRoot(record.workspaceRoot ?? workspaceRoot);
@@ -1948,11 +2167,18 @@ export function AgentPanel({
     if (!task || busy) return;
     setBusy(true);
     try {
+      // Naming this panel's session is what makes the child's prompts
+      // answerable here: the child asks under a fresh session id no window has
+      // open, so without an owner core addresses its approvals at nobody and
+      // they park until the timeout. Read from the RPC params by core, never
+      // from the tool arguments a model controls.
+      const attached = await ensureEditorSession();
       const result = await rpc<SubagentResult>("subagent_spawn", {
         role,
         instructions: task,
         projectSlug,
         maxTurns: 8,
+        ownerSession: attached.id,
       });
       setMessages((current) => [
         ...current,
@@ -1983,7 +2209,7 @@ export function AgentPanel({
       applyGraphSnapshot(graph);
       setGraphTickers({});
       say(`▶ graph ${graph.graphId} planned: ${graph.nodes.length} nodes${template ? ` (template ${template})` : ""}`, "tool");
-      void runGraph(graph.graphId)
+      void runGraph(graph.graphId, { ownerSession: attached.id })
         .then((rollup) =>
           say(
             `Graph ${rollup.status}: ${rollup.passed} passed, ${rollup.failed} failed, ${rollup.totalAttempts} attempt${
@@ -2015,6 +2241,7 @@ export function AgentPanel({
     clear: () => setMessages([]),
     newSession: () => {
       activeTurnRef.current = null;
+      discardApprovals("session-changed");
       setSessionId(null);
       setUsage(null);
       setMessages([{ role: "tool", content: "Started a new session.", tool: "session" }]);
@@ -2049,18 +2276,45 @@ export function AgentPanel({
     await runTurn(text);
   };
 
-  const respondToApproval = async (approved: boolean) => {
-    if (!approval) return;
-    const targetSession = eventSessionId ?? sessionId;
-    if (!targetSession) return;
+  // The click handler. `UserAnswered` returns the post-transition store, so
+  // the reducer itself is the double-send guard: a second click finds the
+  // entry already `answering` and no RPC is issued. There is no in-flight
+  // `Set` beside it that could disagree.
+  //
+  // Note what this function cannot do: it cannot decide. `approved` comes from
+  // the button the human pressed and from nowhere else. No transport failure,
+  // no state transition, and no run ending reaches an `agent_approval_response`
+  // call anywhere in this file.
+  const respondToApproval = async (entry: ApprovalEntry, approved: boolean): Promise<void> => {
+    const before = approvalsRef.current;
+    const after = dispatchApproval({
+      kind: "UserAnswered",
+      requestId: entry.requestId,
+      approved,
+      nowMs: Date.now(),
+    });
+    if (after === before) return;
     try {
-      await rpc("agent_approval_response", { sessionId: targetSession, requestId: approval.requestId, approved });
+      await rpc("agent_approval_response", {
+        requestId: entry.requestId,
+        clientId: editorClientIdRef.current,
+        approved,
+      });
+      dispatchApproval({ kind: "SendAccepted", requestId: entry.requestId });
       setMessages((current) => [
         ...current,
-        { role: "tool", content: approved ? `Approved ${approval.tool}` : `Denied ${approval.tool}`, tool: approval.tool },
+        { role: "tool", content: approved ? `Approved ${entry.tool}` : `Denied ${entry.tool}`, tool: entry.tool },
       ]);
-    } finally {
-      setApproval(null);
+    } catch (error) {
+      // The only classifier in this file, with exactly one call site, and its
+      // default is "retry" — the card stays up and the click is repeatable.
+      // Anything else would be this panel inventing an outcome for a request
+      // core is still holding.
+      dispatchApproval({
+        kind: "SendFailed",
+        requestId: entry.requestId,
+        failure: classifySendFailure(error),
+      });
     }
   };
 
@@ -2101,7 +2355,9 @@ export function AgentPanel({
             onCancel={(graphId) => void cancelGraph(graphId).catch(() => {})}
             onRerun={(graphId) => {
               setGraphTickers({});
-              void runGraph(graphId).catch((error) =>
+              // Re-run from this panel: the run, and therefore its prompts,
+              // move onto this window's session.
+              void runGraph(graphId, { ownerSession: sessionIdRef.current }).catch((error) =>
                 say(`Graph re-run failed: ${error instanceof Error ? error.message : String(error)}`),
               );
             }}
@@ -2198,22 +2454,60 @@ export function AgentPanel({
             </div>
           )}
 
-          {approval && (
-            <div className="w-full self-start rounded-lg border border-line-strong bg-surface-1 p-3">
-              <p className="text-[13px] text-ink-strong">Approve {approval.tool}?</p>
-              <pre className="mt-1.5 max-h-24 overflow-auto text-[11px] text-ink-subtle">
-                {JSON.stringify(approval.arguments, null, 2)}
-              </pre>
-              <div className="mt-2.5 flex gap-2">
-                <Button size="sm" onClick={() => void respondToApproval(true)}>
-                  <ShieldCheck className="mr-1 h-3.5 w-3.5" /> Approve
-                </Button>
-                <Button size="sm" variant="secondary" onClick={() => void respondToApproval(false)}>
-                  <ShieldOff className="mr-1 h-3.5 w-3.5" /> Deny
-                </Button>
+          {/* One card per pending request, oldest first. Parallel graph nodes
+              prompt together and are answered independently in any order; a
+              card whose send is in flight sinks below the others so a hung
+              request cannot hide the queue behind it. A card that can no
+              longer be answered stays visible and says why, rather than
+              vanishing or being answered on the user's behalf. */}
+          {visibleApprovals(approvals).map((entry) => {
+            const answering = entry.state.kind === "answering";
+            const settled = entry.state.kind === "settled";
+            const lapsed = entry.state.kind === "lapsed";
+            return (
+              <div
+                key={entry.requestId}
+                data-approval={entry.requestId}
+                data-approval-state={entry.state.kind}
+                className={`w-full self-start rounded-lg border p-3 ${
+                  lapsed || settled ? "border-line bg-surface-2 opacity-70" : "border-line-strong bg-surface-1"
+                }`}
+              >
+                <p className="text-[13px] text-ink-strong">
+                  Approve {entry.tool}?
+                  {entry.graphLabel ? (
+                    <span className="ml-1.5 text-[11px] text-ink-subtle">for run {entry.graphLabel}</span>
+                  ) : null}
+                </p>
+                <pre className="mt-1.5 max-h-24 overflow-auto text-[11px] text-ink-subtle">
+                  {JSON.stringify(entry.arguments, null, 2)}
+                </pre>
+                {lapsed && entry.state.kind === "lapsed" ? (
+                  <p className="mt-2 text-[11.5px] text-ink-subtle">
+                    No longer answerable — {lapsedExplanation(entry.state.reason)}.
+                  </p>
+                ) : settled && entry.state.kind === "settled" ? (
+                  <p className="mt-2 text-[11.5px] text-ink-subtle">
+                    {entry.state.approved ? "Approved." : "Denied."}
+                  </p>
+                ) : (
+                  <div className="mt-2.5 flex gap-2">
+                    <Button size="sm" disabled={answering} onClick={() => void respondToApproval(entry, true)}>
+                      <ShieldCheck className="mr-1 h-3.5 w-3.5" /> Approve
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={answering}
+                      onClick={() => void respondToApproval(entry, false)}
+                    >
+                      <ShieldOff className="mr-1 h-3.5 w-3.5" /> Deny
+                    </Button>
+                  </div>
+                )}
               </div>
-            </div>
-          )}
+            );
+          })}
         </div>
 
         {!atBottom && (
@@ -2469,22 +2763,26 @@ export function AgentPanel({
               </DropdownMenu.Portal>
             </DropdownMenu.Root>
 
-            {looping ? (
+            {/* Every busy turn is stoppable, not just a /loop: a plain prompt
+                can spend twenty tool round-trips and used to leave closing the
+                window as the only escape. */}
+            {busy ? (
               <button
                 type="button"
-                aria-label="Stop agent loop"
-                onClick={stopLoop}
-                disabled={cancelLoopRef.current}
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#7a2a2a] bg-[#3a1f1f] text-[#f0c0c0] transition-[background-color,transform] enabled:hover:bg-[#492525] enabled:active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-40"
+                aria-label={looping ? "Stop agent loop" : "Stop agent"}
+                onClick={stopAgent}
+                disabled={stopping}
+                className="flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-full border border-danger-soft/60 bg-danger-soft/15 px-3 text-[11px] text-danger-soft transition-[background-color,transform] enabled:hover:bg-danger-soft/25 enabled:active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-60"
               >
-                <Square aria-hidden className="h-3.5 w-3.5" />
+                <Square aria-hidden className="h-3.5 w-3.5 shrink-0" />
+                <span>{stopping ? "Stopping…" : "Stop"}</span>
               </button>
             ) : (
               <button
                 type="button"
                 aria-label="Send message"
                 onClick={() => void send()}
-                disabled={busy || !input.trim()}
+                disabled={!input.trim()}
                 className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-[background-color,transform,opacity] enabled:hover:opacity-90 enabled:active:scale-[0.96] disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-faint disabled:opacity-70"
               >
                 <ArrowUp aria-hidden className="h-4 w-4" strokeWidth={2.2} />

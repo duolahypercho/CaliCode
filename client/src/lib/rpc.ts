@@ -23,16 +23,37 @@ export function currentCoreStatus(): CoreConnectionState {
   return coreStatus;
 }
 
-export async function rpc<T = unknown>(method: string, params: Record<string, unknown> = {}): Promise<T> {
+export type RpcOptions = {
+  /**
+   * Hangs up the request. The agent panel's Stop control owns one of these per
+   * turn, so cancelling is bounded by a single round-trip instead of core's
+   * remaining `maxTurns`.
+   */
+  signal?: AbortSignal;
+};
+
+/** A fetch/body rejection caused by an AbortSignal, not by the network. */
+function isAbortError(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as { name?: unknown }).name === "AbortError";
+}
+
+export async function rpc<T = unknown>(
+  method: string,
+  params: Record<string, unknown> = {},
+  options: RpcOptions = {},
+): Promise<T> {
   let response: Response;
   try {
     response = await fetch("/rpc", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method, params }),
+      signal: options.signal,
     });
   } catch (error) {
-    publishCoreStatus("offline");
+    // The caller hanging up says nothing about core's health: publishing
+    // "offline" here would paint an outage banner over a user-initiated stop.
+    if (!isAbortError(error)) publishCoreStatus("offline");
     throw error;
   }
 
@@ -50,6 +71,9 @@ export async function rpc<T = unknown>(method: string, params: Record<string, un
     rawBody = await response.text();
     envelope = rawBody ? (JSON.parse(rawBody) as typeof envelope) : {};
   } catch (error) {
+    // An abort mid-body is the same hang-up as above — keep the AbortError
+    // identity so the caller can tell cancellation from a server error.
+    if (isAbortError(error)) throw error;
     // A non-JSON response. Treat 5xx gateway errors and explicit 404/502/503/504
     // as transport failures so the UI can explain that core is down, but keep
     // any other status reachable: the server may legitimately return a 4xx with
@@ -108,7 +132,13 @@ export type AgentEvent = {
   type: string;
   sessionId?: string;
   targetSessionId?: string;
-  targetClientId?: string;
+  /**
+   * The one window core addressed this at. `agent.tool_request` omits it when
+   * no client is attached; `agent.approval_request` always carries it, `null`
+   * when nobody is attached, so `route()` can tell "addressed at nobody" from
+   * "a core older than the addressing change".
+   */
+  targetClientId?: string | null;
   projectSlug?: string;
   workspaceRoot?: string;
   delta?: string;
@@ -137,6 +167,19 @@ export type AgentEvent = {
     afterBytes?: number;
   };
   approved?: boolean;
+  /**
+   * `agent.approval_request` only: the panel whose work raised this, and the
+   * graph run it belongs to. DISPLAY ONLY — routing is `targetClientId`, and
+   * a second thing to branch on is how the heuristics grew back before.
+   */
+  ownerSession?: string | null;
+  ownerGraph?: string | null;
+  /** `agent.approval_request` only: core's clock when it raised the prompt. */
+  raisedAtMs?: number;
+  /** `agent.approval_resolved` only: how the request left core's map. */
+  outcome?: string;
+  /** `agent.approval_request` only: the descendant session actually asking. */
+  subagentSessionId?: string;
   /** `agent.usage` events only. */
   usage?: UsageTotals;
   /** `agent.compacted` events only (mirrors the session_compact result). */
@@ -147,9 +190,24 @@ export type AgentEvent = {
   estimatedTokensAfter?: number;
 };
 
-export function connectEvents(onEvent: (event: AgentEvent) => void): () => void {
+/**
+ * `onOpen` fires on every (re)connection, including the ones `EventSource`
+ * makes on its own after a drop.
+ *
+ * The panel re-attaches there, which is what keeps `editor_attachment` — the
+ * map core reads to address an approval — as live as the connection itself.
+ * Without it, a reconnect leaves core addressing prompts at a window that has
+ * not spoken since before the gap.
+ */
+export function connectEvents(
+  onEvent: (event: AgentEvent) => void,
+  onOpen?: () => void,
+): () => void {
   const source = new EventSource("/events");
-  source.onopen = () => publishCoreStatus("ready");
+  source.onopen = () => {
+    publishCoreStatus("ready");
+    onOpen?.();
+  };
   source.onerror = () => publishCoreStatus("offline");
   source.onmessage = (message) => {
     try {
