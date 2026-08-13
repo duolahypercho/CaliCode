@@ -41,6 +41,10 @@ async function createLoopProject(page: Page, suffix: string) {
     .first();
   await expect(project).toBeVisible({ timeout: 10_000 });
   await project.click();
+  // project_open resolves asynchronously and rekeys <AgentPanel key={slug:revision}>
+  // (App.tsx). Anything typed — or any loop started — before that second remount
+  // is discarded with the old panel instance.
+  await expect(page.locator("[data-empty-game-hint]")).toContainText(slug, { timeout: 10_000 });
   return { slug, title };
 }
 
@@ -152,7 +156,11 @@ test.describe("loop completion gate", () => {
       await prompt.fill(`/loop ${goal}`);
       await prompt.press("Enter");
 
-      await expect(page.getByText(/DONE ignored:/).first()).toBeVisible({ timeout: 15_000 });
+      // Distinguish "loop never started" from "gate never fired" on failure.
+      await expect(page.getByText(`▶ loop started: ${goal}`)).toBeVisible({ timeout: 10_000 });
+      // 30s: the gate line lands only after session_create/editor_attach/
+      // loop_report_start/session_save round-trips against the real core.
+      await expect(page.getByText(/DONE ignored:/).first()).toBeVisible({ timeout: 30_000 });
       expect(agentChatCalls).toBeGreaterThan(0);
       if (!sessionId) throw new Error("agent_chat did not carry a session id");
 

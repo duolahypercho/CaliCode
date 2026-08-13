@@ -49,11 +49,16 @@ jobs:
       # and mutate state, and the visual specs share that world — generating
       # baselines in isolation produced screenshots that could never match a
       # real CI run.
+      # continue-on-error: an unrelated functional test failing (e.g. a flaky
+      # spec) must not discard the regenerated baselines — they are written
+      # before the suite finishes, and the Upload step below is the product.
       - name: Write baselines
         working-directory: client
+        continue-on-error: true
         run: pnpm exec playwright test --grep-invert @live --update-snapshots
 
       - name: Upload
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: visual-baselines-linux
