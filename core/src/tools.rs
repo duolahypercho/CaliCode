@@ -1418,7 +1418,7 @@ pub(crate) async fn execute_core_tool_with_activity(
             Ok(json!({ "name": info.name, "scope": info.scope, "instructions": body }))
         }
         "graph_plan" => crate::graph::plan_tool(state, args).await,
-        "graph_run" => crate::graph::run(state, required_str(args, "graphId")?).await,
+        "graph_run" => crate::graph::run(state, required_str(args, "graphId")?, None).await,
         "graph_status" => crate::graph::status(state, args),
         "graph_list" => crate::graph::list_tool(state, args),
         "graph_cancel" => crate::graph::cancel_tool(state, args).await,
@@ -1658,6 +1658,15 @@ pub struct SpawnParent {
     /// Root ancestor session id — `agent.approval_request` events for the
     /// child (and its descendants) are emitted under this id.
     pub approval_session: String,
+    /// The panel whose work this is, already resolved by the spawning agent
+    /// (`ApprovalOwner::resolve`). `None` when the parent itself is
+    /// unattended — a child of unattended work is unattended too, and must
+    /// not invent an owner by naming itself.
+    pub owner_session: Option<String>,
+    /// The graph run the parent belongs to, inherited verbatim: a graph
+    /// node's own subagent is still that run's work, and a cancelled run must
+    /// take its grandchildren's prompts with it.
+    pub owner_graph: Option<String>,
     /// The parent's own depth (0 = top level).
     pub depth: usize,
     /// The parent's ordered permission rules — inherited verbatim so a
@@ -1673,7 +1682,25 @@ pub struct SpawnParent {
 /// [`permission_rules_for_binding`]. Agent-initiated spawns must come through
 /// [`spawn_subagent_for_parent`] instead, inheriting the parent's rules.
 pub async fn spawn_subagent(state: &AppState, args: &Value) -> Result<Value> {
-    spawn_subagent_with(state, args, None, false).await
+    spawn_subagent_with(state, args, None, None, false).await
+}
+
+/// Spawn on behalf of a connected panel: the same direct-spawn contract as
+/// [`spawn_subagent`], plus the calling session recorded as the approval
+/// owner.
+///
+/// Without this a panel that spawned a subagent could not tell that
+/// subagent's approval prompts from another window's: the child asks under
+/// its own fresh session id, which nothing on the wire tied back to the panel
+/// that asked for it. `owner_session` is a Rust argument rather than an
+/// argument key on purpose — a model drives `subagent_spawn`'s args, and must
+/// not be able to address its prompts at somebody's panel.
+pub(crate) async fn spawn_subagent_for_client(
+    state: &AppState,
+    args: &Value,
+    owner_session: Option<&str>,
+) -> Result<Value> {
+    spawn_subagent_with(state, args, None, owner_session, false).await
 }
 
 /// Spawn a graph attempt into a session the engine already reserved.
@@ -1686,6 +1713,7 @@ pub(crate) async fn spawn_graph_subagent(
     state: &AppState,
     args: &Value,
     session_id: &str,
+    graph_id: &str,
     approval_session: Option<&str>,
     workspace_root: Option<&str>,
 ) -> Result<Value> {
@@ -1693,6 +1721,7 @@ pub(crate) async fn spawn_graph_subagent(
         state,
         args,
         session_id,
+        graph_id,
         approval_session,
         workspace_root,
         None,
@@ -1707,6 +1736,7 @@ pub(crate) async fn spawn_graph_subagent_with_effort(
     state: &AppState,
     args: &Value,
     session_id: &str,
+    graph_id: &str,
     approval_session: Option<&str>,
     workspace_root: Option<&str>,
     reasoning_effort: Option<&str>,
@@ -1719,13 +1749,21 @@ pub(crate) async fn spawn_graph_subagent_with_effort(
         "_graphBinding".into(),
         json!({
         "sessionId": session_id,
+        "graphId": graph_id,
         "approvalSession": approval_session,
         "workspaceRoot": workspace_root,
         "reasoningEffort": reasoning_effort,
         "finalResponseDrain": true,
         }),
     );
-    spawn_subagent_with(state, &bound, None, true).await
+    // The graph's owner session is both the approval address and the owner:
+    // a graph is planned by a session a human opened, and its nodes' prompts
+    // belong to that panel. `spawn_subagent_with` derives the owner from the
+    // binding, so an ownerless graph stays ownerless. The graph id rides in
+    // the same private binding — it says which RUN the prompt came from,
+    // which the owner session alone cannot (a panel's turns and its graph's
+    // nodes are owned by, and addressed to, the same session).
+    spawn_subagent_with(state, &bound, None, None, true).await
 }
 
 /// Permission rules a directly spawned agent runs under: the global list plus
@@ -1790,13 +1828,14 @@ pub async fn spawn_subagent_for_parent(
     args: &Value,
     parent: SpawnParent,
 ) -> Result<Value> {
-    spawn_subagent_with(state, args, Some(parent), false).await
+    spawn_subagent_with(state, args, Some(parent), None, false).await
 }
 
 async fn spawn_subagent_with(
     state: &AppState,
     args: &Value,
     parent: Option<SpawnParent>,
+    client_owner: Option<&str>,
     allow_graph_binding: bool,
 ) -> Result<Value> {
     let depth = parent.as_ref().map(|p| p.depth + 1).unwrap_or(0);
@@ -1865,6 +1904,31 @@ async fn spawn_subagent_with(
         .and_then(|binding| binding.get("finalResponseDrain"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // Whose panel this subagent's approval prompts belong to. An
+    // agent-initiated spawn inherits the resolved owner of the agent that
+    // asked for it; a direct spawn takes the calling panel's session (RPC) or
+    // the graph owner from the private binding. None of those existing means
+    // nobody is watching, and the child says so instead of naming itself.
+    let approval_owner = crate::agent::ApprovalOwner::from_ancestor(match parent.as_ref() {
+        Some(parent) => parent.owner_session.clone(),
+        None => client_owner
+            .map(str::to_string)
+            .or_else(|| explicit_approval_session.clone()),
+    });
+    // Which run this work belongs to: inherited from the spawning agent, or
+    // taken from the graph binding for a node the engine spawns itself. A
+    // direct or client spawn belongs to no run and says so. Like the owner
+    // session, it is never read from model-authored arguments — only from a
+    // parent or from the private binding.
+    let owner_graph = match parent.as_ref() {
+        Some(parent) => parent.owner_graph.clone(),
+        None => internal_binding
+            .and_then(|binding| binding.get("graphId"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|graph_id| !graph_id.is_empty())
+            .map(str::to_string),
+    };
     let options = crate::agent::AgentOptions {
         permission_mode: permission_mode.clone(),
         max_turns,
@@ -1884,6 +1948,8 @@ async fn spawn_subagent_with(
             .as_ref()
             .map(|p| p.approval_session.clone())
             .or(explicit_approval_session),
+        approval_owner,
+        owner_graph,
         subagent_depth: depth,
         permission_rules,
     };
@@ -2228,6 +2294,7 @@ mod tests {
             &state,
             &json!({ "role": "tester", "instructions": "report status" }),
             &session_id,
+            "graph-probe",
             Some("session-owner"),
             Some("/tmp/workspace"),
         )
@@ -2304,6 +2371,7 @@ mod tests {
             &state,
             &json!({ "role": "tester", "instructions": "use the editor" }),
             &session_id,
+            "graph-probe",
             Some(owner),
             Some(workspace),
         )
@@ -2326,6 +2394,8 @@ mod tests {
                 permission_mode: "supervised".into(),
                 reasoning_effort: None,
                 approval_session: "session-parent".into(),
+                owner_session: None,
+                owner_graph: None,
                 depth: 0,
                 permission_rules: Vec::new(),
                 workspace_root: None,
@@ -2345,6 +2415,8 @@ mod tests {
                 permission_mode: "auto".into(),
                 reasoning_effort: None,
                 approval_session: "session-parent".into(),
+                owner_session: None,
+                owner_graph: None,
                 depth: 1,
                 permission_rules: Vec::new(),
                 workspace_root: None,
@@ -2374,6 +2446,8 @@ mod tests {
                 permission_mode: "auto".into(),
                 reasoning_effort: Some("max".into()),
                 approval_session: "session-parent".into(),
+                owner_session: None,
+                owner_graph: None,
                 depth: 0,
                 permission_rules: Vec::new(),
                 workspace_root: None,
@@ -2398,6 +2472,8 @@ mod tests {
                 permission_mode: "full-access".into(),
                 reasoning_effort: None,
                 approval_session: "session-root".into(),
+                owner_session: None,
+                owner_graph: None,
                 depth: MAX_SUBAGENT_DEPTH,
                 permission_rules: Vec::new(),
                 workspace_root: None,
@@ -3720,5 +3796,338 @@ mod tests {
             (prefix.len() + 1 + new.len() + 1) as u64
         );
         assert_eq!(activity["truncated"], true);
+    }
+
+    // -----------------------------------------------------------------------
+    // Approval ownership: the core pins.
+    //
+    // These are the assertions no client test can make. The panel is a
+    // projection of `ownerSession` / `ownerGraph` / `targetClientId`; if core
+    // stops stamping them, every window silently shows nothing and every node
+    // parks — and the client suite stays green throughout.
+    // -----------------------------------------------------------------------
+
+    /// A provider that delegates before it reaches the gated tool: the agent
+    /// spawns a subagent, and the SUBAGENT is what asks. That grandchild's
+    /// session belongs to no `graph.updated` snapshot, which is the whole
+    /// point of the case.
+    async fn delegating_call_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let messages: Vec<&Value> = body["messages"].as_array().into_iter().flatten().collect();
+        if messages.iter().any(|message| message["role"] == "tool") {
+            return Sse::new(futures::stream::iter(vec![
+                Ok(Event::default().data(r#"{"choices":[{"delta":{"content":"done"}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ]));
+        }
+        let delegating = messages.iter().any(|message| {
+            message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("delegate to a worker"))
+        });
+        let call = if delegating {
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-spawn","function":{"name":"subagent_spawn","arguments":"{\"role\":\"worker\",\"instructions\":\"use the editor\",\"maxTurns\":2}"}}]}}]}"#
+        } else {
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-echo","function":{"name":"editor_echo","arguments":"{}"}}]}}]}"#
+        };
+        Sse::new(futures::stream::iter(vec![
+            Ok(Event::default().data(call)),
+            Ok(Event::default().data(r#"{"choices":[{"finish_reason":"tool_calls","delta":{}}]}"#)),
+            Ok(Event::default().data("[DONE]")),
+        ]))
+    }
+
+    /// A state that asks before `editor_echo`, wired to a provider that calls
+    /// it once. Direct spawns run at full access, so a config `ask` rule is
+    /// what makes them prompt at all — the same path a user's own config takes.
+    /// Every prompt is recorded, then answered from the event's own
+    /// `targetClientId`, which is the only caller core accepts.
+    async fn approval_probe_state(recorded: Arc<std::sync::Mutex<Vec<Value>>>) -> crate::AppState {
+        approval_probe_state_on(
+            recorded,
+            Router::new().route("/v1/chat/completions", post(browser_call_provider)),
+        )
+        .await
+    }
+
+    async fn delegating_approval_probe_state(
+        recorded: Arc<std::sync::Mutex<Vec<Value>>>,
+    ) -> crate::AppState {
+        let state = approval_probe_state_on(
+            recorded,
+            Router::new().route("/v1/chat/completions", post(delegating_call_provider)),
+        )
+        .await;
+        let spawn = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "subagent_spawn")
+            .expect("subagent_spawn is a core tool");
+        state
+            .tools
+            .write()
+            .await
+            .insert("subagent_spawn".into(), spawn);
+        state
+    }
+
+    /// The window every probe session is attached to.
+    const PROBE_CLIENT: &str = "window-probe";
+
+    async fn attach_probe_window(state: &crate::AppState, session_id: &str) {
+        state.agents.ensure_session(session_id).await.unwrap();
+        state.editor_attachment.write().await.insert(
+            session_id.to_string(),
+            crate::editor_bridge::EditorAttachment {
+                client_id: PROBE_CLIENT.into(),
+                session_id: session_id.to_string(),
+                project_slug: "demo".into(),
+                workspace_root: "/tmp/demo".into(),
+            },
+        );
+    }
+
+    async fn approval_probe_state_on(
+        recorded: Arc<std::sync::Mutex<Vec<Value>>>,
+        app: Router,
+    ) -> crate::AppState {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = mock_state(addr);
+        state.config.write().await.permissions = vec![crate::config::PermissionRule {
+            pattern: "editor_echo".into(),
+            action: crate::config::PermissionAction::Ask,
+        }];
+        state.tools.write().await.insert(
+            "editor_echo".into(),
+            ToolDef {
+                name: "editor_echo".into(),
+                description: "Echo".into(),
+                parameters: json!({"type":"object"}),
+                kind: ToolKind::Browser,
+            },
+        );
+        let mut rx = state.bus.subscribe();
+        let agents = state.agents.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = rx.recv().await {
+                let sid = event["sessionId"].as_str().unwrap_or_default().to_string();
+                let rid = event["requestId"].as_str().unwrap_or_default().to_string();
+                match event["type"].as_str() {
+                    Some("agent.approval_request") => {
+                        recorded.lock().unwrap().push(event.clone());
+                        match event["targetClientId"].as_str() {
+                            // The addressed window answers. Any other caller —
+                            // including this probe with no client id — is
+                            // refused by `respond`, which is the point.
+                            Some(client) => {
+                                let _ = agents.approvals().respond(&rid, Some(client), true).await;
+                            }
+                            // Unaddressed: answerable by nobody, so it would
+                            // park for core's full 300s timer. The probe plays
+                            // that timer's part instead of costing every run
+                            // five minutes. The assertion under test is on the
+                            // recorded event, not on how it ends.
+                            None => {
+                                let _ = agents.approvals().cancel_by_session(&sid).await;
+                            }
+                        }
+                    }
+                    Some("agent.tool_request") => {
+                        let _ = agents
+                            .submit_tool_result(&sid, &rid, json!({ "ok": true }))
+                            .await;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        state
+    }
+
+    fn gated_approval(recorded: &Arc<std::sync::Mutex<Vec<Value>>>) -> Value {
+        let events = recorded.lock().unwrap().clone();
+        let approval = events
+            .iter()
+            .find(|event| event["tool"] == "editor_echo")
+            .cloned()
+            .expect("the gated tool raised no approval request");
+        // Always on the wire, even when there is no owner to name: a client
+        // that has to ask "was the field there?" is back to guessing.
+        for field in ["ownerSession", "ownerGraph", "targetClientId"] {
+            assert!(
+                approval.get(field).is_some(),
+                "{field} missing from {approval}"
+            );
+        }
+        approval
+    }
+
+    #[tokio::test]
+    async fn client_spawn_approvals_carry_the_calling_panels_session() {
+        // A panel spawns a subagent directly, so the child asks under a
+        // session id that panel never opened. The request says whose work it
+        // is, and core addresses it at that panel's window.
+        let recorded: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let state = approval_probe_state(recorded.clone()).await;
+        attach_probe_window(&state, "session-panel").await;
+        let result = spawn_subagent_for_client(
+            &state,
+            &json!({ "role": "tester", "instructions": "use the editor", "maxTurns": 3 }),
+            Some("session-panel"),
+        )
+        .await
+        .unwrap();
+        let child = result["sessionId"].as_str().unwrap().to_string();
+
+        let approval = gated_approval(&recorded);
+        assert_eq!(approval["sessionId"], json!(child));
+        assert_eq!(approval["ownerSession"], json!("session-panel"));
+        assert_eq!(approval["targetClientId"], json!(PROBE_CLIENT));
+        // Not a graph's work, so no run is named.
+        assert_eq!(approval["ownerGraph"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn unattended_spawn_names_no_owner_and_no_window() {
+        // Nothing identifies a watcher here, so the request must say so rather
+        // than name the child's own session — a value some panel might one day
+        // match. This is the "not mine" case for every window, and with no
+        // address it is answerable by nobody.
+        let recorded: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let state = approval_probe_state(recorded.clone()).await;
+        spawn_subagent(
+            &state,
+            &json!({ "role": "tester", "instructions": "use the editor", "maxTurns": 3 }),
+        )
+        .await
+        .unwrap();
+
+        let approval = gated_approval(&recorded);
+        assert_eq!(approval["ownerSession"], Value::Null);
+        assert_eq!(approval["targetClientId"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn owner_cannot_be_smuggled_through_tool_arguments() {
+        // `subagent_spawn` arguments are model-authored. If the owner could be
+        // set there, a model could aim its own approval prompts at somebody's
+        // open window; the owner is a Rust argument for that reason, and args
+        // naming one change nothing.
+        let recorded: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let state = approval_probe_state(recorded.clone()).await;
+        attach_probe_window(&state, "session-victim").await;
+        spawn_subagent(
+            &state,
+            &json!({
+                "role": "tester",
+                "instructions": "use the editor",
+                "maxTurns": 3,
+                "ownerSession": "session-victim"
+            }),
+        )
+        .await
+        .unwrap();
+
+        let approval = gated_approval(&recorded);
+        assert_eq!(approval["ownerSession"], Value::Null);
+        assert_eq!(approval["targetClientId"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn graph_node_approvals_carry_the_graph_owner_session() {
+        let recorded: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let state = approval_probe_state(recorded.clone()).await;
+        let owner = "session-graph-owner";
+        attach_probe_window(&state, owner).await;
+        let session_id = state.agents.reserve_session().await.unwrap();
+        spawn_graph_subagent(
+            &state,
+            &json!({ "role": "tester", "instructions": "use the editor" }),
+            &session_id,
+            "graph-probe",
+            Some(owner),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let approval = gated_approval(&recorded);
+        // A graph node addresses its answer to the owner session and belongs
+        // to it; the node's own session is named separately.
+        assert_eq!(approval["sessionId"], json!(owner));
+        assert_eq!(approval["ownerSession"], json!(owner));
+        assert_eq!(approval["subagentSessionId"], json!(session_id));
+        // …and it names the run. Address and owner are both the panel's own
+        // session here — identical to one of its ordinary turns — so the run
+        // is the only thing that says this prompt is the graph's.
+        assert_eq!(approval["ownerGraph"], json!("graph-probe"));
+        assert_eq!(approval["targetClientId"], json!(PROBE_CLIENT));
+    }
+
+    /// Defect 1's core half. A node spawns its own subagent, and the
+    /// grandchild raises the prompt. Its session appears in no
+    /// `graph.updated` snapshot, because snapshots carry node sessions and
+    /// nothing below them — so a panel matching sessions-it-has-seen could not
+    /// place it, and let the user's turn claim it instead. The run and the
+    /// owner travel down the spawn chain, so nothing has to have been
+    /// observed first.
+    #[tokio::test]
+    async fn a_graph_node_subagent_approval_routes_like_its_graph() {
+        let recorded: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let state = delegating_approval_probe_state(recorded.clone()).await;
+        let owner = "session-graph-owner";
+        attach_probe_window(&state, owner).await;
+        let node_session = state.agents.reserve_session().await.unwrap();
+        spawn_graph_subagent(
+            &state,
+            &json!({ "role": "tester", "instructions": "delegate to a worker", "maxTurns": 3 }),
+            &node_session,
+            "graph-probe",
+            Some(owner),
+            None,
+        )
+        .await
+        .unwrap();
+
+        let approval = gated_approval(&recorded);
+        assert_eq!(approval["ownerGraph"], json!("graph-probe"));
+        assert_eq!(approval["ownerSession"], json!(owner));
+        assert_eq!(approval["sessionId"], json!(owner));
+        // The grandchild is addressed at the graph owner's window, which is
+        // what lets the panel render a card for a session it has never seen.
+        assert_eq!(approval["targetClientId"], json!(PROBE_CLIENT));
+        let asking = approval["subagentSessionId"].as_str().unwrap();
+        // The grandchild, not the node: nothing the panel could have seen.
+        assert_ne!(asking, node_session);
+        assert_ne!(asking, owner);
+    }
+
+    #[tokio::test]
+    async fn a_graph_run_cannot_be_claimed_through_tool_arguments() {
+        // If a run could be named in model-authored arguments, an unattended
+        // agent could dress its own prompts up as a graph node's and have
+        // somebody's open panel answer them.
+        let recorded: Arc<std::sync::Mutex<Vec<Value>>> = Arc::default();
+        let state = approval_probe_state(recorded.clone()).await;
+        attach_probe_window(&state, "session-victim").await;
+        spawn_subagent(
+            &state,
+            &json!({
+                "role": "tester",
+                "instructions": "use the editor",
+                "maxTurns": 3,
+                "graphId": "graph-probe",
+                "_graphBinding": { "graphId": "graph-probe", "approvalSession": "session-victim" }
+            }),
+        )
+        .await
+        .unwrap();
+
+        let approval = gated_approval(&recorded);
+        assert_eq!(approval["ownerGraph"], Value::Null);
+        assert_eq!(approval["ownerSession"], Value::Null);
+        assert_eq!(approval["targetClientId"], Value::Null);
     }
 }

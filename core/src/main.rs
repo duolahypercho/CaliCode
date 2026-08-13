@@ -1,4 +1,5 @@
 mod agent;
+mod approvals;
 mod asset_search;
 mod assets;
 mod baselines;
