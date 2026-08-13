@@ -105,7 +105,15 @@ self.onmessage = function (event) {
         message.script
       ].join("\n");
       var run = new Function("context", '"use strict"; return (async () => { ' + body + ' })();');
-      await run(context);
+      try {
+        await run(context);
+      } catch (error) {
+        // A failed capability call resolves undefined into the script, so the
+        // script's own TypeError surfaces first and buries the real cause. The
+        // capability error happened earlier; report that. (No backticks here:
+        // this source is embedded in a template literal.)
+        throw capabilityError || error;
+      }
       await drainCalls();
       __reply({ type: "done", testId: message.testId });
     } catch (error) {

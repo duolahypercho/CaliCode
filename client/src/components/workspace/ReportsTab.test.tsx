@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { LoopReport, LoopReportSummary, OpenLoopReport } from "../../lib/loopReports";
-import { ReportsTab } from "./ReportsTab";
+import { ReportsTab, summaryLabel } from "./ReportsTab";
 
 const { mockList, mockOpen } = vi.hoisted(() => ({
   mockList: vi.fn(),
@@ -157,9 +157,51 @@ describe("ReportsTab", () => {
     expect(screen.getByText("Arena after the first wave")).toBeTruthy();
     expect(screen.getByText("Tune the cue, then replay.")).toBeTruthy();
 
+    // A cited frame shows as the frame, not just its filename — that is the
+    // reason to read a loop report inside the editor at all.
+    const frame = screen.getByRole("img", { name: "Arena after the first wave" });
+    expect(frame.getAttribute("src")).toBe("/projects/demo/evidence/frame.png");
+
     fireEvent.click(screen.getByRole("button", { name: /player\.ts/ }));
     expect(onOpenFile).toHaveBeenCalledWith("src/player.ts");
     expect(screen.getByRole("button", { name: /report\.json/ }).hasAttribute("disabled")).toBe(true);
+  });
+
+  it("labels each past loop with when it ran and how far it got", () => {
+    // Two soak days on the same objective are indistinguishable without the
+    // date and the totals — which is the whole point of a multi-day report list.
+    const label = summaryLabel({
+      loopId: "loop-1",
+      objective: "Neon arena slice",
+      status: "completed",
+      startedAtMs: Date.UTC(2026, 7, 12, 18, 0),
+      updatedAtMs: Date.UTC(2026, 7, 12, 19, 0),
+      totals: {
+        iterations: 3, workedDurationMs: 0, elapsedDurationMs: 0, agents: 6,
+        checksPassed: 9, checksFailed: 0, checksSkipped: 0,
+        filesChanged: 4, additions: 120, deletions: 8, latestScorePercent: 95,
+      },
+    });
+
+    expect(label).toContain("95%");
+    expect(label).toContain("Neon arena slice");
+    expect(label).toContain("3 iter");
+    expect(label).toContain("4 files");
+    expect(label).toMatch(/Aug\s*1[23]/);
+  });
+
+  it("shows no tile for evidence that is not a displayable image", async () => {
+    const report = opened("completed");
+    report.report.iterations[0].evidence = [
+      { kind: "log", path: "evidence/run.log", caption: "Console output" },
+      { kind: "screenshot", path: "../secrets/frame.png", caption: "Traversal attempt" },
+    ];
+    mockList.mockResolvedValue({ reports: [summary("completed")] });
+    mockOpen.mockResolvedValue(report);
+    render(<ReportsTab projectSlug="demo" coreStatus="ready" canOpenFiles onOpenFile={() => {}} />);
+
+    expect(await screen.findByText("Console output")).toBeTruthy();
+    expect(screen.queryAllByRole("img")).toHaveLength(0);
   });
 
   it("polls a running report and stops after it completes", async () => {

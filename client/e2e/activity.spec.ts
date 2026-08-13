@@ -171,6 +171,10 @@ test.describe("persisted agent activity", () => {
       await compact.click();
       await expect(activity.getByText("Read README.md", { exact: true })).toBeVisible();
       await expect(activity.getByText("Edited README.md +1 -1", { exact: true }).last()).toBeVisible();
+      // Each action holds its own output until that row is clicked.
+      await expect(activity.getByRole("button", { name: "Open README.md" })).toHaveCount(0);
+      await activity.getByRole("button", { name: /Read README\.md/ }).click();
+      await activity.getByRole("button", { name: /Edited README\.md/ }).click();
       await expect(activity.getByRole("button", { name: "Open README.md" })).toHaveCount(2);
       // The expanded action already carries its totals in the summary. Do
       // not repeat a second detached stat label; the compact file summary is

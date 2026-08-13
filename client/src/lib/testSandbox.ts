@@ -188,7 +188,14 @@ class InlineTestSandbox implements TestSandbox {
     });
     try {
       await Promise.race([
-        run({ scene, state, entityFor, assert, log, step, baseline }).then(drainCalls),
+        run({ scene, state, entityFor, assert, log, step, baseline })
+          // A failed capability call resolves `undefined` into the script, so
+          // the script's own TypeError surfaces first and buries the real
+          // cause. The capability error happened earlier; report that.
+          .catch((error: unknown) => {
+            throw capabilityError ?? error;
+          })
+          .then(drainCalls),
         guard,
       ]);
     } finally {

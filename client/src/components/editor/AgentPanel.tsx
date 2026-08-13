@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ArrowDown,
@@ -23,6 +23,17 @@ import {
 } from "lucide-react";
 import { AgentText } from "./AgentText";
 import { GraphPanel } from "./GraphPanel";
+import { ReasoningRow } from "./ReasoningRow";
+import {
+  buildEvaluatorTranscript,
+  formatGoalStatus,
+  goalContinuationPrompt,
+  goalIsVerifiable,
+  type GoalCommand,
+  type GoalState,
+} from "../../lib/goal";
+import { budgetNotice, detectStall, exhaustionPrompt, type LoopAction } from "../../lib/loopGuards";
+import { SubagentChips, type SubagentChipItem } from "./SubagentChips";
 import { Button } from "../ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
 import { Textarea } from "../ui/textarea";
@@ -122,7 +133,54 @@ export async function reportLoopBestEffort<T>(
   }
 }
 
-export function loopIterationPrompt(goal: string, loopId: string, iteration: number): string {
+/** Items and characters of carry-forward inlined into an iteration prompt. */
+const CARRY_ITEM_CAP = 6;
+const CARRY_CHARS_CAP = 1_200;
+
+/**
+ * The previous iteration's unresolved punch list and memory, as prompt text.
+ *
+ * The report on disk stays the source of truth — it outlives the session and
+ * is what the REPORTS page renders. But telling the model to go read it makes
+ * remembering optional: a skipped `loop_report_open` loses the whole carry
+ * silently, and the completion gate only checks that memory *exists*, not that
+ * anyone used it. Inlining the latest slice costs a bounded amount of prompt
+ * and removes the turn that fetching it would take.
+ */
+export function loopCarryForward(report: LoopReport): string {
+  const latest = report.iterations.at(-1);
+  if (!latest) return "";
+  const lines: string[] = [];
+  const unresolved = latest.punchList.filter((item) => !item.resolved);
+  if (unresolved.length > 0) {
+    lines.push(
+      `Unresolved punch list: ${unresolved
+        .slice(0, CARRY_ITEM_CAP)
+        .map((item) => `[${item.priority}] ${item.item}`)
+        .join("; ")}`,
+    );
+  }
+  const memory = latest.nextIterationMemory;
+  const groups: Array<[string, string[]]> = [
+    ["Next actions", memory.nextActions],
+    ["Decisions to keep", memory.decisions],
+    ["Risks", memory.risks],
+    ["Observations", memory.observations],
+  ];
+  for (const [label, values] of groups) {
+    if (values.length > 0) lines.push(`${label}: ${values.slice(0, CARRY_ITEM_CAP).join("; ")}`);
+  }
+  if (lines.length === 0) return "";
+  const block = `Carried forward from iteration ${latest.iteration} (${latest.outcome}): ${lines.join(" | ")}`;
+  return block.length > CARRY_CHARS_CAP ? `${block.slice(0, CARRY_CHARS_CAP)}…` : block;
+}
+
+export function loopIterationPrompt(
+  goal: string,
+  loopId: string,
+  iteration: number,
+  carry = "",
+): string {
   const topology =
     "Use graph_plan + graph_run with three dependency-free specialist Build roots with distinct roles, " +
     "a separate Integration Build depending on every root, and a terminal Judge depending on Integration. " +
@@ -142,7 +200,10 @@ export function loopIterationPrompt(goal: string, loopId: string, iteration: num
   if (iteration === 1) {
     return `${goal}\n\nThis is /loop ${loopId}, iteration ${iteration}. ${topology} ${verification} ${reporting} This is the initial pass: record it and continue to a second verification/repair iteration even if its graph passes. Do not reply DONE yet.`;
   }
-  return `Continue /loop ${loopId}, iteration ${iteration}, toward the goal. Read loop_report_open first and use its nextIterationMemory plus punch list. ${topology} ${verification} ${reporting} When a fresh judge crosses threshold, the report has at least two iterations, and every check passes, call loop_report_update and reply with exactly DONE on its own line and nothing else.`;
+  const carried = carry
+    ? `${carry} Treat that as already read — open the report only if you need detail it omits. `
+    : "Read loop_report_open first and use its nextIterationMemory plus punch list. ";
+  return `Continue /loop ${loopId}, iteration ${iteration}, toward the goal. ${carried}${topology} ${verification} ${reporting} When a fresh judge crosses threshold, the report has at least two iterations, and every check passes, call loop_report_update and reply with exactly DONE on its own line and nothing else.`;
 }
 
 export function isTransientRpcError(error: unknown): boolean {
@@ -577,9 +638,12 @@ function ToolRow({ message }: { message: AgentMessage }) {
   );
 }
 
-function ActivityIcon({ operation, running }: { operation: string; running?: boolean }) {
+function ActivityIcon({ operation, running, failed }: { operation: string; running?: boolean; failed?: boolean }) {
   if (running) {
     return <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-ink-subtle" strokeWidth={2.2} />;
+  }
+  if (failed) {
+    return <X aria-hidden className="h-3 w-3 shrink-0 text-danger-soft" strokeWidth={2.4} />;
   }
   if (operation === "edit" || operation === "write") {
     return <FilePenLine aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.8} />;
@@ -603,17 +667,32 @@ export function ActivityDetailRow({
   action: ActivityAction;
   onOpenFile?: (file: ActivityFileChange) => void;
 }) {
+  const [open, setOpen] = useState(false);
   const file = action.file;
   const canOpen = Boolean(file && isSafeActivityPath(file.path, file.workspaceRoot));
   const fileLabel = file ? file.path : null;
+  const failed = action.status === "error";
   const counts = Boolean(
     file && (file.additions > 0 || file.deletions > 0) && !/[+]\d+\s+[−-]\d+/.test(action.content),
   );
+  // A row only opens when it has something under it. Collapsed by default keeps
+  // a long turn readable: the output of one tool call used to bury the next.
+  const expandable = Boolean(action.detail || fileLabel || (file && file.diff.length > 0));
   return (
     <div className="border-l border-line pl-3">
-      <div className="flex min-w-0 items-center gap-2 py-1 text-[11px] text-ink-subtle">
-        <ActivityIcon operation={file?.operation ?? "tool"} running={action.status === "running"} />
-        <span className="min-w-0 flex-1 truncate">{action.content || `Ran ${action.tool}`}</span>
+      <button
+        type="button"
+        disabled={!expandable}
+        onClick={() => setOpen((current) => !current)}
+        aria-expanded={expandable ? open : undefined}
+        className={`flex w-full min-w-0 items-center gap-2 rounded-md py-1 pr-1 text-left text-[11px] text-ink-subtle transition-colors ${
+          expandable ? "hover:bg-surface-2 active:bg-surface-3" : "cursor-default"
+        }`}
+      >
+        <ActivityIcon operation={file?.operation ?? "tool"} running={action.status === "running"} failed={failed} />
+        <span className={`min-w-0 flex-1 truncate ${failed ? "text-danger-soft" : ""}`}>
+          {action.content || `Ran ${action.tool}`}
+        </span>
         {counts && file ? (
           <span className="inline-flex shrink-0 gap-1 font-mono text-[10px]">
             <span className="text-success-soft">{file.truncated ? "≈" : ""}+{file.additions}</span>
@@ -625,8 +704,15 @@ export function ActivityDetailRow({
             {formatDuration(durationForTurn(action.startedAtMs, action.finishedAtMs))}
           </span>
         ) : null}
-      </div>
-      {fileLabel ? (
+        {expandable ? (
+          <ChevronRight
+            aria-hidden
+            className={`h-3 w-3 shrink-0 text-ink-faint transition-transform ${open ? "rotate-90" : ""}`}
+            strokeWidth={2}
+          />
+        ) : null}
+      </button>
+      {open && fileLabel ? (
         <button
           type="button"
           disabled={!canOpen || !onOpenFile}
@@ -641,12 +727,16 @@ export function ActivityDetailRow({
           {fileLabel}
         </button>
       ) : null}
-      {action.detail ? (
-        <pre className="mb-1 max-h-48 overflow-auto whitespace-pre-wrap font-mono text-[10px] leading-[1.5] text-ink-faint">
+      {open && action.detail ? (
+        <pre
+          className={`mb-1 max-h-48 overflow-auto whitespace-pre-wrap font-mono text-[10px] leading-[1.5] ${
+            failed ? "text-danger-soft" : "text-ink-faint"
+          }`}
+        >
           {action.detail}
         </pre>
       ) : null}
-      {file && file.diff.length > 0 ? (
+      {open && file && file.diff.length > 0 ? (
         <div className="mb-2 overflow-hidden rounded border border-line bg-surface-1 font-mono text-[10px] leading-[1.5]">
           {file.diff.map((row, index) => (
             <div
@@ -697,6 +787,7 @@ export function ActivityTurnRow({
   const elapsed = durationForTurn(marker?.startedAtMs, marker?.completedAtMs, nowMs);
   const operation = latest?.activity?.operation ?? classifyActivityOperation(latest?.tool ?? "tool");
   const summary = latest?.content || (live ? "Working…" : "Completed");
+  const latestFailed = !live && latest?.status === "error";
   const changedFiles = new Map<string, ActivityFileChange>();
   let additions = 0;
   let deletions = 0;
@@ -717,8 +808,8 @@ export function ActivityTurnRow({
         aria-label={`${expanded ? "Collapse" : "Expand"} activity for turn ${turnId}`}
         className="flex w-full items-center gap-2 rounded-md px-1 py-1 text-left text-xs text-ink-subtle transition-colors hover:bg-surface-2 active:bg-surface-3"
       >
-        <ActivityIcon operation={operation} running={live} />
-        <span className="min-w-0 flex-1 truncate text-ink">{summary}</span>
+        <ActivityIcon operation={operation} running={live} failed={latestFailed} />
+        <span className={`min-w-0 flex-1 truncate ${latestFailed ? "text-danger-soft" : "text-ink"}`}>{summary}</span>
         {actions.length > 1 ? <span className="shrink-0 text-[10px] text-ink-faint">{actions.length} actions</span> : null}
         <span className="shrink-0 text-[10px] text-ink-faint">{live ? `${formatDuration(elapsed)} · live` : formatDuration(elapsed)}</span>
         <ChevronRight
@@ -830,6 +921,19 @@ export function AgentPanel({
   // live output ticker (last ~200 chars of each subagent's stream).
   const [activeGraph, setActiveGraph] = useState<TaskGraph | null>(null);
   const [graphTickers, setGraphTickers] = useState<Record<string, string>>({});
+  // Streamed model reasoning, per activity turn. Deliberately NOT part of
+  // `messages`: reasoning is display-only, so keeping it out of the transcript
+  // is what stops it being persisted into the saved session or replayed back
+  // to the provider as if the model had said it.
+  // Session goal (`/goal`). A ref shadows the state because the pursuit loop
+  // reads it between awaits, where a captured render value would be stale —
+  // and clearing the goal mid-flight has to stop the loop on the next check.
+  const [goal, setGoal] = useState<GoalState | null>(null);
+  const goalRef = useRef<GoalState | null>(null);
+  goalRef.current = goal;
+  const [reasoningByTurn, setReasoningByTurn] = useState<
+    Record<string, { text: string; startedAtMs: number; endedAtMs?: number }>
+  >({});
   // A /loop completion must refer to a graph created after that loop began.
   // These refs let the mount-once SSE handler record creation events without
   // re-subscribing, while the authoritative gate still refreshes graph_status.
@@ -987,6 +1091,26 @@ export function AgentPanel({
             copy.push({ role: "assistant", content: event.delta ?? "" });
           }
           return copy;
+        });
+      }
+      if (event.type === "agent.reasoning") {
+        // Same demux as deltas. Subagent reasoning would drown the parent
+        // transcript, so only our own session's thinking is shown; a worker's
+        // progress is already visible through its chip and ticker.
+        const foreign = Boolean(event.sessionId && sessionIdRef.current && event.sessionId !== sessionIdRef.current);
+        if (foreign || event.subagentSessionId) return;
+        const turnId = activeTurnRef.current?.turnId;
+        if (!turnId) return;
+        const delta = event.delta ?? "";
+        if (!delta) return;
+        setReasoningByTurn((current) => {
+          const existing = current[turnId];
+          return {
+            ...current,
+            [turnId]: existing
+              ? { ...existing, text: existing.text + delta }
+              : { text: delta, startedAtMs: Date.now() },
+          };
         });
       }
       if (event.type === "agent.usage" && event.usage) {
@@ -1445,6 +1569,11 @@ export function AgentPanel({
 
   const completeActivityTurn = (turnId: string, completedAtMs = Date.now()): void => {
     if (activeTurnRef.current?.turnId === turnId) activeTurnRef.current = null;
+    setReasoningByTurn((current) =>
+      current[turnId] && current[turnId].endedAtMs === undefined
+        ? { ...current, [turnId]: { ...current[turnId], endedAtMs: completedAtMs } }
+        : current,
+    );
     setMessages((current) =>
       current.map((message) =>
         isTurnMarker(message) && message.turnId === turnId
@@ -1593,6 +1722,122 @@ export function AgentPanel({
       completeActivityTurn(turnId);
       setBusy(false);
     }
+  };
+
+  /**
+   * Ask the tool-less verifier whether the goal is satisfied. It sees only the
+   * transcript, so it can judge only what the worker demonstrated — it
+   * cannot run a check itself and then call that evidence.
+   */
+  const evaluateGoal = async (
+    objective: string,
+  ): Promise<{ met: boolean; reason: string; unavailable?: true }> => {
+    const transcript = buildEvaluatorTranscript(messagesRef.current);
+    try {
+      return await rpc<{ met: boolean; reason: string }>("goal_evaluate", {
+        goal: objective,
+        transcript,
+        projectSlug,
+      });
+    } catch (error) {
+      // An unreachable verifier must never read as success: an unmet goal that
+      // keeps working is recoverable, a false "done" is not. It must not read
+      // as a plain "not met" either — that would spend the whole budget asking
+      // a verifier that is never going to answer, so the caller stops instead.
+      return {
+        met: false,
+        unavailable: true,
+        reason: `verifier unavailable (${error instanceof Error ? error.message : String(error)})`,
+      };
+    }
+  };
+
+  /** Tool rows this turn added, as stall-detector input. */
+  const turnActions = (sinceIndex: number): LoopAction[] =>
+    messagesRef.current.slice(sinceIndex).flatMap((message) =>
+      message.role === "tool" && message.tool
+        ? [{ tool: message.tool, signature: message.content.slice(0, 200), failed: message.status === "error" }]
+        : [],
+    );
+
+  /**
+   * Work the goal turn by turn until the verifier accepts it. Every exit is
+   * deliberate: verified, cleared by the user, stalled, or out of budget — and
+   * the last one still ends with a summary rather than a bare counter.
+   */
+  const pursueGoal = async () => {
+    const actions: LoopAction[] = [];
+    for (let round = 1; round <= MAX_LOOP_ITERATIONS; round += 1) {
+      const state = goalRef.current;
+      if (!state) return;
+      const directive =
+        round === 1
+          ? `${state.goal}\n\n${budgetNotice(round, MAX_LOOP_ITERATIONS)}`
+          : goalContinuationPrompt(state.goal, state.lastReason ?? "", state.evaluations);
+      const before = messagesRef.current.length;
+      const reply = await runTurn(directive);
+      // An empty reply is a cancelled or failed turn; both already spoke.
+      if (!reply) return;
+      if (!goalRef.current) return;
+
+      actions.push(...turnActions(before));
+      const stall = detectStall(actions);
+      if (stall.level === "block") {
+        say(`goal paused — ${stall.reason} Clear it or change the goal.`, "tool");
+        return;
+      }
+      if (stall.level === "warn") say(`heads up — ${stall.reason}`, "tool");
+
+      const verdict = await evaluateGoal(state.goal);
+      if (verdict.unavailable) {
+        say(`goal paused — ${verdict.reason}. The goal is kept; /goal to see it.`, "tool");
+        return;
+      }
+      const evaluated: GoalState = {
+        ...state,
+        evaluations: state.evaluations + 1,
+        lastReason: verdict.reason,
+      };
+      goalRef.current = evaluated;
+      setGoal(evaluated);
+      if (verdict.met) {
+        say(`✔ goal met after ${evaluated.evaluations} check${evaluated.evaluations === 1 ? "" : "s"}: ${verdict.reason}`, "tool");
+        goalRef.current = null;
+        setGoal(null);
+        return;
+      }
+      say(`goal not met yet — ${verdict.reason}`, "tool");
+    }
+    const remaining = goalRef.current;
+    if (!remaining) return;
+    // Out of budget: hand back a summary and keep the goal so it can resume.
+    say(`goal budget spent after ${MAX_LOOP_ITERATIONS} turns — summarizing.`, "tool");
+    await runTurn(exhaustionPrompt(remaining.goal, MAX_LOOP_ITERATIONS));
+  };
+
+  const runGoalCommand = async (command: GoalCommand) => {
+    if (command.action === "show") {
+      say(formatGoalStatus(goalRef.current), "tool");
+      return;
+    }
+    if (command.action === "clear") {
+      const had = Boolean(goalRef.current);
+      goalRef.current = null;
+      setGoal(null);
+      say(had ? "goal cleared." : "no goal was set.", "tool");
+      return;
+    }
+    if (busy || looping) {
+      say("finish or stop the current run before setting a goal.", "tool");
+      return;
+    }
+    const verifiable = goalIsVerifiable(command.goal);
+    if (!verifiable.ok && verifiable.hint) say(verifiable.hint, "tool");
+    const next: GoalState = { goal: command.goal, startedAtMs: Date.now(), evaluations: 0 };
+    goalRef.current = next;
+    setGoal(next);
+    say(`goal set: ${command.goal}`, "tool");
+    await pursueGoal();
   };
 
   const switchModel = async (raw: string) => {
@@ -1820,9 +2065,19 @@ export function AgentPanel({
         say(`■ loop stopped after ${iteration - 1} iterations`, "tool");
         break;
       }
+      // A failed read must not stall the loop: without a carry the prompt
+      // falls back to telling the model to open the report itself.
+      let carry = "";
+      if (iteration > 1) {
+        try {
+          carry = loopCarryForward((await openLoopReport(projectSlug, loopId)).report);
+        } catch (error) {
+          onLog(`loop carry-forward unavailable: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
       const userMessage: AgentMessage = {
         role: "user",
-        content: loopIterationPrompt(goal, loopId, iteration),
+        content: loopIterationPrompt(goal, loopId, iteration, carry),
       };
       say(`loop ${iteration}/${MAX_LOOP_ITERATIONS}`, "tool");
       const iterationStartedAtMs = Date.now();
@@ -2272,6 +2527,7 @@ export function AgentPanel({
     spawnSubagent,
     runGraphGoal,
     stopGraph,
+    runGoalCommand,
   };
 
   const send = async () => {
@@ -2354,6 +2610,22 @@ export function AgentPanel({
   // start marker would place late tool work above narration that happened
   // first, which makes a resumed transcript read out of order.
   const activityAnchors = activityAnchorIndexes(messages);
+  // Chips ride on the newest turn, which is the one the fan-out belongs to.
+  const latestTurnId = [...activityAnchors.keys()].at(-1);
+  const subagentChips: SubagentChipItem[] = (activeGraph?.nodes ?? [])
+    .filter((node) => node.status !== "pending" && node.status !== "ready")
+    .map((node) => ({
+      id: node.id,
+      title: node.title,
+      status:
+        node.status === "running" || node.status === "monitoring"
+          ? ("running" as const)
+          : node.status === "passed"
+            ? ("done" as const)
+            : node.status === "failed" || node.status === "rejected"
+              ? ("failed" as const)
+              : ("pending" as const),
+    }));
 
   const completeCommand = (name: string) => {
     setInput(`/${name} `);
@@ -2427,13 +2699,25 @@ export function AgentPanel({
           {messages.map((message, index) => {
             if (message.turnId) {
               if (activityAnchors.get(message.turnId) !== index) return null;
+              const reasoning = reasoningByTurn[message.turnId];
               return (
-                <ActivityTurnRow
-                  key={`activity-${message.turnId}`}
-                  turnId={message.turnId}
-                  messages={activityGroups.get(message.turnId) ?? [message]}
-                  onOpenFile={onOpenActivityFile}
-                />
+                <Fragment key={`turn-${message.turnId}`}>
+                  {reasoning ? (
+                    <ReasoningRow
+                      text={reasoning.text}
+                      streaming={reasoning.endedAtMs === undefined}
+                      durationMs={(reasoning.endedAtMs ?? Date.now()) - reasoning.startedAtMs}
+                    />
+                  ) : null}
+                  {message.turnId === latestTurnId && subagentChips.length > 0 ? (
+                    <SubagentChips items={subagentChips} />
+                  ) : null}
+                  <ActivityTurnRow
+                    turnId={message.turnId}
+                    messages={activityGroups.get(message.turnId) ?? [message]}
+                    onOpenFile={onOpenActivityFile}
+                  />
+                </Fragment>
               );
             }
             if (message.role === "user") {

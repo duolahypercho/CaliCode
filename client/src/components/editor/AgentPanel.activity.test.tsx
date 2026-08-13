@@ -51,7 +51,40 @@ describe("ActivityTurnRow", () => {
     expect(screen.getByText("Read App.tsx")).toBeTruthy();
     expect(screen.getAllByText("Edited App.tsx +2 -1").length).toBeGreaterThanOrEqual(2);
     expect(screen.queryByText("+2 -1", { exact: true })).toBeNull();
+    // Each action keeps its own output folded away until that row is clicked.
+    expect(screen.queryByText("new line")).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: /Edited App.tsx \+2 -1/ }));
     expect(screen.getByText("new line")).toBeTruthy();
+  });
+
+  it("shows a failed action in red and only reveals its output on click", () => {
+    const marker = { ...createTurnMarker("turn-error", 1_000), status: "done" as const, completedAtMs: 1_400 };
+    render(
+      <ActivityTurnRow
+        turnId="turn-error"
+        messages={[
+          marker,
+          {
+            role: "tool",
+            tool: "loop_report_start",
+            toolCallId: "call-loop",
+            turnId: "turn-error",
+            status: "error",
+            content: "Used loop_report_start",
+            detail: '{\n  "error": "loop report already exists"\n}',
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: /Expand activity for turn turn-error/ }));
+    expect(screen.queryByText(/loop report already exists/)).toBeNull();
+    const row = screen.getByRole("button", { name: /Used loop_report_start/ });
+    expect(row.querySelector(".text-danger-soft")).toBeTruthy();
+
+    fireEvent.click(row);
+    expect(screen.getByText(/loop report already exists/)).toBeTruthy();
   });
 
   it("opens only safe relative activity files", () => {
@@ -84,6 +117,7 @@ describe("ActivityTurnRow", () => {
     );
 
     fireEvent.click(screen.getByRole("button", { name: /Expand activity for turn turn-2/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Read App.tsx/ }));
     fireEvent.click(screen.getByRole("button", { name: "Open src/App.tsx" }));
     expect(onOpen).toHaveBeenCalledWith(file);
   });

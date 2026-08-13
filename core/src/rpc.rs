@@ -415,6 +415,15 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             str_param(&params, "slug")?,
             str_param(&params, "assetId")?,
         ),
+        "blender_asset_export" => {
+            crate::blender::export(
+                &state.projects_root,
+                str_param(&params, "slug")?,
+                str_param(&params, "assetId")?,
+                crate::blender::DEFAULT_EXPORT_TIMEOUT,
+            )
+            .await
+        }
         "blender_asset_status" => crate::blender::status(
             &state.projects_root,
             str_param(&params, "slug")?,
@@ -966,7 +975,11 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                     .and_then(|v| v.as_str())
                     .unwrap_or("full-access")
                     .to_string(),
-                max_turns: params.get("maxTurns").and_then(|v| v.as_u64()).unwrap_or(8) as usize,
+                max_turns: params
+                    .get("maxTurns")
+                    .and_then(|v| v.as_u64())
+                    .map(|value| value as usize)
+                    .unwrap_or(crate::agent::DEFAULT_MAX_TURNS),
                 final_response_drain: params
                     .get("finalResponseDrain")
                     .and_then(Value::as_bool)
@@ -988,6 +1001,9 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                     .filter(|value| !value.is_empty() && value.len() <= 64)
                     .map(str::to_string),
                 system,
+                // A top-level chat is the model picker's own turn: it runs
+                // the selected model, and role routing starts below it.
+                model_roles: Vec::new(),
                 project_slug,
                 workspace_root,
                 // Top-level chat: approvals stay on its own session, depth 0,
@@ -1038,6 +1054,18 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             )
             .await?),
         "agent_sessions" => Ok(json!(state.agents.sessions().await)),
+        // Tool-less per-turn verifier behind the client's `/goal` command.
+        // The evaluator judges only the evidence already in the transcript,
+        // so it cannot confirm a goal by running something itself.
+        "goal_evaluate" => {
+            crate::goal::evaluate(
+                state,
+                str_param(&params, "goal")?,
+                str_param(&params, "transcript")?,
+                params.get("projectSlug").and_then(Value::as_str),
+            )
+            .await
+        }
         // Compact a live agent session: prune old tool results, summarize the
         // middle via one model call, soft-archive the replaced turns in the
         // session file, and rewrite the in-memory transcript.
@@ -1750,6 +1778,25 @@ mod tests {
 
         assert_eq!(result["pong"], true);
         assert_eq!(result["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    /// Both strings are required. Reaching the provider without a goal would
+    /// spend a model call to verify nothing.
+    #[tokio::test]
+    async fn goal_evaluate_requires_a_goal_and_a_transcript() {
+        let projects = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
+
+        let missing_goal = dispatch(&state, "goal_evaluate", json!({ "transcript": "ran it" }))
+            .await
+            .unwrap_err();
+        assert!(missing_goal.to_string().contains("goal"));
+
+        let missing_transcript = dispatch(&state, "goal_evaluate", json!({ "goal": "tests pass" }))
+            .await
+            .unwrap_err();
+        assert!(missing_transcript.to_string().contains("transcript"));
     }
 
     #[tokio::test]

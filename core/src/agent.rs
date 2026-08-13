@@ -15,6 +15,22 @@ use uuid::Uuid;
 /// Idle sessions above this are evicted when a new one is created.
 const MAX_SESSIONS: usize = 32;
 
+/// Turn budget handed to `agent_chat` when the caller names none.
+///
+/// A turn is one provider request, and the loop already ends the moment the
+/// model stops asking for tools — so this is not a task-size budget the user
+/// is meant to tune. It exists only so a model stuck in a tool loop cannot
+/// bill forever.
+pub const DEFAULT_MAX_TURNS: usize = 200;
+
+/// Hard ceiling applied to any caller-supplied turn budget.
+///
+/// Runaway backstop, NOT a product limit: reaching it means the model never
+/// converged, which is a bug or a pathological loop, not an ordinary task.
+/// Raising a caller's request above this is never useful; lowering the value
+/// silently truncates real work, which is the failure this constant replaced.
+pub const MAX_TURNS_CEILING: usize = 1000;
+
 /// A single assistant turn may fan out at most this many subagents; spawn
 /// calls past the cap fail with an error result instead of forking.
 const MAX_SPAWNS_PER_TURN: usize = 8;
@@ -32,6 +48,10 @@ const MAX_SPAWNS_PER_TURN: usize = 8;
 /// hit its own tight, self-describing cap and explain how to page past it. By
 /// the time a result reaches this one, nothing better is available.
 const MAX_TOOL_RESULT_BYTES: usize = 192 * 1024;
+/// Longest `data:image/...` string kept verbatim in a transcript. Real frames
+/// run tens of thousands of characters; this leaves tiny placeholder URLs and
+/// schema examples alone.
+const MAX_INLINE_IMAGE_CHARS: usize = 512;
 /// A drain failure is returned to graph/monitor callers, so keep provider
 /// errors bounded even when a gateway returns a very large error body.
 const MAX_DRAIN_REASON_CHARS: usize = 512;
@@ -182,7 +202,37 @@ fn bind_trusted_call_context(
 /// The overflow form stays valid JSON. Handing the model a JSON document cut
 /// off mid-string would cost it a turn to discover the result is unparseable,
 /// on top of the turn that produced it.
+/// Replace base64 image payloads with a receipt, returning how many were cut.
+///
+/// A captured frame belongs to core, not to the conversation: core harvests it
+/// from the tool event for the contact sheet the monitor and judge actually
+/// look at, so the copy sitting in the transcript is read by nobody and costs
+/// three ways — it is re-sent on every later turn of that agent, it evicts the
+/// provider's cached prefix, and it can be most of the context window. One
+/// measured node turn carried 220,229 base64 characters in a 264,264-character
+/// request, and prefix reuse for that call fell to 16% from a 99% median.
+fn elide_image_payloads(value: &mut Value) -> usize {
+    match value {
+        Value::String(text) => {
+            if text.starts_with("data:image/") && text.len() > MAX_INLINE_IMAGE_CHARS {
+                let bytes = text.len();
+                *text = format!(
+                    "<image elided: {bytes} base64 chars. Core already captured this frame as                      evidence; persist one with editor_persist_capture(path) instead of moving                      pixels through this conversation.>"
+                );
+                return 1;
+            }
+            0
+        }
+        Value::Array(items) => items.iter_mut().map(elide_image_payloads).sum(),
+        Value::Object(fields) => fields.values_mut().map(elide_image_payloads).sum(),
+        _ => 0,
+    }
+}
+
 fn bound_tool_result(tool: &str, outcome: &Value) -> String {
+    let mut elided = outcome.clone();
+    let cut = elide_image_payloads(&mut elided);
+    let outcome = if cut > 0 { &elided } else { outcome };
     let text = outcome.to_string();
     if text.len() <= MAX_TOOL_RESULT_BYTES {
         return text;
@@ -408,6 +458,15 @@ pub struct AgentOptions {
     /// not have to retype opaque routing fields on every iteration.
     pub loop_id: Option<String>,
     pub system: Option<String>,
+    /// Role keys this agent may be routed by, most specific first, matched
+    /// against `model.roles` so a fan-out can put builders and judges on
+    /// different models. Ordered because a judge node carries both the kind
+    /// the engine gave it (`judge`) and the role its plan named (`critic`),
+    /// and a user who mapped only one of them means it. Set by core from the
+    /// spawn — never from a model-authored argument, which is what keeps
+    /// provider choice with the user. Empty (a top-level chat) always runs
+    /// the model picker's selection.
+    pub model_roles: Vec<String>,
     pub project_slug: Option<String>,
     /// Immutable workspace selected by the durable session. Core file tools
     /// resolve here instead of following the project's mutable default.
@@ -439,6 +498,45 @@ pub struct AgentOptions {
     /// so project rules win under last-match-wins). Evaluated before mode
     /// logic. Subagents must inherit their parent's rules, never looser.
     pub permission_rules: Vec<PermissionRule>,
+}
+
+/// Fans one model stream out onto the event bus as two distinct signals.
+///
+/// Visible text stays addressed to the session that produced it, unchanged.
+/// Reasoning is addressed to the parent and carries `subagentSessionId` when a
+/// subagent produced it — the same routing `agent.approval_request` uses, so a
+/// subagent's thinking surfaces in the transcript the user is watching rather
+/// than in a session no UI has open. Reasoning is never written to the
+/// transcript; it exists only for the duration of this stream.
+fn spawn_stream_forwarder(
+    bus: tokio::sync::broadcast::Sender<Value>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<model::StreamChunk>,
+    session_id: String,
+    parent_session_id: String,
+) {
+    tokio::spawn(async move {
+        while let Some(chunk) = rx.recv().await {
+            let event = match chunk {
+                model::StreamChunk::Content(delta) => json!({
+                    "type": "agent.delta",
+                    "sessionId": session_id,
+                    "delta": delta
+                }),
+                model::StreamChunk::Reasoning(delta) => {
+                    let mut event = json!({
+                        "type": "agent.reasoning",
+                        "sessionId": parent_session_id,
+                        "delta": delta
+                    });
+                    if parent_session_id != session_id {
+                        event["subagentSessionId"] = json!(session_id);
+                    }
+                    event
+                }
+            };
+            let _ = bus.send(event);
+        }
+    });
 }
 
 impl AgentManager {
@@ -568,19 +666,18 @@ impl AgentManager {
         session_id: &str,
         options: &AgentOptions,
     ) -> Result<model::ChatResult> {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-        let bus = self.events.clone();
-        let sid_for_delta = session_id.to_string();
-        tokio::spawn(async move {
-            while let Some(delta) = rx.recv().await {
-                let _ = bus.send(json!({
-                    "type": "agent.delta",
-                    "sessionId": sid_for_delta,
-                    "delta": delta
-                }));
-            }
-        });
-        let config = { state.config.read().await.clone() };
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<model::StreamChunk>();
+        spawn_stream_forwarder(
+            self.events.clone(),
+            rx,
+            session_id.to_string(),
+            options
+                .approval_session
+                .clone()
+                .unwrap_or_else(|| session_id.to_string()),
+        );
+        let mut config = { state.config.read().await.clone() };
+        crate::config::apply_role_model(&mut config, &options.model_roles);
         let mut snapshot = {
             let guard = session.lock().await;
             guard.messages.clone()
@@ -632,7 +729,7 @@ impl AgentManager {
             }
         }
         let mut turns = 0usize;
-        let max_turns = options.max_turns.clamp(1, 30);
+        let max_turns = options.max_turns.clamp(1, MAX_TURNS_CEILING);
         let mut tool_calls_log: Vec<Value> = Vec::new();
 
         loop {
@@ -642,23 +739,22 @@ impl AgentManager {
             turns += 1;
             let defs = self.build_tools(registered_tools, &options.permission_rules);
             let schemas: Vec<Value> = defs.iter().map(to_openai_schema).collect();
-            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-            let bus = self.events.clone();
-            let sid_for_delta = current_session_id.clone();
-            tokio::spawn(async move {
-                while let Some(delta) = rx.recv().await {
-                    let _ = bus.send(json!({
-                        "type": "agent.delta",
-                        "sessionId": sid_for_delta,
-                        "delta": delta
-                    }));
-                }
-            });
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<model::StreamChunk>();
+            spawn_stream_forwarder(
+                self.events.clone(),
+                rx,
+                current_session_id.clone(),
+                options
+                    .approval_session
+                    .clone()
+                    .unwrap_or_else(|| current_session_id.clone()),
+            );
             // Clone rather than hold the guard across the streaming model
             // call. Tokio's RwLock is fair, so a queued model_switch writer
             // blocks every later reader — a switch during a subagent run was
             // measured starving the whole harness for >270s.
-            let config = { state.config.read().await.clone() };
+            let mut config = { state.config.read().await.clone() };
+            crate::config::apply_role_model(&mut config, &options.model_roles);
             // Auto-compaction: when the previous call's prompt crossed the
             // configured budget, compact before growing the context further.
             // Failure is non-fatal — the turn proceeds uncompacted.
@@ -973,12 +1069,13 @@ impl AgentManager {
     ) -> Value {
         let reply = match reason.as_deref() {
             Some(reason) => format!(
-                "The agent stopped after {max_turns} turns before producing a final answer. \
-                 {reason}. Send another message to continue."
+                "Stopped after {max_turns} turns without a final answer — this is CaliCode's \
+                 runaway backstop, not a limit you configured. {reason}. Send another message \
+                 to continue."
             ),
             None => format!(
-                "The agent stopped after {max_turns} turns before producing a final answer. \
-                 Send another message to continue."
+                "Stopped after {max_turns} turns without a final answer — this is CaliCode's \
+                 runaway backstop, not a limit you configured. Send another message to continue."
             ),
         };
         {
@@ -2023,6 +2120,7 @@ mod tests {
                 api_key_env: "CALI_MOCK_KEY".into(),
                 temperature: 0.0,
                 max_tokens: Some(128),
+                roles: Default::default(),
             },
             providers: vec![],
             ..Default::default()
@@ -2056,6 +2154,105 @@ mod tests {
             )),
             Ok(Event::default().data("[DONE]")),
         ]
+    }
+
+    async fn reasoning_provider() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        Sse::new(futures::stream::iter(vec![
+            Ok(Event::default().data(
+                json!({"choices":[{"delta":{"reasoning_content":"weighing the options"}}]})
+                    .to_string(),
+            )),
+            Ok(Event::default().data(
+                json!({"choices":[{"delta":{"role":"assistant","content":"visible answer"}}]})
+                    .to_string(),
+            )),
+            Ok(Event::default().data("[DONE]")),
+        ]))
+    }
+
+    #[tokio::test]
+    async fn streamed_reasoning_is_published_separately_and_stays_out_of_the_transcript() {
+        let app = Router::new().route("/v1/chat/completions", post(reasoning_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (bus, mut rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::new();
+        let state = make_state(addr, bus, agents.clone(), tools.clone());
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "think then answer" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 2,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let session_id = result["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(result["reply"], json!("visible answer"));
+
+        let mut reasoning = Vec::new();
+        let mut deltas = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event["type"].as_str() {
+                Some("agent.reasoning") => reasoning.push(event),
+                Some("agent.delta") => deltas.push(event),
+                _ => {}
+            }
+        }
+        assert_eq!(reasoning.len(), 1, "reasoning events: {reasoning:?}");
+        assert_eq!(reasoning[0]["sessionId"], json!(session_id));
+        assert_eq!(reasoning[0]["delta"], json!("weighing the options"));
+        assert!(
+            reasoning[0].get("subagentSessionId").is_none(),
+            "a top-level session is its own parent"
+        );
+        assert!(deltas
+            .iter()
+            .all(|event| event["delta"] != json!("weighing the options")));
+
+        // Display-only: nothing the model deliberated with may be replayed on
+        // the next request or shown as part of the answer.
+        let session = agents.session(&session_id).await.unwrap();
+        let transcript = {
+            let guard = session.lock().await;
+            serde_json::to_string(&guard.messages).unwrap()
+        };
+        assert!(
+            !transcript.contains("weighing the options"),
+            "reasoning leaked into the transcript: {transcript}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_reasoning_is_addressed_to_the_parent_session() {
+        let (bus, mut events) = tokio::sync::broadcast::channel(16);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        spawn_stream_forwarder(bus, rx, "sub-1".into(), "root-1".into());
+        tx.send(model::StreamChunk::Reasoning("thinking".into()))
+            .unwrap();
+        tx.send(model::StreamChunk::Content("answer".into()))
+            .unwrap();
+        drop(tx);
+
+        let reasoning = events.recv().await.unwrap();
+        assert_eq!(reasoning["type"], json!("agent.reasoning"));
+        assert_eq!(reasoning["sessionId"], json!("root-1"));
+        assert_eq!(reasoning["subagentSessionId"], json!("sub-1"));
+        assert_eq!(reasoning["delta"], json!("thinking"));
+
+        // Visible deltas keep naming the producing session, as they always have.
+        let delta = events.recv().await.unwrap();
+        assert_eq!(delta["type"], json!("agent.delta"));
+        assert_eq!(delta["sessionId"], json!("sub-1"));
+        assert!(delta.get("subagentSessionId").is_none());
     }
 
     #[test]
@@ -2167,6 +2364,7 @@ mod tests {
                 api_key_env: "CALI_MOCK_KEY".into(),
                 temperature: 0.0,
                 max_tokens: Some(128),
+                roles: Default::default(),
             },
             providers: vec![],
             ..Default::default()
@@ -2320,7 +2518,11 @@ mod tests {
         assert_eq!(result["maxTurns"], 1);
         let reply = result["reply"].as_str().unwrap();
         assert!(
-            reply.contains("stopped after 1 turns"),
+            reply.contains("Stopped after 1 turns without a final answer"),
+            "unexpected reply: {reply}"
+        );
+        assert!(
+            reply.contains("runaway backstop"),
             "unexpected reply: {reply}"
         );
         assert!(!reply.contains("Turn limit reached before the agent finished"));
@@ -2396,7 +2598,11 @@ mod tests {
         assert_eq!(result["maxTurns"], 1);
         let reply = result["reply"].as_str().unwrap();
         assert!(
-            reply.contains("stopped after 1 turns"),
+            reply.contains("Stopped after 1 turns without a final answer"),
+            "unexpected reply: {reply}"
+        );
+        assert!(
+            reply.contains("runaway backstop"),
             "unexpected reply: {reply}"
         );
         let requests = mock.requests.lock().unwrap();
@@ -2679,6 +2885,7 @@ mod tests {
                 api_key_env: "CALI_MOCK_KEY".into(),
                 temperature: 0.0,
                 max_tokens: Some(128),
+                roles: Default::default(),
             },
             providers: vec![],
             ..Default::default()
@@ -4464,6 +4671,40 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("{\"content"));
+    }
+
+    #[test]
+    fn a_captured_frame_leaves_a_receipt_instead_of_its_pixels() {
+        let frame = format!("data:image/png;base64,{}", "A".repeat(70_000));
+        let outcome = json!({ "dataUrl": frame, "frame": 12 });
+        let bounded = bound_tool_result("editor_capture_frame", &outcome);
+        let parsed: Value = serde_json::from_str(&bounded).unwrap();
+
+        assert!(
+            !bounded.contains("AAAA"),
+            "base64 survived into the transcript"
+        );
+        assert!(bounded.len() < 1_000, "receipt was {} bytes", bounded.len());
+        // The receipt has to say what to do instead, or the model just calls
+        // the same tool again looking for the pixels.
+        assert!(parsed["dataUrl"]
+            .as_str()
+            .unwrap()
+            .contains("editor_persist_capture"));
+        // Everything beside the payload survives: the frame number is what a
+        // report cites.
+        assert_eq!(parsed["frame"], 12);
+    }
+
+    #[test]
+    fn a_short_data_url_is_left_alone() {
+        // Tool schemas and placeholders carry example data URLs. Rewriting
+        // those would make the elision itself the confusing part.
+        let outcome = json!({ "example": "data:image/png;base64,AAAA" });
+        assert_eq!(
+            bound_tool_result("editor_asset_preview", &outcome),
+            outcome.to_string()
+        );
     }
 
     #[test]

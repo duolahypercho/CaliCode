@@ -143,6 +143,8 @@ const FILE_TREE_PANEL: ResizablePanelOptions = {
  */
 interface ViewState {
   tab: WorkspaceTab;
+  /** Views open as dock tabs. Order is the strip order. */
+  openTabs: WorkspaceTab[];
   workspaceFile: string | null;
 }
 
@@ -151,9 +153,18 @@ function readView(): ViewState {
     const raw = localStorage.getItem(VIEW_KEY);
     const parsed = raw ? (JSON.parse(raw) as Partial<ViewState>) : {};
     const tab = WORKSPACE_TABS.includes(parsed.tab as WorkspaceTab) ? (parsed.tab as WorkspaceTab) : "play";
-    return { tab, workspaceFile: typeof parsed.workspaceFile === "string" ? parsed.workspaceFile : null };
+    // A stored strip is filtered against the current view list, so a released
+    // or renamed view cannot restore a tab that no longer has a panel. An
+    // empty result falls back to every view rather than none — a dock with no
+    // tabs has nothing to show and no way back.
+    const stored = Array.isArray(parsed.openTabs)
+      ? parsed.openTabs.filter((entry): entry is WorkspaceTab => WORKSPACE_TABS.includes(entry as WorkspaceTab))
+      : [];
+    const openTabs = stored.length > 0 ? [...new Set(stored)] : [...WORKSPACE_TABS];
+    if (!openTabs.includes(tab)) openTabs.unshift(tab);
+    return { tab, openTabs, workspaceFile: typeof parsed.workspaceFile === "string" ? parsed.workspaceFile : null };
   } catch {
-    return { tab: "play", workspaceFile: null };
+    return { tab: "play", openTabs: [...WORKSPACE_TABS], workspaceFile: null };
   }
 }
 
@@ -181,6 +192,11 @@ export default function App() {
   const [captureEvery, setCaptureEvery] = useState(3);
   const [assetSearch, setAssetSearch] = useState("");
   const [tab, setTab] = useState<WorkspaceTab>(() => readView().tab);
+  const [openTabs, setOpenTabs] = useState<WorkspaceTab[]>(() => readView().openTabs);
+  // Dock fills the window, hiding the sidebar and chat. Not persisted: full
+  // screen is a momentary mode, and restoring into it on launch would hide
+  // the conversation with no obvious way back.
+  const [toolsExpanded, setToolsExpanded] = useState(false);
   // Asset open in the 3D builder (BUILD tab); null shows the picker.
   const [builderAssetId, setBuilderAssetId] = useState<string | null>(null);
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
@@ -421,8 +437,8 @@ export default function App() {
   }, [pinnedProjectSlugs]);
 
   useEffect(() => {
-    localStorage.setItem(VIEW_KEY, JSON.stringify({ tab, workspaceFile } satisfies ViewState));
-  }, [tab, workspaceFile]);
+    localStorage.setItem(VIEW_KEY, JSON.stringify({ tab, openTabs, workspaceFile } satisfies ViewState));
+  }, [tab, openTabs, workspaceFile]);
 
   useEffect(() => subscribeCoreStatus(setCoreStatus), []);
 
@@ -907,6 +923,27 @@ export default function App() {
     const timer = window.setTimeout(() => void persistProjectNow(), 800);
     return () => window.clearTimeout(timer);
   }, [coreStatus, project, persistProjectNow]);
+
+  /** Open a view as a tab (or focus it when already open) and select it. */
+  const addWorkspaceTab = useCallback((next: WorkspaceTab) => {
+    setOpenTabs((current) => (current.includes(next) ? current : [...current, next]));
+    setTab(next);
+  }, []);
+
+  /**
+   * Close a tab. Closing the active one selects its neighbour rather than
+   * leaving the dock pointed at a view that is no longer in the strip.
+   */
+  const closeWorkspaceTab = useCallback((target: WorkspaceTab) => {
+    setOpenTabs((current) => {
+      if (current.length <= 1) return current;
+      const index = current.indexOf(target);
+      if (index < 0) return current;
+      const next = current.filter((entry) => entry !== target);
+      setTab((active) => (active === target ? next[Math.min(index, next.length - 1)] : active));
+      return next;
+    });
+  }, []);
 
   const toggleTools = useCallback(() => {
     if (window.matchMedia("(min-width: 1024px)").matches) {
@@ -1579,21 +1616,38 @@ export default function App() {
           <aside
             data-tools-panel
             style={{ "--tools-width": `${toolsPanel.width}px` } as CSSProperties}
-            className={`${
-              toolsOpen ? "fixed inset-y-0 right-0 z-40 flex w-[min(720px,94vw)] shadow-2xl" : "hidden"
-            } max-w-[960px] shrink-0 flex-col overflow-hidden bg-surface-0 lg:static lg:flex lg:shadow-none ${
-              toolsVisible
-                ? "lg:visible lg:w-[var(--tools-width)] lg:min-w-[360px] lg:border-l lg:border-line"
-                : "lg:invisible lg:w-0 lg:min-w-0 lg:border-l-0"
-            } ${
-              toolsAnimating
-                ? "lg:[transition:width_300ms_ease,min-width_300ms_ease,border-width_300ms_ease,visibility_300ms]"
-                : ""
-            }`}
+            className={
+              // Full screen is its own layout, not a wider dock: the drag
+              // width, the responsive drawer and the slide transition all stop
+              // applying, so it is expressed as a separate class list rather
+              // than as overrides fighting the docked one.
+              toolsExpanded
+                ? "fixed inset-0 z-50 flex w-full max-w-none flex-col overflow-hidden bg-surface-0"
+                : `${
+                    toolsOpen ? "fixed inset-y-0 right-0 z-40 flex w-[min(720px,94vw)] shadow-2xl" : "hidden"
+                  } max-w-[960px] shrink-0 flex-col overflow-hidden bg-surface-0 lg:static lg:flex lg:shadow-none ${
+                    toolsVisible
+                      ? "lg:visible lg:w-[var(--tools-width)] lg:min-w-[360px] lg:border-l lg:border-line"
+                      : "lg:invisible lg:w-0 lg:min-w-0 lg:border-l-0"
+                  } ${
+                    toolsAnimating
+                      ? "lg:[transition:width_300ms_ease,min-width_300ms_ease,border-width_300ms_ease,visibility_300ms]"
+                      : ""
+                  }`
+            }
           >
           <WorkspaceTabs
+            openTabs={openTabs}
             active={tab}
             onChange={setTab}
+            onAdd={addWorkspaceTab}
+            onClose={closeWorkspaceTab}
+            expanded={toolsExpanded}
+            onToggleExpand={() => setToolsExpanded((current) => !current)}
+            onCollapse={() => {
+              setToolsExpanded(false);
+              toggleTools();
+            }}
             badges={{ test: failing || undefined }}
             // Without a workspace there is no preview server; core serves no
             // /play route, and the old label hardcoded port 5199.

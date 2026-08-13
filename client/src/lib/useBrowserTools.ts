@@ -822,7 +822,32 @@ export function useBrowserTools({
           const target = runtimeRef.current;
           if (!target) return { error: "runtime not ready" };
           const current = liveProjectRef.current;
-          const results = await runTests(current, target, current.tests, pushLog);
+          // The agent's suite compares against real saved baselines, exactly as
+          // the TESTS panel does. Without this the runner has no comparator and
+          // every `baseline()` call in an agent-authored test would fail.
+          const results = await runTests(
+            current,
+            target,
+            current.tests,
+            pushLog,
+            async (name, dataUrl, threshold = 8) => {
+              try {
+                return await rpc<{ pass: boolean; distance: number; threshold: number }>(
+                  "test_baseline_compare",
+                  {
+                    slug: current.slug,
+                    name,
+                    image: dataUrl.split(",")[1] ?? "",
+                    threshold,
+                  },
+                );
+              } catch (error) {
+                // Fail closed: an unreachable comparator is not a passing frame.
+                pushLog(`baseline compare failed: ${error instanceof Error ? error.message : String(error)}`);
+                return { pass: false, distance: 64, threshold };
+              }
+            },
+          );
           setTestResults(results);
           return results;
         },

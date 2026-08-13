@@ -10,6 +10,7 @@ mod config;
 mod devserver;
 mod editor_bridge;
 mod fileread;
+mod goal;
 mod graph;
 mod image3d;
 mod image_mesh;

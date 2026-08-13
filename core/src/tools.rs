@@ -706,6 +706,12 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             kind: ToolKind::Core,
         },
         ToolDef {
+            name: "blender_asset_export".into(),
+            description: "Run Blender headlessly to rebuild a .blend-backed asset's GLB, waiting for the export to finish. Returns the written byte count.".into(),
+            parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"assetId":{"type":"string"}},"required":["slug","assetId"]}),
+            kind: ToolKind::Core,
+        },
+        ToolDef {
             name: "test_baseline_save".into(),
             description: "Save a screenshot baseline for a named test.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"image":{"type":"string"}},"required":["slug","name","image"]}),
@@ -869,7 +875,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                                 },
                                 "reference": {"type": "string", "minLength": 1, "description": "Required when kind=judge: named AAA reference (e.g. 'DOOM (2016) arena combat slice')."},
                                 "threshold": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Judge pass score 0-100, default 90."},
-                                "maxTurns": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Subagent turn budget, default 8."}
+                                "maxTurns": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Subagent turn budget, default 100. Leave it unset unless the node is unusually cheap — the budget is a runaway backstop, not a work estimate."}
                             },
                             "additionalProperties": false
                         }
@@ -1322,6 +1328,13 @@ pub(crate) async fn execute_core_tool_with_activity(
             required_str(args, "slug")?,
             required_str(args, "assetId")?,
         )?),
+        "blender_asset_export" => Ok(crate::blender::export(
+            root,
+            required_str(args, "slug")?,
+            required_str(args, "assetId")?,
+            crate::blender::DEFAULT_EXPORT_TIMEOUT,
+        )
+        .await?),
         "asset_search" => {
             let query = required_str(args, "query")?;
             let slug = args.get("slug").and_then(Value::as_str);
@@ -1766,6 +1779,29 @@ pub(crate) async fn spawn_graph_subagent_with_effort(
     spawn_subagent_with(state, &bound, None, None, true).await
 }
 
+/// Role keys this spawn may be routed by, most specific first.
+///
+/// The engine can name a more specific key than the plan's role — a judge node
+/// is spawned with role `critic` but should honour a `judge:` mapping — and it
+/// passes that as `_modelRoleHint`. The hint is read only when this spawn also
+/// carries the engine's private graph binding, so the same key in a model's own
+/// `subagent_spawn` arguments is ignored: routing stays the user's choice.
+fn model_role_candidates(engine_spawn: bool, args: &Value, role: &str) -> Vec<String> {
+    let mut candidates = Vec::with_capacity(2);
+    if engine_spawn {
+        if let Some(hint) = args
+            .get("_modelRoleHint")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|hint| !hint.is_empty())
+        {
+            candidates.push(hint.to_string());
+        }
+    }
+    candidates.push(role.to_string());
+    candidates
+}
+
 /// Permission rules a directly spawned agent runs under: the global list plus
 /// tightening rules from its bound workspace (or the project's default base
 /// when no session workspace is bound).
@@ -1848,7 +1884,10 @@ async fn spawn_subagent_with(
     registered.extend(state.mcp.tool_defs().await);
     let role = required_str(args, "role")?;
     let instructions = required_str(args, "instructions")?;
-    let max_turns = args["maxTurns"].as_u64().unwrap_or(6) as usize;
+    let max_turns = args["maxTurns"]
+        .as_u64()
+        .map(|value| value as usize)
+        .unwrap_or(crate::agent::DEFAULT_MAX_TURNS);
     let slug = args
         .get("projectSlug")
         .and_then(|v| v.as_str())
@@ -1939,6 +1978,7 @@ async fn spawn_subagent_with(
             .or(explicit_reasoning_effort),
         loop_id: None,
         system: Some(system),
+        model_roles: model_role_candidates(internal_binding.is_some(), args, role),
         project_slug: slug,
         workspace_root: parent
             .as_ref()
@@ -2188,6 +2228,7 @@ mod tests {
                 api_key_env: "CALI_MOCK_KEY".into(),
                 temperature: 0.0,
                 max_tokens: Some(64),
+                roles: Default::default(),
             },
             providers: vec![],
             ..Default::default()
@@ -2459,6 +2500,90 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0]["reasoning_effort"], "max");
+    }
+
+    /// The point of fanning out is specialists, and specialists are only
+    /// distinct if their models can be. The role the spawner names is what
+    /// selects one; anything unmapped keeps the user's picked model.
+    #[tokio::test]
+    async fn a_subagent_runs_the_model_its_role_is_routed_to() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(effort_provider))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = mock_state(addr);
+        {
+            let mut config = state.config.write().await;
+            config
+                .model
+                .roles
+                .insert("coder".into(), "minimax-m3".into());
+        }
+
+        for role in ["coder", "artist"] {
+            spawn_subagent(
+                &state,
+                &json!({ "role": role, "instructions": "report status", "maxTurns": 1 }),
+            )
+            .await
+            .unwrap();
+        }
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["model"], "minimax-m3");
+        assert_eq!(requests[1]["model"], "mock");
+    }
+
+    #[test]
+    fn only_an_engine_spawn_may_offer_a_more_specific_role_key() {
+        let args = json!({ "role": "critic", "_modelRoleHint": "judge" });
+        assert_eq!(
+            model_role_candidates(true, &args, "critic"),
+            vec!["judge".to_string(), "critic".to_string()]
+        );
+        // The same key in a model's own arguments is ignored: routing may only
+        // be widened by the engine, never by the agent being spawned.
+        assert_eq!(
+            model_role_candidates(false, &args, "critic"),
+            vec!["critic".to_string()]
+        );
+    }
+
+    /// Role routing is a user setting, so the argument surface a model drives
+    /// must not reach it — otherwise a subagent could name its own model and
+    /// leave the provider the user chose.
+    #[tokio::test]
+    async fn a_model_authored_model_argument_cannot_reroute_a_spawn() {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/v1/chat/completions", post(effort_provider))
+            .with_state(requests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let state = mock_state(addr);
+
+        spawn_subagent(
+            &state,
+            &json!({
+                "role": "coder",
+                "instructions": "report status",
+                "maxTurns": 1,
+                "model": "gpt-5.6-luna",
+                "provider": "codex-router",
+                "baseUrl": "http://127.0.0.1:4100/v1",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1, "the spawn must still reach the mock");
+        assert_eq!(requests[0]["model"], "mock");
     }
 
     #[tokio::test]

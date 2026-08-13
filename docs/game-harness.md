@@ -158,14 +158,15 @@ await step(60);
 assert(entityFor("Patrol Car").position.x !== before, "patrol car should move");
 ```
 
-> **Known gap.** `editor_run_tests` calls `runTests` **without** a
-> `baselineCompare` callback (`useBrowserTools.ts:179`), so `baseline()` inside
-> an agent-run test resolves `{pass: true, distance: 0}` — it does not compare
-> anything. The TESTS panel button in `App.tsx` passes the real
-> `test_baseline_compare` RPC. Until that is unified: use scripted tests for
-> *behavioural* invariants, and judge *visuals* with `editor_capture_frame` plus
-> a critic pass (§6). Ask the human to press RUN TESTS for real baseline
-> enforcement.
+> **Baselines are real now.** `editor_run_tests` passes the same
+> `test_baseline_compare` RPC the TESTS panel uses, so `baseline()` inside an
+> agent-run test compares against the saved PNG and fails on drift. A
+> comparator that cannot be reached returns `{pass: false, distance: 64}`
+> rather than a pass — an unreachable comparator is not a matching frame.
+>
+> This previously synthesised `{pass: true, distance: 0}`, which let a suite
+> certify a scene it had never compared. If you are reading an older
+> transcript, treat its green baseline assertions as unproven.
 
 ---
 

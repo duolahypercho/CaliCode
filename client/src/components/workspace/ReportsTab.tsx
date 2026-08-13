@@ -179,7 +179,7 @@ export function ReportsTab({ projectSlug, coreStatus, canOpenFiles, workspaceRoo
                 >
                   {summaries.map((summary) => (
                     <option key={summary.loopId} value={summary.loopId}>
-                      {statusText(summary.status)}: {summary.objective}
+                      {summaryLabel(summary)}
                     </option>
                   ))}
                 </select>
@@ -242,6 +242,7 @@ export function ReportsTab({ projectSlug, coreStatus, canOpenFiles, workspaceRoo
                   <IterationDetails
                     key={iteration.iteration}
                     iteration={iteration}
+                    projectSlug={projectSlug}
                     openByDefault={index === 0}
                     canOpenFiles={canOpenFiles}
                     onOpenFile={onOpenFile}
@@ -295,12 +296,13 @@ function Metric({ label, value }: { label: string; value: string }) {
 
 interface IterationDetailsProps {
   iteration: LoopIteration;
+  projectSlug: string;
   openByDefault: boolean;
   canOpenFiles: boolean;
   onOpenFile: (path: string) => void;
 }
 
-function IterationDetails({ iteration, openByDefault, canOpenFiles, onOpenFile }: IterationDetailsProps) {
+function IterationDetails({ iteration, projectSlug, openByDefault, canOpenFiles, onOpenFile }: IterationDetailsProps) {
   const passedChecks = iteration.checks.filter((check) => check.status === "passed").length;
   return (
     <details open={openByDefault} className="group rounded-lg border border-line bg-surface-1">
@@ -408,7 +410,12 @@ function IterationDetails({ iteration, openByDefault, canOpenFiles, onOpenFile }
 
         {iteration.evidence.length > 0 ? (
           <IterationSection icon={ImageIcon} title="Evidence">
-            <EvidenceGrid evidence={iteration.evidence} canOpenFiles={canOpenFiles} onOpenFile={onOpenFile} />
+            <EvidenceGrid
+              evidence={iteration.evidence}
+              projectSlug={projectSlug}
+              canOpenFiles={canOpenFiles}
+              onOpenFile={onOpenFile}
+            />
           </IterationSection>
         ) : null}
 
@@ -423,6 +430,22 @@ function IterationDetails({ iteration, openByDefault, canOpenFiles, onOpenFile }
   );
 }
 
+/**
+ * One line per past loop, so a soak spanning days reads as a trajectory
+ * rather than a list of identical objectives: when it ran, how it ended, and
+ * how much it moved. `<option>` renders plain text only, so this is a string.
+ */
+export function summaryLabel(summary: LoopReportSummary): string {
+  const when = new Date(summary.startedAtMs).toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  const totals = summary.totals;
+  const parts = [when, statusText(summary.status), `${totals.iterations} iter`];
+  // The score is the trajectory: across a multi-day soak it is the one number
+  // that says whether yesterday's work moved the judge.
+  if (totals.latestScorePercent != null) parts.push(`${Math.round(totals.latestScorePercent)}%`);
+  if (totals.filesChanged > 0) parts.push(`${totals.filesChanged} files`);
+  return `${parts.join(" · ")} — ${summary.objective}`;
+}
+
 function IterationSection({ icon: Icon, title, children }: { icon: typeof Gauge; title: string; children: ReactNode }) {
   return (
     <section>
@@ -435,12 +458,20 @@ function IterationSection({ icon: Icon, title, children }: { icon: typeof Gauge;
   );
 }
 
+/** Project files are served by core at `/projects/<slug>/<path>`. */
+function evidenceImageSrc(projectSlug: string, path: string): string | null {
+  if (!isSafeReportPath(path) || !/\.(png|jpe?g|webp|gif)$/i.test(path)) return null;
+  return `/projects/${encodeURIComponent(projectSlug)}/${path.split("/").map(encodeURIComponent).join("/")}`;
+}
+
 function EvidenceGrid({
   evidence,
+  projectSlug,
   canOpenFiles,
   onOpenFile,
 }: {
   evidence: LoopEvidence[];
+  projectSlug: string;
   canOpenFiles: boolean;
   onOpenFile: (path: string) => void;
 }) {
@@ -453,10 +484,34 @@ function EvidenceGrid({
             {item.capturedAtMs ? <span className="ml-auto text-[9px] text-ink-faint">{formatDate(item.capturedAtMs)}</span> : null}
           </div>
           <p className="mt-1 text-[11px] leading-[1.45] text-ink">{item.caption || titleCase(item.kind)}</p>
+          <EvidenceThumbnail
+            src={evidenceImageSrc(projectSlug, item.path)}
+            alt={item.caption || titleCase(item.kind)}
+          />
           <FileAction path={item.path} canOpen={canOpenFiles} onOpen={onOpenFile} compact />
         </div>
       ))}
     </div>
+  );
+}
+
+/**
+ * A frame the loop cited is worth more than its filename: the standalone
+ * report.html already embeds it, and the whole point of reports living in the
+ * editor is seeing the evidence without leaving. A file that no longer exists
+ * hides itself rather than leaving a broken tile.
+ */
+function EvidenceThumbnail({ src, alt }: { src: string | null; alt: string }) {
+  const [failed, setFailed] = useState(false);
+  if (!src || failed) return null;
+  return (
+    <img
+      src={src}
+      alt={alt}
+      loading="lazy"
+      onError={() => setFailed(true)}
+      className="mt-2 max-h-40 w-full rounded border border-line bg-surface-1 object-contain"
+    />
   );
 }
 

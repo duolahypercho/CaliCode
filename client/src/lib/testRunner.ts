@@ -65,9 +65,16 @@ export async function runTests(
         log: (message) => logs.push(message),
         step: (frames) => runtime.waitFrames(frames),
         baseline: async (name, dataUrl, threshold = 8) => {
-          const result = baselineCompare
-            ? await baselineCompare(name, dataUrl, threshold)
-            : { pass: true, distance: 0, threshold };
+          // A visual assertion with no comparator fails loudly. This used to
+          // synthesise {pass: true, distance: 0}, which let a suite certify a
+          // scene it had never actually compared — the most expensive kind of
+          // green, because it looks like evidence.
+          if (!baselineCompare) {
+            throw new Error(
+              `baseline("${name}") cannot run: this test runner was created without a baseline comparator`,
+            );
+          }
+          const result = await baselineCompare(name, dataUrl, threshold);
           worstDistance = Math.max(worstDistance ?? 0, result.distance);
           return result;
         },

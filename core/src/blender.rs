@@ -4,9 +4,14 @@ use base64::Engine;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, UNIX_EPOCH};
+use tokio::process::Command as AsyncCommand;
 
 const BRIDGE_SOURCE: &str = include_str!("../blender/calicode_bridge.py");
+/// Blender pulls in a full Python runtime and can spend minutes on a heavy
+/// rig, but an agent loop must not hang on it forever.
+pub const DEFAULT_EXPORT_TIMEOUT: Duration = Duration::from_secs(180);
+const MAX_DIAGNOSTIC_LEN: usize = 600;
 
 pub fn import_asset(root: &Path, slug: &str, name: &str, data_base64: &str) -> Result<Value> {
     if !name.to_ascii_lowercase().ends_with(".blend") {
@@ -99,6 +104,119 @@ pub fn open(root: &Path, slug: &str, asset_id: &str) -> Result<Value> {
         "source": paths.source,
         "output": paths.output
     }))
+}
+
+/// Headless, awaited GLB export.
+///
+/// `open` hands the .blend to a windowed Blender and returns immediately —
+/// correct for a human, useless to an agent, which would report an asset that
+/// does not exist yet. `--background` runs the bridge's immediate export and
+/// exits, so the GLB is on disk before this returns. A clean exit that wrote no
+/// GLB is still a failure: Blender reports script errors on stderr and exits 0.
+pub async fn export(root: &Path, slug: &str, asset_id: &str, timeout: Duration) -> Result<Value> {
+    let paths = asset_paths(root, slug, asset_id)?;
+    std::fs::write(&paths.bridge, BRIDGE_SOURCE)?;
+    let previous = modified_unix_seconds(&paths.output);
+
+    let mut command = AsyncCommand::new(headless_binary());
+    command
+        .arg("--background")
+        .arg(&paths.source)
+        .arg("--python")
+        .arg(&paths.bridge)
+        .arg("--")
+        .arg(&paths.output)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        // A timed-out export must not leave Blender running against the project.
+        .kill_on_drop(true);
+
+    let child = command.spawn().context(
+        "failed to launch Blender; install Blender or set CALI_BLENDER_BIN to its executable",
+    )?;
+    let finished = tokio::time::timeout(timeout, child.wait_with_output())
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Blender export timed out after {}s and was terminated",
+                timeout.as_secs()
+            )
+        })?
+        .context("failed to wait for Blender")?;
+
+    if !finished.status.success() {
+        anyhow::bail!(
+            "Blender exited with {}: {}",
+            finished.status,
+            diagnostic_tail(&finished.stderr)
+        );
+    }
+    if !paths.output.is_file() {
+        anyhow::bail!(
+            "Blender exited cleanly but wrote no GLB: {}",
+            diagnostic_tail(&finished.stderr)
+        );
+    }
+
+    let bytes = std::fs::metadata(&paths.output)
+        .context("failed to stat the exported GLB")?
+        .len();
+    Ok(json!({
+        "exported": true,
+        "assetId": asset_id,
+        "output": paths.output,
+        "bytes": bytes,
+        "refreshed": modified_unix_seconds(&paths.output) != previous,
+    }))
+}
+
+/// Last few lines of Blender's stderr, bounded so a stack trace cannot flood
+/// the model's context.
+fn diagnostic_tail(stderr: &[u8]) -> String {
+    let text = String::from_utf8_lossy(stderr);
+    let tail = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .rev()
+        .take(6)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if tail.is_empty() {
+        return "no stderr output".into();
+    }
+    match tail.char_indices().nth(MAX_DIAGNOSTIC_LEN) {
+        // Truncate on a char boundary; Blender stderr is lossy UTF-8 and a byte
+        // slice through a multibyte sequence would panic.
+        Some((boundary, _)) => format!("{}…", &tail[..boundary]),
+        None => tail,
+    }
+}
+
+fn modified_unix_seconds(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|delta| delta.as_secs())
+}
+
+/// Headless never resolves through macOS `open`: that detaches the process, so
+/// there would be nothing to await or read an exit status from.
+fn headless_binary() -> PathBuf {
+    if let Some(binary) = std::env::var_os("CALI_BLENDER_BIN") {
+        return PathBuf::from(binary);
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let bundled = Path::new("/Applications/Blender.app/Contents/MacOS/Blender");
+        if bundled.is_file() {
+            return bundled.to_path_buf();
+        }
+    }
+    PathBuf::from("blender")
 }
 
 struct AssetPaths {
@@ -213,6 +331,64 @@ mod tests {
         assert!(std::fs::read_to_string(paths.bridge)
             .unwrap()
             .contains("save_post"));
+    }
+
+    #[test]
+    fn diagnostic_tail_keeps_the_last_lines_and_never_splits_a_char() {
+        assert_eq!(diagnostic_tail(b""), "no stderr output");
+        assert_eq!(diagnostic_tail(b"one\n\ntwo\nthree\n"), "one | two | three");
+        // A multibyte tail longer than the cap must truncate on a char boundary
+        // rather than panicking on a byte slice through a UTF-8 sequence.
+        let wide = "\u{4e16}".repeat(MAX_DIAGNOSTIC_LEN + 40);
+        let tail = diagnostic_tail(wide.as_bytes());
+        assert!(tail.ends_with('…'));
+        assert_eq!(tail.chars().count(), MAX_DIAGNOSTIC_LEN + 1);
+    }
+
+    #[tokio::test]
+    async fn export_rejects_an_asset_that_is_not_blender_backed() {
+        let root = tempfile::tempdir().unwrap();
+        crate::store::create_project(root.path(), "demo", "Demo").unwrap();
+        // `asset-cube` is the procedural starter asset: no blender metadata, so
+        // this must fail before Blender is ever launched.
+        let error = export(
+            root.path(),
+            "demo",
+            "asset-cube",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("not backed by Blender"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn export_fails_when_the_blender_binary_is_missing() {
+        let root = tempfile::tempdir().unwrap();
+        crate::store::create_project(root.path(), "demo", "Demo").unwrap();
+        let asset = import_asset(
+            root.path(),
+            "demo",
+            "runner.blend",
+            &STANDARD.encode(b"BLENDER"),
+        )
+        .unwrap();
+        let missing = root.path().join("no-such-blender");
+        std::env::set_var("CALI_BLENDER_BIN", &missing);
+        let result = export(
+            root.path(),
+            "demo",
+            asset["id"].as_str().unwrap(),
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        std::env::remove_var("CALI_BLENDER_BIN");
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("failed to launch Blender"), "got: {error}");
     }
 
     #[test]

@@ -72,6 +72,20 @@ fn http_client() -> Result<&'static reqwest::Client, AttemptError> {
         .map_err(|err| AttemptError::fatal(anyhow::anyhow!("http client unavailable: {err}")))
 }
 
+/// One piece of a live model stream, tagged with which of the two streams it
+/// belongs to.
+///
+/// Reasoning is display-only. It must stay distinguishable all the way to the
+/// caller because it may never be appended to `ChatResult::content`, written
+/// into the transcript, or replayed into a later request — providers charge
+/// for it once and reject it as input, and a user reading the assistant
+/// message must not see the model's private deliberation inside it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamChunk {
+    Content(String),
+    Reasoning(String),
+}
+
 /// A single-attempt failure, tagged with whether retrying could help.
 /// 4xx auth/validation errors and mid-stream failures (content already
 /// forwarded to the caller) are never retryable.
@@ -100,7 +114,7 @@ pub async fn chat(
     config: &AppConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
 ) -> Result<ChatResult> {
     chat_with_session(config, messages, tools, delta_tx, None).await
 }
@@ -115,7 +129,7 @@ pub async fn chat_with_session(
     config: &AppConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     session_id: Option<&str>,
 ) -> Result<ChatResult> {
     chat_with_backoff_session(
@@ -142,7 +156,7 @@ pub async fn chat_with_effort_session(
     config: &AppConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     reasoning_effort: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<ChatResult> {
@@ -168,7 +182,7 @@ pub async fn chat_with_effort_session_once(
     config: &AppConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     reasoning_effort: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<ChatResult> {
@@ -192,7 +206,7 @@ async fn chat_with_backoff(
     config: &AppConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     backoff_ms: &[u64],
 ) -> Result<ChatResult> {
     chat_with_backoff_session(config, messages, tools, delta_tx, None, None, backoff_ms).await
@@ -202,7 +216,7 @@ async fn chat_with_backoff_session(
     config: &AppConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     reasoning_effort: Option<&str>,
     session_id: Option<&str>,
     backoff_ms: &[u64],
@@ -278,7 +292,7 @@ async fn chat_with_retries(
     config: &AppConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     reasoning_effort: Option<&str>,
     session_id: Option<&str>,
     backoff_ms: &[u64],
@@ -339,7 +353,7 @@ async fn chat_once(
     config: &AppConfig,
     messages: &[Value],
     tools: Option<&[Value]>,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     reasoning_effort: Option<&str>,
     session_id: Option<&str>,
 ) -> Result<ChatResult, AttemptError> {
@@ -374,6 +388,15 @@ async fn chat_once(
     );
     let capabilities = provider_capabilities(config);
     let supports_cache_key = provider_supports_prompt_cache_key(config);
+    // Anthropic traffic carries its own breakpoints; every other provider keeps
+    // the caller's messages untouched.
+    let marked;
+    let messages = if marks_anthropic_cache_control(config) {
+        marked = apply_anthropic_cache_control(messages, cache_retention);
+        marked.as_slice()
+    } else {
+        messages
+    };
     let mut body = json!({
         "model": codex_router_chat_gateway_model(config),
         "messages": messages,
@@ -580,7 +603,7 @@ struct ResponsesRequest<'a> {
     config: &'a AppConfig,
     messages: &'a [Value],
     tools: Option<&'a [Value]>,
-    delta_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&'a tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     reasoning_effort: Option<&'a str>,
     session_id: Option<&'a str>,
     key: &'a str,
@@ -948,7 +971,7 @@ fn apply_responses_payload(
     tool_calls: &mut Vec<InFlightTool>,
     usage: &mut Option<Usage>,
     text_filter: &mut VisibleTextFilter,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     received_delta: &mut bool,
 ) -> Option<anyhow::Error> {
     let event_type = payload["type"].as_str().unwrap_or_default();
@@ -1016,6 +1039,14 @@ fn apply_responses_payload(
     }
 
     match event_type {
+        // The Responses request asks for `summary: "auto"`, so a reasoning
+        // model streams its summary here. Display-only, exactly like the
+        // chat-completions reasoning fields.
+        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+            if let (Some(tx), Some(delta)) = (delta_tx, payload["delta"].as_str()) {
+                send_reasoning(tx, delta);
+            }
+        }
         "response.output_text.delta" | "response.refusal.delta" => {
             if let Some(delta) = payload["delta"].as_str() {
                 append_response_text(
@@ -1076,7 +1107,7 @@ fn append_response_text(
     text: String,
     content: &mut String,
     text_filter: &mut VisibleTextFilter,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     received_delta: &mut bool,
 ) {
     append_visible_text(text_filter.push(&text), content, delta_tx, received_delta);
@@ -1085,7 +1116,7 @@ fn append_response_text(
 fn append_visible_text(
     text: String,
     content: &mut String,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     received_delta: &mut bool,
 ) {
     if text.is_empty() {
@@ -1094,8 +1125,59 @@ fn append_visible_text(
     *received_delta = true;
     content.push_str(&text);
     if let Some(tx) = delta_tx {
-        let _ = tx.send(text);
+        let _ = tx.send(StreamChunk::Content(text));
     }
+}
+
+/// Forwards whatever reasoning the provider streamed alongside this payload.
+///
+/// Deliberately does not touch `content` or `received_delta`: reasoning never
+/// becomes part of the answer, and a stream that emitted only reasoning before
+/// dropping has produced nothing the user has to keep — flagging it as
+/// consumed output would make every long-thinking model unretryable, while
+/// replaying a few thinking tokens on retry costs nothing.
+fn append_reasoning(
+    source: &serde_json::Map<String, Value>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
+) {
+    let Some(tx) = delta_tx else {
+        return;
+    };
+    // The same text under three names: `reasoning_content` (DeepSeek and most
+    // OpenAI-compatible proxies), `reasoning` (OpenRouter), and
+    // `reasoning_details[]` (OpenRouter's structured form). OpenRouter sends
+    // the last two together carrying identical text, so only the first source
+    // that actually yields text is forwarded — emitting every present field
+    // would double the thinking block on those gateways.
+    for key in ["reasoning_content", "reasoning"] {
+        if let Some(text) = source
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+        {
+            let _ = tx.send(StreamChunk::Reasoning(text.to_string()));
+            return;
+        }
+    }
+    let Some(details) = source.get("reasoning_details").and_then(Value::as_array) else {
+        return;
+    };
+    for detail in details {
+        if let Some(text) = detail
+            .get("text")
+            .or_else(|| detail.get("summary"))
+            .and_then(Value::as_str)
+        {
+            send_reasoning(tx, text);
+        }
+    }
+}
+
+fn send_reasoning(tx: &tokio::sync::mpsc::UnboundedSender<StreamChunk>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let _ = tx.send(StreamChunk::Reasoning(text.to_string()));
 }
 
 fn response_tool_slot(tool_calls: &mut Vec<InFlightTool>, index: usize) -> &mut InFlightTool {
@@ -1239,6 +1321,72 @@ fn is_luna_model(model: &str) -> bool {
     model.contains("gpt-5.6-luna") || model.contains("gpt-5-6-luna")
 }
 
+fn is_anthropic_model(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    model.contains("claude") || model.starts_with("anthropic/")
+}
+
+/// Whether this request must carry its own Anthropic cache breakpoints.
+///
+/// Scoped deliberately to OpenRouter. It does not cache Anthropic models
+/// automatically — the caller places the breakpoints — and it returns 200
+/// either way, so an unmarked tool-heavy loop silently re-bills its whole
+/// prefix every turn. Other OpenAI-shaped gateways are excluded because a
+/// proxy that already injects markers upstream would push the request past
+/// Anthropic's four-breakpoint ceiling and fail the call outright.
+fn marks_anthropic_cache_control(config: &AppConfig) -> bool {
+    let is_openrouter = config.model.provider.eq_ignore_ascii_case("openrouter")
+        || is_openrouter_base_url(config.model.base_url.trim());
+    is_openrouter && is_anthropic_model(&config.model.default)
+}
+
+/// Two breakpoints, mirroring the layout Pi uses: one closing the system
+/// prompt, one rolling on the newest user turn so every earlier turn is a
+/// cache read. Anthropic allows four, so this stays clear of the ceiling.
+///
+/// `role: "tool"` messages are never marked — OpenRouter hangs on a marker
+/// there rather than rejecting it — and empty content is left alone because
+/// Anthropic rejects an empty text block.
+fn apply_anthropic_cache_control(messages: &[Value], retention: CacheRetention) -> Vec<Value> {
+    let marker = if retention == CacheRetention::Long {
+        json!({ "type": "ephemeral", "ttl": "1h" })
+    } else {
+        json!({ "type": "ephemeral" })
+    };
+    let mut out = messages.to_vec();
+    let last_of = |role: &str| -> Option<usize> {
+        out.iter()
+            .rposition(|message| message.get("role").and_then(Value::as_str) == Some(role))
+    };
+    for index in [last_of("system"), last_of("user")].into_iter().flatten() {
+        mark_cache_control(&mut out[index], &marker);
+    }
+    out
+}
+
+fn mark_cache_control(message: &mut Value, marker: &Value) -> bool {
+    match message.get_mut("content") {
+        Some(Value::String(text)) => {
+            if text.trim().is_empty() {
+                return false;
+            }
+            let text = std::mem::take(text);
+            message["content"] = json!([
+                { "type": "text", "text": text, "cache_control": marker }
+            ]);
+            true
+        }
+        Some(Value::Array(parts)) => match parts.last_mut() {
+            Some(last) if last.is_object() => {
+                last["cache_control"] = marker.clone();
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 fn is_codex_router_luna(config: &AppConfig) -> bool {
     config
         .model
@@ -1356,7 +1504,7 @@ fn apply_payload(
     tool_calls: &mut Vec<InFlightTool>,
     usage: &mut Option<Usage>,
     text_filter: &mut VisibleTextFilter,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     received_delta: &mut bool,
 ) {
     // OpenAI sends `"usage": null` on content chunks and the real object in a
@@ -1374,11 +1522,13 @@ fn apply_payload(
         return;
     };
     if let Some(delta) = choice.get("delta").and_then(Value::as_object) {
+        append_reasoning(delta, delta_tx);
         append_content(delta, content, text_filter, delta_tx, received_delta);
         append_tool_calls(delta, tool_calls, received_delta, true);
         return;
     }
     if let Some(message) = choice.get("message").and_then(Value::as_object) {
+        append_reasoning(message, delta_tx);
         append_content(message, content, text_filter, delta_tx, received_delta);
         append_tool_calls(message, tool_calls, received_delta, false);
     }
@@ -1388,7 +1538,7 @@ fn append_content(
     source: &serde_json::Map<String, Value>,
     content: &mut String,
     text_filter: &mut VisibleTextFilter,
-    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<String>>,
+    delta_tx: Option<&tokio::sync::mpsc::UnboundedSender<StreamChunk>>,
     received_delta: &mut bool,
 ) {
     if let Some(text) = source.get("content").and_then(Value::as_str) {
@@ -1470,6 +1620,158 @@ mod tests {
         assert_eq!(delta["tool_calls"][0]["function"]["name"], "project_list");
     }
 
+    /// Feeds payloads through `apply_payload` and returns
+    /// (visible content, streamed visible, streamed reasoning).
+    fn stream_payloads(payloads: &[Value]) -> (String, String, String) {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        let mut received = false;
+        let mut text_filter = VisibleTextFilter::default();
+        for payload in payloads {
+            apply_payload(
+                payload,
+                &mut content,
+                &mut calls,
+                &mut usage,
+                &mut text_filter,
+                Some(&tx),
+                &mut received,
+            );
+        }
+        append_visible_text(text_filter.finish(), &mut content, Some(&tx), &mut received);
+        drop(tx);
+        let (visible, reasoning) = drain_stream(&mut rx);
+        (content, visible, reasoning)
+    }
+
+    #[test]
+    fn streamed_reasoning_content_never_enters_visible_content() {
+        let (content, visible, reasoning) = stream_payloads(&[
+            json!({ "choices": [{ "delta": { "reasoning_content": "weighing options" } }] }),
+            json!({ "choices": [{ "delta": { "reasoning_content": " carefully" } }] }),
+            json!({ "choices": [{ "delta": { "content": "Here is the answer." } }] }),
+        ]);
+        assert_eq!(content, "Here is the answer.");
+        assert_eq!(visible, "Here is the answer.");
+        assert_eq!(reasoning, "weighing options carefully");
+    }
+
+    #[test]
+    fn openrouter_reasoning_string_and_details_array_both_stream() {
+        let (content, visible, reasoning) = stream_payloads(&[
+            json!({ "choices": [{ "delta": { "reasoning": "step one" } }] }),
+            json!({
+                "choices": [{
+                    "delta": {
+                        "reasoning_details": [
+                            { "type": "reasoning.text", "text": " step two" },
+                            { "type": "reasoning.text", "text": " step three" }
+                        ]
+                    }
+                }]
+            }),
+            json!({ "choices": [{ "delta": { "content": "done" } }] }),
+        ]);
+        assert_eq!(content, "done");
+        assert_eq!(visible, "done");
+        assert_eq!(reasoning, "step one step two step three");
+    }
+
+    #[test]
+    fn openrouter_duplicate_reasoning_fields_stream_the_text_once() {
+        // OpenRouter puts the same text in `reasoning` and in
+        // `reasoning_details[]`; forwarding both would double the thinking
+        // block in the UI.
+        let (_, _, reasoning) = stream_payloads(&[json!({
+            "choices": [{
+                "delta": {
+                    "reasoning": "one thought",
+                    "reasoning_details": [{ "type": "reasoning.text", "text": "one thought" }]
+                }
+            }]
+        })]);
+        assert_eq!(reasoning, "one thought");
+    }
+
+    #[test]
+    fn non_streaming_message_shape_carries_reasoning_too() {
+        let (content, visible, reasoning) = stream_payloads(&[json!({
+            "choices": [{
+                "message": { "reasoning_content": "thought it through", "content": "final" }
+            }]
+        })]);
+        assert_eq!(content, "final");
+        assert_eq!(visible, "final");
+        assert_eq!(reasoning, "thought it through");
+    }
+
+    #[test]
+    fn payload_without_reasoning_streams_only_visible_text() {
+        let (content, visible, reasoning) = stream_payloads(&[
+            json!({ "choices": [{ "delta": { "content": "plain " } }] }),
+            json!({ "choices": [{ "delta": { "content": "answer" } }] }),
+        ]);
+        assert_eq!(content, "plain answer");
+        assert_eq!(visible, "plain answer");
+        assert!(reasoning.is_empty());
+    }
+
+    #[test]
+    fn reasoning_alone_does_not_mark_the_stream_as_consumed() {
+        // A stream that emitted only reasoning before dropping has produced
+        // nothing the user keeps, so it must still be retryable.
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        let mut received = false;
+        let mut text_filter = VisibleTextFilter::default();
+        apply_payload(
+            &json!({ "choices": [{ "delta": { "reasoning_content": "still thinking" } }] }),
+            &mut content,
+            &mut calls,
+            &mut usage,
+            &mut text_filter,
+            Some(&tx),
+            &mut received,
+        );
+        assert!(!received);
+        assert!(content.is_empty());
+    }
+
+    #[test]
+    fn responses_reasoning_summary_deltas_stream_as_reasoning() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut content = String::new();
+        let mut calls = Vec::new();
+        let mut usage = None;
+        let mut received = false;
+        let mut text_filter = VisibleTextFilter::default();
+        for payload in [
+            json!({ "type": "response.reasoning_summary_text.delta", "delta": "planning" }),
+            json!({ "type": "response.output_text.delta", "delta": "shipped" }),
+        ] {
+            assert!(apply_responses_payload(
+                &payload,
+                &mut content,
+                &mut calls,
+                &mut usage,
+                &mut text_filter,
+                Some(&tx),
+                &mut received,
+            )
+            .is_none());
+        }
+        append_visible_text(text_filter.finish(), &mut content, Some(&tx), &mut received);
+        drop(tx);
+        let (visible, reasoning) = drain_stream(&mut rx);
+        assert_eq!(content, "shipped");
+        assert_eq!(visible, "shipped");
+        assert_eq!(reasoning, "planning");
+    }
+
     #[test]
     fn streaming_tool_deltas_without_indexes_stay_in_one_call() {
         // Continuation chunks from some gateways omit `index`. They still
@@ -1546,10 +1848,27 @@ mod tests {
         }
         append_visible_text(filter.finish(), &mut content, Some(&tx), &mut received);
         drop(tx);
-        let streamed = std::iter::from_fn(|| rx.try_recv().ok()).collect::<String>();
+        let (streamed, reasoning) = drain_stream(&mut rx);
         assert_eq!(content, "Visible answer");
         assert_eq!(streamed, "Visible answer");
+        assert_eq!(reasoning, "");
         assert!(received);
+    }
+
+    /// Splits a finished stream into (visible, reasoning) so a test can assert
+    /// that neither leaked into the other.
+    fn drain_stream(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamChunk>,
+    ) -> (String, String) {
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        while let Ok(chunk) = rx.try_recv() {
+            match chunk {
+                StreamChunk::Content(text) => visible.push_str(&text),
+                StreamChunk::Reasoning(text) => reasoning.push_str(&text),
+            }
+        }
+        (visible, reasoning)
     }
 
     #[test]
@@ -1716,6 +2035,7 @@ mod tests {
                 api_key_env: "CALI_MOCK_KEY".into(),
                 temperature: 0.0,
                 max_tokens: Some(32),
+                roles: Default::default(),
             },
             providers: vec![],
             ..Default::default()
@@ -2227,6 +2547,109 @@ mod tests {
             body.get("stream_options").is_none(),
             "unknown compatible providers must not receive optional stream fields"
         );
+    }
+
+    #[test]
+    fn anthropic_cache_control_marks_the_system_and_newest_user_turn() {
+        let messages = vec![
+            json!({ "role": "system", "content": "you are cali" }),
+            json!({ "role": "user", "content": "build a level" }),
+            json!({ "role": "assistant", "content": "", "tool_calls": [] }),
+            json!({ "role": "tool", "tool_call_id": "c1", "content": "{\"ok\":true}" }),
+            json!({ "role": "user", "content": "continue" }),
+        ];
+        let marked = apply_anthropic_cache_control(&messages, CacheRetention::Short);
+
+        let ephemeral = json!({ "type": "ephemeral" });
+        assert_eq!(marked[0]["content"][0]["cache_control"], ephemeral);
+        assert_eq!(marked[0]["content"][0]["text"], json!("you are cali"));
+        // Only the newest user turn rolls forward; the earlier one is plain.
+        assert_eq!(marked[1], messages[1]);
+        assert_eq!(marked[4]["content"][0]["cache_control"], ephemeral);
+        // A marker on a tool result hangs OpenRouter, so that role stays bare.
+        assert_eq!(marked[3], messages[3]);
+        assert_eq!(marked[2], messages[2]);
+    }
+
+    #[test]
+    fn anthropic_cache_control_skips_empty_content_and_uses_long_ttl() {
+        let empty = vec![json!({ "role": "user", "content": "   " })];
+        assert_eq!(
+            apply_anthropic_cache_control(&empty, CacheRetention::Short),
+            empty,
+            "an empty text block would be rejected by Anthropic"
+        );
+
+        let parts = vec![json!({
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "look" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,AAAA" } }
+            ]
+        })];
+        let marked = apply_anthropic_cache_control(&parts, CacheRetention::Long);
+        assert_eq!(
+            marked[0]["content"][1]["cache_control"],
+            json!({ "type": "ephemeral", "ttl": "1h" })
+        );
+        assert!(marked[0]["content"][0].get("cache_control").is_none());
+    }
+
+    #[tokio::test]
+    async fn openrouter_claude_receives_cache_control_but_gpt_does_not() {
+        for (model, expects_marker) in [
+            ("anthropic/claude-sonnet-4-5", true),
+            ("openai/gpt-4o", false),
+        ] {
+            let captured: Arc<std::sync::Mutex<Option<Value>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let captured_for_route = captured.clone();
+            let app = Router::new().route(
+                "/v1/chat/completions",
+                post(move |axum::Json(body): axum::Json<Value>| {
+                    let captured = captured_for_route.clone();
+                    async move {
+                        *captured.lock().unwrap() = Some(body);
+                        success_sse()
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+            let mut config = test_config(format!("http://{addr}/v1"));
+            config.model.provider = "openrouter".into();
+            config.model.default = model.into();
+            chat_with_session(
+                &config,
+                &[
+                    json!({ "role": "system", "content": "you are cali" }),
+                    json!({ "role": "user", "content": "hello" }),
+                ],
+                None,
+                None,
+                Some("session-1"),
+            )
+            .await
+            .unwrap();
+
+            let body = captured.lock().unwrap().clone().expect("request captured");
+            let system = &body["messages"][0];
+            if expects_marker {
+                assert_eq!(
+                    system["content"][0]["cache_control"],
+                    json!({ "type": "ephemeral" }),
+                    "{model} must carry its own breakpoints"
+                );
+            } else {
+                assert_eq!(
+                    system["content"],
+                    json!("you are cali"),
+                    "{model} caches automatically; markers would be wrong"
+                );
+            }
+        }
     }
 
     #[tokio::test]

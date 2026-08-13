@@ -202,7 +202,14 @@ self.onmessage = (event: MessageEvent<RunRequest | HostResult>) => {
         `"use strict"; return (async () => { ${body} })();`,
       ) as (...args: unknown[]) => Promise<void>;
 
-      await run(...NETWORK_GLOBALS.map(() => undefined), context);
+      try {
+        await run(...NETWORK_GLOBALS.map(() => undefined), context);
+      } catch (error) {
+        // A failed capability call resolves `undefined` into the script, so the
+        // script's own TypeError surfaces first and buries the real cause. The
+        // capability error happened earlier; report that.
+        throw capabilityError ?? error;
+      }
       await drainCalls();
       post({ type: "done", testId: message.testId });
     } catch (error) {

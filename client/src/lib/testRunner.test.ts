@@ -86,6 +86,23 @@ describe("test runner", () => {
     expect(results[0].pass).toBe(true);
   });
 
+  it("fails a baseline assertion when no comparator was supplied", async () => {
+    const project = starterProject();
+    project.tests = [
+      {
+        id: "baseline",
+        name: "Visual",
+        script:
+          "const result = await baseline('shot', 'data:image/png;base64,abc', 8); assert(result.pass, 'baseline failed');",
+      },
+    ];
+    // No comparator: this must not resolve to a synthetic pass, or a suite
+    // could certify a scene it never compared.
+    const results = await runTests(project, new FakeRuntime() as never, project.tests, () => undefined);
+    expect(results[0].pass).toBe(false);
+    expect(results[0].error).toContain("baseline comparator");
+  });
+
   it("exposes an immutable state.world snapshot and refreshes it after step", async () => {
     const project = starterProject();
     project.tests = [{

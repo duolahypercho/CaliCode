@@ -480,6 +480,15 @@ pub struct ModelConfig {
     pub api_key_env: String,
     pub temperature: f64,
     pub max_tokens: Option<u32>,
+    /// Per-role model routing: `role -> "model"` or `"provider/model"`.
+    ///
+    /// Fanning one goal out to specialists only pays if the specialists can
+    /// differ — a cheap fast builder and a strong independent judge are not
+    /// the same choice. Routing lives in config, never in tool arguments: a
+    /// model names the *role* it is spawning, so letting it name the model
+    /// too would be a subagent escaping the provider the user picked.
+    #[serde(default)]
+    pub roles: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for ModelConfig {
@@ -491,8 +500,51 @@ impl Default for ModelConfig {
             api_key_env: "CALI_OPENAI_API_KEY".to_string(),
             temperature: 0.4,
             max_tokens: Some(4096),
+            roles: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// Point one agent role at the model its user assigned, returning the model
+/// that ended up selected when a mapping applied.
+///
+/// A mapping value is either a bare model id (keep the active provider) or
+/// `provider/model`, where the prefix counts as a provider only when it
+/// matches a configured preset — model ids carry slashes of their own
+/// (`anthropic/claude-sonnet-4-5`), so an unmatched prefix stays part of the
+/// model name rather than silently pointing the call at nothing.
+pub fn apply_role_model(config: &mut AppConfig, candidates: &[String]) -> Option<String> {
+    let target = candidates
+        .iter()
+        .map(|candidate| candidate.trim())
+        .filter(|candidate| !candidate.is_empty())
+        .find_map(|candidate| {
+            config
+                .model
+                .roles
+                .iter()
+                .find(|(mapped, _)| mapped.eq_ignore_ascii_case(candidate))
+                .map(|(_, target)| target.trim().to_string())
+                .filter(|target| !target.is_empty())
+        })?;
+    let preset = target.split_once('/').and_then(|(provider, model)| {
+        config
+            .providers
+            .iter()
+            .find(|preset| preset.id == provider)
+            .map(|preset| (preset.clone(), model.trim().to_string()))
+    });
+    let model = match preset {
+        Some((preset, model)) if !model.is_empty() => {
+            config.model.provider = preset.id;
+            config.model.base_url = preset.base_url;
+            config.model.api_key_env = preset.api_key_env;
+            model
+        }
+        _ => target,
+    };
+    config.model.default = model.clone();
+    Some(model)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1097,5 +1149,112 @@ mod tests {
         std::env::set_var("CALI_CODEX_ROUTER_KEY", "env-key");
         assert_eq!(api_key(&config), "env-key");
         std::env::remove_var("CALI_CODEX_ROUTER_KEY");
+    }
+
+    fn routed_config() -> AppConfig {
+        let mut config = AppConfig {
+            providers: default_providers(),
+            ..Default::default()
+        };
+        config.model.provider = "openai".into();
+        config.model.default = "gpt-4.1-mini".into();
+        config.model.base_url = "https://api.openai.com/v1".into();
+        config.model.api_key_env = "CALI_OPENAI_API_KEY".into();
+        config
+    }
+
+    #[test]
+    fn role_routing_moves_one_role_without_touching_the_others() {
+        let mut config = routed_config();
+        config
+            .model
+            .roles
+            .insert("coder".into(), "minimax-token-plan-minimax-m3".into());
+
+        assert_eq!(
+            apply_role_model(&mut config.clone(), &["coder".to_string()]).as_deref(),
+            Some("minimax-token-plan-minimax-m3")
+        );
+        // An unmapped role, an absent role, and a blank one all keep the
+        // user's picked model — routing is opt-in per role.
+        for role in [
+            vec!["artist".to_string()],
+            vec!["  ".to_string()],
+            Vec::new(),
+        ] {
+            let mut untouched = config.clone();
+            assert_eq!(apply_role_model(&mut untouched, &role), None);
+            assert_eq!(untouched.model.default, "gpt-4.1-mini");
+        }
+    }
+
+    #[test]
+    fn a_provider_qualified_role_switches_endpoint_and_key_together() {
+        let mut config = routed_config();
+        config.model.roles.insert(
+            "judge".into(),
+            format!("{}/gpt-5.6-luna", crate::config::CODEX_ROUTER_PROVIDER_ID),
+        );
+
+        assert_eq!(
+            apply_role_model(&mut config, &["JUDGE".to_string()]).as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            config.model.provider,
+            crate::config::CODEX_ROUTER_PROVIDER_ID
+        );
+        assert_eq!(config.model.base_url, crate::config::CODEX_ROUTER_BASE_URL);
+        assert_eq!(config.model.api_key_env, "CALI_CODEX_ROUTER_KEY");
+    }
+
+    /// A judge node is spawned with its plan role (`critic`) but is the
+    /// engine's judge by kind, so it offers both keys. Whichever one the user
+    /// actually mapped must win, and the more specific one wins a tie.
+    #[test]
+    fn ordered_role_candidates_prefer_the_most_specific_mapping() {
+        let judge_node = ["judge".to_string(), "critic".to_string()];
+
+        let mut only_role = routed_config();
+        only_role
+            .model
+            .roles
+            .insert("critic".into(), "mapped-by-role".into());
+        assert_eq!(
+            apply_role_model(&mut only_role, &judge_node).as_deref(),
+            Some("mapped-by-role")
+        );
+
+        let mut both = routed_config();
+        both.model
+            .roles
+            .insert("critic".into(), "mapped-by-role".into());
+        both.model
+            .roles
+            .insert("judge".into(), "mapped-by-kind".into());
+        assert_eq!(
+            apply_role_model(&mut both, &judge_node).as_deref(),
+            Some("mapped-by-kind")
+        );
+    }
+
+    #[test]
+    fn a_slash_that_is_not_a_provider_stays_part_of_the_model_id() {
+        let mut config = routed_config();
+        config.model.provider = "openrouter".into();
+        config.model.base_url = "https://openrouter.ai/api/v1".into();
+        config
+            .model
+            .roles
+            .insert("critic".into(), "anthropic/claude-sonnet-4-5".into());
+
+        assert_eq!(
+            apply_role_model(&mut config, &["critic".to_string()]).as_deref(),
+            Some("anthropic/claude-sonnet-4-5")
+        );
+        // Splitting on the slash would have pointed the call at a provider
+        // that does not exist and dropped the vendor half of the model id.
+        assert_eq!(config.model.provider, "openrouter");
+        assert_eq!(config.model.base_url, "https://openrouter.ai/api/v1");
     }
 }

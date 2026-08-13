@@ -6,6 +6,7 @@ import {
   graphQualityReference,
   hasRecordedLoopIteration,
   isTransientRpcError,
+  loopCarryForward,
   loopIterationPrompt,
   reportLoopBestEffort,
   settleRunningToolRows,
@@ -14,7 +15,7 @@ import {
 } from "./AgentPanel";
 import type { AgentEvent } from "../../lib/rpc";
 import type { TaskGraph } from "../../lib/graph";
-import type { OpenLoopReport } from "../../lib/loopReports";
+import type { LoopReport, OpenLoopReport } from "../../lib/loopReports";
 import type { AgentMessage } from "../../lib/types";
 
 const mocks = vi.hoisted(() => ({
@@ -383,6 +384,49 @@ describe("loop reporting", () => {
         nodes: passingGraph().nodes.map((node) => ({ ...node, reference: node.kind === "build" ? "untrusted" : null })),
       }),
     ).toBeNull();
+  });
+
+  it("inlines the previous iteration's carry-forward instead of asking for a fetch", () => {
+    const report = {
+      loopId: "loop-carry",
+      projectSlug: "demo",
+      reference: "Hades arena",
+      status: "running" as const,
+      iterations: [
+        {
+          iteration: 1,
+          outcome: "needs-work" as const,
+          summary: "flat lighting",
+          startedAtMs: 1, completedAtMs: 2,
+          agents: [], checks: [], changedFiles: [], evidence: [], scores: [],
+          punchList: [
+            { priority: "high" as const, item: "Add a rim light", resolved: false },
+            { priority: "low" as const, item: "Already handled", resolved: true },
+          ],
+          nextIterationMemory: {
+            observations: [], decisions: ["Keep three build roots"], risks: [],
+            nextActions: ["Add a rim light"],
+          },
+        },
+      ],
+    } as unknown as LoopReport;
+
+    const carry = loopCarryForward(report);
+    expect(carry).toContain("Add a rim light");
+    expect(carry).toContain("Keep three build roots");
+    // A resolved item is noise in the next pass — it invites redoing work.
+    expect(carry).not.toContain("Already handled");
+
+    const prompt = loopIterationPrompt("polish the game", "loop-carry", 2, carry);
+    expect(prompt).toContain("Add a rim light");
+    expect(prompt).not.toContain("Read loop_report_open first");
+    // Without a carry the prompt must still tell the model where to look.
+    expect(loopIterationPrompt("polish the game", "loop-carry", 2)).toContain("Read loop_report_open first");
+  });
+
+  it("carries nothing forward from a report with no iterations yet", () => {
+    const empty = { loopId: "l", projectSlug: "d", status: "running", iterations: [] } as unknown as LoopReport;
+    expect(loopCarryForward(empty)).toBe("");
   });
 
   it("keeps the full completion topology in repair-iteration prompts", () => {

@@ -38,12 +38,14 @@ pub const MAX_ATTEMPTS_PER_NODE: u32 = 5;
 pub const DEFAULT_JUDGE_THRESHOLD: u32 = 90;
 /// "Utterly perfect" mode.
 pub const PERFECT_THRESHOLD: u32 = 100;
-pub const DEFAULT_NODE_MAX_TURNS: usize = 8;
+/// Build workers ship a whole slice of the goal — author scripts, run PIE,
+/// capture frames, fix what the frames show. They stop when the work is done;
+/// this is only the runaway backstop for one that never converges.
+pub const DEFAULT_NODE_MAX_TURNS: usize = 100;
 /// Integration workers have to inspect every dependency, exercise the live
-/// game, collect chronological evidence, and report. Eight turns repeatedly
-/// stranded them on the final verification call, so keep a bounded floor
-/// without changing the global 30-turn agent cap.
-const INTEGRATION_MIN_TURNS: usize = 16;
+/// game, collect chronological evidence, and report, so an explicitly small
+/// per-node budget still gets floored here.
+const INTEGRATION_MIN_TURNS: usize = 60;
 /// Ready Build nodes executed concurrently per wave. Judge nodes never share
 /// a wave — a judge always runs alone.
 pub const MAX_PARALLEL_NODES: usize = 3;
@@ -56,8 +58,12 @@ const REPORT_SAVE_LIMIT: usize = 16 * 1024;
 const MONITOR_REPORT_LIMIT: usize = 16 * 1024;
 /// Each Build dep's report shown to the judge is capped at this.
 const JUDGE_DEP_REPORT_LIMIT: usize = 1024;
-/// Turn budget for the fresh-context critic subagent.
-const JUDGE_MAX_TURNS: usize = 6;
+/// Turn budget for the fresh-context critic subagent. Deliberately far below
+/// a Build worker's: a judge only inspects and scores, and a critic that
+/// starts *doing* work is a critic that stopped being independent. Six turns
+/// stranded it before it could open the game, so it buys enough to look —
+/// not enough to build.
+const JUDGE_MAX_TURNS: usize = 20;
 /// Per-attempt tool attestations are a bounded supplement to the worker's
 /// prose. They contain summaries only; large console/test payloads never enter
 /// the graph state or monitor prompt.
@@ -214,7 +220,7 @@ fn is_integration_node(node: &GraphNode) -> bool {
 }
 
 fn effective_node_max_turns(node: &GraphNode) -> usize {
-    let requested = node.max_turns.clamp(1, 30);
+    let requested = node.max_turns.clamp(1, crate::agent::MAX_TURNS_CEILING);
     if is_integration_node(node) {
         requested.max(INTEGRATION_MIN_TURNS)
     } else {
@@ -1519,7 +1525,7 @@ pub fn plan_with_effort(
             ],
             reference: Some(format!("a shipped, AAA-quality result for: {goal}")),
             threshold: Some(DEFAULT_JUDGE_THRESHOLD),
-            max_turns: 6,
+            max_turns: JUDGE_MAX_TURNS,
             deps: sinks,
             status: NodeStatus::Pending,
             attempts: 0,
@@ -3108,6 +3114,14 @@ fn build_node_args(state: &AppState, graph: &TaskGraph, index: usize) -> Value {
         "projectSlug": graph.project_slug,
         "system": node_system_prompt(node),
         "reasoningEffort": graph.reasoning_effort,
+        // A judge node is a critic by plan role but the engine's judge by
+        // kind. Offering `judge` first means routing the judge to its own
+        // model works whether or not the run produced contact sheets — with
+        // frames the critic takes a different spawn path entirely.
+        "_modelRoleHint": match node.kind {
+            NodeKind::Judge => Some("judge"),
+            NodeKind::Build => None,
+        },
     })
 }
 
@@ -3195,7 +3209,8 @@ async fn monitor_node(
         json!({ "role": "system", "content": system }),
         json!({ "role": "user", "content": user_content }),
     ];
-    let config = { state.config.read().await.clone() };
+    let mut config = { state.config.read().await.clone() };
+    crate::config::apply_role_model(&mut config, &["monitor".to_string()]);
     let fail = |note: &str| MonitorVerdict {
         pass: false,
         notes: vec![note.to_string()],
@@ -3255,6 +3270,10 @@ async fn spawn_critic_with_frames(
         final_response_drain: true,
         reasoning_effort: graph.reasoning_effort.clone(),
         system: Some(system),
+        // `judge` and `monitor` are the engine's own reserved role keys: they
+        // are not plan-authored node roles, so a user routing the judge to a
+        // stronger model can do it without also moving every critic node.
+        model_roles: vec!["judge".into()],
         loop_id: None,
         project_slug: graph.project_slug.clone(),
         workspace_root: graph.workspace_root.clone(),
@@ -3456,6 +3475,9 @@ async fn judge_node(
             "maxTurns": JUDGE_MAX_TURNS,
             "projectSlug": graph.project_slug,
             "system": system,
+            // Same judge, frames or not: a run that captured nothing must not
+            // silently drop back to the builders' model.
+            "_modelRoleHint": "judge",
         });
         spawn_bound_attempt(state, graph, &args, session_id).await
     } else {
@@ -5315,6 +5337,25 @@ mod tests {
         assert_eq!(build_node_args(&state, &graph, 0)["maxTurns"], 8);
     }
 
+    #[tokio::test]
+    async fn node_turn_budgets_are_only_clamped_by_the_runaway_backstop() {
+        let state = test_state_for_prompts();
+        // The old ceiling silently truncated any node budget above 30, so a
+        // long node was cut off mid-work rather than when it was finished.
+        let mut node = build_prompt_node("coder", "Arena blockout");
+        node.max_turns = 250;
+        let graph = graph_with(vec![node]);
+        assert_eq!(build_node_args(&state, &graph, 0)["maxTurns"], 250);
+
+        let mut runaway = build_prompt_node("coder", "Arena blockout");
+        runaway.max_turns = crate::agent::MAX_TURNS_CEILING * 4;
+        let graph = graph_with(vec![runaway]);
+        assert_eq!(
+            build_node_args(&state, &graph, 0)["maxTurns"],
+            crate::agent::MAX_TURNS_CEILING
+        );
+    }
+
     #[test]
     fn plan_persists_the_integration_minimum_budget() {
         let dir = tempfile::tempdir().unwrap();
@@ -6669,6 +6710,7 @@ mod tests {
                 api_key_env: "CALI_MOCK_KEY".into(),
                 temperature: 0.0,
                 max_tokens: Some(128),
+                roles: Default::default(),
             },
             ..Default::default()
         };

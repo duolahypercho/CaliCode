@@ -1050,9 +1050,15 @@ fn render_markdown_iteration(out: &mut String, iteration: &IterationReport) {
             } else {
                 &evidence.caption
             };
+            let embed = if is_inline_image(&evidence.path) {
+                "!"
+            } else {
+                ""
+            };
             writeln!(
                 out,
-                "- [{}]({}) — {}",
+                "- {}[{}]({}) — {}",
+                embed,
                 md_inline(caption),
                 md_link_destination(&evidence.path),
                 evidence.kind.label()
@@ -1214,14 +1220,28 @@ fn render_html_iteration(out: &mut String, iteration: &IterationReport) {
             } else {
                 &evidence.caption
             };
-            write!(
-                out,
-                "<li><a href=\"{}\">{}</a><span>{}</span></li>",
-                html_attr(&relative_url(&evidence.path)),
-                html_text(caption),
-                evidence.kind.label()
-            )
-            .unwrap();
+            let href = html_attr(&evidence_url(&evidence.path));
+            let caption_text = html_text(caption);
+            let kind_label = evidence.kind.label();
+            if is_inline_image(&evidence.path) {
+                write!(
+                    out,
+                    "<li class=\"media\"><figure><a href=\"{href}\"><img src=\"{href}\" alt=\"{caption_text}\" loading=\"lazy\"></a><figcaption>{caption_text}<span>{kind_label}</span></figcaption></figure></li>"
+                )
+                .unwrap();
+            } else if is_inline_video(&evidence.path) {
+                write!(
+                    out,
+                    "<li class=\"media\"><figure><video src=\"{href}\" controls preload=\"metadata\"></video><figcaption>{caption_text}<span>{kind_label}</span></figcaption></figure></li>"
+                )
+                .unwrap();
+            } else {
+                write!(
+                    out,
+                    "<li><a href=\"{href}\">{caption_text}</a><span>{kind_label}</span></li>"
+                )
+                .unwrap();
+            }
         }
         out.push_str("</ul>");
     }
@@ -1950,7 +1970,48 @@ fn md_table(value: &str) -> String {
 }
 
 fn md_link_destination(value: &str) -> String {
-    relative_url(value)
+    evidence_url(value)
+}
+
+/// `report.html` and `report.md` are written to
+/// `<project>/reports/loops/<loop-id>/`, but evidence paths are recorded
+/// project-relative. Without this hop up, every link resolves inside the loop
+/// directory and 404s.
+const EVIDENCE_URL_PREFIX: &str = "../../../";
+
+/// Percent-encoded link to project-relative evidence, usable from a report
+/// document. Absolute paths and URLs are already self-locating and pass through.
+fn evidence_url(value: &str) -> String {
+    // Percent-encoding an absolute URL would destroy its scheme separator;
+    // escaping for the surrounding attribute happens at the call site.
+    if value.contains("://") {
+        return value.to_string();
+    }
+    let encoded = relative_url(value);
+    if value.starts_with('/') {
+        encoded
+    } else {
+        format!("{EVIDENCE_URL_PREFIX}{encoded}")
+    }
+}
+
+fn has_extension(value: &str, extensions: &[&str]) -> bool {
+    let tail = value
+        .rsplit('/')
+        .next()
+        .unwrap_or(value)
+        .to_ascii_lowercase();
+    extensions.iter().any(|ext| tail.ends_with(ext))
+}
+
+/// Only inline media the browser can actually decode; anything else stays a
+/// plain link rather than rendering as a broken image.
+fn is_inline_image(value: &str) -> bool {
+    has_extension(value, &[".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"])
+}
+
+fn is_inline_video(value: &str) -> bool {
+    has_extension(value, &[".mp4", ".webm", ".mov"])
 }
 
 fn relative_url(value: &str) -> String {
@@ -2030,6 +2091,12 @@ code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .
 .detail, .command { display: block; margin-top: 5px; }
 .files, .evidence, .punch-list { list-style: none; margin: 0; padding: 0; }
 .files li, .evidence li { display: flex; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--line); padding: 9px 0; }
+.evidence li.media { display: block; }
+.evidence figure { margin: 0; }
+/* Cap rather than stretch: a small capture upscaled to the column width just
+   renders as blur, and contact sheets are already wide. */
+.evidence figure img, .evidence figure video { display: block; max-width: min(100%, 720px); height: auto; border: 1px solid var(--line); border-radius: 6px; background: #0d1117; }
+.evidence figcaption { display: flex; justify-content: space-between; gap: 18px; padding: 7px 0 0; }
 ins { color: var(--accent); text-decoration: none; }
 del { color: var(--danger); text-decoration: none; }
 a { color: var(--accent); text-underline-offset: 3px; }
@@ -2221,13 +2288,46 @@ mod tests {
         let markdown = std::fs::read_to_string(paths.markdown).unwrap();
         let html = std::fs::read_to_string(paths.html).unwrap();
         assert!(markdown.contains("## Iteration 1 — Needs work"));
-        assert!(markdown.contains("[Arena after the first wave](evidence/frame%20001.png)"));
+        assert!(
+            markdown.contains("![Arena after the first wave](../../../evidence/frame%20001.png)")
+        );
+        // Non-image evidence stays a plain link rather than a broken embed.
+        assert!(markdown.contains("[Full playthrough](../../../evidence/playthrough.mp4)"));
         assert!(markdown.contains("scripts/player.ts` (+41 -7)"));
         assert!(markdown.contains("Next-iteration memory"));
         assert!(html.starts_with("<!doctype html>"));
-        assert!(html.contains("evidence/frame%20001.png"));
+        assert!(html.contains("../../../evidence/frame%20001.png"));
+        assert!(html.contains("<img src=\"../../../evidence/frame%20001.png\""));
+        assert!(html.contains("<video src=\"../../../evidence/playthrough.mp4\""));
         assert!(html.contains("Combat readability"));
         assert!(html.contains("Tune the dodge cue, then replay."));
+    }
+
+    #[test]
+    fn evidence_urls_climb_out_of_the_loop_report_directory() {
+        // report.html lives at <project>/reports/loops/<loop-id>/, so a
+        // project-relative capture must hop up three levels to resolve.
+        assert_eq!(
+            evidence_url("reports/video/sheet.png"),
+            "../../../reports/video/sheet.png"
+        );
+        // Already-self-locating destinations are left alone.
+        assert_eq!(evidence_url("/tmp/frame.png"), "/tmp/frame.png");
+        assert_eq!(
+            evidence_url("https://example.com/a.png"),
+            "https://example.com/a.png"
+        );
+    }
+
+    #[test]
+    fn inline_media_detection_is_extension_and_case_insensitive() {
+        assert!(is_inline_image("reports/video/Sheet.PNG"));
+        assert!(is_inline_image("a/b/frame.jpeg"));
+        assert!(!is_inline_image("reports/trace.json"));
+        // A directory that looks like an image must not fool the check.
+        assert!(!is_inline_image("weird.png/trace.json"));
+        assert!(is_inline_video("clips/run.mp4"));
+        assert!(!is_inline_video("clips/run.png"));
     }
 
     #[test]

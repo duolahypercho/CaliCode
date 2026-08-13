@@ -1,3 +1,5 @@
+import { parseGoalCommand, type GoalCommand } from "./goal";
+
 // Slash-command registry for the agent panel — the harness surface that codex,
 // opencode, and t3-code all expose. Commands are data; execution is delegated to
 // a `SlashContext` the panel supplies so this module stays free of React state.
@@ -31,6 +33,8 @@ export interface SlashContext {
   runGraphGoal: (goal: string, template?: string) => Promise<void>;
   /** Cancel the active task graph, if any. */
   stopGraph: () => void | Promise<void>;
+  /** Set, show or clear the session goal (see lib/goal). */
+  runGoalCommand: (command: GoalCommand) => void | Promise<void>;
 }
 
 /** Roles core's subagent_spawn understands. */
@@ -43,8 +47,16 @@ export interface SlashCommand {
   run: (args: string, ctx: SlashContext) => void | Promise<void>;
 }
 
-/** Max iterations `/loop` will run before stopping on its own. */
-export const MAX_LOOP_ITERATIONS = 25;
+/**
+ * Iterations `/loop` will run before it stops asking for tools and hands back
+ * a summary. This is a runaway backstop, not a product limit: the loop's real
+ * exit is its completion gate, and the real runaway guard is `detectStall`
+ * in lib/loopGuards — a counter only catches a stuck loop by accident, since
+ * twenty iterations of genuine progress and twenty repeats of one failing
+ * action look identical to it. Comparable harnesses bear this out: Codex and
+ * opencode ship no cap at all, and Hermes — the one that does — sits at 90.
+ */
+export const MAX_LOOP_ITERATIONS = 100;
 
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   {
@@ -119,6 +131,12 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
       }
       return ctx.runGraphGoal(match[2].trim(), match[1]);
     },
+  },
+  {
+    name: "goal",
+    summary: "Keep working toward a goal, re-checked after every turn",
+    usage: "[<objective> | clear]",
+    run: (args, ctx) => ctx.runGoalCommand(parseGoalCommand(args)),
   },
   {
     name: "graph-stop",

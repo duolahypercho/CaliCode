@@ -39,6 +39,35 @@ model:
 Provider presets: `openai`, `codex-router`, `openrouter`, `local`. Switch from
 the agent panel or with `/model provider:model`.
 
+### Per-role models
+
+`model.roles` routes a fanned-out agent to its own model, so builders can run
+on a fast cheap model while the judge that grades them runs on a strong one:
+
+```yaml
+model:
+  default: gpt-5.6-luna
+  provider: codex-router
+  roles:
+    coder: minimax-token-plan-minimax-m3
+    artist: minimax-token-plan-minimax-m3
+    judge: codex-router/gpt-5.6-luna
+    monitor: gpt-4.1-mini
+```
+
+A key is matched case-insensitively against the role the spawn names —
+whatever `subagent_spawn` or a graph node carries (`coder`, `artist`,
+`tester`, `critic`, …), plus two the engine reserves for its own critics:
+`judge` (the blind judge that sees dependency contact sheets) and `monitor`
+(the per-node acceptance check). A value is a bare model id, or
+`provider/model` when the provider preset differs — the prefix counts as a
+provider only if it names a configured preset, so `anthropic/claude-sonnet-4-5`
+stays one model id on `openrouter`.
+
+Unmapped roles, and every top-level chat, run the model picker's selection.
+Routing is config-only: a model naming its own model in `subagent_spawn`
+arguments is ignored, so a subagent cannot leave the provider you chose.
+
 `codex-router` points at the local Codex Router gateway
 (`http://127.0.0.1:4100/v1`) and reuses the router's managed provider
 credentials, so DeepSeek and other router-enabled models work without a second
