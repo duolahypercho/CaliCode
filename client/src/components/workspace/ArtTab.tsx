@@ -7,7 +7,6 @@ import { ConfirmDialog } from "./ConfirmDialog";
 
 interface ArtTabProps {
   slug: string;
-  theme: "dark" | "light";
   assets: Asset[];
   entities: Entity[];
   onGenerate: (assets: Asset[]) => void;
@@ -34,7 +33,6 @@ const BATCH = 4;
  */
 export function ArtTab({
   slug,
-  theme,
   assets,
   entities,
   onGenerate,
@@ -177,7 +175,7 @@ export function ArtTab({
       </div>
 
       {previewAsset ? (
-        <AssetPreview asset={previewAsset} slug={slug} theme={theme} onClose={() => setPreviewId(null)} />
+        <AssetPreview asset={previewAsset} slug={slug} onClose={() => setPreviewId(null)} />
       ) : null}
 
       {visible.length === 0 ? (

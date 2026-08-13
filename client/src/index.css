@@ -39,6 +39,22 @@
   --raised: #ffffff; /* elevated cards: the composer, floating panels */
   /* keyboard focus ring — 5.2:1 on --surface-0, clears WCAG 1.4.11 */
   --focus-ring: #6b6b6b;
+  /*
+   * PIE viewport stage — deliberately NOT redefined under .dark.
+   *
+   * This is the game surface, not app chrome, so it holds its own art
+   * direction in both themes. It is also the agent's evidence channel:
+   * editor_capture_frame photographs this scene, and a human's theme
+   * preference must not change what the agent sees. Painting the stage from
+   * --surface-0 made the light theme render a white scene under white fog —
+   * captures came back as blank white rectangles (every pixel above the
+   * "non-dark" threshold, zero coloured pixels). The values below match the
+   * dark ramp's --surface-0 / --ink-faint / --line-strong, so the dark theme
+   * looks exactly as it did.
+   */
+  --viewport-backdrop: #0a0a0a;
+  --viewport-grid-axis: #6a6a6a;
+  --viewport-grid-line: #2e2e2e;
   /* legacy names still referenced in components */
   --color-text-subtle: var(--ink-subtle);
   --color-text-default: var(--ink);

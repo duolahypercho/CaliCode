@@ -17,6 +17,7 @@ import type { CaliSpec } from "../../lib/assetPipeline";
 import { caliObjectFromSpec } from "../../lib/procedural";
 import { disposeTree } from "../../lib/pie";
 import { rpc } from "../../lib/rpc";
+import { themeToken } from "../../lib/theme";
 import type { Asset, Entity, Vec3 } from "../../lib/types";
 
 /**
@@ -51,15 +52,6 @@ export interface AssetBuilderProps {
   onSave?(assetId: string): Promise<void>;
   onClose(): void;
   registerViewportApi?(api: BuilderViewportApi | null): void;
-}
-
-/**
- * Reads a design token off the document root so the WebGL scene follows the
- * same light/dark palette as the DOM chrome around it. Same trick as
- * AssetPreview; the fallback covers jsdom, where the stylesheet is absent.
- */
-function themeToken(name: string, fallback: string): string {
-  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
 }
 
 const ASSET_GROUP = "__builder_asset__";
@@ -205,6 +197,9 @@ export function AssetBuilder({
     rendererRef.current = renderer;
 
     const scene = new THREE.Scene();
+    // An authoring panel, so this one does follow the app's light/dark ramp —
+    // unlike the PIE viewport, which pins a dark stage because it is the
+    // game surface and the agent's capture target.
     scene.background = new THREE.Color(themeToken("--surface-0", "#0a0a0a"));
     sceneRef.current = scene;
 

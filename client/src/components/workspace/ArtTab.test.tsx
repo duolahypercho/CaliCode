@@ -34,7 +34,6 @@ function renderArtTab(entities: Entity[], onRemove = vi.fn()) {
   render(
     <ArtTab
       slug="starter"
-      theme="dark"
       assets={[asset]}
       entities={entities}
       onGenerate={() => {}}
@@ -89,7 +88,6 @@ describe("ArtTab asset removal", () => {
       return (
         <ArtTab
           slug="starter"
-          theme="dark"
           assets={assets}
           entities={[]}
           onGenerate={() => {}}

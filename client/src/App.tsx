@@ -1713,7 +1713,6 @@ export default function App() {
               <div role="tabpanel" id="workspace-panel-art" aria-labelledby="workspace-tab-art" className="absolute inset-0">
                 <ArtTab
                   slug={project.slug}
-                  theme={theme}
                   assets={project.assets}
                   entities={project.entities}
                   onGenerate={(created) =>

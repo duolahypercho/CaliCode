@@ -13,12 +13,12 @@ import {
 import { disposeTree } from "../../lib/pie";
 import { assetObject, gltfAssetUrl } from "../../lib/procedural";
 import { rpc } from "../../lib/rpc";
+import { themeToken } from "../../lib/theme";
 import type { Asset, Vec3 } from "../../lib/types";
 
 interface AssetPreviewProps {
   asset: Asset;
   slug: string;
-  theme: "dark" | "light";
   onClose?: () => void;
 }
 
@@ -38,7 +38,7 @@ const TOGGLE_ON = "bg-surface-3 text-ink-strong";
  * assetObject so clips remain available to the mixer and Blender exports can
  * be cache-busted in place without rebuilding the rest of the editor.
  */
-export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps) {
+export function AssetPreview({ asset, slug, onClose }: AssetPreviewProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
@@ -53,6 +53,7 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
   const playingRef = useRef(false);
   const wireframeRef = useRef(false);
   const skeletonVisibleRef = useRef(false);
+  const showGridRef = useRef(true);
   const positionRef = useRef<Vec3>(ORIGIN);
 
   const [position, setPosition] = useState<Vec3>(ORIGIN);
@@ -75,6 +76,7 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
   playingRef.current = playing;
   wireframeRef.current = wireframe;
   skeletonVisibleRef.current = showSkeleton;
+  showGridRef.current = showGrid;
 
   useEffect(() => {
     if (!isBlenderAsset(asset)) {
@@ -128,9 +130,11 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
     renderer.setSize(Math.max(container.clientWidth, 1), Math.max(container.clientHeight, 1), false);
     container.appendChild(renderer.domElement);
 
-    const styles = getComputedStyle(document.documentElement);
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(styles.getPropertyValue("--surface-0").trim() || "#0a0a0a");
+    // A preview panel, so it follows the app's light/dark ramp — unlike the
+    // PIE viewport, which pins a dark stage because it is the game surface
+    // and the agent's capture target.
+    scene.background = new THREE.Color(themeToken("--surface-0", "#0a0a0a"));
     const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight || 1, 0.1, 100);
     camera.position.set(...CAMERA_START);
     cameraRef.current = camera;
@@ -148,14 +152,47 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
     fill.position.set(-5, 2, -3);
     scene.add(hemi, key, fill);
 
-    const grid = new THREE.GridHelper(
-      GRID_SIZE,
-      GRID_CELLS,
-      styles.getPropertyValue("--line-strong").trim() || "#2e2e2e",
-      styles.getPropertyValue("--line").trim() || "#1e1e1e",
-    );
+    const makeGrid = () => {
+      const helper = new THREE.GridHelper(
+        GRID_SIZE,
+        GRID_CELLS,
+        themeToken("--line-strong", "#2e2e2e"),
+        themeToken("--line", "#1e1e1e"),
+      );
+      // Rebuilt grids inherit the live toggle rather than snapping back on.
+      helper.visible = showGridRef.current;
+      return helper;
+    };
+    const disposeGrid = (helper: THREE.GridHelper) => {
+      helper.geometry.dispose();
+      const materials = Array.isArray(helper.material) ? helper.material : [helper.material];
+      materials.forEach((material) => material.dispose());
+    };
+    let grid = makeGrid();
     gridRef.current = grid;
     scene.add(grid);
+
+    // Toggling the theme rewrites the tokens on <html>. Repaint in place: a
+    // remount would drop the WebGL context, refetch the glTF and reset the
+    // animation to frame 0 mid-playback. GridHelper bakes its colours into
+    // vertex data, so that one has to be rebuilt.
+    //
+    // Watching <html> rather than taking the theme as a prop is what makes
+    // this correct. The prop arrived from App state, and App writes the class
+    // in its own effect — a parent effect, which React runs *after* this
+    // child's. Rebuilding on the prop therefore read the tokens one commit
+    // early and painted the outgoing theme's colours every time.
+    const repaintForTheme = () => {
+      (scene.background as THREE.Color).set(themeToken("--surface-0", "#0a0a0a"));
+      scene.remove(grid);
+      disposeGrid(grid);
+      grid = makeGrid();
+      gridRef.current = grid;
+      scene.add(grid);
+    };
+    const themeObserver = new MutationObserver(repaintForTheme);
+    themeObserver.observe(document.documentElement, { attributeFilter: ["class"] });
+
     const root = new THREE.Group();
     rootRef.current = root;
     scene.add(root);
@@ -240,6 +277,7 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
     return () => {
       cancelAnimationFrame(animationFrame);
       observer.disconnect();
+      themeObserver.disconnect();
       canvas.removeEventListener("pointerdown", onPointerDown);
       canvas.removeEventListener("pointermove", onPointerMove);
       canvas.removeEventListener("pointerup", endDrag);
@@ -249,9 +287,7 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
       mixerRef.current = null;
       clipsRef.current = [];
       disposeTree(root);
-      grid.geometry.dispose();
-      const gridMaterials = Array.isArray(grid.material) ? grid.material : [grid.material];
-      gridMaterials.forEach((material) => material.dispose());
+      disposeGrid(grid);
       rootRef.current = null;
       objectRef.current = null;
       skeletonRef.current = null;
@@ -262,7 +298,9 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
       renderer.dispose();
       canvas.remove();
     };
-  }, [theme]);
+    // Mount-once: the theme observer above repaints in place, so nothing here
+    // needs a theme-keyed teardown.
+  }, []);
 
   useEffect(() => {
     const root = rootRef.current;
@@ -345,7 +383,9 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
       setClipNames([]);
       setHasSkeleton(false);
     };
-  }, [asset, liveReady, liveVersion, slug, theme]);
+    // No theme dependency: the scene survives a theme swap now, so the model
+    // is not refetched and the animation is not reset when it changes.
+  }, [asset, liveReady, liveVersion, slug]);
 
   const activateClip = useCallback((object: THREE.Object3D, clips: THREE.AnimationClip[], index: number) => {
     mixerRef.current?.stopAllAction();
