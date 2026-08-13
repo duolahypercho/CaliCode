@@ -77,6 +77,9 @@ export function FolderPicker({ value, onChange, disabled = false }: FolderPicker
   if (!browsing) {
     return (
       <div className="space-y-2">
+        {/* No ring utility here: the shared `:where(button):focus-visible` outline in
+            index.css already draws this button's focus indicator, and a Tailwind ring
+            on top of it would paint a second one. */}
         <button
           type="button"
           disabled={disabled || loading}
@@ -87,7 +90,7 @@ export function FolderPicker({ value, onChange, disabled = false }: FolderPicker
               void load();
             }
           }}
-          className="flex w-full flex-col items-center gap-2 rounded-lg border border-dashed border-border bg-card px-4 py-8 text-sm text-[var(--color-text-subtle)] transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          className="flex w-full flex-col items-center gap-2 rounded-lg border border-dashed border-border bg-card px-4 py-8 text-sm text-[var(--color-text-subtle)] transition-colors hover:bg-accent/50"
         >
           {loading ? (
             <Loader2 aria-hidden="true" className="h-5 w-5 animate-spin" />
@@ -134,11 +137,14 @@ export function FolderPicker({ value, onChange, disabled = false }: FolderPicker
         ) : (
           listing?.dirs.map((dir) => (
             <div key={dir.path} className="group flex items-center gap-1 rounded-md hover:bg-accent/50">
+              {/* `focus-ring-inset` rather than a Tailwind ring: the shared outline is the
+                  app's single indicator, and this row sits inside the max-h-56 scroller,
+                  which clips an outset one. */}
               <button
                 type="button"
                 disabled={disabled || loading}
                 onClick={() => void load(dir.path)}
-                className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-[var(--color-text-strong)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                className="focus-ring-inset flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-[var(--color-text-strong)]"
               >
                 <Folder aria-hidden="true" className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                 <span className="truncate">{dir.name}</span>

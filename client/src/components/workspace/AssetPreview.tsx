@@ -30,7 +30,7 @@ const GRID_CELLS = 12;
 const FIT_SPAN = 1.6;
 const TIMELINE_FPS = 30;
 const BUTTON_BASE =
-  "inline-flex min-h-[26px] items-center justify-center rounded border border-line-strong bg-surface-1/90 px-2 py-1 text-[10px] tracking-[0.08em] text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong active:bg-surface-3 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40";
+  "inline-flex min-h-[26px] items-center justify-center rounded border border-line-strong bg-surface-1/90 px-2 py-1 text-[10px] tracking-[0.08em] text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong active:bg-surface-3 disabled:cursor-not-allowed disabled:opacity-40";
 const TOGGLE_ON = "bg-surface-3 text-ink-strong";
 
 /**
@@ -538,7 +538,7 @@ export function AssetPreview({ asset, slug, theme, onClose }: AssetPreviewProps)
               aria-label="Animation clip"
               value={clipIndex}
               onChange={(event) => setClipIndex(Number(event.target.value))}
-              className="max-w-[180px] rounded border border-line-strong bg-surface-1 px-2 py-1 text-[10px] text-ink focus-visible:outline-none"
+              className="max-w-[180px] rounded border border-line-strong bg-surface-1 px-2 py-1 text-[10px] text-ink"
             >
               {clipNames.map((name, index) => (
                 <option key={`${name}-${index}`} value={index}>

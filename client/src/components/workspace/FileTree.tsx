@@ -4,16 +4,26 @@ import { readTree, type FileNode } from "../../lib/workspace";
 interface FileTreeProps {
   workspaceId: string;
   activePath: string | null;
+  /** Paths with an unsaved buffer in App, marked so edits are visible before navigating away. */
+  dirtyPaths?: ReadonlySet<string>;
   onOpenFile: (path: string) => void;
   onError: (message: string) => void;
 }
+
+const NO_DIRTY_PATHS: ReadonlySet<string> = new Set<string>();
 
 /**
  * Lazy file tree over a live workspace. Directories load one level per
  * expansion — the San Francisco repo's `public/data` alone is ~410MB, so a
  * recursive walk would stall the pane.
  */
-export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileTreeProps) {
+export function FileTree({
+  workspaceId,
+  activePath,
+  dirtyPaths = NO_DIRTY_PATHS,
+  onOpenFile,
+  onError,
+}: FileTreeProps) {
   // Held in a ref, not a dependency. App passes an inline arrow, so a new
   // identity every render meant: error -> pushLog -> re-render -> effect
   // re-runs -> error. That measured 197 /rpc calls in 10.6s with the tree
@@ -84,10 +94,18 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
     [children, expanded, workspaceId],
   );
 
+  // A collapsed folder would otherwise hide the fact that something inside it
+  // is unsaved, which is exactly the state the marker exists to advertise.
+  const dirtyInside = (dir: string) => {
+    for (const path of dirtyPaths) if (path.startsWith(`${dir}/`)) return true;
+    return false;
+  };
+
   const renderNodes = (nodes: FileNode[], depth: number) =>
     nodes.map((node) => {
       const open = expanded.has(node.path);
       const active = node.path === activePath;
+      const dirty = node.kind === "dir" ? dirtyInside(node.path) : dirtyPaths.has(node.path);
       return (
         <div key={node.path}>
           <button
@@ -96,7 +114,7 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
             aria-expanded={node.kind === "dir" ? open : undefined}
             style={{ paddingLeft: `${depth * 12 + 8}px` }}
             aria-busy={pending.has(node.path) || undefined}
-            className={`flex min-h-[28px] w-full items-center gap-1.5 rounded py-[5px] pr-2 text-left text-[12px] transition-colors focus-visible:outline-none ${
+            className={`flex min-h-[28px] w-full items-center gap-1.5 rounded py-[5px] pr-2 text-left text-[12px] transition-colors ${
               active
                 ? "bg-surface-3 text-ink-strong active:bg-surface-3"
                 : "text-ink-subtle hover:bg-surface-2 hover:text-ink active:bg-surface-3"
@@ -106,6 +124,24 @@ export function FileTree({ workspaceId, activePath, onOpenFile, onError }: FileT
               {node.kind === "dir" ? (pending.has(node.path) ? "◌" : open ? "▾" : "▸") : ""}
             </span>
             <span className="min-w-0 flex-1 truncate">{node.name}</span>
+            {dirty ? (
+              node.kind === "dir" ? (
+                <span
+                  aria-label="contains unsaved changes"
+                  title="Contains unsaved changes"
+                  className="shrink-0 text-[9px] text-ink"
+                >
+                  ●
+                </span>
+              ) : (
+                <span
+                  title="Unsaved changes"
+                  className="shrink-0 text-[9px] tracking-[0.1em] text-ink"
+                >
+                  MODIFIED
+                </span>
+              )
+            ) : null}
           </button>
           {node.kind === "dir" && open ? renderNodes(children[node.path] ?? [], depth + 1) : null}
         </div>

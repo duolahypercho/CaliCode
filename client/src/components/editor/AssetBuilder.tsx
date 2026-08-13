@@ -53,14 +53,23 @@ export interface AssetBuilderProps {
   registerViewportApi?(api: BuilderViewportApi | null): void;
 }
 
+/**
+ * Reads a design token off the document root so the WebGL scene follows the
+ * same light/dark palette as the DOM chrome around it. Same trick as
+ * AssetPreview; the fallback covers jsdom, where the stylesheet is absent.
+ */
+function themeToken(name: string, fallback: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+}
+
 const ASSET_GROUP = "__builder_asset__";
 const HISTORY_CAP = 100;
 type GizmoMode = "translate" | "rotate" | "scale";
 
 const BUTTON_BASE =
-  "inline-flex min-h-[26px] items-center justify-center rounded border px-2 py-1 text-[10px] tracking-[0.1em] transition-colors hover:text-[#dcdcdc] active:border-white/50 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40";
-const TOGGLE_ON = "border-white/40 text-[#e6e6e6]";
-const TOGGLE_OFF = "border-white/10 text-[#9c9c9c]";
+  "inline-flex min-h-[26px] items-center justify-center rounded border px-2 py-1 text-[10px] tracking-[0.1em] transition-colors hover:text-ink-strong active:border-ink-subtle disabled:cursor-not-allowed disabled:opacity-40";
+const TOGGLE_ON = "border-line-strong bg-surface-3 text-ink-strong";
+const TOGGLE_OFF = "border-line text-ink-subtle";
 const FIELD_CLASS =
   "w-full rounded-md border border-line bg-surface-1 px-2 py-1.5 text-xs text-ink-strong outline-none transition-colors";
 const LABEL_CLASS = "mb-1 block text-[10.5px] text-ink-subtle";
@@ -196,7 +205,7 @@ export function AssetBuilder({
     rendererRef.current = renderer;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x0b0b0b);
+    scene.background = new THREE.Color(themeToken("--surface-0", "#0a0a0a"));
     sceneRef.current = scene;
 
     const camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight || 1, 0.1, 100);
@@ -213,8 +222,29 @@ export function AssetBuilder({
     const fill = new THREE.DirectionalLight(0xffffff, 0.6);
     fill.position.set(-5, 2, -3);
     scene.add(hemi, key, fill);
-    const grid = new THREE.GridHelper(12, 12, 0x3a3a3a, 0x1c1c1c);
+    const makeGrid = () =>
+      new THREE.GridHelper(12, 12, themeToken("--line-strong", "#2e2e2e"), themeToken("--line", "#1e1e1e"));
+    const disposeGrid = (helper: THREE.GridHelper) => {
+      helper.geometry.dispose();
+      const materials = Array.isArray(helper.material) ? helper.material : [helper.material];
+      materials.forEach((material) => material.dispose());
+    };
+    let grid = makeGrid();
     scene.add(grid);
+
+    // Toggling the theme rewrites the tokens on <html>. Repaint the scene
+    // chrome in place rather than remounting, which would drop the WebGL
+    // context and the gizmo with it. GridHelper bakes its colours into vertex
+    // data, so that one has to be rebuilt.
+    const repaintForTheme = () => {
+      (scene.background as THREE.Color).set(themeToken("--surface-0", "#0a0a0a"));
+      scene.remove(grid);
+      disposeGrid(grid);
+      grid = makeGrid();
+      scene.add(grid);
+    };
+    const themeObserver = new MutationObserver(repaintForTheme);
+    themeObserver.observe(document.documentElement, { attributeFilter: ["class"] });
 
     // Gizmo lives OUTSIDE the asset group so spec rebuilds never dispose it.
     const gizmo = new TransformControls(camera, renderer.domElement);
@@ -312,6 +342,7 @@ export function AssetBuilder({
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
+      themeObserver.disconnect();
       window.removeEventListener("keydown", onKeyDown);
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
       registerViewportApi?.(null);
@@ -321,8 +352,7 @@ export function AssetBuilder({
       orbit.dispose();
       const assetGroup = scene.getObjectByName(ASSET_GROUP);
       if (assetGroup) disposeTree(assetGroup);
-      grid.geometry.dispose();
-      grid.material.dispose();
+      disposeGrid(grid);
       sceneRef.current = null;
       rendererRef.current = null;
       renderer.forceContextLoss();
@@ -459,10 +489,10 @@ export function AssetBuilder({
   return (
     <div className="flex h-full min-h-0 w-full" aria-label={`Asset builder for ${asset.name}`}>
       {/* viewport */}
-      <div className="relative min-w-0 flex-1 overflow-hidden bg-[#0b0b0b]">
+      <div className="relative min-w-0 flex-1 overflow-hidden bg-surface-0">
         <div ref={containerRef} className="h-full w-full" />
         {unavailable ? (
-          <p className="absolute inset-0 flex items-center justify-center text-[11px] tracking-[0.1em] text-[#8f8f8f]">
+          <p className="absolute inset-0 flex items-center justify-center text-[11px] tracking-[0.1em] text-ink-subtle">
             WEBGL UNAVAILABLE
           </p>
         ) : null}
@@ -480,17 +510,17 @@ export function AssetBuilder({
               onClick={() => setMode(value)}
               aria-pressed={mode === value}
               disabled={unavailable}
-              className={`pointer-events-auto bg-[#0e0e0e]/90 ${BUTTON_BASE} ${mode === value ? TOGGLE_ON : TOGGLE_OFF}`}
+              className={`pointer-events-auto ${BUTTON_BASE} ${mode === value ? TOGGLE_ON : `bg-surface-0/90 ${TOGGLE_OFF}`}`}
             >
               {label}
             </button>
           ))}
         </div>
-        <p className="pointer-events-none absolute bottom-2.5 left-2.5 rounded border border-white/[0.07] bg-[#0e0e0e]/90 px-2 py-1 text-[10px] tracking-[0.08em] text-[#8f8f8f]">
+        <p className="pointer-events-none absolute bottom-2.5 left-2.5 rounded border border-line bg-surface-0/90 px-2 py-1 text-[10px] tracking-[0.08em] text-ink-subtle">
           {spec.targetName} · {components.length} COMPONENTS · {uses > 0 ? `IN USE ${uses}` : "READY"}
         </p>
         {status ? (
-          <p className="pointer-events-none absolute bottom-2.5 right-2.5 max-w-[60%] truncate rounded border border-white/[0.07] bg-[#0e0e0e]/90 px-2 py-1 text-[10px] text-ink-subtle">
+          <p className="pointer-events-none absolute bottom-2.5 right-2.5 max-w-[60%] truncate rounded border border-line bg-surface-0/90 px-2 py-1 text-[10px] text-ink-subtle">
             {status}
           </p>
         ) : null}
@@ -541,6 +571,15 @@ export function AssetBuilder({
 
         <div className="mb-1 text-[10.5px] text-ink-subtle">Components</div>
         <ul className="mb-3 max-h-[180px] overflow-y-auto rounded-md border border-line" role="listbox" aria-label="Component tree">
+          {components.length === 0 ? (
+            /* Without this the empty list is a 2px-tall bordered sliver under
+               the "Components" heading — every other list in the app says what
+               belongs in it. Presentational because a listbox only permits
+               option/group children, and this is a message, not a choice. */
+            <li role="presentation" className="px-2 py-3 text-[11px] text-ink-subtle">
+              No components yet — add a primitive above.
+            </li>
+          ) : null}
           {flattenTree(components).map(({ component, depth }) => (
             <li key={component.id} className="flex items-center border-b border-line/50 last:border-b-0">
               <button
@@ -550,7 +589,7 @@ export function AssetBuilder({
                 onClick={(event) => select(component.id, event.shiftKey)}
                 style={{ paddingLeft: `${8 + depth * 12}px` }}
                 className={`min-w-0 flex-1 truncate py-1.5 pr-1 text-left text-[11px] transition-colors ${
-                  selectedIds.includes(component.id) ? "bg-white/[0.06] text-ink-strong" : "text-ink-subtle hover:text-ink"
+                  selectedIds.includes(component.id) ? "bg-surface-2 text-ink-strong" : "text-ink-subtle hover:text-ink"
                 }`}
               >
                 {component.name ?? component.id}
@@ -562,7 +601,11 @@ export function AssetBuilder({
                 type="button"
                 aria-label={`Remove ${component.name ?? component.id}`}
                 onClick={() => removeSelected(component.id)}
-                className="px-2 py-1.5 text-[10px] text-ink-faint transition-colors hover:text-ink"
+                /* Was a 10px glyph sitting 6px from the select button, so a
+                   near-miss on select deleted the row instead. App-standard
+                   hit target, and a border to make the two targets read as
+                   separate. */
+                className="flex min-h-[28px] shrink-0 items-center border-l border-line px-2 text-[10px] text-ink-faint transition-colors hover:text-danger-soft active:border-danger-soft"
               >
                 ✕
               </button>

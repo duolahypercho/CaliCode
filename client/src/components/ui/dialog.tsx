@@ -22,7 +22,7 @@ export const DialogContent = React.forwardRef<
       {...props}
     >
       {children}
-      <DialogPrimitive.Close className="absolute right-3 top-3 inline-flex min-h-[28px] min-w-[28px] items-center justify-center rounded-md p-1 transition-colors hover:bg-accent active:bg-accent/70 focus-visible:outline-none disabled:cursor-not-allowed">
+      <DialogPrimitive.Close className="absolute right-3 top-3 inline-flex min-h-[28px] min-w-[28px] items-center justify-center rounded-md p-1 transition-colors hover:bg-accent active:bg-accent/70 focus-ring disabled:cursor-not-allowed">
         <X className="h-4 w-4" />
         <span className="sr-only">Close</span>
       </DialogPrimitive.Close>
@@ -31,11 +31,32 @@ export const DialogContent = React.forwardRef<
 ));
 DialogContent.displayName = "DialogContent";
 
-export function DialogTitle({ className, ...props }: React.HTMLAttributes<HTMLHeadingElement>) {
-  return <h2 className={cn("text-lg font-medium", className)} {...props} />;
-}
+/**
+ * These two MUST stay Radix primitives, not a bare <h2>/<p>.
+ *
+ * Radix generates the ids for `aria-labelledby`/`aria-describedby` on
+ * DialogContent and hands them to Title/Description through context. A plain
+ * heading never receives them, so the content pointed at ids that were never
+ * rendered and every dialog in the app announced as an unnamed "dialog" with
+ * two dangling IDREFs. Nothing caught it: react-dialog dropped its dev-time
+ * "DialogContent requires a DialogTitle" check in 1.1.x (WarningProvider is
+ * now a pass-through), so the dialogs failed silently. Wrapping the primitives
+ * keeps the same markup — Title still renders an h2, Description still renders
+ * a p — and wires the names up. dialog.test.tsx holds the line.
+ */
+export const DialogTitle = React.forwardRef<
+  React.ElementRef<typeof DialogPrimitive.Title>,
+  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
+>(({ className, ...props }, ref) => (
+  <DialogPrimitive.Title ref={ref} className={cn("text-lg font-medium", className)} {...props} />
+));
+DialogTitle.displayName = "DialogTitle";
 
-export function DialogDescription({ className, ...props }: React.HTMLAttributes<HTMLParagraphElement>) {
-  return <p className={cn("text-sm text-muted-foreground", className)} {...props} />;
-}
+export const DialogDescription = React.forwardRef<
+  React.ElementRef<typeof DialogPrimitive.Description>,
+  React.ComponentPropsWithoutRef<typeof DialogPrimitive.Description>
+>(({ className, ...props }, ref) => (
+  <DialogPrimitive.Description ref={ref} className={cn("text-sm text-muted-foreground", className)} {...props} />
+));
+DialogDescription.displayName = "DialogDescription";
 

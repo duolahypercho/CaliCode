@@ -19,10 +19,11 @@ export interface Issue {
   repro: string;
 }
 
+/** Severity reads off the theme tokens so the tint tracks light and dark, and so HIGH outranks MED. */
 const SEVERITY_TINT: Record<Issue["severity"], string> = {
-  HIGH: "#c8c8c8",
-  MED: "#8f8f8f",
-  LOW: "#949494",
+  HIGH: "var(--danger-soft)",
+  MED: "var(--ink)",
+  LOW: "var(--ink-subtle)",
 };
 
 /**
@@ -55,7 +56,7 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
                 type="button"
                 onClick={onRun}
                 disabled={!canRun || running}
-                className="flex h-[52px] w-[52px] items-center justify-center rounded-full border border-line-strong text-lg text-ink transition-colors active:border-ink-subtle focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex h-[52px] w-[52px] items-center justify-center rounded-full border border-line-strong text-lg text-ink transition-colors active:border-ink-subtle disabled:cursor-not-allowed disabled:opacity-40"
                 aria-label="Run playtest"
               >
                 ▶
@@ -85,7 +86,7 @@ export function TestTab({ results, frames, running, canRun, onRun, onFixAll }: T
             type="button"
             onClick={() => onFixAll(issues)}
             disabled={issues.length === 0}
-            className="ml-auto inline-flex min-h-[28px] items-center rounded-md border border-line-strong bg-secondary px-3 py-1.5 text-[11px] font-bold tracking-[0.1em] text-ink-strong transition-colors enabled:hover:bg-secondary/80 active:bg-secondary/70 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+            className="ml-auto inline-flex min-h-[28px] items-center rounded-md border border-line-strong bg-secondary px-3 py-1.5 text-[11px] font-bold tracking-[0.1em] text-ink-strong transition-colors enabled:hover:bg-secondary/80 active:bg-secondary/70 disabled:cursor-not-allowed disabled:opacity-40"
           >
             {issues.length === 0 ? "NOTHING TO FIX" : `FIX ALL ${issues.length}`}
           </button>

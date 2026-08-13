@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { ChevronDown, ChevronRight } from "lucide-react";
 import type { LogEntry } from "../editor/ConsolePanel";
 import type { PieState } from "../../lib/pie";
 
@@ -31,6 +32,18 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
     document.addEventListener("visibilitychange", updateVisibility);
     return () => document.removeEventListener("visibilitychange", updateVisibility);
   }, []);
+
+  // This console is the only place a failed autosave is written down, and it
+  // ships collapsed. Opening it on the session's first error means a user does
+  // not have to already suspect something broke in order to find out that it
+  // did; after that it stays under their control.
+  const errorCount = logs.reduce((total, log) => total + (log.level === "error" ? 1 : 0), 0);
+  const autoOpened = useRef(false);
+  useEffect(() => {
+    if (errorCount === 0 || autoOpened.current) return;
+    autoOpened.current = true;
+    setOpen(true);
+  }, [errorCount]);
 
   // Browsers intentionally throttle requestAnimationFrame in background tabs.
   // Calling the resulting zero sample "RUNNING" looked like a game stall even
@@ -73,9 +86,26 @@ export function LiveBar({ stats, pieState, logs }: LiveBarProps) {
           type="button"
           onClick={() => setOpen((current) => !current)}
           aria-expanded={open}
-          className="ml-auto inline-flex min-h-[28px] shrink-0 items-center rounded-md border border-line px-2.5 py-[5px] text-[10px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink active:bg-surface-3 focus-visible:outline-none"
+          // Only labelled when there is a count to announce; otherwise the
+          // button's own text is the name.
+          aria-label={errorCount > 0 ? `CONSOLE, ${errorCount} error${errorCount === 1 ? "" : "s"}` : undefined}
+          className="ml-auto inline-flex min-h-[28px] shrink-0 items-center gap-1.5 rounded-md border border-line px-2.5 py-[5px] text-[10px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink active:bg-surface-3"
         >
-          CONSOLE {open ? "▾" : "▸"}
+          <span>CONSOLE</span>
+          {errorCount > 0 ? (
+            <span
+              aria-hidden
+              data-console-errors
+              className="inline-flex min-w-[15px] items-center justify-center rounded-full border border-danger-soft/40 bg-danger-soft/15 px-1 py-px text-[9px] font-bold tracking-normal tabular-nums text-danger-soft"
+            >
+              {errorCount}
+            </span>
+          ) : null}
+          {open ? (
+            <ChevronDown aria-hidden className="h-3 w-3" strokeWidth={1.7} />
+          ) : (
+            <ChevronRight aria-hidden className="h-3 w-3" strokeWidth={1.7} />
+          )}
         </button>
       </div>
       {open ? (

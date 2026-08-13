@@ -175,7 +175,7 @@ export function ReportsTab({ projectSlug, coreStatus, canOpenFiles, workspaceRoo
                   aria-label="Open report"
                   value={selectedId ?? report.loopId}
                   onChange={(event) => void chooseReport(event.target.value)}
-                  className="h-7 max-w-[180px] appearance-none rounded-md border border-line bg-surface-1 py-1 pl-2.5 pr-7 text-[11px] text-ink focus-visible:outline-none"
+                  className="h-7 max-w-[180px] appearance-none rounded-md border border-line bg-surface-1 py-1 pl-2.5 pr-7 text-[11px] text-ink"
                 >
                   {summaries.map((summary) => (
                     <option key={summary.loopId} value={summary.loopId}>
@@ -627,9 +627,9 @@ function ReportSkeleton() {
 }
 
 const SECONDARY_BUTTON =
-  "inline-flex items-center gap-1.5 rounded-md border border-line-strong bg-surface-1 px-3 py-1.5 text-[11px] font-medium text-ink-strong transition-colors hover:bg-surface-2 active:bg-surface-3 focus-visible:outline-none";
+  "inline-flex items-center gap-1.5 rounded-md border border-line-strong bg-surface-1 px-3 py-1.5 text-[11px] font-medium text-ink-strong transition-colors hover:bg-surface-2 active:bg-surface-3";
 const ICON_BUTTON =
-  "inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong active:bg-surface-3 focus-visible:outline-none";
+  "inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong active:bg-surface-3";
 
 function hasMemory(memory: NextIterationMemory): boolean {
   return memory.observations.length + memory.decisions.length + memory.risks.length + memory.nextActions.length > 0;

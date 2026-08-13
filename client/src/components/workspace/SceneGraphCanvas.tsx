@@ -165,7 +165,7 @@ export function SceneGraphCanvas({
         <button
           type="button"
           onClick={onAddEntity}
-          className="mt-1.5 rounded-md border border-line py-2 text-[11px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong active:border-ink-subtle active:bg-surface-2 focus-visible:outline-none"
+          className="mt-1.5 rounded-md border border-line py-2 text-[11px] tracking-[0.14em] text-ink-subtle transition-colors hover:text-ink-strong active:border-ink-subtle active:bg-surface-2"
         >
           ADD ENTITY
         </button>
@@ -223,7 +223,7 @@ export function SceneGraphCanvas({
                 onPointerDown={(event) => event.stopPropagation()}
                 onClick={() => entityId && onSelect(selected ? null : entityId)}
                 disabled={!entityId}
-                className="flex w-full items-center gap-2 border-b border-line px-2.5 py-2 text-left transition-colors focus-visible:outline-none enabled:hover:bg-surface-2 enabled:active:bg-surface-3 disabled:cursor-grab"
+                className="flex w-full items-center gap-2 border-b border-line px-2.5 py-2 text-left transition-colors enabled:hover:bg-surface-2 enabled:active:bg-surface-3 disabled:cursor-grab"
               >
                 <span aria-hidden className="h-[7px] w-[7px] shrink-0 border border-ink-subtle" />
                 <span className="min-w-0 flex-1 truncate text-xs font-bold text-ink-strong">{node.title}</span>

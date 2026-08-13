@@ -142,7 +142,7 @@ export function NewProjectDialog({ open, busy, error, onOpenChange, onCreate, on
                       aria-pressed={selected}
                       autoFocus={index === 0}
                       onClick={() => setSelectedTemplateId(template.id)}
-                      className={`group relative min-h-0 rounded-lg border p-3 text-left transition-colors focus-visible:outline-none md:min-h-44 md:p-4 ${
+                      className={`group relative min-h-0 rounded-lg border p-3 text-left transition-colors md:min-h-44 md:p-4 ${
                         selected
                           ? "border-ring bg-accent"
                           : "border-border bg-card hover:bg-accent/50"

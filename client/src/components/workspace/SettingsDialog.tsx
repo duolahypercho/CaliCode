@@ -132,7 +132,7 @@ export function SettingsDialog({ open, onOpenChange, modelList, onChanged, proje
               aria-selected={tab === entry.id}
               aria-controls={`settings-panel-${entry.id}`}
               onClick={() => setTab(entry.id)}
-              className={`flex-1 px-3 py-1.5 text-[11px] font-medium tracking-[0.08em] transition-colors focus-visible:outline-none ${
+              className={`flex-1 px-3 py-1.5 text-[11px] font-medium tracking-[0.08em] transition-colors ${
                 tab === entry.id ? "bg-surface-3 text-ink-strong" : "text-ink-subtle hover:text-ink"
               }`}
             >

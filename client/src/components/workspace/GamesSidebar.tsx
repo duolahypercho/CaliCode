@@ -24,6 +24,7 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { hasOverlayWindowControls } from "../../lib/desktop";
+import type { CoreConnectionState } from "../../lib/rpc";
 import type { Project } from "../../lib/types";
 import { relativeTime, type SessionSummary } from "../../lib/sessions";
 import { SessionSearchDialog } from "./SessionSearchDialog";
@@ -51,6 +52,11 @@ interface GamesSidebarProps {
   /** Opens a folder on disk as a game in this list. */
   pinnedProjectSlugs?: string[];
   onProjectAction?: (project: Project, action: ProjectMenuAction) => void;
+  /**
+   * Connection state of the core. An empty game list is usually an offline
+   * core rather than an empty disk, so the empty state says which it is.
+   */
+  coreStatus?: CoreConnectionState;
   /** Opens the assets library view. */
   onOpenAssetsLibrary: () => void;
   /** True while the assets library view is the active view. */
@@ -93,7 +99,7 @@ function HeaderIcon({
       aria-label={label}
       onClick={onClick}
       disabled={disabled}
-      className="inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink-strong focus-visible:outline-none disabled:opacity-35"
+      className="inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink-strong disabled:opacity-35"
     >
       <Icon aria-hidden size={15} strokeWidth={1.7} />
     </button>
@@ -116,7 +122,7 @@ function NavRow({
     <button
       type="button"
       onClick={onClick}
-      className={`flex min-h-8 w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors focus-visible:outline-none ${
+      className={`flex min-h-8 w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors ${
         active
           ? "bg-surface-3 text-ink-strong"
           : "text-ink hover:bg-surface-2 hover:text-ink-strong active:bg-surface-3"
@@ -146,6 +152,7 @@ export function GamesSidebar({
   onNewGame,
   pinnedProjectSlugs = [],
   onProjectAction = () => undefined,
+  coreStatus = "unknown",
   onOpenAssetsLibrary,
   assetsLibraryActive = false,
   overlay = false,
@@ -270,7 +277,26 @@ export function GamesSidebar({
           between runs — the layout around it still is. */}
       <div data-games-list className="-mx-1 min-h-0 flex-1 overflow-y-auto px-1 pb-1 pt-1 [scrollbar-width:thin]">
         {projects.length === 0 ? (
-          <p className="px-2 py-2 text-xs text-ink-subtle">No games yet.</p>
+          /* Reachable state: with the core offline there is nothing to list,
+             so this has to explain the list and offer the one way to fill it. */
+          <div data-games-empty className="px-2 py-2">
+            <p className="text-xs leading-relaxed text-ink-subtle">
+              No games yet. A game holds its chats, scene, and assets — and the folder you attach to it.
+            </p>
+            {coreStatus === "offline" ? (
+              <p className="mt-1.5 text-[11px] leading-relaxed text-ink-subtle">
+                Core is offline; your saved games will appear when it reconnects.
+              </p>
+            ) : null}
+            <button
+              type="button"
+              onClick={onNewGame}
+              className="mt-2.5 inline-flex min-h-8 w-full items-center justify-center gap-1.5 rounded-md border border-line-strong bg-surface-2 px-2 py-1.5 text-[12px] text-ink-strong transition-colors hover:bg-surface-3"
+            >
+              <Plus aria-hidden size={14} strokeWidth={1.8} className="shrink-0" />
+              Create your first game
+            </button>
+          </div>
         ) : (
           projects.map((project) => {
             const open = expanded === project.slug;
@@ -291,7 +317,7 @@ export function GamesSidebar({
                       setExpanded(open ? null : project.slug);
                       if (project.slug !== activeSlug) onOpenProject(project.slug);
                     }}
-                    className={`flex min-h-9 w-full items-center gap-1.5 rounded-md px-2 py-1.5 pr-16 text-left text-[12px] transition-colors focus-visible:outline-none ${
+                    className={`flex min-h-9 w-full items-center gap-1.5 rounded-md px-2 py-1.5 pr-16 text-left text-[12px] transition-colors ${
                       /* The game row only carries the selected gray while the
                          game itself is the view — once a chat session is
                          selected, its row is the single highlight. */
@@ -331,6 +357,18 @@ export function GamesSidebar({
                 </div>
                 {open ? (
                   <div className="mb-1.5 ml-[13px] mt-1 flex flex-col gap-0.5 border-l border-line pl-2.5">
+                    {/* Without this the disclosure opens onto a bare 1px rule
+                        beside nothing. It sits where the first chat will. */}
+                    {list.length === 0 ? (
+                      <button
+                        type="button"
+                        onClick={() => onNewSession(project.slug)}
+                        className="flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[11.5px] text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink active:bg-surface-3"
+                      >
+                        <Plus aria-hidden size={13} strokeWidth={1.8} className="shrink-0 text-ink-faint" />
+                        <span className="min-w-0 flex-1 truncate">Start a chat in {project.title}</span>
+                      </button>
+                    ) : null}
                     {list.map((session) => {
                       const active = session.id === activeSessionId;
                       const running = runningSessionIds?.has(session.id) ?? false;
@@ -340,7 +378,7 @@ export function GamesSidebar({
                           type="button"
                           onClick={() => onSelectSession(project.slug, session.id)}
                           aria-label={running ? `${session.title} (agent running)` : undefined}
-                          className={`group flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[11.5px] transition-colors focus-visible:outline-none ${
+                          className={`group flex min-h-8 w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[11.5px] transition-colors ${
                             active
                               ? "bg-surface-3 text-ink-strong"
                               : "text-ink-subtle hover:bg-surface-2 hover:text-ink active:bg-surface-3"
@@ -389,7 +427,7 @@ export function GamesSidebar({
             <button
               type="button"
               aria-label="Studio menu"
-              className="flex min-h-8 w-full items-center gap-2 rounded-md px-1 py-1 text-left transition-colors hover:bg-surface-2 focus-visible:outline-none data-[state=open]:bg-surface-2"
+              className="flex min-h-8 w-full items-center gap-2 rounded-md px-1 py-1 text-left transition-colors hover:bg-surface-2 data-[state=open]:bg-surface-2"
             >
               <span
                 aria-hidden

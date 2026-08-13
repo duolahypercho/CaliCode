@@ -32,37 +32,39 @@ export function PlayOverlay({
 
   return (
     <>
-      <div className="pointer-events-none absolute inset-0 shadow-[inset_0_0_160px_40px_rgba(0,0,0,0.85)]" />
+      {/* Vignette mixed from --surface-0 so it fades the viewport edges into the
+          page in either theme, instead of laying a black frame over light. */}
+      <div className="pointer-events-none absolute inset-0 shadow-[inset_0_0_160px_40px_color-mix(in_srgb,var(--surface-0)_85%,transparent)]" />
 
-      <div className="absolute left-3.5 top-3.5 inline-flex items-center gap-2.5 rounded-md border border-white/10 bg-black/50 px-3 py-1.5 text-[10.5px] tracking-[0.14em] text-[#c0c0c0] backdrop-blur">
+      <div className="absolute left-3.5 top-3.5 inline-flex items-center gap-2.5 rounded-md border border-line bg-surface-0/80 px-3 py-1.5 text-[10.5px] tracking-[0.14em] text-ink backdrop-blur">
         <span
-          className={`h-1.5 w-1.5 ${running ? "animate-pulse bg-[#bdbdbd]" : "bg-[#8a8a8a]"}`}
+          className={`h-1.5 w-1.5 ${running ? "animate-pulse bg-ink" : "bg-ink-subtle"}`}
           aria-hidden
         />
         {pieState.toUpperCase()}
-        <span className="text-[#8a8a8a]">·</span>
-        <span className="text-[#828282]">{hint}</span>
+        <span className="text-ink-subtle">·</span>
+        <span className="text-ink-subtle">{hint}</span>
       </div>
 
       <div className="absolute right-3 top-3 flex gap-1.5">
         <button
           type="button"
           onClick={onTogglePlay}
-          className="h-8 min-w-[44px] rounded-md border border-white/[0.12] bg-black/50 px-3 text-[10px] tracking-[0.12em] text-[#d4d4d4] backdrop-blur transition-colors active:border-white/50 focus-visible:outline-none"
+          className="h-8 min-w-[44px] rounded-md border border-line-strong bg-surface-0/80 px-3 text-[10px] tracking-[0.12em] text-ink-strong backdrop-blur transition-colors active:border-ink-faint"
         >
           {running ? "PAUSE" : "PLAY"}
         </button>
         <button
           type="button"
           onClick={onReset}
-          className="h-8 min-w-[44px] rounded-md border border-white/[0.12] bg-black/50 px-3 text-[10px] tracking-[0.12em] text-[#d4d4d4] backdrop-blur transition-colors active:border-white/50 focus-visible:outline-none"
+          className="h-8 min-w-[44px] rounded-md border border-line-strong bg-surface-0/80 px-3 text-[10px] tracking-[0.12em] text-ink-strong backdrop-blur transition-colors active:border-ink-faint"
         >
           RESET
         </button>
       </div>
 
       <div className="absolute bottom-3.5 left-3.5 flex max-w-[70%] flex-wrap items-center gap-2">
-        <span className="text-[10px] tracking-[0.12em] text-[#8a8a8a]">TWEAK LIVE</span>
+        <span className="text-[10px] tracking-[0.12em] text-ink-subtle">TWEAK LIVE</span>
         {pins.map((pin) => {
           const active = pin.id === activePin;
           return (
@@ -71,10 +73,10 @@ export function PlayOverlay({
               type="button"
               onClick={() => onTogglePin(pin.id)}
               aria-pressed={active}
-              className={`inline-flex min-h-[28px] items-center rounded border border-white/[0.14] px-2.5 py-[5px] text-[10px] font-bold tracking-[0.1em] backdrop-blur transition-colors focus-visible:outline-none ${
+              className={`inline-flex min-h-[28px] items-center rounded border border-line-strong px-2.5 py-[5px] text-[10px] font-bold tracking-[0.1em] backdrop-blur transition-colors ${
                 active
-                  ? "bg-[#c6c6c6] text-[#0a0a0a] active:bg-[#b4b4b4]"
-                  : "bg-black/50 text-[#c6c6c6] active:border-white/50"
+                  ? "bg-ink-strong text-surface-0 active:bg-ink"
+                  : "bg-surface-0/80 text-ink active:border-ink-faint"
               }`}
             >
               {pin.label}

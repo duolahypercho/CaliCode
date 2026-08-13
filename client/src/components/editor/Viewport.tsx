@@ -4,6 +4,15 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { PieRuntime, type PieState } from "../../lib/pie";
 import type { CapturedFrame, Project } from "../../lib/types";
 
+/**
+ * Reads a design token off the document root so the WebGL scene follows the
+ * same light/dark palette as the DOM chrome around it. Same trick as
+ * AssetPreview; the fallback covers jsdom, where the stylesheet is absent.
+ */
+function themeToken(name: string, fallback: string): string {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || fallback;
+}
+
 interface ViewportProps {
   project: Project;
   selectedEntityId: string | null;
@@ -57,8 +66,9 @@ export function Viewport({
     rendererRef.current = renderer;
 
     const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0x080808);
-    scene.fog = new THREE.Fog(0x080808, 18, 42);
+    const backdrop = themeToken("--surface-0", "#0a0a0a");
+    scene.background = new THREE.Color(backdrop);
+    scene.fog = new THREE.Fog(backdrop, 18, 42);
     sceneRef.current = scene;
     const camera = new THREE.PerspectiveCamera(50, container.clientWidth / container.clientHeight, 0.1, 100);
     // Closer than the old (5, 4, 6) framing so a default-sized project
@@ -85,11 +95,25 @@ export function Viewport({
     const fill = new THREE.DirectionalLight(0xc8d4ff, 0.6);
     fill.position.set(-5, 2, -3);
     scene.add(fill);
-    // Brighter grid so it actually reads against the dark background; the
-    // old (0x3a3a3a, 0x1c1c1c) palette against 0x080808 was nearly
+    // Grid tones come off the token ramp so they read against the canvas in
+    // either theme; the old fixed (0x3a3a3a, 0x1c1c1c) pair was nearly
     // invisible. The lines are still subdued so the project reads first.
-    const grid = new THREE.GridHelper(20, 20, 0x6a6a6a, 0x363636);
-    grid.position.y = -0.01;
+    const makeGrid = () => {
+      const helper = new THREE.GridHelper(
+        20,
+        20,
+        themeToken("--ink-faint", "#6a6a6a"),
+        themeToken("--line-strong", "#2e2e2e"),
+      );
+      helper.position.y = -0.01;
+      return helper;
+    };
+    const disposeGrid = (helper: THREE.GridHelper) => {
+      helper.geometry.dispose();
+      const materials = Array.isArray(helper.material) ? helper.material : [helper.material];
+      materials.forEach((material) => material.dispose());
+    };
+    let grid = makeGrid();
     scene.add(grid);
 
     // PieRuntime exclusively owns the project group. Building it here as well
@@ -111,6 +135,25 @@ export function Viewport({
     });
     runtimeRef.current = runtime;
     handlersRef.current.onRuntimeReady(runtime);
+
+    // Toggling the theme rewrites the tokens on <html>. Repaint the scene
+    // chrome in place instead of remounting: a remount would tear down the
+    // PieRuntime and the WebGL context along with it. GridHelper bakes its
+    // colours into vertex data, so that one has to be rebuilt. The repaint
+    // has to invalidate as well — the loop below only draws what changed, and
+    // nothing else marks a token swap as a change.
+    const repaintForTheme = () => {
+      const next = themeToken("--surface-0", "#0a0a0a");
+      (scene.background as THREE.Color).set(next);
+      (scene.fog as THREE.Fog).color.set(next);
+      scene.remove(grid);
+      disposeGrid(grid);
+      grid = makeGrid();
+      scene.add(grid);
+      runtime.invalidate();
+    };
+    const themeObserver = new MutationObserver(repaintForTheme);
+    themeObserver.observe(document.documentElement, { attributeFilter: ["class"] });
 
     const raycaster = new THREE.Raycaster();
     const pointer = new THREE.Vector2();
@@ -172,7 +215,9 @@ export function Viewport({
     return () => {
       cancelAnimationFrame(frame);
       observer.disconnect();
+      themeObserver.disconnect();
       renderer.domElement.removeEventListener("pointerdown", onPointerDown);
+      disposeGrid(grid);
       runtime.dispose();
       handlersRef.current.onRuntimeReady(null);
       controls.dispose();

@@ -2138,7 +2138,7 @@ export function AgentPanel({
                         setInput(starter.prompt);
                         window.requestAnimationFrame(() => inputRef.current?.focus());
                       }}
-                      className="flex min-h-10 items-center gap-2 rounded-lg border border-line bg-surface-1 px-3 py-2 text-left text-[12px] text-ink transition-colors hover:bg-surface-2 active:bg-surface-3 focus-visible:outline-none"
+                      className="flex min-h-10 items-center gap-2 rounded-lg border border-line bg-surface-1 px-3 py-2 text-left text-[12px] text-ink transition-colors hover:bg-surface-2 active:bg-surface-3"
                     >
                       <Icon aria-hidden className="h-3.5 w-3.5 shrink-0 text-ink-faint" strokeWidth={1.7} />
                       <span>{starter.label}</span>
@@ -2254,7 +2254,7 @@ export function AgentPanel({
                   event.preventDefault();
                   completeCommand(command.name);
                 }}
-                className={`flex min-h-[28px] w-full items-baseline gap-2 px-3 py-1.5 text-left text-xs transition-colors focus-visible:outline-none active:bg-surface-3 ${
+                className={`flex min-h-[28px] w-full items-baseline gap-2 px-3 py-1.5 text-left text-xs transition-colors active:bg-surface-3 ${
                   index === activeMenuIndex ? "bg-surface-2" : "hover:bg-surface-2"
                 }`}
               >
@@ -2305,7 +2305,7 @@ export function AgentPanel({
             rows={2}
             aria-label="Agent prompt"
             placeholder="What should we build or improve?  Type / for commands"
-            className="min-h-[56px] resize-none border-0 bg-transparent px-3 py-2.5 text-[13px] leading-[1.55] text-ink-strong shadow-none placeholder:text-ink-faint focus-visible:!outline-none"
+            className="min-h-[56px] resize-none border-0 bg-transparent px-3 py-2.5 text-[13px] leading-[1.55] text-ink-strong shadow-none placeholder:text-ink-faint focus-ring-inset"
           />
           <div className="flex min-h-10 items-center gap-1.5 px-1.5 pb-0.5">
             <Select value={permissionMode} onValueChange={setPermissionMode}>
@@ -2375,7 +2375,7 @@ export function AgentPanel({
                   aria-label="Active model"
                   disabled={!modelList || modelChoices.length === 0 || busy || looping}
                   title={modelList ? `${modelList.active.provider} · ${modelList.active.model}${effort ? ` · ${effort}` : ""}` : "No model"}
-                  className="ml-auto flex h-8 max-w-[320px] shrink items-center gap-1.5 rounded-full px-2 text-[10.5px] text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink focus-visible:outline-none disabled:opacity-50 data-[state=open]:bg-surface-2"
+                  className="ml-auto flex h-8 max-w-[320px] shrink items-center gap-1.5 rounded-full px-2 text-[10.5px] text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink disabled:opacity-50 data-[state=open]:bg-surface-2"
                 >
                   <Zap aria-hidden className="h-3.5 w-3.5 shrink-0 text-ink" strokeWidth={1.8} />
                   {/* In a narrow composer the model name is the first thing to
@@ -2475,7 +2475,7 @@ export function AgentPanel({
                 aria-label="Stop agent loop"
                 onClick={stopLoop}
                 disabled={cancelLoopRef.current}
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#7a2a2a] bg-[#3a1f1f] text-[#f0c0c0] transition-[background-color,transform] enabled:hover:bg-[#492525] enabled:active:scale-[0.96] focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-40"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-[#7a2a2a] bg-[#3a1f1f] text-[#f0c0c0] transition-[background-color,transform] enabled:hover:bg-[#492525] enabled:active:scale-[0.96] disabled:cursor-not-allowed disabled:opacity-40"
               >
                 <Square aria-hidden className="h-3.5 w-3.5" />
               </button>
@@ -2485,7 +2485,7 @@ export function AgentPanel({
                 aria-label="Send message"
                 onClick={() => void send()}
                 disabled={busy || !input.trim()}
-                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-[background-color,transform,opacity] enabled:hover:opacity-90 enabled:active:scale-[0.96] focus-visible:outline-none disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-faint disabled:opacity-70"
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-primary text-primary-foreground transition-[background-color,transform,opacity] enabled:hover:opacity-90 enabled:active:scale-[0.96] disabled:cursor-not-allowed disabled:bg-surface-3 disabled:text-ink-faint disabled:opacity-70"
               >
                 <ArrowUp aria-hidden className="h-4 w-4" strokeWidth={2.2} />
               </button>

@@ -81,7 +81,7 @@ function SectionNav({
             aria-selected={selected}
             aria-controls={`settings-panel-${section.id}`}
             onClick={() => onSelect(section.id)}
-            className={`flex min-h-9 w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-[12px] transition-colors focus-visible:outline-none ${
+            className={`flex min-h-9 w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-[12px] transition-colors ${
               selected
                 ? "bg-surface-3 text-ink-strong"
                 : "text-ink-subtle hover:bg-surface-2 hover:text-ink-strong active:bg-surface-3"
@@ -120,7 +120,7 @@ function PageHeader({
         type="button"
         aria-label="Close settings"
         onClick={onClose}
-        className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong focus-visible:outline-none"
+        className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong"
       >
         <X aria-hidden size={17} strokeWidth={1.7} />
       </button>
@@ -195,7 +195,7 @@ function GeneralSection({ projectSlug }: { projectSlug?: string }) {
               href="https://github.com/duolahypercho/CaliCode/releases"
               target="_blank"
               rel="noreferrer"
-              className="mt-2 inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong focus-visible:outline-none"
+              className="mt-2 inline-flex items-center gap-1.5 rounded-md px-2 py-1.5 text-xs font-medium text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong"
             >
               Releases and downloads
               <ArrowUpRight aria-hidden size={13} strokeWidth={1.7} />
@@ -523,7 +523,7 @@ function ThemeSection({
                 type="button"
                 aria-pressed={selected}
                 onClick={() => onThemeChange(option.id)}
-                className={`flex items-center gap-3 rounded-lg border px-3.5 py-3 text-left transition-colors focus-visible:outline-none ${
+                className={`flex items-center gap-3 rounded-lg border px-3.5 py-3 text-left transition-colors ${
                   selected
                     ? "border-line-strong bg-surface-3 text-ink-strong"
                     : "border-line bg-surface-1 text-ink-subtle hover:bg-surface-2 hover:text-ink-strong"
@@ -595,7 +595,7 @@ export function SettingsPage({
             autoFocus
             aria-label="Back to workspace"
             onClick={onClose}
-            className="inline-flex h-7 translate-y-px items-center gap-1.5 rounded-md px-1.5 text-[13px] font-semibold text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong focus-visible:outline-none"
+            className="inline-flex h-7 translate-y-px items-center gap-1.5 rounded-md px-1.5 text-[13px] font-semibold text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong"
           >
             <ArrowLeft aria-hidden size={15} strokeWidth={1.7} className="shrink-0" />
             <span>Workspace</span>

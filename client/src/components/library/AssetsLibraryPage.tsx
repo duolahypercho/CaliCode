@@ -138,7 +138,7 @@ export function AssetsLibraryPage({ installedRepoIds, onInstall, onUninstall, pr
               placeholder="Search assets"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              className="h-8 w-full rounded-md border border-line bg-transparent pl-8 pr-3 text-[13px] text-ink placeholder:text-ink-faint focus-visible:outline-none"
+              className="h-8 w-full rounded-md border border-line bg-transparent pl-8 pr-3 text-[13px] text-ink placeholder:text-ink-faint"
             />
           </div>
           <div className="flex flex-wrap items-center gap-1.5">
@@ -150,7 +150,7 @@ export function AssetsLibraryPage({ installedRepoIds, onInstall, onUninstall, pr
                   type="button"
                   aria-pressed={selected}
                   onClick={() => setCategory(entry)}
-                  className={`rounded-full border border-line px-2.5 py-1 text-[11px] transition-colors focus-visible:outline-none ${
+                  className={`rounded-full border border-line px-2.5 py-1 text-[11px] transition-colors ${
                     selected ? "bg-surface-3 text-ink-strong" : "text-ink-subtle hover:bg-surface-2"
                   }`}
                 >
@@ -176,7 +176,7 @@ export function AssetsLibraryPage({ installedRepoIds, onInstall, onUninstall, pr
                   aria-label={repo.name}
                   data-asset-card={repo.id}
                   onClick={() => setOpenRepoId(repo.id)}
-                  className="group overflow-hidden rounded-lg border border-line bg-surface-0 text-left transition-colors hover:bg-surface-2 focus-visible:outline-none"
+                  className="group overflow-hidden rounded-lg border border-line bg-surface-0 text-left transition-colors hover:bg-surface-2"
                 >
                   <RepoVisual repo={repo} />
                   <div className="flex flex-col gap-1.5 p-3">
@@ -233,7 +233,7 @@ export function AssetsLibraryPage({ installedRepoIds, onInstall, onUninstall, pr
                       href={openRepo.url}
                       target="_blank"
                       rel="noreferrer"
-                      className="mt-1.5 inline-flex items-center gap-1.5 rounded text-[12px] text-ink hover:text-ink-strong focus-visible:outline-none"
+                      className="mt-1.5 inline-flex items-center gap-1.5 rounded text-[12px] text-ink hover:text-ink-strong"
                     >
                       <span className="break-all">{displayUrl(openRepo.url)}</span>
                       <ExternalLink aria-hidden size={12} strokeWidth={1.8} className="shrink-0" />

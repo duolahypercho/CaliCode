@@ -35,7 +35,7 @@ export function AssetLibrarySection({ attached, onToggleRepo, onRepoSetting }: A
                   type="button"
                   aria-expanded={open}
                   onClick={() => setExpanded(open ? null : repo.id)}
-                  className={`flex min-h-8 w-full items-center gap-1.5 rounded-md px-2 py-1.5 pr-8 text-left text-[12px] transition-colors focus-visible:outline-none ${
+                  className={`flex min-h-8 w-full items-center gap-1.5 rounded-md px-2 py-1.5 pr-8 text-left text-[12px] transition-colors ${
                     attachment ? "text-ink-strong" : "text-ink-subtle"
                   } hover:bg-surface-2 hover:text-ink-strong active:bg-surface-3`}
                 >
@@ -56,7 +56,7 @@ export function AssetLibrarySection({ attached, onToggleRepo, onRepoSetting }: A
                   type="button"
                   aria-label={attachment ? `Remove ${repo.name} from game` : `Add ${repo.name} to game`}
                   onClick={() => onToggleRepo(repo.id, !attachment)}
-                  className={`absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded transition-[color,background-color,opacity] duration-150 hover:bg-surface-3 hover:text-ink-strong focus-visible:pointer-events-auto focus-visible:opacity-100 focus-visible:outline-none ${
+                  className={`absolute right-1 top-1 inline-flex h-6 w-6 items-center justify-center rounded transition-[color,background-color,opacity] duration-150 hover:bg-surface-3 hover:text-ink-strong focus-visible:pointer-events-auto focus-visible:opacity-100 ${
                     attachment
                       ? "text-ink"
                       : "pointer-events-none text-ink-subtle opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100"
@@ -106,7 +106,7 @@ export function AssetLibrarySection({ attached, onToggleRepo, onRepoSetting }: A
                     <button
                       type="button"
                       onClick={() => onToggleRepo(repo.id, true)}
-                      className="self-start rounded-md border border-line px-2 py-1 text-[10.5px] font-bold tracking-[0.08em] text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong focus-visible:outline-none"
+                      className="self-start rounded-md border border-line px-2 py-1 text-[10.5px] font-bold tracking-[0.08em] text-ink transition-colors hover:bg-surface-2 hover:text-ink-strong"
                     >
                       ADD TO GAME
                     </button>
@@ -165,7 +165,7 @@ function SettingRow({
           id={inputId}
           value={String(value)}
           onChange={(event) => onChange(event.target.value)}
-          className="w-[104px] shrink-0 rounded border border-line bg-surface-1 px-1 py-0.5 text-[11px] text-ink outline-none"
+          className="focus-ring-inset w-[104px] shrink-0 rounded border border-line bg-surface-1 px-1 py-0.5 text-[11px] text-ink"
         >
           {(setting.options ?? []).map((option) => (
             <option key={option} value={option}>
@@ -205,7 +205,7 @@ function SettingRow({
         onKeyDown={(event) => {
           if (event.key === "Enter") commit(event.currentTarget.value);
         }}
-        className="w-[104px] shrink-0 rounded border border-line bg-surface-1 px-1.5 py-0.5 text-[11px] text-ink outline-none"
+        className="focus-ring-inset w-[104px] shrink-0 rounded border border-line bg-surface-1 px-1.5 py-0.5 text-[11px] text-ink"
       />
     </label>
   );
