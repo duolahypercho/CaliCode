@@ -1429,18 +1429,25 @@ mod tests {
             .unwrap();
         let session_id = opened["sessionId"].as_str().unwrap().to_string();
 
-        // Comfortably past macOS's ~2 KB TTYHOG, as a single command line.
-        let filler = "x".repeat(6000);
+        // Past macOS's ~2 KB TTYHOG, and deliberately under Linux's 4096-byte
+        // canonical-mode line discipline buffer (`N_TTY_BUF_SIZE`), which
+        // *discards* input past that on a line with no newline — so a 6000-byte
+        // single line could never complete there and the shell never ran the
+        // command. That is a kernel limit rather than anything this code can
+        // chunk around, and it made the test fail deterministically on CI while
+        // passing locally on macOS. 3000 still exceeds the queue this exercises
+        // on both platforms.
+        let filler = "x".repeat(3000);
         let written = terminals
             .input(&session_id, &format!("echo {filler} | wc -c\r"))
             .await
             .unwrap();
-        assert_eq!(written["written"], json!(6014));
+        assert_eq!(written["written"], json!(3014));
 
         // `wc -c` counts the echoed argument plus its newline: proof the whole
         // paste reached the shell rather than a truncated prefix.
-        let seen = expect_output(&mut events, &session_id, "6001").await;
-        assert!(seen.contains("6001"), "{seen:?}");
+        let seen = expect_output(&mut events, &session_id, "3001").await;
+        assert!(seen.contains("3001"), "{seen:?}");
 
         terminals.close(&session_id);
     }
