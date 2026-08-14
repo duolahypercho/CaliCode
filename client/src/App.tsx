@@ -1,15 +1,41 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { Viewport } from "./components/editor/Viewport";
-import type { LogEntry } from "./components/editor/ConsolePanel";
+import { ConsolePanel, type LogEntry } from "./components/editor/ConsolePanel";
 import { AgentPanel } from "./components/editor/AgentPanel";
-import { ArrowLeft, ArrowRight, ChevronDown, PanelLeft, PanelRight } from "lucide-react";
+import {
+  ArrowLeft,
+  ArrowRight,
+  ChevronDown,
+  PanelBottom,
+  PanelLeft,
+  PanelRight,
+} from "lucide-react";
 import blenderLogo from "./assets/blender-logo.svg";
 import { hasOverlayWindowControls } from "./lib/desktop";
-import { GamesSidebar, type ProjectMenuAction } from "./components/workspace/GamesSidebar";
+import {
+  GamesSidebar,
+  type ProjectMenuAction,
+  type SessionMenuAction,
+} from "./components/workspace/GamesSidebar";
 import { AssetsLibraryPage } from "./components/library/AssetsLibraryPage";
 import { SettingsPage } from "./components/settings/SettingsPage";
-import { createSession, listSessions, type SessionSummary } from "./lib/sessions";
-import { WORKSPACE_TABS, WorkspaceTabs, type WorkspaceTab } from "./components/workspace/WorkspaceTabs";
+import {
+  archiveSession,
+  createSession,
+  forkSession,
+  listSessions,
+  renameSession,
+  type SessionSummary,
+} from "./lib/sessions";
+import {
+  MULTI_INSTANCE_TABS,
+  WORKSPACE_TABS,
+  WorkspaceTabs,
+  nextTabId,
+  tabKind,
+  type WorkspaceTab,
+  type WorkspaceTabId,
+} from "./components/workspace/WorkspaceTabs";
 import { PlayOverlay, type TweakPin } from "./components/workspace/PlayOverlay";
 import { TweakPanel, entityTweakControls, type TweakControl } from "./components/workspace/TweakPanel";
 import { LiveBar, type LiveStats } from "./components/workspace/LiveBar";
@@ -18,6 +44,7 @@ import { Dialog, DialogClose, DialogContent, DialogDescription, DialogTitle } fr
 import { Input } from "./components/ui/input";
 import { Label } from "./components/ui/label";
 import { currentCoreStatus, rpc, subscribeCoreStatus, type CoreConnectionState } from "./lib/rpc";
+import { withIntroducedTabs } from "./lib/viewState";
 import {
   attachRepo,
   attachedRepos,
@@ -38,6 +65,10 @@ import { CodeTab } from "./components/workspace/CodeTab";
 import { ArtTab } from "./components/workspace/ArtTab";
 import { SceneGraphCanvas } from "./components/workspace/SceneGraphCanvas";
 import { TestTab, toIssues } from "./components/workspace/TestTab";
+import { BrowserTab } from "./components/workspace/BrowserTab";
+import { TerminalTab } from "./components/workspace/TerminalTab";
+import { BottomPanel } from "./components/workspace/BottomPanel";
+import { SideChat, type SideChatDraft, type SideMessage } from "./components/editor/SideChat";
 import { ReportsTab } from "./components/workspace/ReportsTab";
 import { FileTree } from "./components/workspace/FileTree";
 import { FileEditor } from "./components/workspace/FileEditor";
@@ -58,18 +89,21 @@ import {
   type ResizablePanelOptions,
 } from "./hooks/useResizablePanels";
 import type { PieRuntime, PieState } from "./lib/pie";
-import type { Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
+import type { AgentMessage, Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
 import type { ProjectTemplate } from "./lib/projectTemplates";
 import { importMime, isBlenderAsset } from "./lib/blender";
 
 const snapshotScripts = (p: Project): Record<string, string> => Object.fromEntries(p.scripts.map((x) => [x.id, x.code]));
 
 const VIEW_KEY = "calicode-view";
+/** The dock's console tab is fixed, so its id is a constant rather than a uuid. */
+const CONSOLE_TAB_ID = "console";
 
 /** Small icon button used in the collapsed-sidebar chrome strip. */
 const CHROME_ICON_BUTTON =
   "inline-flex h-7 w-7 items-center justify-center rounded-md text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink-strong disabled:opacity-35";
 const PINNED_PROJECTS_KEY = "calicode-pinned-projects";
+const PINNED_SESSIONS_KEY = "calicode-pinned-sessions";
 const THEME_KEY = "calicode-theme";
 
 type Theme = "dark" | "light";
@@ -96,6 +130,15 @@ type DialogProjectAction = Exclude<ProjectMenuAction, "pin" | "reveal" | "attach
 interface PendingProjectAction {
   action: DialogProjectAction;
   project: Project;
+}
+
+/** Only renaming stops for a dialog; the rest act on the spot — archiving
+ *  included, since Settings → Archive can undo it. */
+type DialogSessionAction = Extract<SessionMenuAction, "rename">;
+
+interface PendingSessionAction {
+  action: DialogSessionAction;
+  session: SessionSummary;
 }
 
 /**
@@ -142,9 +185,20 @@ const FILE_TREE_PANEL: ResizablePanelOptions = {
  * lost work even though nothing was lost.
  */
 interface ViewState {
-  tab: WorkspaceTab;
+  tab: WorkspaceTabId;
   /** Views open as dock tabs. Order is the strip order. */
-  openTabs: WorkspaceTab[];
+  openTabs: WorkspaceTabId[];
+  /**
+   * Views this editor has already offered.
+   *
+   * Without it, adding a view to `WORKSPACE_TABS` shipped it to nobody: the
+   * stored strip is filtered against the catalogue, so an editor that had ever
+   * saved one simply never grew the new tab, and BROWSER was invisible to
+   * every existing install. Recording what has been offered is what separates
+   * "new, show it once" from "the user closed it", which openTabs alone cannot
+   * express.
+   */
+  seenTabs?: WorkspaceTab[];
   workspaceFile: string | null;
 }
 
@@ -157,14 +211,26 @@ function readView(): ViewState {
     // or renamed view cannot restore a tab that no longer has a panel. An
     // empty result falls back to every view rather than none — a dock with no
     // tabs has nothing to show and no way back.
+    // Bare ids only: a second side chat is a memory-only thread, so restoring
+    // its tab would reopen an empty panel the user never asked for again.
     const stored = Array.isArray(parsed.openTabs)
       ? parsed.openTabs.filter((entry): entry is WorkspaceTab => WORKSPACE_TABS.includes(entry as WorkspaceTab))
       : [];
-    const openTabs = stored.length > 0 ? [...new Set(stored)] : [...WORKSPACE_TABS];
+    // An editor that predates `seenTabs` is treated as having been offered
+    // exactly what it has open, so only genuinely new views appear.
+    const seen = Array.isArray(parsed.seenTabs)
+      ? parsed.seenTabs.filter((entry): entry is WorkspaceTab => WORKSPACE_TABS.includes(entry as WorkspaceTab))
+      : stored;
+    const openTabs = withIntroducedTabs(stored, seen, WORKSPACE_TABS);
     if (!openTabs.includes(tab)) openTabs.unshift(tab);
-    return { tab, openTabs, workspaceFile: typeof parsed.workspaceFile === "string" ? parsed.workspaceFile : null };
+    return {
+      tab,
+      openTabs,
+      seenTabs: [...WORKSPACE_TABS],
+      workspaceFile: typeof parsed.workspaceFile === "string" ? parsed.workspaceFile : null,
+    };
   } catch {
-    return { tab: "play", openTabs: [...WORKSPACE_TABS], workspaceFile: null };
+    return { tab: "play", openTabs: [...WORKSPACE_TABS], seenTabs: [...WORKSPACE_TABS], workspaceFile: null };
   }
 }
 
@@ -173,6 +239,9 @@ function sameWorkspaceRoot(left: string | null | undefined, right: string | null
   const normalize = (value: string) => value.trim().replace(/[\\/]+$/, "");
   return normalize(left) === normalize(right);
 }
+
+/** Stable identity for a game with no side thread yet. */
+const EMPTY_SIDE_THREAD: SideMessage[] = [];
 
 export default function App() {
   const [project, setProject] = useState<Project>(starterProject);
@@ -191,12 +260,45 @@ export default function App() {
   const [modelList, setModelList] = useState<ModelList | null>(null);
   const [captureEvery, setCaptureEvery] = useState(3);
   const [assetSearch, setAssetSearch] = useState("");
-  const [tab, setTab] = useState<WorkspaceTab>(() => readView().tab);
-  const [openTabs, setOpenTabs] = useState<WorkspaceTab[]>(() => readView().openTabs);
+  const [tab, setTab] = useState<WorkspaceTabId>(() => readView().tab);
+  const [openTabs, setOpenTabs] = useState<WorkspaceTabId[]>(() => readView().openTabs);
+  // Render mirror of the strip, so an opener can allocate against the current
+  // set without waiting for a re-render.
+  const openTabsRef = useRef<WorkspaceTabId[]>(openTabs);
+  openTabsRef.current = openTabs;
+  /**
+   * What the agent browser currently has open, so the BROWSER tab can show the
+   * page's own title and favicon the way a browser tab does.
+   *
+   * Polled here rather than inside the panel because the panel unmounts when
+   * you switch to another view — which is exactly when the strip is the only
+   * thing still telling you what is open.
+   */
+  const [browserPage, setBrowserPage] = useState<{ title?: string; icon?: string }>({});
   // Dock fills the window, hiding the sidebar and chat. Not persisted: full
   // screen is a momentary mode, and restoring into it on launch would hide
   // the conversation with no obvious way back.
   const [toolsExpanded, setToolsExpanded] = useState(false);
+  // The bottom dock and its terminal sessions. Sessions outlive a dismissal so
+  // reopening the panel returns to the shells you left running.
+  // Side chat: an observer conversation about the run. It holds a copy of the
+  // transcript and talks to a tool-less endpoint, so asking about a run can
+  // never alter it.
+  const [mainTranscript, setMainTranscript] = useState<AgentMessage[]>([]);
+  // Text `/side <question>` puts in the side chat's composer, unsent. The
+  // nonce is what makes a repeat of the same question reach the panel again.
+  // Drafts and threads are per side chat, not per project: `/side` twice
+  // opens two threads, and a question typed into one must not appear in the
+  // other.
+  const [sideChatDrafts, setSideChatDrafts] = useState<Record<string, SideChatDraft>>({});
+  // Side threads per game, held here so closing the tab does not discard the
+  // conversation. Memory only: a side chat is never written to disk, and
+  // quitting the app still ends it.
+  const [sideChatThreads, setSideChatThreads] = useState<Record<string, SideMessage[]>>({});
+  const [bottomOpen, setBottomOpen] = useState(false);
+  const [bottomAnimating, setBottomAnimating] = useState(false);
+  const [terminalTabs, setTerminalTabs] = useState<Array<{ id: string; title: string }>>([]);
+  const [activeTerminalId, setActiveTerminalId] = useState<string | null>(CONSOLE_TAB_ID);
   // Asset open in the 3D builder (BUILD tab); null shows the picker.
   const [builderAssetId, setBuilderAssetId] = useState<string | null>(null);
   const [previewAssetId, setPreviewAssetId] = useState<string | null>(null);
@@ -215,11 +317,16 @@ export default function App() {
   // from, still needs a spinner on its sidebar row. AgentPanel reports each
   // transition (start/stop, plus a null on unmount) into this set.
   const [runningSessionIds, setRunningSessionIds] = useState<ReadonlySet<string>>(() => new Set());
-  const [pinnedProjectSlugs, setPinnedProjectSlugs] = useState<string[]>(readPinnedProjects);
+  const [pinnedProjectSlugs, setPinnedProjectSlugs] = useState<string[]>(() => readPinnedIds(PINNED_PROJECTS_KEY));
+  const [pinnedSessionIds, setPinnedSessionIds] = useState<string[]>(() => readPinnedIds(PINNED_SESSIONS_KEY));
   const [pendingProjectAction, setPendingProjectAction] = useState<PendingProjectAction | null>(null);
   const [projectActionTitle, setProjectActionTitle] = useState("");
   const [projectActionBusy, setProjectActionBusy] = useState(false);
   const [projectActionError, setProjectActionError] = useState("");
+  const [pendingSessionAction, setPendingSessionAction] = useState<PendingSessionAction | null>(null);
+  const [sessionActionTitle, setSessionActionTitle] = useState("");
+  const [sessionActionBusy, setSessionActionBusy] = useState(false);
+  const [sessionActionError, setSessionActionError] = useState("");
   const [sessionRevision, setSessionRevision] = useState(0);
   // Scripts as of the last load or save, so CODE can show a real diff.
   const [scriptBaseline, setScriptBaseline] = useState<Record<string, string>>({});
@@ -272,6 +379,65 @@ export default function App() {
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
   }, []);
+  // Only while the BROWSER tab is in the strip: this asks core, which asks the
+  // page, and there is no reason to do that for a view nobody has open. Core
+  // caches the favicon per origin, so the repeat cost is a lookup.
+  const browserTabOpen = openTabs.includes("browser");
+  // Side chats are numbered by strip position rather than by id: closing the
+  // first should renumber the rest, not leave a gap where it was.
+  const sideChatIds = useMemo(() => openTabs.filter((id) => tabKind(id) === "sidechat"), [openTabs]);
+  const sideChatNames = useMemo(
+    () =>
+      Object.fromEntries(
+        sideChatIds.map((id, index) => [id, index === 0 ? "Side chat" : `Side chat ${index + 1}`]),
+      ),
+    [sideChatIds],
+  );
+  /**
+   * Where the next `/side` goes. Each run gets its own thread, except that an
+   * untouched panel — nothing asked, nothing typed — is used before a new one
+   * is opened beside it. Without that, the side chat the dock ships with would
+   * sit empty forever while every question opened another tab next to it.
+   */
+  const openFreshSideChat = (): WorkspaceTabId => {
+    const pristine = sideChatIds.find(
+      (id) => !sideChatDrafts[id] && (sideChatThreads[`${project.slug}::${id}`]?.length ?? 0) === 0,
+    );
+    if (!pristine) return addWorkspaceTab("sidechat");
+    setTab(pristine);
+    return pristine;
+  };
+
+  /** Strip labels. The first side chat keeps the plain view label. */
+  const sideChatTitles = useMemo(
+    () => Object.fromEntries(sideChatIds.slice(1).map((id, index) => [id, `Side chat ${index + 2}`])),
+    [sideChatIds],
+  );
+  useEffect(() => {
+    if (!browserTabOpen) {
+      setBrowserPage({});
+      return;
+    }
+    let cancelled = false;
+    const poll = () => {
+      rpc<{ running?: boolean; title?: string | null; icon?: string | null }>("browser_status")
+        .then((status) => {
+          if (cancelled) return;
+          setBrowserPage(
+            status?.running
+              ? { title: status.title ?? undefined, icon: status.icon ?? undefined }
+              : {},
+          );
+        })
+        .catch(() => undefined);
+    };
+    poll();
+    const timer = window.setInterval(poll, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [browserTabOpen]);
   // From lg up the tools dock occupies the row, so the sidebar must also leave
   // room for it at its narrowest; below lg the dock is an overlay drawer.
   const toolsDocked = mainView === "chat" && toolsVisible && viewportWidth >= TOOLS_DOCK_BREAKPOINT;
@@ -437,7 +603,17 @@ export default function App() {
   }, [pinnedProjectSlugs]);
 
   useEffect(() => {
-    localStorage.setItem(VIEW_KEY, JSON.stringify({ tab, openTabs, workspaceFile } satisfies ViewState));
+    localStorage.setItem(PINNED_SESSIONS_KEY, JSON.stringify(pinnedSessionIds));
+  }, [pinnedSessionIds]);
+
+  useEffect(() => {
+    // `seenTabs` is the whole current catalogue, not the open strip: once a
+    // view has been offered it must not be offered again just because it was
+    // closed.
+    localStorage.setItem(
+      VIEW_KEY,
+      JSON.stringify({ tab, openTabs, seenTabs: [...WORKSPACE_TABS], workspaceFile } satisfies ViewState),
+    );
   }, [tab, openTabs, workspaceFile]);
 
   useEffect(() => subscribeCoreStatus(setCoreStatus), []);
@@ -924,25 +1100,87 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [coreStatus, project, persistProjectNow]);
 
-  /** Open a view as a tab (or focus it when already open) and select it. */
-  const addWorkspaceTab = useCallback((next: WorkspaceTab) => {
-    setOpenTabs((current) => (current.includes(next) ? current : [...current, next]));
-    setTab(next);
+  /**
+   * Open a view as a tab and select it. A repeatable view (the side chat)
+   * opens another instance every time rather than focusing the one already
+   * there — two asks are two threads.
+   */
+  const addWorkspaceTab = useCallback((kind: WorkspaceTab): WorkspaceTabId => {
+    // Read and write the ref, not just state: `/side` twice in one tick has to
+    // allocate two ids, and the second call runs before React has re-rendered
+    // with the first.
+    const current = openTabsRef.current;
+    const opened = MULTI_INSTANCE_TABS.includes(kind) ? nextTabId(kind, current) : kind;
+    if (!current.includes(opened)) {
+      const next = [...current, opened];
+      openTabsRef.current = next;
+      setOpenTabs(next);
+    }
+    setTab(opened);
+    return opened;
   }, []);
+
+  /** Select the newest instance of a view, opening one only if none is open. */
+  const focusWorkspaceTab = useCallback((kind: WorkspaceTab): WorkspaceTabId => {
+    const existing = [...openTabsRef.current].reverse().find((id) => tabKind(id) === kind);
+    if (!existing) return addWorkspaceTab(kind);
+    setTab(existing);
+    return existing;
+  }, [addWorkspaceTab]);
 
   /**
    * Close a tab. Closing the active one selects its neighbour rather than
    * leaving the dock pointed at a view that is no longer in the strip.
    */
-  const closeWorkspaceTab = useCallback((target: WorkspaceTab) => {
+  const closeWorkspaceTab = useCallback((target: WorkspaceTabId) => {
     setOpenTabs((current) => {
       if (current.length <= 1) return current;
       const index = current.indexOf(target);
       if (index < 0) return current;
       const next = current.filter((entry) => entry !== target);
+      openTabsRef.current = next;
       setTab((active) => (active === target ? next[Math.min(index, next.length - 1)] : active));
       return next;
     });
+    // Closing a side chat ends that thread. Ids are reused once freed, so a
+    // thread left behind would reappear inside the next chat to take the id.
+    if (tabKind(target) === "sidechat") {
+      setSideChatDrafts(({ [target]: _closed, ...rest }) => rest);
+      setSideChatThreads((current) =>
+        Object.fromEntries(Object.entries(current).filter(([key]) => !key.endsWith(`::${target}`))),
+      );
+    }
+  }, []);
+
+  const addTerminal = useCallback(() => {
+    const id = crypto.randomUUID();
+    setTerminalTabs((current) => [...current, { id, title: `Terminal ${current.length + 1}` }]);
+    setActiveTerminalId(id);
+  }, []);
+
+  const closeTerminal = useCallback((id: string) => {
+    setTerminalTabs((current) => {
+      const index = current.findIndex((tab) => tab.id === id);
+      if (index < 0) return current;
+      const next = current.filter((tab) => tab.id !== id);
+      // The console is always there to fall back to, so closing the last
+      // shell leaves the dock open on it rather than dismissing the panel.
+      setActiveTerminalId((active) =>
+        active === id ? (next[Math.min(index, next.length - 1)]?.id ?? CONSOLE_TAB_ID) : active,
+      );
+      return next;
+    });
+  }, []);
+
+  /** Animate only while toggling: a height transition would fight a drag. */
+  // The error count follows the log into the dock; without it a failure that
+  // scrolls past is invisible while the panel is closed.
+  const consoleErrors = logs.reduce((total, log) => total + (log.level === "error" ? 1 : 0), 0);
+
+  const toggleBottom = useCallback(() => {
+    setBottomAnimating(true);
+    window.setTimeout(() => setBottomAnimating(false), 340);
+    setBottomOpen((open) => !open);
   }, []);
 
   const toggleTools = useCallback(() => {
@@ -1057,9 +1295,15 @@ export default function App() {
       const slug = session.projectSlug ?? project.slug;
       (map[slug] ??= []).push(session);
     }
-    for (const list of Object.values(map)) list.sort((left, right) => right.updatedAt - left.updatedAt);
+    const pinned = new Set(pinnedSessionIds);
+    for (const list of Object.values(map)) {
+      list.sort(
+        (left, right) =>
+          Number(pinned.has(right.id)) - Number(pinned.has(left.id)) || right.updatedAt - left.updatedAt,
+      );
+    }
     return map;
-  }, [project.slug, sessions]);
+  }, [pinnedSessionIds, project.slug, sessions]);
 
   // Platform is fixed for the lifetime of the document.
   const overlayControls = useMemo(hasOverlayWindowControls, []);
@@ -1172,20 +1416,19 @@ export default function App() {
         if (project.slug === target.slug) setProject(adoptSaved(result.project));
         pushLog(`${result.created ? "created" : "reused"} ${result.branch} at ${result.path}`);
       } else if (pending.action === "archive") {
-        const result = await rpc<{ deleted: number }>("session_archive_project", { slug: target.slug });
+        const result = await rpc<{ archived: number }>("session_archive_project", { slug: target.slug });
         setSessions((current) => current.filter((session) => session.projectSlug !== target.slug));
         if (project.slug === target.slug) {
           setActiveSessionId(null);
           setSessionRevision((current) => current + 1);
         }
-        pushLog(`archived ${result.deleted} chat${result.deleted === 1 ? "" : "s"} for ${target.title}`);
+        pushLog(
+          `archived ${result.archived} chat${result.archived === 1 ? "" : "s"} for ${target.title} — restore them in Settings > Archive`,
+        );
       } else if (pending.action === "remove") {
+        // project_delete drops the game's chats, archived ones included: an
+        // archive entry whose game is gone cannot be restored into anything.
         await rpc("project_delete", { slug: target.slug });
-        try {
-          await rpc("session_archive_project", { slug: target.slug });
-        } catch (error) {
-          pushLog(`project removed, but its chat cleanup failed: ${reason(error)}`, "error");
-        }
         const remaining = projects.filter((item) => item.slug !== target.slug);
         setProjects(remaining);
         setPinnedProjectSlugs((current) => current.filter((slug) => slug !== target.slug));
@@ -1203,6 +1446,89 @@ export default function App() {
       pushLog(`${pending.action} failed: ${message}`, "error");
     } finally {
       setProjectActionBusy(false);
+    }
+  };
+
+  const copyToClipboard = (value: string, label: string) => {
+    void navigator.clipboard
+      ?.writeText(value)
+      .then(() => pushLog(`copied ${label}`))
+      .catch((error: unknown) => pushLog(`copy failed: ${reason(error)}`, "error"));
+  };
+
+  const handleSessionAction = (target: SessionSummary, action: SessionMenuAction) => {
+    if (action === "pin") {
+      setPinnedSessionIds((current) =>
+        current.includes(target.id) ? current.filter((id) => id !== target.id) : [...current, target.id],
+      );
+      return;
+    }
+    if (action === "copy-id") {
+      copyToClipboard(target.id, `chat id ${target.id}`);
+      return;
+    }
+    if (action === "copy-path") {
+      if (!target.workspaceRoot) return;
+      copyToClipboard(target.workspaceRoot, target.workspaceRoot);
+      return;
+    }
+    if (action === "continue") {
+      const slug = target.projectSlug ?? project.slug;
+      // Fork rather than resume: the original transcript stays as it was, and
+      // the new chat carries its history forward.
+      void forkSession(target.id)
+        .then((record) => {
+          const created: SessionSummary = { ...record, messageCount: record.messages.length };
+          setSessions((current) => [created, ...current.filter((session) => session.id !== created.id)]);
+          pushNav({ slug, sessionId: created.id });
+          setActiveSessionId(created.id);
+          setSessionRevision((current) => current + 1);
+          if (slug !== project.slug) void openProject(slug);
+          pushLog(`continued ${target.title} in a new chat`);
+        })
+        .catch((error) => pushLog(`continue failed: ${reason(error)}`, "error"));
+      return;
+    }
+    if (action === "archive") {
+      // No confirmation: nothing is lost, and the log line says where it went.
+      void archiveSession(target.id)
+        .then(() => {
+          setSessions((current) => current.filter((item) => item.id !== target.id));
+          setPinnedSessionIds((current) => current.filter((id) => id !== target.id));
+          if (activeSessionId === target.id) {
+            // The panel is showing a chat that is no longer in the sidebar;
+            // drop back to the game's empty chat rather than a hidden one.
+            pushNav({ slug: target.projectSlug ?? project.slug, sessionId: null });
+            setActiveSessionId(null);
+            setSessionRevision((current) => current + 1);
+          }
+          pushLog(`archived ${target.title} — restore it in Settings > Archive`);
+        })
+        .catch((error) => pushLog(`archive failed: ${reason(error)}`, "error"));
+      return;
+    }
+    setSessionActionError("");
+    setSessionActionTitle(target.title);
+    setPendingSessionAction({ action, session: target });
+  };
+
+  const runPendingSessionAction = async () => {
+    const pending = pendingSessionAction;
+    if (!pending || sessionActionBusy) return;
+    const target = pending.session;
+    setSessionActionBusy(true);
+    setSessionActionError("");
+    try {
+      const renamed = await renameSession(target.id, sessionActionTitle.trim());
+      setSessions((current) => current.map((item) => (item.id === target.id ? { ...item, ...renamed } : item)));
+      pushLog(`renamed chat to ${renamed.title}`);
+      setPendingSessionAction(null);
+    } catch (error) {
+      const message = reason(error);
+      setSessionActionError(message);
+      pushLog(`${pending.action} failed: ${message}`, "error");
+    } finally {
+      setSessionActionBusy(false);
     }
   };
 
@@ -1401,6 +1727,8 @@ export default function App() {
           onNewGame={() => setNewProjectOpen(true)}
           pinnedProjectSlugs={pinnedProjectSlugs}
           onProjectAction={handleProjectAction}
+          onSessionAction={handleSessionAction}
+          pinnedSessionIds={pinnedSessionIds}
           onOpenAssetsLibrary={() => {
             setMainView("library");
             setToolsOpen(false);
@@ -1447,6 +1775,11 @@ export default function App() {
           />
         )}
 
+        {/* Everything right of the games rail stacks: the workbench row, then
+            the bottom dock. The dock is a sibling rather than an overlay so it
+            shortens the chat and the tools column together. */}
+        <div className="flex min-w-0 flex-1 flex-col">
+        <div className="flex min-h-0 flex-1">
         {/* Center: the agent conversation is the primary column. The hard
             min-width is the CSS backstop for the JS panel clamps: even if a
             stale stored width or a missed clamp over-grows a side panel, the
@@ -1516,9 +1849,19 @@ export default function App() {
                 </button>
                 <button
                   type="button"
+                  aria-label="Toggle terminal panel"
+                  aria-pressed={bottomOpen}
+                  onClick={toggleBottom}
+                  className={`${CHROME_ICON_BUTTON} ${bottomOpen ? "bg-surface-2 text-ink-strong" : ""}`}
+                >
+                  <PanelBottom aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.7} />
+                </button>
+                <button
+                  type="button"
                   aria-label="Toggle tools panel"
+                  aria-pressed={toolsVisible}
                   onClick={toggleTools}
-                  className={CHROME_ICON_BUTTON}
+                  className={`${CHROME_ICON_BUTTON} ${toolsVisible ? "bg-surface-2 text-ink-strong" : ""}`}
                 >
                   <PanelRight aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.7} />
                 </button>
@@ -1577,6 +1920,18 @@ export default function App() {
               browserTools={browserTools}
               initialSessionId={activeSessionId}
               onSessionsChanged={setSessions}
+              onTranscriptChange={setMainTranscript}
+              onOpenSideChat={(draft, anchor, options) => {
+                const id = options?.fresh ? openFreshSideChat() : focusWorkspaceTab("sidechat");
+                if (!toolsVisible) toggleTools();
+                // Always bump the draft, even with nothing to put in the
+                // composer: it is the signal the panel focuses on, and a side
+                // chat you opened but have to click into is half-opened.
+                setSideChatDrafts((current) => ({
+                  ...current,
+                  [id]: { text: draft ?? "", anchor, nonce: (current[id]?.nonce ?? 0) + 1 },
+                }));
+              }}
               onSessionActivated={(created) => {
                 setSessions((current) => [created, ...current.filter((session) => session.id !== created.id)]);
                 setActiveSessionId(created.id);
@@ -1598,6 +1953,7 @@ export default function App() {
             />
           )}
         </main>
+
 
         {mainView === "chat" ? (
           <ResizeHandle
@@ -1649,6 +2005,8 @@ export default function App() {
               toggleTools();
             }}
             badges={{ test: failing || undefined }}
+            tabTitles={{ browser: browserPage.title, ...sideChatTitles }}
+            tabIcons={{ browser: browserPage.icon }}
             // Without a workspace there is no preview server; core serves no
             // /play route, and the old label hardcoded port 5199.
           />
@@ -1841,6 +2199,55 @@ export default function App() {
               </div>
             ) : null}
 
+            {/* Kept mounted while the tab is in the strip, unlike the other
+                panels: the side thread lives only in this component's state,
+                so unmounting it on a tab switch would throw the conversation
+                away — which is not what "temporary" promises. */}
+            {sideChatIds.map((id) => (
+              <div
+                key={id}
+                role="tabpanel"
+                id={`workspace-panel-${id}`}
+                aria-labelledby={`workspace-tab-${id}`}
+                className={`absolute inset-0 ${tab === id ? "" : "hidden"}`}
+              >
+                <SideChat
+                  projectSlug={project.slug}
+                  name={sideChatNames[id]}
+                  mainTranscript={mainTranscript}
+                  modelList={modelList}
+                  draft={sideChatDrafts[id] ?? null}
+                  messages={sideChatThreads[`${project.slug}::${id}`] ?? EMPTY_SIDE_THREAD}
+                  onMessagesChange={(next) =>
+                    setSideChatThreads((current) => ({ ...current, [`${project.slug}::${id}`]: next }))
+                  }
+                  onClose={() => closeWorkspaceTab(id)}
+                />
+              </div>
+            ))}
+
+            {tab === "browser" ? (
+              <div
+                role="tabpanel"
+                id="workspace-panel-browser"
+                aria-labelledby="workspace-tab-browser"
+                className="absolute inset-0"
+              >
+                <BrowserTab />
+              </div>
+            ) : null}
+
+            {tab === "terminal" ? (
+              <div
+                role="tabpanel"
+                id="workspace-panel-terminal"
+                aria-labelledby="workspace-tab-terminal"
+                className="absolute inset-0"
+              >
+                <TerminalTab projectSlug={project.slug} theme={theme} />
+              </div>
+            ) : null}
+
             {tab === "test" ? (
               <div role="tabpanel" id="workspace-panel-test" aria-labelledby="workspace-tab-test" className="absolute inset-0">
                 <TestTab
@@ -1898,9 +2305,51 @@ export default function App() {
             ) : null}
           </div>
 
-          <LiveBar stats={stats} pieState={pieState} logs={logs} />
+          {/* Runtime stats belong to the running game, so they are shown only
+              while PLAY is the visible view. Sitting under BROWSER or CODE
+              they read as telemetry for whatever is on screen — a paused
+              signal and 0 fps over a web page describe nothing. */}
+          {tab === "play" ? <LiveBar stats={stats} pieState={pieState} /> : null}
           </aside>
         ) : null}
+        </div>
+
+        <div
+          data-bottom-dock
+          className={`shrink-0 overflow-hidden border-t border-line ${
+            bottomOpen ? "h-[var(--bottom-dock-height)]" : "h-0 border-t-0"
+          } ${bottomAnimating ? "[transition:height_300ms_ease,border-width_300ms_ease]" : ""}`}
+          style={{ "--bottom-dock-height": "260px" } as CSSProperties}
+        >
+          {bottomOpen ? (
+            <BottomPanel
+              tabs={[
+                { id: CONSOLE_TAB_ID, title: "Console", kind: "console" as const, badge: consoleErrors || undefined },
+                ...terminalTabs,
+              ]}
+              activeId={activeTerminalId}
+              onSelect={setActiveTerminalId}
+              onAdd={addTerminal}
+              onCloseTab={closeTerminal}
+              onClose={() => toggleBottom()}
+            >
+              {/* Every session stays mounted: unmounting would close its shell
+                  and lose the scrollback, so only the active one is shown. */}
+              <div className={`h-full ${activeTerminalId === CONSOLE_TAB_ID ? "block" : "hidden"}`}>
+                <ConsolePanel logs={logs} />
+              </div>
+              {terminalTabs.map((tab) => (
+                <div
+                  key={tab.id}
+                  className={`h-full ${tab.id === activeTerminalId ? "block" : "hidden"}`}
+                >
+                  <TerminalTab projectSlug={project.slug} theme={theme} />
+                </div>
+              ))}
+            </BottomPanel>
+          ) : null}
+        </div>
+        </div>
       </div>
 
       <SettingsPage
@@ -1915,6 +2364,7 @@ export default function App() {
             .then(setModelList)
             .catch(() => undefined)
         }
+        onSessionsChanged={() => listSessions().then(setSessions)}
       />
 
       <Dialog
@@ -2028,11 +2478,55 @@ export default function App() {
                     busy={projectActionBusy}
                     disabled={pendingProjectAction.action === "worktree" && !pendingProjectAction.project.workspaceRoot}
                     confirmLabel={projectActionConfirmLabel(pendingProjectAction.action)}
-                    destructive={pendingProjectAction.action === "archive" || pendingProjectAction.action === "remove"}
+                    destructive={pendingProjectAction.action === "remove"}
                     onConfirm={() => void runPendingProjectAction()}
                   />
                 </div>
               )}
+            </>
+          ) : null}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={pendingSessionAction !== null}
+        onOpenChange={(open) => {
+          if (!open && !sessionActionBusy) {
+            setPendingSessionAction(null);
+            setSessionActionError("");
+          }
+        }}
+      >
+        <DialogContent className="max-w-sm border-line bg-popover text-ink-strong shadow-[0_24px_80px_rgba(0,0,0,0.6)]">
+          {pendingSessionAction ? (
+            <>
+              <DialogTitle>Rename chat</DialogTitle>
+              <DialogDescription className="mt-1 leading-relaxed text-ink-subtle">
+                Only the sidebar label changes; the transcript stays as it is.
+              </DialogDescription>
+
+              <form
+                className="mt-4"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  void runPendingSessionAction();
+                }}
+              >
+                <Label htmlFor="rename-session-title">Chat name</Label>
+                <Input
+                  id="rename-session-title"
+                  className="mt-1 border-line-strong bg-surface-1"
+                  value={sessionActionTitle}
+                  onChange={(event) => setSessionActionTitle(event.target.value)}
+                  autoFocus
+                />
+                {sessionActionError ? <p className="mt-2 text-xs text-danger-soft">{sessionActionError}</p> : null}
+                <ProjectActionButtons
+                  busy={sessionActionBusy}
+                  disabled={!sessionActionTitle.trim()}
+                  confirmLabel="Save changes"
+                />
+              </form>
             </>
           ) : null}
         </DialogContent>
@@ -2111,8 +2605,10 @@ function projectActionDialogDescription({ action, project }: PendingProjectActio
   if (action === "worktree") {
     return `Create calicode/${project.slug} under ~/.cali/worktrees and attach ${project.title} to it.`;
   }
-  if (action === "archive") return `Permanently delete every saved chat for ${project.title}. The project files stay intact.`;
-  return `Permanently remove ${project.title} and its saved chats. This cannot be undone.`;
+  if (action === "archive") {
+    return `Move every saved chat for ${project.title} to the archive. They stay in Settings > Archive until you restore or delete them.`;
+  }
+  return `Permanently remove ${project.title} and its saved chats, archived ones included. This cannot be undone.`;
 }
 
 function projectActionConfirmLabel(action: DialogProjectAction): string {
@@ -2204,15 +2700,16 @@ function reason(error: unknown): string {
 }
 
 /**
- * Pinned slugs, validated on read — a corrupted localStorage value must not
- * white-screen the editor (readView validates for the same reason).
+ * Pinned slugs and chat ids, validated on read — a corrupted localStorage
+ * value must not white-screen the editor (readView validates for the same
+ * reason).
  */
-function readPinnedProjects(): string[] {
+function readPinnedIds(key: string): string[] {
   try {
-    const raw = localStorage.getItem(PINNED_PROJECTS_KEY);
+    const raw = localStorage.getItem(key);
     const parsed: unknown = raw ? JSON.parse(raw) : [];
     return Array.isArray(parsed)
-      ? [...new Set(parsed.filter((slug): slug is string => typeof slug === "string"))]
+      ? [...new Set(parsed.filter((id): id is string => typeof id === "string"))]
       : [];
   } catch {
     return [];

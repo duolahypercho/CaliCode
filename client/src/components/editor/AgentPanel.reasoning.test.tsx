@@ -33,6 +33,7 @@ vi.mock("../../lib/sessions", () => ({
 }));
 
 vi.mock("../../lib/modelMeta", () => ({
+  contextLimitFor: vi.fn(() => null),
   defaultEffort: vi.fn((levels: string[]) => levels[0] ?? null),
   effortLevelsFor: vi.fn(() => []),
   loadModelDev: mocks.loadModelDev,
@@ -42,6 +43,7 @@ vi.mock("../../lib/coreConfig", () => ({
   contextWindowOf: vi.fn(() => 100_000),
   formatTokens: vi.fn((value: number) => String(value)),
   readCoreConfig: mocks.readCoreConfig,
+  sandboxSummary: vi.fn(() => null),
 }));
 
 vi.mock("../../lib/graph", () => ({
@@ -98,7 +100,7 @@ beforeEach(() => {
   mocks.listGraphs.mockResolvedValue([]);
   mocks.graphStatus.mockResolvedValue({});
   mocks.openLoopReport.mockResolvedValue({ report: null });
-  mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {} });
+  mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {}, contextLimits: {} });
   mocks.readCoreConfig.mockResolvedValue(null);
   mocks.rpc.mockImplementation(async (method: string) => {
     if (method === "agent_chat") return { sessionId: "session-1", reply: "Done.", toolCalls: [] };

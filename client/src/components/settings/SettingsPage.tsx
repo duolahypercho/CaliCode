@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import {
+  Activity,
+  Archive,
   ArrowLeft,
   ArrowUpRight,
   Check,
@@ -16,6 +18,8 @@ import {
 import packageJson from "../../../package.json";
 import { McpSection } from "../editor/McpSection";
 import { SkillsSection } from "../editor/SkillsSection";
+import { ArchiveSection } from "./ArchiveSection";
+import { StatusSection } from "./StatusSection";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { Label } from "../ui/label";
@@ -27,7 +31,7 @@ import type { ModelList, ProviderPreset } from "../../lib/types";
 const NEW_PROVIDER = "__new__";
 const ROUTER_PROVIDER = "codex-router";
 
-export type SettingsSection = "general" | "providers" | "skills" | "mcp" | "theme";
+export type SettingsSection = "general" | "status" | "providers" | "skills" | "mcp" | "archive" | "theme";
 export type SettingsTheme = "dark" | "light";
 
 const SETTINGS_SECTIONS: {
@@ -37,9 +41,11 @@ const SETTINGS_SECTIONS: {
   icon: typeof SettingsIcon;
 }[] = [
   { id: "general", label: "General", description: "CaliCode and core status.", icon: SettingsIcon },
+  { id: "status", label: "Status", description: "Token usage and cache hit rate.", icon: Activity },
   { id: "providers", label: "Providers", description: "Models and authentication.", icon: KeyRound },
   { id: "skills", label: "Skills", description: "Agent instruction packs.", icon: WandSparkles },
   { id: "mcp", label: "MCP", description: "External agent tools.", icon: Plug },
+  { id: "archive", label: "Archive", description: "Archived chats: restore or delete.", icon: Archive },
   { id: "theme", label: "Theme", description: "Appearance preferences.", icon: SlidersHorizontal },
 ];
 
@@ -55,6 +61,8 @@ export interface SettingsPageProps {
   onClose: () => void;
   modelList: ModelList | null;
   onChanged: () => void | Promise<void>;
+  /** Called after a restore, so the shell's sidebar list picks the chat up. */
+  onSessionsChanged?: () => void | Promise<void>;
   projectSlug?: string;
   theme: SettingsTheme;
   onThemeChange: (theme: SettingsTheme) => void;
@@ -555,6 +563,7 @@ export function SettingsPage({
   onClose,
   modelList,
   onChanged,
+  onSessionsChanged,
   projectSlug,
   theme,
   onThemeChange,
@@ -627,6 +636,16 @@ export function SettingsPage({
           </div>
           <div
             role="tabpanel"
+            id="settings-panel-status"
+            aria-labelledby="settings-tab-status"
+            hidden={section !== "status"}
+          >
+            {/* Mounted only while selected: the ledger is read on mount, so a
+                hidden panel would show numbers from whenever settings opened. */}
+            {section === "status" && <StatusSection />}
+          </div>
+          <div
+            role="tabpanel"
             id="settings-panel-providers"
             aria-labelledby="settings-tab-providers"
             hidden={section !== "providers"}
@@ -648,6 +667,17 @@ export function SettingsPage({
             hidden={section !== "mcp"}
           >
             <McpSection headingLevel={2} />
+          </div>
+          <div
+            role="tabpanel"
+            id="settings-panel-archive"
+            aria-labelledby="settings-tab-archive"
+            hidden={section !== "archive"}
+          >
+            {/* Mounted only while selected: the archive is read on mount, so a
+                hidden panel would show whatever was archived when settings
+                opened rather than now. */}
+            {section === "archive" && <ArchiveSection onSessionsChanged={onSessionsChanged} />}
           </div>
           <div
             role="tabpanel"

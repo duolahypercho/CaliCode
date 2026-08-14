@@ -107,6 +107,120 @@ describe("GamesSidebar project actions", () => {
   });
 });
 
+describe("GamesSidebar session actions", () => {
+  const session: SessionSummary = {
+    id: "sess-1",
+    title: "Tune jump physics",
+    projectSlug: "starter",
+    provider: null,
+    model: null,
+    workspaceRoot: null,
+    worktreeId: null,
+    branch: null,
+    createdAt: Math.floor(Date.now() / 1000) - 600,
+    updatedAt: Math.floor(Date.now() / 1000) - 120,
+    messageCount: 4,
+  };
+
+  function renderWithSession(overrides: Partial<ComponentProps<typeof GamesSidebar>> = {}) {
+    return renderSidebar({ sessions: { starter: [session] }, ...overrides });
+  }
+
+  it("opens the chat menu from the row ellipsis", async () => {
+    renderWithSession();
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open actions for chat Tune jump physics" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+
+    expect(await screen.findByRole("menuitem", { name: "Pin chat" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Rename chat" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Continue in new chat" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Copy chat ID" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Archive chat" })).toBeTruthy();
+    // Permanent deletion lives in Settings > Archive, never one click from the row.
+    expect(screen.queryByRole("menuitem", { name: "Delete chat" })).toBeNull();
+  });
+
+  it("offers the working directory only for a chat that has one", async () => {
+    renderWithSession();
+    fireEvent.contextMenu(screen.getByRole("button", { name: /^Tune jump physics/ }));
+    expect(await screen.findByRole("menuitem", { name: "Copy chat ID" })).toBeTruthy();
+    expect(screen.queryByRole("menuitem", { name: "Copy working directory" })).toBeNull();
+
+    cleanup();
+    renderSidebar({ sessions: { starter: [{ ...session, workspaceRoot: "/Users/dev/code/my-game" }] } });
+    fireEvent.contextMenu(screen.getByRole("button", { name: /^Tune jump physics/ }));
+    expect(await screen.findByRole("menuitem", { name: "Copy working directory" })).toBeTruthy();
+  });
+
+  it("shows unpin and marks the row once the chat is pinned", async () => {
+    const onSessionAction = vi.fn();
+    renderWithSession({ pinnedSessionIds: [session.id], onSessionAction });
+
+    const row = screen.getByRole("button", { name: /^Tune jump physics/ });
+    expect(row.querySelector("[data-session-pinned]")).toBeTruthy();
+
+    fireEvent.contextMenu(row);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Unpin chat" }));
+    expect(onSessionAction).toHaveBeenCalledWith(session, "pin");
+  });
+
+  it("opens the same menu when the chat row is right-clicked", async () => {
+    renderWithSession();
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: /^Tune jump physics/ }));
+
+    expect(await screen.findByRole("menuitem", { name: "Rename chat" })).toBeTruthy();
+  });
+
+  it("dispatches the selected action with the session", async () => {
+    const onSessionAction = vi.fn();
+    renderWithSession({ onSessionAction });
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: /^Tune jump physics/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Archive chat" }));
+
+    expect(onSessionAction).toHaveBeenCalledWith(session, "archive");
+  });
+
+  /* Archiving is the row's clear action, so it must be one click from the row
+     — not one menu deep like the rest of the chat actions. */
+  it("archives from the row itself, revealed on hover", async () => {
+    const onSessionAction = vi.fn();
+    renderWithSession({ onSessionAction });
+
+    const archive = screen.getByRole("button", { name: "Archive Tune jump physics" });
+    expect(archive.className).toContain("opacity-0");
+    expect(archive.className).toContain("group-hover:opacity-100");
+    expect(archive.className).toContain("group-focus-within:opacity-100");
+
+    fireEvent.click(archive);
+    expect(onSessionAction).toHaveBeenCalledWith(session, "archive");
+    // One click, no dialog and no menu in between.
+    expect(screen.queryByRole("menu")).toBeNull();
+  });
+
+  it("keeps the chat ellipsis hidden until hover or keyboard focus", () => {
+    renderWithSession();
+
+    const trigger = screen.getByRole("button", { name: "Open actions for chat Tune jump physics" });
+    expect(trigger.className).toContain("opacity-0");
+    expect(trigger.className).toContain("group-hover:opacity-100");
+    expect(trigger.className).toContain("group-focus-within:opacity-100");
+  });
+
+  it("keeps the right-click menu on the chat row from opening the project menu", async () => {
+    renderWithSession();
+
+    fireEvent.contextMenu(screen.getByRole("button", { name: /^Tune jump physics/ }));
+
+    await screen.findByRole("menuitem", { name: "Rename chat" });
+    expect(screen.queryByRole("menuitem", { name: "Remove" })).toBeNull();
+  });
+});
+
 describe("GamesSidebar header", () => {
   it("renders the wordmark as a static two-tone lockup, not a menu button", () => {
     renderSidebar();
@@ -165,7 +279,7 @@ describe("GamesSidebar rows", () => {
     const gameRow = screen.getByRole("button", { name: "CaliCode Starter" });
     expect(gameRow.classList.contains("bg-surface-3")).toBe(false);
 
-    const sessionRow = screen.getByRole("button", { name: /Tune jump physics/ });
+    const sessionRow = screen.getByRole("button", { name: /^Tune jump physics/ });
     expect(sessionRow.classList.contains("bg-surface-3")).toBe(true);
   });
 });
@@ -292,7 +406,7 @@ describe("GamesSidebar running indicator", () => {
       runningSessionIds: new Set([sessionRunning.id]),
     });
 
-    const idleRow = screen.getByRole("button", { name: /Idle chat/ });
+    const idleRow = screen.getByRole("button", { name: /^Idle chat/ });
     expect(idleRow.querySelector('[data-testid="session-running-spinner"]')).toBeNull();
   });
 

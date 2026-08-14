@@ -23,6 +23,14 @@ use std::path::{Path, PathBuf};
 pub const MAX_BODY_BYTES: usize = 64 * 1024;
 const MAX_NAME_LEN: usize = 48;
 
+/// The entry file of a directory-packaged skill (`<dir>/<name>/SKILL.md`).
+const PACKAGE_ENTRY: &str = "SKILL.md";
+
+/// How many support files `skill_load` will name back to the agent. A skill
+/// that ships hundreds of references (some published ones ship 400+) must not
+/// turn one `skill_load` into a wall of paths.
+const MAX_LISTED_FILES: usize = 40;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SkillScope {
@@ -45,8 +53,13 @@ pub struct SkillInfo {
     pub name: String,
     pub description: String,
     pub scope: SkillScope,
-    /// Absolute path, for the UI.
+    /// Absolute path, for the UI. For a packaged skill this is its `SKILL.md`.
     pub path: String,
+    /// Set only for a directory-packaged skill: the package root that its
+    /// support files resolve against. `None` for a plain `<name>.md`, which is
+    /// what keeps a flat skill from ever exposing the whole skills directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dir: Option<String>,
     /// Derived from `SkillsConfig.disabled`; always false for broken files.
     pub enabled: bool,
     /// Parse problem, if any. Broken files stay listed so the UI can show
@@ -189,6 +202,111 @@ pub fn load_skill(
     load_from_dirs(&global_skills_dir(), project_dir.as_deref(), name, disabled)
 }
 
+/// Support files a packaged skill ships, relative to its root and sorted.
+/// Empty for a flat `<name>.md` skill, which has no package to walk.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFiles {
+    pub files: Vec<String>,
+    /// True when the package holds more than [`MAX_LISTED_FILES`]; the agent
+    /// can still read an unlisted file by naming its path directly.
+    pub truncated: bool,
+}
+
+/// Enumerate a packaged skill's support files, excluding its entry file.
+pub fn list_skill_files(info: &SkillInfo) -> SkillFiles {
+    let Some(dir) = info.dir.as_deref().map(Path::new) else {
+        return SkillFiles::default();
+    };
+    let mut files = Vec::new();
+    walk_support(dir, dir, 0, &mut files);
+    files.sort();
+    let truncated = files.len() > MAX_LISTED_FILES;
+    files.truncate(MAX_LISTED_FILES);
+    SkillFiles { files, truncated }
+}
+
+/// Depth is bounded because a skill package is user-supplied content and a
+/// symlink loop inside one must not hang the scan.
+fn walk_support(root: &Path, dir: &Path, depth: usize, out: &mut Vec<String>) {
+    const MAX_DEPTH: usize = 4;
+    if depth > MAX_DEPTH || out.len() > MAX_LISTED_FILES {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for path in entries.flatten().map(|entry| entry.path()) {
+        // Symlinks are not followed during the walk; a listed path still has
+        // to survive the escape check in `load_skill_file` before it is read.
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            walk_support(root, &path, depth + 1, out);
+        } else if meta.is_file() && path.file_name().is_some_and(|f| f != PACKAGE_ENTRY) {
+            if let Ok(rel) = path.strip_prefix(root) {
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+}
+
+/// Read one support file from inside a packaged skill.
+///
+/// The skill must be enabled and packaged, and `rel` must resolve inside its
+/// own directory — the same containment rule `scan_dir` applies, extended to
+/// the sub-path so `references/../../../.ssh/id_rsa` cannot be reached.
+pub fn load_skill_file(
+    projects_root: &Path,
+    slug: Option<&str>,
+    name: &str,
+    rel: &str,
+    disabled: &[String],
+) -> Result<(SkillInfo, String)> {
+    let project_dir = slug.and_then(|slug| project_skills_dir(projects_root, slug));
+    load_file_from_dirs(
+        &global_skills_dir(),
+        project_dir.as_deref(),
+        name,
+        rel,
+        disabled,
+    )
+}
+
+fn load_file_from_dirs(
+    global: &Path,
+    project: Option<&Path>,
+    name: &str,
+    rel: &str,
+    disabled: &[String],
+) -> Result<(SkillInfo, String)> {
+    let (info, _) = load_from_dirs(global, project, name, disabled)?;
+    let Some(dir) = info.dir.as_deref().map(Path::new) else {
+        bail!("skill '{name}' is a single file and ships no support files");
+    };
+    let rel_path = Path::new(rel);
+    if rel.trim().is_empty() || rel_path.is_absolute() {
+        bail!("file must be a relative path inside the skill");
+    }
+    if rel_path
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        bail!("file must not escape the skill directory");
+    }
+    let target = dir.join(rel_path);
+    let (Ok(real), Ok(real_dir)) = (target.canonicalize(), dir.canonicalize()) else {
+        bail!("skill file not found: {rel}");
+    };
+    if !real.starts_with(&real_dir) || !real.is_file() {
+        bail!("skill file not found: {rel}");
+    }
+    let text =
+        std::fs::read_to_string(&real).with_context(|| format!("cannot read skill file {rel}"))?;
+    Ok((info, truncate_body(text)))
+}
+
 /// Compact system-prompt index of enabled skills; `""` when there are none.
 pub fn prompt_index(projects_root: &Path, slug: Option<&str>, disabled: &[String]) -> String {
     render_index(&list_skills(projects_root, slug, disabled))
@@ -282,10 +400,21 @@ fn truncate_body(mut body: String) -> String {
     body
 }
 
-/// Scan one directory for `*.md` skills. Missing/unreadable dirs yield an
-/// empty vec. Symlinks that escape the directory are skipped — project skill
-/// dirs can live inside user repos, and a symlinked "skill" pointing at
-/// `~/.ssh` must not become readable through `skill_load`.
+/// Scan one directory for skills in either supported layout:
+///
+/// - `<dir>/<name>.md` — a single self-contained file.
+/// - `<dir>/<name>/SKILL.md` — a package whose sibling files (`references/`,
+///   `scripts/`, …) load on demand through [`load_skill_file`]. This is the
+///   layout the wider agent-skill ecosystem publishes, and the reason skills
+///   that orchestrate via "load references/foo.md" work here at all.
+///
+/// Only the package root is scanned for an entry file; a nested `SKILL.md`
+/// under `references/` is support content, not a second skill.
+///
+/// Missing/unreadable dirs yield an empty vec. Symlinks that escape the
+/// directory are skipped — project skill dirs can live inside user repos, and
+/// a symlinked "skill" pointing at `~/.ssh` must not become readable through
+/// `skill_load`.
 fn scan_dir(dir: &Path, scope: SkillScope) -> Vec<SkillInfo> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -296,11 +425,19 @@ fn scan_dir(dir: &Path, scope: SkillScope) -> Vec<SkillInfo> {
     let mut files: Vec<PathBuf> = entries
         .flatten()
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
+        .filter_map(|path| {
+            if path
+                .extension()
                 .and_then(|ext| ext.to_str())
-                .map(|ext| ext.eq_ignore_ascii_case("md"))
-                .unwrap_or(false)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            {
+                return Some(path);
+            }
+            // A directory counts only when it actually holds an entry file, so
+            // an unrelated folder in the skills dir stays silently ignored
+            // rather than being listed as a broken skill.
+            let entry_file = path.join(PACKAGE_ENTRY);
+            entry_file.is_file().then_some(entry_file)
         })
         .collect();
     files.sort();
@@ -318,10 +455,16 @@ fn scan_dir(dir: &Path, scope: SkillScope) -> Vec<SkillInfo> {
         if !real.is_file() {
             continue;
         }
-        let stem = path
-            .file_stem()
+        // A package's identity is its folder, so a broken `foo/SKILL.md` is
+        // reported as "foo" rather than as "SKILL".
+        let packaged = path.file_name().is_some_and(|file| file == PACKAGE_ENTRY);
+        let package_dir = packaged.then(|| path.parent()).flatten();
+        let stem = package_dir
+            .or(Some(path.as_path()))
+            .and_then(|source| source.file_stem())
             .map(|stem| stem.to_string_lossy().to_string())
             .unwrap_or_default();
+        let dir = package_dir.map(|dir| dir.display().to_string());
         let path_string = path.display().to_string();
         let info = match std::fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
@@ -334,6 +477,7 @@ fn scan_dir(dir: &Path, scope: SkillScope) -> Vec<SkillInfo> {
                         description: frontmatter.description,
                         scope,
                         path: path_string,
+                        dir,
                         enabled: true,
                         error: None,
                     }
@@ -343,6 +487,7 @@ fn scan_dir(dir: &Path, scope: SkillScope) -> Vec<SkillInfo> {
                         description: frontmatter.description,
                         scope,
                         path: path_string,
+                        dir,
                         enabled: false,
                         error: Some(format!(
                             "duplicate skill name '{}' in this scope",
@@ -356,6 +501,7 @@ fn scan_dir(dir: &Path, scope: SkillScope) -> Vec<SkillInfo> {
                 description: String::new(),
                 scope,
                 path: path_string,
+                dir,
                 enabled: false,
                 error: Some(error.to_string()),
             },
@@ -420,6 +566,104 @@ mod tests {
             parse_skill("---\nname: a\ndescription: |\n  first line\n  injected line\n---\n")
                 .unwrap();
         assert_eq!(frontmatter.description, "first line");
+    }
+
+    /// `<dir>/<name>/SKILL.md` plus a support file, the layout most published
+    /// agent-skill packages ship in.
+    fn write_package(dir: &Path, folder: &str, name: &str, description: &str, body: &str) {
+        let root = dir.join(folder);
+        write_skill(&root, PACKAGE_ENTRY, name, description, body);
+    }
+
+    #[test]
+    fn packaged_and_flat_skills_are_both_discovered() {
+        let global = tempfile::tempdir().unwrap();
+        write_skill(global.path(), "flat.md", "flat-one", "a flat skill", "F");
+        write_package(
+            global.path(),
+            "threejs-game-director",
+            "threejs-game-director",
+            "orchestrates a build",
+            "load references/phase-playbook.md",
+        );
+        // A folder with no entry file is not a skill and must not be listed.
+        std::fs::create_dir_all(global.path().join("not-a-skill")).unwrap();
+
+        let skills = list_from_dirs(global.path(), None, &[]);
+        let names: Vec<&str> = skills.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["flat-one", "threejs-game-director"]);
+
+        let packaged = skills.iter().find(|s| s.name == "threejs-game-director");
+        assert!(packaged.unwrap().dir.is_some(), "package exposes its root");
+        let flat = skills.iter().find(|s| s.name == "flat-one").unwrap();
+        assert!(flat.dir.is_none(), "a flat skill must not expose a dir");
+    }
+
+    #[test]
+    fn support_files_list_and_load_from_inside_the_package() {
+        let global = tempfile::tempdir().unwrap();
+        write_package(global.path(), "director", "director", "d", "body");
+        let refs = global.path().join("director").join("references");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("game-feel.md"), "# Game feel\nhitstop").unwrap();
+
+        let skills = list_from_dirs(global.path(), None, &[]);
+        let info = skills.iter().find(|s| s.name == "director").unwrap();
+        let listed = list_skill_files(info);
+        assert_eq!(listed.files, vec!["references/game-feel.md"]);
+        assert!(!listed.truncated);
+        // The entry file is the instructions, not a support file.
+        assert!(!listed.files.iter().any(|f| f == PACKAGE_ENTRY));
+
+        let (_, contents) = load_file_from_dirs(
+            global.path(),
+            None,
+            "director",
+            "references/game-feel.md",
+            &[],
+        )
+        .unwrap();
+        assert!(contents.contains("hitstop"));
+    }
+
+    #[test]
+    fn support_file_reads_cannot_escape_the_package() {
+        let global = tempfile::tempdir().unwrap();
+        write_package(global.path(), "director", "director", "d", "body");
+        write_skill(global.path(), "other.md", "other", "sibling", "SECRET");
+
+        for attempt in [
+            "../other.md",
+            "references/../../other.md",
+            "/etc/passwd",
+            "",
+        ] {
+            let result = load_file_from_dirs(global.path(), None, "director", attempt, &[]);
+            assert!(result.is_err(), "{attempt} must be rejected");
+        }
+    }
+
+    #[test]
+    fn flat_skill_has_no_support_files() {
+        let global = tempfile::tempdir().unwrap();
+        write_skill(global.path(), "flat.md", "flat-one", "d", "body");
+        let skills = list_from_dirs(global.path(), None, &[]);
+        let info = skills.iter().find(|s| s.name == "flat-one").unwrap();
+        assert!(list_skill_files(info).files.is_empty());
+        assert!(load_file_from_dirs(global.path(), None, "flat-one", "a.md", &[]).is_err());
+    }
+
+    #[test]
+    fn broken_package_is_named_after_its_folder() {
+        let global = tempfile::tempdir().unwrap();
+        let root = global.path().join("threejs-shaders");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(PACKAGE_ENTRY), "no frontmatter here").unwrap();
+
+        let skills = list_from_dirs(global.path(), None, &[]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "threejs-shaders");
+        assert!(skills[0].error.is_some());
     }
 
     #[test]

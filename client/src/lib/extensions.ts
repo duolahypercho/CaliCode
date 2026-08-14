@@ -10,8 +10,12 @@ export interface SkillInfo {
   name: string;
   description: string;
   scope: SkillScope;
-  /** Absolute path of the skill file, for display. */
+  /** Absolute path of the skill file, for display. For a packaged skill
+   * (`<name>/SKILL.md`) this is the entry file, not the folder. */
   path: string;
+  /** Package root, present only for a directory-packaged skill — the marker
+   * that it ships support files the agent can load on demand. */
+  dir?: string;
   /** Derived from the config's skills.disabled list. */
   enabled: boolean;
   /** Parse problem, if any — rows with an error cannot be toggled or loaded. */

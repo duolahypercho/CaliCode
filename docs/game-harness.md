@@ -177,20 +177,38 @@ autocomplete.
 
 | Command | Usage | What it does |
 |---|---|---|
-| `/help` | — | Lists every registered command |
-| `/loop` | `/loop <goal>` | Autonomous run: re-sends the goal, then "continue", until the agent replies `DONE` alone on a line, the cap is hit, or you press STOP |
+| `/help` | — | Lists every registered command, skills included |
+| `/loop` | `/loop [interval] <goal>` | Autonomous run: re-sends the goal until the agent replies `DONE` alone on a line and the completion gate accepts it, the cap is hit, or you press STOP. With an interval (`30s`, `15m`, `2h`) it becomes a watch: it waits that long between checks and keeps going after the goal is met, until you stop it |
+| `/goal` | `/goal [objective \| clear]` | Keeps working toward an objective, re-checked by the evaluator after every turn. Bare prints the current goal |
+| `/graph` | `/graph <goal>` | Plans a task DAG for the goal and runs it node by node |
+| `/graph-template` | `/graph-template <template> <goal>` | Same, from a named template (`aaa-fps`, `polished-asset`, …) |
+| `/graph-stop` | — | Cancels the running graph after the current node |
+| `/spawn` | `/spawn <role> <task>` | Runs one scoped subagent: `planner`, `coder`, `tester`, or `critic` |
+| `/side` | `/side [question]` | Opens a side chat — a read-only thread about this run. Every `/side` opens its own thread |
 | `/model` | `/model <provider>:<model>` | Switches the active model; bare `<model>` keeps the current provider |
-| `/compact` | — | One supervised turn that summarizes the transcript into 5–8 bullets and *replaces* it |
-| `/diff` | — | Asks the agent to list every file it changed this session |
-| `/sessions` | — | Prints saved sessions from `~/.cali/sessions` |
-| `/resume` | — | Reloads the most recent saved session |
+| `/compact` | `/compact [instructions \| clear]` | Summarizes the middle of the transcript and replaces it, keeping a protected head and tail. Instructions say what the summary must preserve and are remembered for the chat, so the automatic compactions that follow obey them too; `clear` forgets them |
+| `/usage` | — | Token totals for the session and how full the context window is |
+| `/diff` | — | Lists every file the agent changed this session |
+| `/checkpoints` | — | Restore points taken automatically during unattended runs |
+| `/restore` | `/restore <id> [confirm]` | Rolls the game back to a restore point. Destructive, so the first call only describes what it would overwrite |
+| `/sessions` | — | Prints saved chats from `~/.cali/sessions` |
+| `/resume` | `/resume [chat-id]` | Reloads a saved chat — the most recent one without an id, or any id (or unambiguous prefix) from `/sessions` |
 | `/fork` | — | Branches the current session into a new one |
 | `/clear` | — | Clears the visible transcript, keeps the session id |
 | `/new` | — | Fresh session id, empty transcript |
+| `/<skill>` | `/<skill> [task]` | Every enabled skill is a command; running one asks the agent to load it and follow it |
+
+Compaction runs on its own as well. Core watches the last model call's prompt
+size against `compaction.threshold` of the context window (0.75 by default,
+`~/.cali/config.yaml`) and compacts before the next turn grows it further.
+Cheapest measure first: if truncating stale tool results is enough on its own
+the summarization call is skipped entirely. Either way the transcript says what
+happened — an automatic compaction announces itself as one, because a context
+meter that drops with no explanation reads as lost work.
 
 Loop mechanics worth knowing before you write one:
 
-- **Cap is 25 iterations** (`MAX_LOOP_ITERATIONS`), each iteration allowing up
+- **Cap is 100 iterations** (`MAX_LOOP_ITERATIONS`), each iteration allowing up
   to **10 tool-calling turns** inside the core agent loop. Budget accordingly:
   a phase that needs 400 placements will not fit in one loop unless the agent
   writes a placement routine instead of 400 individual calls.

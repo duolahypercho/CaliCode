@@ -35,6 +35,7 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 use tokio::time::{timeout, Duration};
 
 use crate::config::{McpServerConfig, McpToolFilter};
+use crate::sandbox;
 use crate::tools::{ToolDef, ToolKind};
 
 const INIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -742,10 +743,25 @@ fn rpc_result(response: Value, server_id: &str) -> Result<Value> {
 /// safe baseline and the server's declared `env` (same pattern as
 /// `devserver::resolve_command`), so `CALI_*_API_KEY` and other parent
 /// secrets never reach an MCP server. Declared vars win over the baseline.
+///
+/// The filesystem is confined the same way a dev server's is, but the network
+/// deliberately is **not**. An MCP server is usually a client for some remote
+/// API — that is the entire reason it exists — so denying egress here would
+/// not harden anything, it would just make every useful server fail to work.
+/// The asymmetry is intentional: this is third-party code we let onto the
+/// network on purpose, and the boundary that matters is the one around the
+/// user's files.
+///
+/// A server has no workspace of its own (they are configured globally, before
+/// any project is open), so it gets [`sandbox::ambient_policy`]: the caches
+/// and `~/.cali`. One that persists state elsewhere needs an entry in
+/// `sandbox.writable_extra`.
 fn build_command(cfg: &McpServerConfig) -> Command {
-    let mut command = Command::new(&cfg.command);
+    let policy = sandbox::ambient_policy(sandbox::Network::Full);
+    let (program, args) = sandbox::confine(&policy, &cfg.command, &cfg.args);
+    let mut command = Command::new(program);
     command
-        .args(&cfg.args)
+        .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -933,9 +949,17 @@ impl McpManager {
                     info.namespaced.clone(),
                     ToolDef {
                         name: info.namespaced.clone(),
-                        description: format!("[MCP:{}] {}", client.server_id, info.description),
-                        parameters: object_schema(&info.input_schema),
+                        description: clamp_chars(
+                            &format!("[MCP:{}] {}", client.server_id, info.description),
+                            MAX_TOOL_DESCRIPTION_CHARS,
+                        ),
+                        parameters: bound_tool_schema(object_schema(&info.input_schema)),
                         kind: ToolKind::Mcp,
+                        // Unused for MCP: `is_destructive` answers from the
+                        // server's own trust flag before it ever looks here.
+                        // Set closed anyway so the field never becomes a
+                        // second, quieter source of truth.
+                        access: crate::tools::Access::Guarded,
                     },
                 );
             }
@@ -1189,6 +1213,88 @@ fn object_schema(schema: &Value) -> Value {
     }
 }
 
+/// Longest serialized schema kept for one MCP tool.
+///
+/// A third-party server decides how big its schemas are, and this one does not
+/// pay for that decision once — a tool schema rides in *every* request for the
+/// life of the session, so an over-generous server is a per-turn tax. 4KB is
+/// far more than any hand-written schema needs and still bounds the worst case
+/// at `MAX_TOOLS_PER_SERVER`.
+const MAX_TOOL_SCHEMA_BYTES: usize = 4096;
+/// Longest description kept for one MCP tool, for the same reason.
+const MAX_TOOL_DESCRIPTION_CHARS: usize = 600;
+/// Longest description kept for a single property while trimming.
+const MAX_PROPERTY_DESCRIPTION_CHARS: usize = 160;
+
+fn clamp_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}…")
+}
+
+/// Recursively shorten the prose inside a schema, leaving its shape intact.
+fn trim_schema_prose(value: &mut Value) {
+    match value {
+        Value::Object(fields) => {
+            // Neither is needed to *call* the tool, and both are where servers
+            // put paragraphs.
+            fields.remove("examples");
+            fields.remove("$comment");
+            if let Some(Value::String(text)) = fields.get_mut("description") {
+                *text = clamp_chars(text, MAX_PROPERTY_DESCRIPTION_CHARS);
+            }
+            for nested in fields.values_mut() {
+                trim_schema_prose(nested);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(trim_schema_prose),
+        _ => {}
+    }
+}
+
+/// Bound one MCP tool's schema without making it uncallable.
+///
+/// Order matters: prose goes first because it is the part that costs tokens and
+/// carries no contract. Only if that is not enough does the shape get reduced
+/// to names and types — still a valid schema the model can fill in, and it says
+/// so, rather than a truncated fragment the provider would reject.
+fn bound_tool_schema(schema: Value) -> Value {
+    if schema.to_string().len() <= MAX_TOOL_SCHEMA_BYTES {
+        return schema;
+    }
+    let mut trimmed = schema;
+    trim_schema_prose(&mut trimmed);
+    if trimmed.to_string().len() <= MAX_TOOL_SCHEMA_BYTES {
+        return trimmed;
+    }
+
+    let properties = trimmed
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|props| {
+            props
+                .iter()
+                .map(|(name, spec)| {
+                    let kind = spec.get("type").cloned().unwrap_or(json!("string"));
+                    (name.clone(), json!({ "type": kind }))
+                })
+                .collect::<serde_json::Map<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut reduced = json!({
+        "type": "object",
+        "properties": properties,
+        "description": "Schema reduced to names and types: the server's own \
+                        description of this tool was too large to carry every turn.",
+    });
+    if let Some(required) = trimmed.get("required") {
+        reduced["required"] = required.clone();
+    }
+    reduced
+}
+
 /// `"mcp__" + id + "__" + sanitized remote name`, clamped to 64 chars total
 /// (the provider function-name limit `tool_register` already assumes).
 /// Sanitize: chars outside `[A-Za-z0-9_-]` become `_`. When clamping
@@ -1347,6 +1453,81 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn a_modest_schema_is_left_exactly_alone() {
+        // The common case must not be touched at all: an unnecessary rewrite
+        // of a small schema would change the tool array byte-for-byte and cost
+        // the prompt cache for nothing.
+        let schema = json!({
+            "type": "object",
+            "properties": { "path": { "type": "string", "description": "file to read" } },
+            "required": ["path"],
+        });
+        assert_eq!(bound_tool_schema(schema.clone()), schema);
+    }
+
+    #[test]
+    fn an_oversized_schema_loses_its_prose_before_its_shape() {
+        // Prose is where servers put paragraphs and is not part of the
+        // contract; the properties are, so they survive.
+        let mut properties = serde_json::Map::new();
+        for i in 0..40 {
+            properties.insert(
+                format!("field_{i}"),
+                json!({
+                    "type": "string",
+                    "description": "x".repeat(300),
+                    "examples": ["y".repeat(200)],
+                }),
+            );
+        }
+        let schema = json!({ "type": "object", "properties": properties, "required": ["field_0"] });
+        assert!(schema.to_string().len() > MAX_TOOL_SCHEMA_BYTES);
+
+        let bounded = bound_tool_schema(schema);
+        assert!(
+            bounded.to_string().len() <= MAX_TOOL_SCHEMA_BYTES,
+            "still {} bytes",
+            bounded.to_string().len()
+        );
+        // Every field is still callable, and still typed.
+        let props = bounded["properties"].as_object().unwrap();
+        assert_eq!(props.len(), 40);
+        assert_eq!(props["field_7"]["type"], json!("string"));
+        assert_eq!(bounded["required"], json!(["field_0"]));
+        // The parts that only cost tokens are gone.
+        assert!(!bounded.to_string().contains("examples"));
+    }
+
+    #[test]
+    fn a_schema_too_large_even_without_prose_keeps_names_and_types() {
+        // Reduced, not truncated: a cut-off fragment would be invalid JSON
+        // schema and the provider would reject the whole request.
+        let mut properties = serde_json::Map::new();
+        for i in 0..600 {
+            properties.insert(
+                format!("really_long_field_name_number_{i}"),
+                json!({ "type": "integer" }),
+            );
+        }
+        let schema = json!({ "type": "object", "properties": properties });
+        let bounded = bound_tool_schema(schema);
+        assert_eq!(bounded["type"], json!("object"));
+        assert!(bounded["properties"].is_object());
+        assert!(bounded["description"].as_str().unwrap().contains("reduced"));
+        // Still parseable as a schema, which a truncation would not be.
+        assert!(serde_json::to_string(&bounded).is_ok());
+    }
+
+    #[test]
+    fn a_runaway_tool_description_is_clamped() {
+        assert_eq!(clamp_chars("short", MAX_TOOL_DESCRIPTION_CHARS), "short");
+        let long = "d".repeat(MAX_TOOL_DESCRIPTION_CHARS * 2);
+        let clamped = clamp_chars(&long, MAX_TOOL_DESCRIPTION_CHARS);
+        assert_eq!(clamped.chars().count(), MAX_TOOL_DESCRIPTION_CHARS + 1);
+        assert!(clamped.ends_with('…'));
+    }
+
+    #[test]
     fn object_schema_wraps_non_object_schemas() {
         let object = json!({ "type": "object", "properties": { "a": { "type": "string" } } });
         assert_eq!(object_schema(&object), object);
@@ -1483,6 +1664,32 @@ for line in sys.stdin:
             .any(|(k, v)| k == "MCP_DECLARED" && v.as_deref() == Some("declared-value")));
         // Baseline PATH survives so bare commands like `python3` resolve.
         assert!(envs.iter().any(|(k, _)| k == "PATH"));
+    }
+
+    /// The deliberate asymmetry with `devserver`: an MCP server's filesystem
+    /// is confined, its network is not. Most of them exist to call a remote
+    /// API, so a deny would break them rather than harden them.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn build_command_confines_the_filesystem_but_not_the_network() {
+        if !sandbox::settings().enabled {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = fake_cfg(dir.path(), 30);
+        let command = build_command(&cfg);
+        let std = command.as_std();
+        assert_eq!(std.get_program(), sandbox::SANDBOX_EXEC);
+        let args: Vec<String> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args[1].contains("(allow network*)"));
+        assert!(args.iter().any(|a| a.starts_with("WRITABLE_ROOT_0=")));
+        // The command and its arguments survive intact after `--`.
+        let separator = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[separator + 1], cfg.command);
+        assert_eq!(args[separator + 2..], cfg.args[..]);
     }
 
     /// End-to-end proof of the env scrub: the spawned child itself reports

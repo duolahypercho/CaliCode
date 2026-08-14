@@ -66,10 +66,13 @@ async function reopenGameAfterReload(page: Page, title: string) {
 }
 
 async function expectAutosaved(page: Page, slug: string) {
-  const consoleToggle = page.getByRole("button", { name: /CONSOLE/ });
-  if ((await consoleToggle.getAttribute("aria-expanded")) !== "true") {
-    await consoleToggle.click();
+  // The log moved out of the editor and into the bottom dock's Console tab,
+  // which is the dock's first tab and opens with it.
+  const dockToggle = page.getByRole("button", { name: "Toggle terminal panel" });
+  if ((await dockToggle.getAttribute("aria-pressed")) !== "true") {
+    await dockToggle.click();
   }
+  await page.getByRole("tab", { name: "Console" }).click();
   await expect(page.getByText(new RegExp(`saved ${escapeRegExp(slug)}`, "i")).last()).toBeVisible({
     timeout: 12_000,
   });

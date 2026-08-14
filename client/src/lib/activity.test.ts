@@ -9,6 +9,8 @@ import {
   isSafeActivityPath,
   repairLegacyActivitySummary,
   sessionWorkedMs,
+  summariseChangedFiles,
+  type ActivityFileChange,
 } from "./activity";
 
 describe("activity paths", () => {
@@ -156,5 +158,76 @@ describe("turn timing", () => {
       { role: "user" as const, content: "no metadata here" },
     ];
     expect(sessionWorkedMs(messages, 10_000)).toBe(4_000);
+  });
+});
+
+describe("clock durations", () => {
+  it("keeps every unit below the largest one, zero-padded", () => {
+    expect(formatDuration(60_409_000, "clock")).toBe("16h 46m 49s");
+    expect(formatDuration(247_000, "clock")).toBe("4m 07s");
+    expect(formatDuration(12_000, "clock")).toBe("12s");
+  });
+
+  it("drops leading empty units at each boundary", () => {
+    expect(formatDuration(59_999, "clock")).toBe("59s");
+    expect(formatDuration(60_000, "clock")).toBe("1m 00s");
+    expect(formatDuration(3_599_000, "clock")).toBe("59m 59s");
+    expect(formatDuration(3_600_000, "clock")).toBe("1h 00m 00s");
+  });
+
+  it("reads zero and negative elapsed as 0s rather than a placeholder", () => {
+    expect(formatDuration(0, "clock")).toBe("0s");
+    expect(formatDuration(400, "clock")).toBe("0s");
+    expect(formatDuration(-5_000, "clock")).toBe("0s");
+  });
+
+  it("leaves the compact style the transcript uses untouched", () => {
+    expect(formatDuration(0)).toBe("<1s");
+    expect(formatDuration(247_000)).toBe("4m 7s");
+  });
+});
+
+describe("summariseChangedFiles", () => {
+  const change = (path: string, additions: number, deletions: number, overrides: Partial<ActivityFileChange> = {}): ActivityFileChange => ({
+    path,
+    operation: "edit",
+    additions,
+    deletions,
+    diff: [],
+    ...overrides,
+  });
+
+  it("counts a repeatedly edited path once and sums its totals", () => {
+    const summary = summariseChangedFiles([
+      change("src/a.ts", 10, 0),
+      change("src/b.ts", 3, 1),
+      change("src/a.ts", 5, 2),
+      change("src/a.ts", 1, 1),
+    ]);
+    expect(summary.files.map((file) => file.path)).toEqual(["src/a.ts", "src/b.ts"]);
+    expect(summary.files[0]).toMatchObject({ additions: 16, deletions: 3 });
+    expect(summary.additions).toBe(19);
+    expect(summary.deletions).toBe(4);
+  });
+
+  it("ignores reads, searches and commands — they changed nothing", () => {
+    const summary = summariseChangedFiles([
+      change("src/a.ts", 4, 0, { operation: "read" }),
+      change("src/b.ts", 9, 9, { operation: "search" }),
+      change("src/c.ts", 0, 2, { operation: "write" }),
+      undefined,
+      null,
+    ]);
+    expect(summary.files.map((file) => file.path)).toEqual(["src/c.ts"]);
+    expect(summary).toMatchObject({ additions: 0, deletions: 2 });
+  });
+
+  it("keeps the latest diff for a path and remembers a truncated capture", () => {
+    const summary = summariseChangedFiles([
+      change("src/a.ts", 1, 0, { truncated: true, diff: [{ type: "added", oldLine: null, newLine: 1, text: "first" }] }),
+      change("src/a.ts", 1, 0, { diff: [{ type: "added", oldLine: null, newLine: 9, text: "latest" }] }),
+    ]);
+    expect(summary.files[0].diff).toEqual([{ type: "added", oldLine: null, newLine: 9, text: "latest" }]);
+    expect(summary.files[0].truncated).toBe(true);
   });
 });

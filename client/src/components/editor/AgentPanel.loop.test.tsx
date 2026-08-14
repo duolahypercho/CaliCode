@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   AgentPanel,
@@ -51,6 +51,7 @@ vi.mock("../../lib/sessions", () => ({
 }));
 
 vi.mock("../../lib/modelMeta", () => ({
+  contextLimitFor: vi.fn(() => null),
   defaultEffort: vi.fn((levels: string[]) => levels[0] ?? null),
   effortLevelsFor: vi.fn(() => []),
   loadModelDev: mocks.loadModelDev,
@@ -60,6 +61,7 @@ vi.mock("../../lib/coreConfig", () => ({
   contextWindowOf: vi.fn(() => 100_000),
   formatTokens: vi.fn((value: number) => String(value)),
   readCoreConfig: mocks.readCoreConfig,
+  sandboxSummary: vi.fn(() => null),
 }));
 
 vi.mock("../../lib/graph", () => ({
@@ -159,7 +161,7 @@ beforeEach(() => {
   mocks.listGraphs.mockResolvedValue([]);
   mocks.graphStatus.mockResolvedValue({});
   mocks.openLoopReport.mockImplementation(async (_slug: string, loopId: string) => readyLoopReport(loopId));
-  mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {} });
+  mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {}, contextLimits: {} });
   mocks.readCoreConfig.mockResolvedValue(null);
   mocks.rpc.mockImplementation(async (method: string) => {
     if (method === "editor_attach") return {};
@@ -725,6 +727,35 @@ describe("loop reporting", () => {
     expect(mocks.graphStatus).toHaveBeenCalledWith("graph-loop");
     expect(mocks.openLoopReport).toHaveBeenCalledTimes(1);
     expect(mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_update")).toHaveLength(1);
+  });
+
+  it("keeps watching on an interval instead of finishing when the goal is met", async () => {
+    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
+    mocks.graphStatus.mockResolvedValue(passingGraph());
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === "editor_attach") return {};
+      if (method === "agent_chat") return { sessionId: "session-1", reply: "DONE", toolCalls: [] };
+      return {};
+    });
+
+    renderPanel();
+    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
+    fireEvent.change(prompt, { target: { value: "/loop 1s polish the game" } });
+    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
+
+    // A paced loop is a watch: an accepted DONE answers this check and the
+    // loop re-arms rather than declaring itself finished.
+    expect(await screen.findByText(/goal met at iteration 1 — watching again in 1s/)).toBeTruthy();
+    expect(await screen.findByText(/next check in 1s/)).toBeTruthy();
+    expect(screen.queryByText(/✔ loop complete/)).toBeNull();
+    // The pill says which kind of run is up there.
+    expect(screen.getByText("every 1s")).toBeTruthy();
+
+    // Stop cuts the wait short rather than sitting it out.
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Stop loop" }));
+    });
+    expect(await screen.findByText(/loop stopped after/)).toBeTruthy();
   });
 
   it("reports an iteration failure as blocked without claiming the loop hit its cap", async () => {

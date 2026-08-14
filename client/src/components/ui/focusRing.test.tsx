@@ -45,14 +45,16 @@ const scannable = (path: string): string => {
 afterEach(cleanup);
 
 describe("focus ring", () => {
-  it("defines one token-driven ring in both themes", () => {
-    expect(css).toMatch(/:root\s*\{[^}]*--focus-ring:/s);
-    expect(css).toMatch(/\.dark\s*\{[^}]*--focus-ring:/s);
-    expect(css).toMatch(/\.focus-ring:focus-visible\s*\{\s*outline: 2px solid var\(--focus-ring\);/);
+  it("draws no focus outline at all — the product decision this file guards", () => {
+    // Rings were removed deliberately: hover tints, active fills and selected
+    // backgrounds carry the affordance. Restoring one is a product change, so
+    // it should break here first rather than reappear by accident.
+    expect(css).not.toMatch(/outline:\s*2px solid/);
+    expect(css).not.toMatch(/--focus-ring\s*:/);
+    expect(css).toMatch(/\.focus-ring:focus-visible[\s\S]*?outline: none;/);
   });
 
-  it("no longer suppresses focus rings app-wide", () => {
-    // The only `outline: none` left is the narrow [data-no-focus-ring] opt-out.
+  it("suppresses the outline in exactly one place, so there is one thing to undo", () => {
     const suppressions = css.match(/outline: none/g) ?? [];
     expect(suppressions).toHaveLength(1);
     expect(css).toMatch(/\[data-no-focus-ring\]:focus-visible\s*\{\s*outline: none;/);
@@ -120,15 +122,8 @@ describe("focus ring", () => {
     expect(offenders.map((path) => relative(process.cwd(), path))).toEqual([]);
   });
 
-  it("draws menu and listbox rows' ring inside the row, not on the popover padding", () => {
-    const inset = css.match(
-      /:where\(\s*\[role="option"\][^)]*\):focus-visible\s*\{\s*outline-offset: -2px;/s,
-    );
-    expect(inset, 'expected an inset ring rule for [role="option"] / [role="menuitem"]').not.toBeNull();
-    expect(inset?.[0]).toContain('[role="menuitem"]');
-
-    // It has to come after the shared rule to win: both are zero-specificity.
-    expect(css.indexOf(inset?.[0] as string)).toBeGreaterThan(css.indexOf(".focus-ring:focus-visible"));
+  it("leaves no outline-offset behind, which would only nudge a ring nothing draws", () => {
+    expect(css).not.toMatch(/outline-offset/);
   });
 
   it("styles no ARIA role the app never renders", () => {
@@ -140,14 +135,10 @@ describe("focus ring", () => {
     }
   });
 
-  it("makes .focus-ring-inset draw a ring on its own, not just move one", () => {
-    // The shared rule deliberately skips [tabindex="-1"], and the focus-return
-    // targets (ArtTab's panel, EntityProperties' empty state) are exactly that.
-    // If this class only set outline-offset it would promise those nodes a ring
-    // no rule ever draws.
-    expect(css).toMatch(
-      /\.focus-ring-inset:focus-visible\s*\{\s*outline: 2px solid var\(--focus-ring\);\s*outline-offset: -2px;/,
-    );
+  it("keeps .focus-ring-inset resolving, so the files spelling it stay honest", () => {
+    // The class survives as an inert hook rather than being edited out of
+    // every consumer; it must still land in the suppression rule, not dangle.
+    expect(css).toMatch(/\.focus-ring-inset:focus-visible[\s\S]*?outline: none;/);
   });
 
   it("gives every focus-ring-inset target a rule that reaches it", () => {

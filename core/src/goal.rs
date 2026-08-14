@@ -94,8 +94,9 @@ async fn evaluate_with_config(
 
 /// Keep the tail of an over-long excerpt: the most recent activity is the
 /// evidence a verdict turns on. Returns the kept slice and whether anything
-/// was dropped.
-fn clamp_transcript(transcript: &str) -> (&str, bool) {
+/// was dropped. Shared with `advisor.rs`, which caps the same excerpt for the
+/// same reason.
+pub fn clamp_transcript(transcript: &str) -> (&str, bool) {
     let total = transcript.chars().count();
     if total <= MAX_TRANSCRIPT_CHARS {
         return (transcript, false);

@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vitest";
 import {
   buildEvaluatorTranscript,
+  buildTranscriptWindow,
   formatGoalStatus,
   goalContinuationPrompt,
   goalIsVerifiable,
@@ -31,6 +32,34 @@ describe("parseGoalCommand", () => {
       action: "set",
       goal: "clear the level of debris",
     });
+  });
+});
+
+describe("buildTranscriptWindow", () => {
+  const messages = [
+    { role: "user", content: "add a double jump" },
+    { role: "assistant", content: "on it" },
+    { role: "tool", content: "3 tests passed", tool: "run_tests" },
+  ];
+
+  test("reports a whole transcript as untruncated", () => {
+    expect(buildTranscriptWindow(messages)).toMatchObject({ kept: 3, total: 3, truncated: false });
+  });
+
+  test("counts what the budget dropped", () => {
+    const window = buildTranscriptWindow(messages, 45);
+    expect(window).toMatchObject({ kept: 1, total: 3, truncated: true });
+    expect(window.text).toContain("3 tests passed");
+  });
+
+  test("reports a head-clipped single entry as truncated", () => {
+    const window = buildTranscriptWindow([{ role: "user", content: "x".repeat(200) }], 40);
+    expect(window).toMatchObject({ kept: 1, total: 1, truncated: true });
+  });
+
+  test("ignores entries with no content when counting", () => {
+    const window = buildTranscriptWindow([...messages, { role: "assistant", content: "  " }]);
+    expect(window).toMatchObject({ kept: 3, total: 3, truncated: false });
   });
 });
 

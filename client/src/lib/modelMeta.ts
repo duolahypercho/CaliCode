@@ -8,7 +8,9 @@
 import { Models } from "@opencode-ai/models";
 import type { Model, ProviderMap } from "@opencode-ai/models";
 
-const CACHE_KEY = "calicode-modeldev-v2";
+// v3 adds context limits; a v2 payload has none and would answer "unknown"
+// for every model until it expired.
+const CACHE_KEY = "calicode-modeldev-v3";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** model id (bare or provider-prefixed) → accepted effort values; [] = none. */
@@ -121,15 +123,64 @@ export function reduceCatalog(data: ProviderMap): Record<string, string[]> {
   return catalog;
 }
 
+/** model id (bare and provider-prefixed) → advertised context window in tokens. */
+export type ContextLimits = Record<string, number>;
+
+/**
+ * Each model's advertised context window, so compaction sizes itself to the
+ * model actually running instead of one fixed guess.
+ *
+ * Keyed both bare and provider-prefixed for the same reason `reduceRegistry`
+ * is: the active model arrives as either form. A model is recorded under a
+ * larger window when providers disagree — the vendor's own listing is the one
+ * that tends to be current, and under-reporting compacts early, which costs
+ * real work.
+ *
+ * `limit.context` of 0 means "not applicable" (image and embedding entries
+ * carry it), never "no context", so those are skipped rather than recorded.
+ */
+export function reduceContextLimits(data: ProviderMap): ContextLimits {
+  const limits: ContextLimits = {};
+  const record = (key: string, context: number) => {
+    const current = limits[key];
+    if (current === undefined || context > current) limits[key] = context;
+  };
+  for (const [providerId, provider] of Object.entries(data)) {
+    for (const model of Object.values(provider.models ?? {})) {
+      const context = model.limit?.context;
+      if (typeof context !== "number" || !Number.isFinite(context) || context <= 0) continue;
+      record(model.id, context);
+      record(`${providerId}/${model.id}`, context);
+    }
+  }
+  return limits;
+}
+
+/** The window for a model id, tolerating a provider prefix. `null` = unknown. */
+export function contextLimitFor(limits: ContextLimits | null, modelId: string): number | null {
+  if (!limits || !modelId) return null;
+  const direct = limits[modelId];
+  if (typeof direct === "number") return direct;
+  // "openrouter/anthropic/claude-x" → try progressively barer ids.
+  const parts = modelId.split("/");
+  for (let i = 1; i < parts.length; i += 1) {
+    const candidate = limits[parts.slice(i).join("/")];
+    if (typeof candidate === "number") return candidate;
+  }
+  return null;
+}
+
 export interface ModelDevData {
   index: EffortIndex;
   catalog: Record<string, string[]>;
+  contextLimits: ContextLimits;
 }
 
 interface CachedIndex {
   at: number;
   index: EffortIndex;
   catalog: Record<string, string[]>;
+  contextLimits: ContextLimits;
 }
 
 function readCache(): CachedIndex | null {
@@ -139,6 +190,9 @@ function readCache(): CachedIndex | null {
     const parsed = JSON.parse(raw) as CachedIndex;
     if (typeof parsed !== "object" || parsed === null || typeof parsed.at !== "number") return null;
     if (typeof parsed.catalog !== "object" || parsed.catalog === null) return null;
+    // A cache written before context limits existed would answer "unknown" for
+    // every model for a full day. The key is versioned, but check anyway.
+    if (typeof parsed.contextLimits !== "object" || parsed.contextLimits === null) return null;
     return parsed;
   } catch {
     return null;
@@ -154,10 +208,16 @@ function readCache(): CachedIndex | null {
  */
 export async function loadModelDev(): Promise<ModelDevData> {
   const cached = readCache();
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) return { index: cached.index, catalog: cached.catalog };
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+    return { index: cached.index, catalog: cached.catalog, contextLimits: cached.contextLimits };
+  }
   try {
     const providers = await Models.make().providers();
-    const data: ModelDevData = { index: reduceRegistry(providers), catalog: reduceCatalog(providers) };
+    const data: ModelDevData = {
+      index: reduceRegistry(providers),
+      catalog: reduceCatalog(providers),
+      contextLimits: reduceContextLimits(providers),
+    };
     try {
       localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), ...data } satisfies CachedIndex));
     } catch {
@@ -167,12 +227,16 @@ export async function loadModelDev(): Promise<ModelDevData> {
   } catch {
     // Offline: a stale answer still beats guessing, and the bundled snapshot
     // (regenerated with every package release) beats an empty index.
-    if (cached) return { index: cached.index, catalog: cached.catalog };
+    if (cached) return { index: cached.index, catalog: cached.catalog, contextLimits: cached.contextLimits };
     try {
       const snapshot = await import("@opencode-ai/models/snapshot");
-      return { index: reduceRegistry(snapshot.providers), catalog: reduceCatalog(snapshot.providers) };
+      return {
+        index: reduceRegistry(snapshot.providers),
+        catalog: reduceCatalog(snapshot.providers),
+        contextLimits: reduceContextLimits(snapshot.providers),
+      };
     } catch {
-      return { index: {}, catalog: {} };
+      return { index: {}, catalog: {}, contextLimits: {} };
     }
   }
 }

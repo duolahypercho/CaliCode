@@ -17,7 +17,19 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SRC_TAURI="$ROOT/client/src-tauri"
 BUILT_APP="$SRC_TAURI/target/release/bundle/macos/CaliCode.app"
 INSTALLED_APP="/Applications/CaliCode.app"
-SIGNING_IDENTITY="${CODESIGN_IDENTITY:-${APPLE_SIGNING_IDENTITY:--}}"
+# An ad-hoc signature ("-") is keyed to the binary's hash, so macOS treats every
+# rebuild as a different app and drops its TCC grants — the developer re-approves
+# Desktop/Documents access after each build, and a shell spawned in a folder that
+# is no longer granted blocks forever in getcwd() rather than failing. A stable
+# local identity keeps the grant across rebuilds. Create one once with
+# scripts/dev-signing-identity.sh; without it this falls back to ad-hoc.
+LOCAL_SIGNING_IDENTITY="${CALI_SIGNING_IDENTITY:-CaliCode Dev}"
+if [ -z "${CODESIGN_IDENTITY:-}" ] && [ -z "${APPLE_SIGNING_IDENTITY:-}" ] \
+  && /usr/bin/security find-identity -v -p codesigning 2>/dev/null | grep -q "$LOCAL_SIGNING_IDENTITY"; then
+  SIGNING_IDENTITY="$LOCAL_SIGNING_IDENTITY"
+else
+  SIGNING_IDENTITY="${CODESIGN_IDENTITY:-${APPLE_SIGNING_IDENTITY:--}}"
+fi
 
 case "$MODE" in
   build|dev|install) ;;

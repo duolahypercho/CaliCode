@@ -12,6 +12,8 @@ bytes = "1"
 futures = "0.3"
 globset = "0.4"
 image = "0.25"
+libc = "0.2"
+portable-pty = "0.9"
 regex = "1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,6 +22,7 @@ serde_yaml = "0.9"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
+tokio-tungstenite = "0.24"
 tower-http = { version = "0.5", features = ["cors", "fs", "set-header", "trace"] }
 tracing = "0.1"
 tracing-subscriber = "0.3"

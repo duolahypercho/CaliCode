@@ -94,7 +94,9 @@ test.describe("console drawer @visual", () => {
     await page.setViewportSize({ width: 1440, height: 900 });
     await page.goto("/");
     await settle(page);
-    await page.getByRole("button", { name: /CONSOLE/ }).click();
+    const dockToggle = page.getByRole("button", { name: "Toggle terminal panel" });
+    if ((await dockToggle.getAttribute("aria-pressed")) !== "true") await dockToggle.click();
+    await page.getByRole("tab", { name: "Console" }).click();
     await settle(page);
 
     await expect(page).toHaveScreenshot("console-expanded.png", {

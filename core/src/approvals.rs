@@ -44,6 +44,9 @@ struct PendingApproval {
     /// The graph run this belongs to. Display on the client, and the key for
     /// `cancel_by_graph`.
     owner_graph: Option<String>,
+    /// The tool this request is about. Needed so an "always allow" can grant
+    /// exactly the tool the user was shown and nothing wider.
+    tool: String,
     sender: oneshot::Sender<Value>,
 }
 
@@ -144,6 +147,7 @@ impl Approvals {
                 target_client_id: request.target_client_id.clone(),
                 owner_session: request.owner_session.clone(),
                 owner_graph: request.owner_graph.clone(),
+                tool: request.tool.to_string(),
                 sender: tx,
             },
         );
@@ -220,6 +224,7 @@ impl Approvals {
         client_id: Option<&str>,
         approved: bool,
     ) -> Result<Value> {
+        let answered;
         {
             let pending = self.pending.lock().await;
             let entry = pending
@@ -234,12 +239,17 @@ impl Approvals {
                     "approval {request_id} has no attached window and cannot be answered"
                 ),
             }
+            // Captured before resolving: the entry is removed by `resolve`, and
+            // the caller needs these to record an "always allow" against the
+            // right session and the exact tool the user was shown.
+            answered = Some((entry.answer_session.clone(), entry.tool.clone()));
         }
+        let (session, tool) = answered.expect("the guard above returns on a missing entry");
         if self
             .resolve(request_id, Resolution::Answered { approved })
             .await
         {
-            Ok(json!({ "accepted": true }))
+            Ok(json!({ "accepted": true, "sessionId": session, "tool": tool }))
         } else {
             anyhow::bail!("no pending approval {request_id}")
         }

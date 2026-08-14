@@ -24,10 +24,12 @@ test("live bar exposes build, fps, and a console", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByText("FPS", { exact: false }).first()).toBeVisible();
 
-  const consoleToggle = page.getByRole("button", { name: /CONSOLE/ });
-  await expect(consoleToggle).toHaveAttribute("aria-expanded", "false");
-  await consoleToggle.click();
-  await expect(consoleToggle).toHaveAttribute("aria-expanded", "true");
+  // The log lives in the bottom dock now, behind the panel toggle.
+  const dockToggle = page.getByRole("button", { name: "Toggle terminal panel" });
+  await expect(dockToggle).toHaveAttribute("aria-pressed", "false");
+  await dockToggle.click();
+  await expect(dockToggle).toHaveAttribute("aria-pressed", "true");
+  await expect(page.getByRole("tab", { name: "Console" })).toBeVisible();
 });
 
 test("tweak pins open a live inspector over the viewport", async ({ page }) => {

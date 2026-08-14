@@ -38,6 +38,10 @@ const PER_MESSAGE_OVERHEAD_TOKENS: usize = 4;
 /// summarization call itself stays bounded.
 const SUMMARY_TRANSCRIPT_MESSAGE_CAP: usize = 1500;
 
+/// Cap on an operator's `/compact <instructions>` steer, so a pasted file
+/// cannot crowd the transcript out of the summarization call.
+pub const MAX_INSTRUCTION_CHARS: usize = 2_000;
+
 /// Marker prefixed to the summary assistant message produced by [`apply`].
 pub const SUMMARY_MARKER: &str = "[Conversation summary — earlier messages were compacted]";
 
@@ -206,23 +210,39 @@ fn render_for_summary(message: &Value) -> String {
 /// is rendered into the request; the tail is excluded because it survives
 /// verbatim. The caller performs the model call and feeds the resulting text
 /// to [`apply`].
-pub fn build_summary_request(messages: &[Value], boundaries: &Boundaries) -> Vec<Value> {
+pub fn build_summary_request(
+    messages: &[Value],
+    boundaries: &Boundaries,
+    instructions: Option<&str>,
+) -> Vec<Value> {
     let transcript = messages[..boundaries.tail_start]
         .iter()
         .map(render_for_summary)
         .collect::<Vec<_>>()
         .join("\n\n");
+    let mut system = "You are the context summarizer for a coding agent. Summarize the \
+                      conversation the user provides into a structured handoff that lets the \
+                      agent continue seamlessly. Respond with exactly these markdown sections, \
+                      each with concise bullet points:\n\
+                      ## Goal\n## Constraints\n## Progress\n## Decisions\n## Files touched\n## Next steps\n\
+                      Be specific: preserve file paths, tool names, error messages, chosen \
+                      approaches, and open questions. Do not invent details."
+        .to_string();
+    // The operator's steer is additive: it says what to keep, never which
+    // sections to drop. A summary missing ## Next steps would break the
+    // handoff this whole pipeline exists to produce, so the shape is not
+    // negotiable and the instruction is bounded before it is embedded.
+    if let Some(instructions) = instructions.map(str::trim).filter(|text| !text.is_empty()) {
+        let bounded: String = instructions.chars().take(MAX_INSTRUCTION_CHARS).collect();
+        system.push_str(
+            "\n\nThe operator asked you to pay particular attention to the following. Keep \
+             every section above; expand the ones this touches and preserve these details \
+             verbatim where they appear:\n",
+        );
+        system.push_str(&bounded);
+    }
     vec![
-        json!({
-            "role": "system",
-            "content": "You are the context summarizer for a coding agent. Summarize the \
-                        conversation the user provides into a structured handoff that lets the \
-                        agent continue seamlessly. Respond with exactly these markdown sections, \
-                        each with concise bullet points:\n\
-                        ## Goal\n## Constraints\n## Progress\n## Decisions\n## Files touched\n## Next steps\n\
-                        Be specific: preserve file paths, tool names, error messages, chosen \
-                        approaches, and open questions. Do not invent details."
-        }),
+        json!({ "role": "system", "content": system }),
         json!({
             "role": "user",
             "content": format!("Summarize this conversation:\n\n{transcript}")
@@ -643,6 +663,57 @@ mod tests {
     // ---- build_summary_request -------------------------------------------
 
     #[test]
+    fn summary_request_carries_the_operators_steer_without_dropping_sections() {
+        let messages = vec![
+            system("s"),
+            user("build a tower"),
+            assistant("ok"),
+            user("make it taller"),
+            assistant("done middle work"),
+            user("tail question"),
+            assistant("tail answer"),
+        ];
+        let b = Boundaries {
+            head_end: 3,
+            tail_start: 5,
+        };
+        let request = build_summary_request(&messages, &b, Some("  keep the repro steps  "));
+        let sys = request[0]["content"].as_str().unwrap();
+        assert!(sys.contains("keep the repro steps"));
+        // The handoff shape is not negotiable: a steer adds emphasis, it does
+        // not get to remove the sections the agent resumes from.
+        for section in ["## Goal", "## Next steps"] {
+            assert!(sys.contains(section), "steer dropped {section}");
+        }
+    }
+
+    #[test]
+    fn summary_request_ignores_a_blank_steer_and_bounds_a_huge_one() {
+        let messages = vec![
+            system("s"),
+            user("a"),
+            assistant("b"),
+            user("c"),
+            assistant("d"),
+        ];
+        let b = Boundaries {
+            head_end: 3,
+            tail_start: 4,
+        };
+        let blank = build_summary_request(&messages, &b, Some("   "));
+        assert!(!blank[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("particular attention"));
+
+        let huge = "x".repeat(MAX_INSTRUCTION_CHARS * 3);
+        let bounded = build_summary_request(&messages, &b, Some(&huge));
+        let sys = bounded[0]["content"].as_str().unwrap();
+        assert!(sys.contains(&"x".repeat(MAX_INSTRUCTION_CHARS)));
+        assert!(!sys.contains(&"x".repeat(MAX_INSTRUCTION_CHARS + 1)));
+    }
+
+    #[test]
     fn summary_request_has_system_and_user_with_sections() {
         let messages = vec![
             system("s"),
@@ -657,7 +728,7 @@ mod tests {
             head_end: 3,
             tail_start: 5,
         };
-        let request = build_summary_request(&messages, &b);
+        let request = build_summary_request(&messages, &b, None);
         assert_eq!(request.len(), 2);
         assert_eq!(request[0]["role"], "system");
         assert_eq!(request[1]["role"], "user");
@@ -693,7 +764,7 @@ mod tests {
             head_end: 3,
             tail_start: 5,
         };
-        let request = build_summary_request(&messages, &b);
+        let request = build_summary_request(&messages, &b, None);
         let transcript = request[1]["content"].as_str().unwrap();
         assert!(transcript.contains("file_grep"));
         assert!(transcript.contains("match at line 4"));
@@ -707,7 +778,7 @@ mod tests {
             head_end: 3,
             tail_start: 3,
         };
-        let request = build_summary_request(&messages, &b);
+        let request = build_summary_request(&messages, &b, None);
         let transcript = request[1]["content"].as_str().unwrap();
         assert!(transcript.chars().count() < SUMMARY_TRANSCRIPT_MESSAGE_CAP * 2);
     }
@@ -914,7 +985,7 @@ mod tests {
         let b = select_boundaries(&messages, threshold).expect("compactable");
         prune_old_tool_results(&mut messages, b.tail_start);
 
-        let request = build_summary_request(&messages, &b);
+        let request = build_summary_request(&messages, &b, None);
         assert_eq!(request.len(), 2);
 
         let out = apply(

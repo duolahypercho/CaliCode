@@ -99,7 +99,9 @@ test("importing an image reaches the asset library and the console", async ({ pa
     buffer: Buffer.from(PNG_1PX, "base64"),
   });
 
-  await page.getByRole("button", { name: /CONSOLE/ }).click();
+  const dockToggle = page.getByRole("button", { name: "Toggle terminal panel" });
+  if ((await dockToggle.getAttribute("aria-pressed")) !== "true") await dockToggle.click();
+  await page.getByRole("tab", { name: "Console" }).click();
   await expect(page.getByText(/imported asset\.png/i)).toBeVisible({ timeout: 20_000 });
   // Scope to the library: the console line above also contains "asset.png",
   // so an unscoped match proved nothing about the asset reaching the library.
@@ -116,7 +118,9 @@ test("generated cali asset promotes into the scene", async ({ page }) => {
     buffer: Buffer.from(PNG_1PX, "base64"),
   });
 
-  await page.getByRole("button", { name: /CONSOLE/ }).click();
+  const dockToggle = page.getByRole("button", { name: "Toggle terminal panel" });
+  if ((await dockToggle.getAttribute("aria-pressed")) !== "true") await dockToggle.click();
+  await page.getByRole("tab", { name: "Console" }).click();
   await expect(page.getByText(/generated image-to-3D spec/i)).toBeVisible({ timeout: 20_000 });
 
   await page.getByRole("button", { name: "Promote cali.png" }).first().click();
@@ -138,7 +142,9 @@ test("edits autosave the project and the test tab runs the suite", async ({ page
   const current = await nameField.inputValue();
   await nameField.fill(current.endsWith(" *") ? current.slice(0, -2) : `${current} *`);
   await nameField.press("Enter");
-  await page.getByRole("button", { name: /CONSOLE/ }).click();
+  const dockToggle = page.getByRole("button", { name: "Toggle terminal panel" });
+  if ((await dockToggle.getAttribute("aria-pressed")) !== "true") await dockToggle.click();
+  await page.getByRole("tab", { name: "Console" }).click();
   await expect(page.getByText(/saved starter/i).first()).toBeVisible({ timeout: 10_000 });
 
   await openTab(page, "test");
@@ -182,9 +188,14 @@ test("agent panel exposes model and subagent controls", async ({ page }) => {
   expect(composerRadius).toBeGreaterThanOrEqual(20);
 
   // The old ··· session menu is gone; subagents run via /spawn instead.
-  await page.getByLabel("Agent prompt").fill("/spawn");
+  // Enter on a bare command completes it rather than firing it, so the role
+  // and task still have to be typed; running it early only printed usage.
+  const composer = page.getByLabel("Agent prompt");
+  await composer.fill("/spawn");
   await page.keyboard.press("Enter");
-  await expect(page.getByText(/Usage: \/spawn/)).toBeVisible();
+  await expect(composer).toHaveValue("/spawn ");
+  await expect(page.getByText(/Usage: \/spawn/)).toHaveCount(0);
+  await composer.fill("");
 
   // The header toggle hides and restores the tools dock.
   const dock = page.getByRole("tablist", { name: "Workspace" });
@@ -210,7 +221,9 @@ test("assets library opens from the sidebar, shows detail, installs, and yields 
     // Reload so the app's initial session listing includes this transcript,
     // then make it the active session before leaving chat.
     await page.reload();
-    const previousSession = page.getByRole("button", { name: new RegExp(sessionTitle) });
+    // The row and its hover actions menu both carry the chat name, so this
+    // has to name the row exactly rather than matching the name anywhere.
+    const previousSession = page.getByRole("button", { name: new RegExp(`^${sessionTitle}`) });
     await expect(previousSession).toBeVisible();
     await previousSession.click();
     await expect(page.getByText("Keep the asset library session reachable.")).toBeVisible();
@@ -286,4 +299,31 @@ test("supervised agent tool approval completes live @live", async ({ page }) => 
   // markdown ("**4**") that the panel renders literally.
   await expect(page.getByText(/editor_scene_inspect/).last()).toBeVisible({ timeout: 45_000 });
   await expect(page.locator('[data-role="assistant"]').last()).toContainText(/\d/, { timeout: 45_000 });
+});
+
+test("/side opens the side chat with the question waiting, unsent", async ({ page }) => {
+  await page.goto("/");
+
+  await page.getByLabel("Agent prompt").fill("/side why did that last edit fail?");
+  await page.keyboard.press("Enter");
+
+  // The command opens the panel; the question waits so it can be edited there.
+  const side = page.getByLabel("Side chat prompt");
+  await expect(side).toHaveValue("why did that last edit fail?");
+  await expect(page.getByRole("button", { name: "Send side chat message" })).toBeEnabled();
+
+  // Its command set is its own: the agent panel's run-altering commands are
+  // not reachable from a panel that promises not to touch the run.
+  await side.fill("/");
+  await expect(page.getByText("Clear this side thread")).toBeVisible();
+  await expect(page.getByText("Run autonomously toward a goal until done")).toHaveCount(0);
+
+  await side.fill("/loop ship the game");
+  await page.keyboard.press("Enter");
+  await expect(page.getByText(/Unknown command \/loop/)).toBeVisible();
+
+  // And the side chat's model picker never moves the run's active model.
+  const runModel = await page.getByLabel("Active model").getAttribute("title");
+  await expect(page.getByLabel("Side chat model")).toBeVisible();
+  expect(await page.getByLabel("Active model").getAttribute("title")).toBe(runModel);
 });

@@ -1,29 +1,38 @@
-import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ArrowDown,
   ArrowUp,
   BookOpen,
   Check,
+  ChevronDown,
   ChevronRight,
   Clock3,
+  Eye,
   FilePenLine,
   Gamepad2,
+  Hand,
   Loader2,
+  MessageCircleQuestion,
   ScanSearch,
   Search,
   ShieldCheck,
   ShieldOff,
   Sparkles,
+  ShieldPlus,
   Square,
   Terminal,
   TestTube2,
   X,
-  Zap,
 } from "lucide-react";
 import { AgentText } from "./AgentText";
 import { GraphPanel } from "./GraphPanel";
 import { ReasoningRow } from "./ReasoningRow";
+import { ModelPicker, buildModelChoices } from "./ModelPicker";
+import { RunStatusPill, type ActiveLoopRun } from "./RunStatusPill";
+import type { SideChatAnchor } from "./SideChat";
+import { SlashMenu } from "./SlashMenu";
+import { TurnFileSummaryCard } from "./TurnFileSummaryCard";
 import {
   buildEvaluatorTranscript,
   formatGoalStatus,
@@ -33,6 +42,18 @@ import {
   type GoalState,
 } from "../../lib/goal";
 import { budgetNotice, detectStall, exhaustionPrompt, type LoopAction } from "../../lib/loopGuards";
+import {
+  AUTO_CHECKPOINT_KEEP,
+  checkpointTakenAtMs,
+  dueForCheckpoint,
+  formatCheckpointAge,
+  formatCheckpointList,
+  readAutoCheckpoints,
+  recordAutoCheckpoint,
+  restoreWarning,
+  type AutoCheckpointReason,
+  type CheckpointKind,
+} from "../../lib/checkpoints";
 import { SubagentChips, type SubagentChipItem } from "./SubagentChips";
 import { Button } from "../ui/button";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../ui/select";
@@ -53,11 +74,25 @@ import {
   type LapsedReason,
   type ResolvedOutcome,
 } from "../../lib/approvalStore";
-import { contextWindowOf, formatTokens, readCoreConfig, type CoreConfig } from "../../lib/coreConfig";
+import {
+  contextWindowOf,
+  formatTokens,
+  readCoreConfig,
+  sandboxSummary,
+  type CoreConfig,
+} from "../../lib/coreConfig";
+import { listSkills, type SkillInfo } from "../../lib/extensions";
+import { formatInterval } from "../../lib/interval";
 import {
   MAX_LOOP_ITERATIONS,
-  matchCommands,
-  parseSlash,
+  SLASH_COMMANDS,
+  completeSlashToken,
+  matchCommandsIn,
+  runsBare,
+  parseSlashIn,
+  skillCommands,
+  slashTokenAt,
+  type SlashCommand,
   type SlashContext,
 } from "../../lib/slashCommands";
 import {
@@ -69,7 +104,14 @@ import {
   saveSession,
   type SessionSummary,
 } from "../../lib/sessions";
-import { defaultEffort, effortLevelsFor, loadModelDev, type EffortIndex } from "../../lib/modelMeta";
+import {
+  contextLimitFor,
+  defaultEffort,
+  effortLevelsFor,
+  loadModelDev,
+  type ContextLimits,
+  type EffortIndex,
+} from "../../lib/modelMeta";
 import {
   DEFAULT_JUDGE_THRESHOLD,
   cancelGraph,
@@ -92,6 +134,7 @@ import {
   isTurnMarker,
   repairLegacyActivitySummary,
   sessionWorkedMs,
+  summariseChangedFiles,
   type ActivityAction,
   type ActivityFileChange,
 } from "../../lib/activity";
@@ -492,26 +535,74 @@ export function ownsBrowserToolEvent(
   return Boolean(owner.activeGraph?.nodes.some((node) => node.sessionId === routedSessionId));
 }
 
-// Core accepts exactly these permission modes (core/src/agent.rs
-// `requires_approval`): "full-access" | "auto" | "auto-accept-edits" |
-// "supervised" | "plan". "Sandbox" maps onto core's `auto` (safe tools run
-// freely, irreversible writes ask), matching codex-style workspace sandboxes.
-// "Plan" is core's real plan mode: dispatch is restricted to the read-only
-// whitelist (`plan_mode_allows`), so the agent can inspect and plan but
-// nothing is modified.
+/**
+ * This control answers one question only: **when does the agent ask?**
+ *
+ * It deliberately does NOT offer a "Sandbox" mode, which is what it used to
+ * call core's `auto`. CaliCode has no OS-level confinement — no Seatbelt, no
+ * Landlock, no bubblewrap — so that label promised process isolation nothing
+ * implements, and a user picking the "safe-sounding" option got the opposite
+ * of what they thought. Codex's own rule is the right one: only auto-approve
+ * what you can actually enforce. If real confinement lands later, it belongs
+ * beside this as a second control, not inside it.
+ *
+ * What *is* enforced is path confinement: file tools resolve through
+ * `workspace::safe_resolve`, which rejects `..` escapes, so writes stay inside
+ * the selected game's folder in every mode. That is stated under the composer
+ * as a fact rather than offered as a choice.
+ *
+ * Core still accepts all five strings (core/src/agent.rs `requires_approval`),
+ * so a persisted `auto-accept-edits` keeps working; the UI just stops offering
+ * it, because it differed from `auto` only in whether the dev server prompted
+ * — and the dev server now prompts in both.
+ */
 const PERMISSION_OPTIONS = [
-  { value: "full-access", label: "Full access", hint: "Runs every tool without asking" },
-  { value: "auto-accept-edits", label: "Accept edits", hint: "Scene edits apply automatically; file writes and commands still ask" },
-  { value: "auto", label: "Sandbox", hint: "Safe tools run freely; irreversible writes ask first" },
-  { value: "supervised", label: "Manual", hint: "Asks before every tool call" },
-  { value: "plan", label: "Plan", hint: "Read-only: inspect and plan; write tools are blocked" },
+  {
+    value: "supervised",
+    label: "Manual",
+    hint: "Asks before every tool",
+    icon: Hand,
+    danger: false,
+  },
+  {
+    value: "auto",
+    label: "Auto",
+    hint: "Writes and the dev server ask first",
+    icon: ShieldCheck,
+    danger: false,
+  },
+  {
+    value: "full-access",
+    label: "Full access",
+    hint: "Never asks · no approval gate",
+    icon: ShieldOff,
+    danger: true,
+  },
 ] as const;
+
+/**
+ * Plan is not a rung on the approval ladder — it restricts which tools may be
+ * dispatched at all, so it sits below a divider rather than among the modes
+ * that only decide when to ask.
+ */
+const PLAN_OPTION = {
+  value: "plan",
+  label: "Plan",
+  hint: "Read-only — writes are blocked",
+  icon: Eye,
+  danger: false,
+} as const;
+
+const ALL_PERMISSION_OPTIONS = [...PERMISSION_OPTIONS, PLAN_OPTION];
 
 // Which efforts each model accepts comes from the models.dev registry (the
 // catalog opencode's picker is built on) — a gpt-4.1-mini has none, an
 // o-series has low/medium/high, a deepseek-v4-flash has low/high/max. The
 // user's chosen effort is remembered per model.
 const EFFORT_STORAGE_KEY = "calicode-model-effort-map";
+
+/** How much of a step's output rides along when a question is anchored to it. */
+const ANCHOR_DETAIL_CHARS = 2000;
 
 const GAME_STARTERS = [
   {
@@ -559,6 +650,19 @@ interface AgentPanelProps {
   initialSessionId?: string | null;
   /** Fired with the fresh list whenever the saved sessions change. */
   onSessionsChanged?: (sessions: SessionSummary[]) => void;
+  /**
+   * Read-only mirror of the transcript for the side chat. The observer must
+   * never reach into this panel's state, so it is handed a copy rather than
+   * given a way to change it.
+   */
+  onTranscriptChange?: (messages: AgentMessage[]) => void;
+  /** Reveals the side chat — what `/side` runs. The draft arrives unsent. */
+  /**
+   * Reveal the side chat. `fresh` opens another thread beside the ones already
+   * open — what `/side` means every time it is run; without it the newest
+   * existing thread is focused, so a per-step question does not multiply tabs.
+   */
+  onOpenSideChat?: (draft?: string, anchor?: SideChatAnchor, options?: { fresh?: boolean }) => void;
   onSessionActivated?: (session: SessionSummary) => void;
   /** Opens a workspace file when a safe activity path is selected. */
   onOpenActivityFile?: (file: ActivityFileChange) => void;
@@ -586,7 +690,7 @@ interface AgentPanelProps {
  * a left rule (the opencode/t3code idiom). Tool messages without a `status`
  * are informational lines (slash-command output, session notes).
  */
-function ToolRow({ message }: { message: AgentMessage }) {
+export function ToolRow({ message, onAsk }: { message: AgentMessage; onAsk?: (message: AgentMessage) => void }) {
   const [open, setOpen] = useState(false);
   const expandable = Boolean(message.detail);
   const heading =
@@ -595,14 +699,18 @@ function ToolRow({ message }: { message: AgentMessage }) {
       : message.status
         ? `Ran ${message.tool}`
         : null;
+  // A step is worth asking about once it has a name; slash-command output and
+  // session notes are this panel's own words, not the run's work.
+  const askable = Boolean(onAsk && message.tool && message.status);
   return (
-    <div data-role="tool" className="w-full max-w-[94%] self-start">
+    <div data-role="tool" className="group/tool flex w-full max-w-[94%] flex-col self-start">
+      <div className="flex w-full items-center gap-1">
       <button
         type="button"
         disabled={!expandable}
         onClick={() => setOpen((current) => !current)}
         aria-expanded={expandable ? open : undefined}
-        className={`flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left text-xs text-ink-subtle transition-colors ${
+        className={`flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-0.5 text-left text-xs text-ink-subtle transition-colors ${
           expandable ? "hover:bg-surface-2 active:bg-surface-3" : "cursor-default"
         }`}
       >
@@ -629,6 +737,18 @@ function ToolRow({ message }: { message: AgentMessage }) {
           />
         ) : null}
       </button>
+      {askable ? (
+        <button
+          type="button"
+          aria-label={`Ask about ${message.tool} in side chat`}
+          title="Ask about this step in the side chat"
+          onClick={() => onAsk?.(message)}
+          className="shrink-0 rounded p-1 text-ink-faint opacity-0 transition-[opacity,background-color,color] hover:bg-surface-2 hover:text-ink group-hover/tool:opacity-100"
+        >
+          <MessageCircleQuestion aria-hidden className="h-3 w-3" strokeWidth={1.8} />
+        </button>
+      ) : null}
+      </div>
       {open && message.detail ? (
         <pre className="ml-[5px] mt-1 max-h-64 overflow-auto whitespace-pre-wrap border-l border-line pl-3 font-mono text-[11px] leading-[1.6] text-ink-subtle">
           {message.detail}
@@ -638,12 +758,27 @@ function ToolRow({ message }: { message: AgentMessage }) {
   );
 }
 
-function ActivityIcon({ operation, running, failed }: { operation: string; running?: boolean; failed?: boolean }) {
+function ActivityIcon({
+  operation,
+  running,
+  failed,
+  stopped,
+}: {
+  operation: string;
+  running?: boolean;
+  failed?: boolean;
+  stopped?: boolean;
+}) {
   if (running) {
     return <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-ink-subtle" strokeWidth={2.2} />;
   }
   if (failed) {
     return <X aria-hidden className="h-3 w-3 shrink-0 text-danger-soft" strokeWidth={2.4} />;
+  }
+  // A stopped turn is neither done nor failed; a ✓ beside the word "Stopped"
+  // reads as though the work finished.
+  if (stopped) {
+    return <Square aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={2} />;
   }
   if (operation === "edit" || operation === "write") {
     return <FilePenLine aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.8} />;
@@ -786,19 +921,9 @@ export function ActivityTurnRow({
   }, [live]);
   const elapsed = durationForTurn(marker?.startedAtMs, marker?.completedAtMs, nowMs);
   const operation = latest?.activity?.operation ?? classifyActivityOperation(latest?.tool ?? "tool");
-  const summary = latest?.content || (live ? "Working…" : "Completed");
+  const summary = latest?.content || (live ? "Working…" : marker?.stopped ? "Stopped" : "Completed");
   const latestFailed = !live && latest?.status === "error";
-  const changedFiles = new Map<string, ActivityFileChange>();
-  let additions = 0;
-  let deletions = 0;
-  for (const action of actions) {
-    const file = action.activity;
-    if (!file || (file.operation !== "edit" && file.operation !== "write")) continue;
-    changedFiles.set(file.path, file);
-    additions += file.additions;
-    deletions += file.deletions;
-  }
-  const changed = [...changedFiles.values()];
+  const changed = summariseChangedFiles(actions.map((action) => action.activity));
   return (
     <div data-role="activity-turn" data-turn-id={turnId} className="w-full max-w-[94%] self-start">
       <button
@@ -808,7 +933,7 @@ export function ActivityTurnRow({
         aria-label={`${expanded ? "Collapse" : "Expand"} activity for turn ${turnId}`}
         className="flex w-full items-center gap-2 rounded-md px-1 py-1 text-left text-xs text-ink-subtle transition-colors hover:bg-surface-2 active:bg-surface-3"
       >
-        <ActivityIcon operation={operation} running={live} failed={latestFailed} />
+        <ActivityIcon operation={operation} running={live} failed={latestFailed} stopped={marker?.stopped} />
         <span className={`min-w-0 flex-1 truncate ${latestFailed ? "text-danger-soft" : "text-ink"}`}>{summary}</span>
         {actions.length > 1 ? <span className="shrink-0 text-[10px] text-ink-faint">{actions.length} actions</span> : null}
         <span className="shrink-0 text-[10px] text-ink-faint">{live ? `${formatDuration(elapsed)} · live` : formatDuration(elapsed)}</span>
@@ -818,18 +943,9 @@ export function ActivityTurnRow({
           strokeWidth={2}
         />
       </button>
-      {!expanded && changed.length > 0 ? (
-        <div className="mt-1 flex justify-end pr-1">
-          <span
-            data-activity-change-summary
-            className="inline-flex items-center gap-1.5 rounded-full border border-line px-2.5 py-1 text-[10px] tabular-nums text-ink-subtle"
-          >
-            {changed.length} {changed.length === 1 ? "file" : "files"} changed
-            <span className="text-success-soft">+{additions}</span>
-            <span className="text-danger-soft">-{deletions}</span>
-          </span>
-        </div>
-      ) : null}
+      {/* Only once the turn is over: a running turn's totals are a moving
+          target, and the expanded view already lists every action. */}
+      {!expanded && !live ? <TurnFileSummaryCard summary={changed} onOpenFile={onOpenFile} /> : null}
       {expanded ? (
         <div className="mt-1 space-y-0.5">
           {actions.length === 0 ? (
@@ -870,6 +986,116 @@ export function activityAnchorIndexes(messages: AgentMessage[]): Map<string, num
   return anchors;
 }
 
+/**
+ * Answers one question — when does the agent ask? — and says plainly what it
+ * cannot answer. The rows read as a ladder from most to least supervised, so
+ * "further down is more freedom" is legible without reading every hint, and
+ * the footer states the confinement that holds in all of them rather than
+ * leaving the picker to imply it.
+ */
+function PermissionPicker({
+  value,
+  onChange,
+  projectSlug,
+  sandboxNote,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  projectSlug: string;
+  /** Core's resolved confinement state; null when core has not said. */
+  sandboxNote: string | null;
+}) {
+  const active = ALL_PERMISSION_OPTIONS.find((option) => option.value === value);
+  const ActiveIcon = active?.icon ?? ShieldCheck;
+  return (
+    <DropdownMenu.Root>
+      <DropdownMenu.Trigger asChild>
+        <button
+          type="button"
+          aria-label="Permission mode"
+          className={`inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-2.5 text-[11px] transition-colors hover:bg-surface-2 active:bg-surface-3 ${
+            active?.danger ? "text-[#e58a52]" : "text-ink-subtle"
+          }`}
+        >
+          <ActiveIcon aria-hidden className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
+          <span>{active?.label ?? value}</span>
+          <ChevronDown aria-hidden className="h-3 w-3 shrink-0 opacity-60" strokeWidth={2} />
+        </button>
+      </DropdownMenu.Trigger>
+      <DropdownMenu.Portal>
+        <DropdownMenu.Content
+          align="start"
+          side="top"
+          sideOffset={8}
+          collisionPadding={8}
+          className="z-50 w-[248px] overflow-hidden rounded-[12px] border border-line bg-popover p-1 text-popover-foreground shadow-[0_18px_45px_rgba(0,0,0,0.28)]"
+        >
+          {PERMISSION_OPTIONS.map((option) => (
+            <PermissionRow
+              key={option.value}
+              option={option}
+              selected={option.value === value}
+              onSelect={() => onChange(option.value)}
+            />
+          ))}
+          <DropdownMenu.Separator className="my-1 h-px bg-line" />
+          <PermissionRow
+            option={PLAN_OPTION}
+            selected={PLAN_OPTION.value === value}
+            onSelect={() => onChange(PLAN_OPTION.value)}
+          />
+          {/* Two lines, not one. The note comes from core's resolved state
+              rather than a constant — this used to claim "not sandboxed"
+              unconditionally, which could not be right in every case and was
+              checked against nothing. But the resolved wording is longer than
+              the constant it replaced, and sharing a line truncated the slug to
+              "Writes sta…", which tells the user nothing at all. When core says
+              nothing, the second line is simply absent. */}
+          <div className="mt-1 border-t border-line px-2 pb-0.5 pt-1.5 text-[10px] text-ink-faint">
+            <p className="truncate">
+              Writes stay in <span className="text-ink-subtle">{projectSlug}</span>
+            </p>
+            {sandboxNote ? <p className="truncate">{sandboxNote}</p> : null}
+          </div>
+        </DropdownMenu.Content>
+      </DropdownMenu.Portal>
+    </DropdownMenu.Root>
+  );
+}
+
+function PermissionRow({
+  option,
+  selected,
+  onSelect,
+}: {
+  option: (typeof ALL_PERMISSION_OPTIONS)[number];
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const Icon = option.icon;
+  return (
+    <DropdownMenu.Item
+      onSelect={onSelect}
+      className={`flex cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 outline-none transition-colors data-[highlighted]:bg-surface-2 ${
+        selected ? "bg-surface-2" : ""
+      }`}
+    >
+      <Icon
+        aria-hidden
+        className={`mt-[2px] h-3.5 w-3.5 shrink-0 ${option.danger ? "text-[#e58a52]" : "text-ink-subtle"}`}
+        strokeWidth={1.8}
+      />
+      <span className="min-w-0 flex-1">
+        <span className={`block text-[12.5px] leading-none ${option.danger ? "text-[#e58a52]" : "text-ink-strong"}`}>
+          {option.label}
+        </span>
+        <span className="mt-0.5 block text-[10.5px] leading-snug text-ink-faint">{option.hint}</span>
+      </span>
+      {selected ? <Check aria-hidden className="mt-[2px] h-3 w-3 shrink-0 text-ink-subtle" strokeWidth={2.6} /> : null}
+    </DropdownMenu.Item>
+  );
+}
+
 export function AgentPanel({
   projectSlug,
   workspaceRoot,
@@ -879,6 +1105,8 @@ export function AgentPanel({
   onLog,
   initialSessionId = null,
   onSessionsChanged,
+  onTranscriptChange,
+  onOpenSideChat,
   onSessionActivated,
   onOpenActivityFile,
   onActiveSessionChange,
@@ -889,6 +1117,17 @@ export function AgentPanel({
   messagesRef.current = messages;
   const [input, setInput] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  // Caret offset in the composer. The slash menu keys off the token under the
+  // caret rather than the head of the message, so it has to follow the caret,
+  // not just the text.
+  const [caret, setCaret] = useState(0);
+  // Where completing a command should leave the caret, applied after the
+  // controlled value lands — setting it before React re-renders would be
+  // overwritten by the value swap.
+  const pendingCaretRef = useRef<number | null>(null);
+  // Installed skills, offered as `/<skill>` beside the built-in commands.
+  const [skills, setSkills] = useState<SkillInfo[]>([]);
+  const skillsLoadedRef = useRef<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionWorkspaceRoot, setSessionWorkspaceRoot] = useState<string | null>(workspaceRoot);
   const [busy, setBusy] = useState(false);
@@ -906,12 +1145,16 @@ export function AgentPanel({
   // turn; graph/subagent workers inherit the coordinator's selected value.
   const [effortByModel, setEffortByModel] = useState<Record<string, string>>(readStoredEfforts);
   const [effortIndex, setEffortIndex] = useState<EffortIndex | null>(null);
+  const [contextLimits, setContextLimits] = useState<ContextLimits | null>(null);
   // models.dev per-provider catalogs, used to surface current models the
   // hand-maintained config hasn't caught up to yet.
   const [registryCatalog, setRegistryCatalog] = useState<Record<string, string[]> | null>(null);
   const [providerTarget, setProviderTarget] = useState("openai");
   const [modelInput, setModelInput] = useState("");
   const [looping, setLooping] = useState(false);
+  // What the running loop is for, kept beside `looping` so the composer's
+  // status pill can name the objective after its start line has scrolled away.
+  const [activeLoop, setActiveLoop] = useState<ActiveLoopRun | null>(null);
   // Stop is state, not a ref: the old ref-only flag re-rendered nothing, so
   // the button's disabled/label flipped at whatever unrelated render came next.
   const [stopping, setStopping] = useState(false);
@@ -941,6 +1184,12 @@ export function AgentPanel({
   const loopBaselineAvailableRef = useRef(false);
   const loopKnownGraphIdsRef = useRef<Set<string>>(new Set());
   const loopObservedGraphIdsRef = useRef<Set<string>>(new Set());
+  // Automatic restore points. The throttle stamp is panel-wide rather than
+  // per-run so a loop restarted a minute after the last one does not copy the
+  // project again, and the per-run counter decides whether the closing line
+  // about restore points is true enough to print.
+  const lastCheckpointAtRef = useRef<number | null>(null);
+  const runCheckpointsRef = useRef(0);
   // Cumulative session token totals from `agent.usage` events, feeding the
   // context meter beside the composer and the /usage command.
   const [usage, setUsage] = useState<UsageTotals | null>(null);
@@ -962,6 +1211,11 @@ export function AgentPanel({
   // the one-window-one-inbox invariant the whole design rests on.
   const editorClientIdRef = useRef<string | null>(null);
   if (!editorClientIdRef.current) editorClientIdRef.current = readEditorClientId();
+  const onTranscriptChangeRef = useRef(onTranscriptChange);
+  onTranscriptChangeRef.current = onTranscriptChange;
+  useEffect(() => {
+    onTranscriptChangeRef.current?.(messages);
+  }, [messages]);
   const onSessionsChangedRef = useRef(onSessionsChanged);
   onSessionsChangedRef.current = onSessionsChanged;
   // Stable handles for the activity/running reporters: they always see the
@@ -1020,26 +1274,7 @@ export function AgentPanel({
 
   // Keep the active model in the compact composer, where it is visible and
   // switchable without opening the larger session-settings popover.
-  const modelChoices = (modelList?.providers ?? []).flatMap((provider) => {
-    const configured = [
-      ...(modelList?.active.provider === provider.id && modelList.active.model ? [modelList.active.model] : []),
-      ...(provider.models ?? []),
-    ];
-    // Configured models first, then what models.dev says the provider offers
-    // today (newest release first) — capped so aggregators with hundreds of
-    // models don't swamp the menu.
-    const fromRegistry = (registryCatalog?.[provider.id] ?? [])
-      .filter((model) => !configured.includes(model))
-      .slice(0, 24);
-    const models = [...configured, ...fromRegistry].filter(
-      (model, index, choices) => model && choices.indexOf(model) === index,
-    );
-    return models.map((model) => ({
-      value: `${provider.id}:${model}`,
-      label: model,
-      hint: provider.label,
-    }));
-  });
+  const modelChoices = buildModelChoices(modelList, registryCatalog);
   const activeModelValue = modelList ? `${modelList.active.provider}:${modelList.active.model}` : "";
 
   const selectProvider = (provider: string) => {
@@ -1053,6 +1288,41 @@ export function AgentPanel({
     setProviderTarget(modelList?.active.provider ?? "openai");
     setModelInput(modelList?.active.model ?? "");
   }, [modelList]);
+
+  // Skills change outside this panel — a file dropped in the skills dir, a
+  // toggle in Settings — so the list is refetched each time the menu opens
+  // and not only on mount. The dependency is the boolean, so that is one call
+  // per open rather than one per keystroke; the mount load is what makes a
+  // pasted or typed-through `/<skill>` resolve without opening the menu at all.
+  const slashMenuOpen = slashTokenAt(input, caret) !== null;
+  useEffect(() => {
+    if (!slashMenuOpen && skillsLoadedRef.current === projectSlug) return;
+    let cancelled = false;
+    void listSkills(projectSlug)
+      .then((list) => {
+        if (cancelled) return;
+        // Marked loaded on arrival, not on dispatch: StrictMode mounts twice
+        // and this ref outlives the remount, so claiming the load up front
+        // made the discarded first attempt the only one — and skills stayed
+        // empty until the menu was opened by hand.
+        skillsLoadedRef.current = projectSlug;
+        setSkills(list);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [projectSlug, slashMenuOpen]);
+
+  useEffect(() => {
+    const target = pendingCaretRef.current;
+    if (target === null) return;
+    pendingCaretRef.current = null;
+    const field = inputRef.current;
+    if (!field) return;
+    field.focus();
+    field.setSelectionRange(target, target);
+  }, [input]);
 
   useEffect(() => {
     const eventIsLocalActivity = (event: AgentEvent): boolean => {
@@ -1129,13 +1399,22 @@ export function AgentPanel({
         // RPC result itself stays silent on success and this event speaks.
         const foreign = Boolean(event.sessionId && sessionIdRef.current && event.sessionId !== sessionIdRef.current);
         if (!foreign) {
-          const parts = [
-            `Compacted context: archived ${event.archivedMessages ?? 0} message${(event.archivedMessages ?? 0) === 1 ? "" : "s"}`,
-          ];
-          if (event.prunedToolResults) parts.push(`pruned ${event.prunedToolResults} old tool result${event.prunedToolResults === 1 ? "" : "s"}`);
+          // Auto-compaction rewrites the transcript without being asked, so
+          // the line has to say that it was automatic — otherwise the context
+          // meter drops and nothing explains why.
+          const opening = event.trigger === "auto" ? "Auto-compacted context" : "Compacted context";
+          const parts =
+            event.strategy === "prune"
+              ? [`${opening}: pruned ${event.prunedToolResults ?? 0} old tool result${(event.prunedToolResults ?? 0) === 1 ? "" : "s"}, no summary needed`]
+              : [
+                  `${opening}: archived ${event.archivedMessages ?? 0} message${(event.archivedMessages ?? 0) === 1 ? "" : "s"}`,
+                ];
+          if (event.strategy !== "prune" && event.prunedToolResults)
+            parts.push(`pruned ${event.prunedToolResults} old tool result${event.prunedToolResults === 1 ? "" : "s"}`);
           if (event.estimatedTokensBefore != null && event.estimatedTokensAfter != null) {
             parts.push(`~${formatTokens(event.estimatedTokensBefore)} → ~${formatTokens(event.estimatedTokensAfter)} tokens`);
           }
+          if (event.strategy !== "prune" && event.instructions) parts.push("kept what you asked it to keep");
           setMessages((current) => [
             ...current,
             { role: "tool", content: parts.join(", "), tool: "compaction" },
@@ -1492,6 +1771,7 @@ export function AgentPanel({
     void loadModelDev().then((data) => {
       setEffortIndex(data.index);
       setRegistryCatalog(data.catalog);
+      setContextLimits(data.contextLimits);
     });
     // Compaction tuning for the context meter; offline core just means the
     // meter measures against the built-in default window.
@@ -1501,6 +1781,12 @@ export function AgentPanel({
   }, []);
 
   const activeModelId = modelList?.active.model ?? "";
+  /**
+   * The active model's advertised context window, or null while the registry
+   * loads. Sent to core with every turn so compaction sizes itself to this
+   * model — core keeps no catalog of its own on purpose.
+   */
+  const activeContextLimit = contextLimitFor(contextLimits, activeModelId);
   /** Effort for a model: the user's saved pick, else the model's default; null when the model has no effort control. */
   const effortFor = (modelId: string): string | null => {
     const levels = effortLevelsFor(effortIndex, modelId);
@@ -1550,8 +1836,8 @@ export function AgentPanel({
 
   // A stopped turn drops the response core would have replied with, so any tool
   // row still spinning will never receive its finish event. Settle those rows
-  // and say plainly what the abort could not undo: core may still be running a
-  // tool it already dispatched (there is no `agent_cancel` RPC yet).
+  // and say plainly what the stop could not undo: `agent_cancel` refuses the
+  // rest of the batch, but a tool already dispatched runs to its own end.
   const noteTurnCancelled = (turnId: string): void => {
     const settled = settleRunningToolRows(messagesRef.current, turnId, Date.now());
     if (settled !== messagesRef.current) {
@@ -1567,7 +1853,11 @@ export function AgentPanel({
     return turnId;
   };
 
-  const completeActivityTurn = (turnId: string, completedAtMs = Date.now()): void => {
+  const completeActivityTurn = (
+    turnId: string,
+    completedAtMs = Date.now(),
+    outcome: "done" | "stopped" = "done",
+  ): void => {
     if (activeTurnRef.current?.turnId === turnId) activeTurnRef.current = null;
     setReasoningByTurn((current) =>
       current[turnId] && current[turnId].endedAtMs === undefined
@@ -1577,7 +1867,7 @@ export function AgentPanel({
     setMessages((current) =>
       current.map((message) =>
         isTurnMarker(message) && message.turnId === turnId
-          ? { ...message, status: "done" as const, completedAtMs }
+          ? { ...message, status: "done" as const, completedAtMs, stopped: outcome === "stopped" }
           : message,
       ),
     );
@@ -1606,6 +1896,10 @@ export function AgentPanel({
       // round-trips. Keep the request bounded, but leave enough headroom for
       // a complete build before the explicit loop/continue controls take over.
       maxTurns: 20,
+      // Core has no model catalog by design, so the window travels with the
+      // turn. Omitted while the registry is still loading — core then falls
+      // back rather than being told a wrong number.
+      ...(activeContextLimit ? { contextLength: activeContextLimit } : {}),
       workspaceRoot: attachedWorkspaceRoot,
       loopId: activeLoopId,
       finalResponseDrain: Boolean(activeLoopId),
@@ -1719,7 +2013,7 @@ export function AgentPanel({
       return "";
     } finally {
       if (turnAbortRef.current === controller) turnAbortRef.current = null;
-      completeActivityTurn(turnId);
+      completeActivityTurn(turnId, Date.now(), controller.signal.aborted ? "stopped" : "done");
       setBusy(false);
     }
   };
@@ -1761,11 +2055,116 @@ export function AgentPanel({
     );
 
   /**
+   * Take a restore point in front of an unattended turn.
+   *
+   * Two rules make this safe to call from inside a run. It happens *before* the
+   * turn, so the state it captures is the last one nobody has broken yet — a
+   * turn that deletes the project must never also be the turn that saves over
+   * the way back. And it can only ever log: a checkpoint is a copy of the whole
+   * project directory, so a full disk fails here first, and a run that dies for
+   * want of a backup is a worse outcome than a run with one backup missing.
+   */
+  const takeAutoCheckpoint = async (reason: AutoCheckpointReason, objective: string, force: boolean) => {
+    const startedAtMs = Date.now();
+    if (!force && !dueForCheckpoint(lastCheckpointAtRef.current, startedAtMs)) return;
+    // Stamped before the RPC, not after: a checkpoint that fails must not leave
+    // every following iteration retrying a copy that is going to fail again.
+    lastCheckpointAtRef.current = startedAtMs;
+    try {
+      // `checkpoint_create`, not `project_checkpoint`: the latter copies
+      // ~/.cali/projects/<slug>/ only, so once a game owns a workspaceRoot —
+      // the normal /loop setup — it captured the scene document and not one
+      // line of the source the agent actually edits. `checkpoint_create` takes
+      // a git snapshot of the attached repo when there is one and falls back to
+      // the same directory copy when there is not, so it is a strict
+      // improvement at every call site.
+      const created = await rpc<{ id?: string }>("checkpoint_create", { slug: projectSlug });
+      const id = created?.id;
+      if (typeof id !== "string" || id.length === 0) throw new Error("core returned no checkpoint id");
+      recordAutoCheckpoint(projectSlug, { id, takenAtMs: Date.now(), reason, objective });
+      runCheckpointsRef.current += 1;
+      onLog(`restore point ${id} taken before this /${reason} turn`);
+      // Bound the bytes, not just the list. Directory-copy checkpoints are the
+      // expensive kind and a 72-hour run took hundreds of them with nothing
+      // ever deleting one; git snapshots share objects and cost almost nothing,
+      // but pruning both keeps one policy rather than two.
+      void rpc("checkpoint_prune", { slug: projectSlug, keep: AUTO_CHECKPOINT_KEEP }).catch(() => {});
+    } catch (error) {
+      onLog(`restore point skipped: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  /**
+   * The closing line of an unattended run. Quiet, and only printed when there
+   * is actually something to restore — claiming a restore point that a failed
+   * `project_checkpoint` never produced is worse than saying nothing.
+   */
+  const announceRestorePoints = () => {
+    const count = runCheckpointsRef.current;
+    if (count === 0) return;
+    say(
+      `${count} restore point${count === 1 ? "" : "s"} saved during this run — /checkpoints lists them, /restore <id> confirm rolls back.`,
+      "tool",
+    );
+  };
+
+  const listCheckpoints = () => {
+    say(formatCheckpointList(readAutoCheckpoints(projectSlug), Date.now()), "tool");
+  };
+
+  // /restore — the only destructive command in the panel, and the reason it
+  // takes two sends. The first prints what `project_revert` replaces; only the
+  // explicit `confirm` reaches core.
+  const restoreCheckpoint = async (id: string, confirmed: boolean) => {
+    if (busy || looping) {
+      say("stop the current run before restoring — a revert under a live turn would fight it.", "tool");
+      return;
+    }
+    const recorded = readAutoCheckpoints(projectSlug).find((entry) => entry.id === id);
+    // An id typed from outside this panel — one the agent's own checkpoint tool
+    // made, say — still carries its timestamp, so it can still be dated.
+    const takenAtMs = recorded?.takenAtMs ?? checkpointTakenAtMs(id);
+    const age = takenAtMs === null ? null : formatCheckpointAge(Math.max(0, Date.now() - takenAtMs));
+    if (!confirmed) {
+      // Core is asked which mechanism owns this id rather than the local
+      // registry guessing: the two kinds cover opposite halves of the game, so
+      // naming the wrong one in a confirmation is how someone approves a
+      // rollback that does not do what they just read. An unreachable core
+      // falls back to the more conservative project-copy wording.
+      let kind: CheckpointKind = "project";
+      try {
+        const listed = await rpc<{ checkpoints?: Array<{ id?: string; kind?: string }> }>("checkpoint_list", {
+          slug: projectSlug,
+        });
+        const entry = listed?.checkpoints?.find((candidate) => candidate.id === id);
+        if (entry?.kind === "git") kind = "git";
+      } catch {
+        /* fall through to the project-copy wording */
+      }
+      say(restoreWarning(id, age, Boolean(workspaceRootRef.current), kind), "tool");
+      return;
+    }
+    try {
+      // Paired with `checkpoint_create` above: it dispatches on the id's own
+      // kind, so a git restore point comes back through `git restore` (HEAD and
+      // the branch untouched, every commit since still in the history) and a
+      // copy-kind id through the directory copy.
+      await rpc("checkpoint_restore", { slug: projectSlug, id });
+      say(
+        `restored ${id}. Reload the window so the editor re-reads the project — the copy still open here would otherwise autosave straight back over it.`,
+        "tool",
+      );
+    } catch (error) {
+      say(`restore failed: ${error instanceof Error ? error.message : String(error)}`, "tool");
+    }
+  };
+
+  /**
    * Work the goal turn by turn until the verifier accepts it. Every exit is
    * deliberate: verified, cleared by the user, stalled, or out of budget — and
    * the last one still ends with a summary rather than a bare counter.
    */
-  const pursueGoal = async () => {
+  const pursueGoalRounds = async () => {
     const actions: LoopAction[] = [];
     for (let round = 1; round <= MAX_LOOP_ITERATIONS; round += 1) {
       const state = goalRef.current;
@@ -1774,6 +2173,7 @@ export function AgentPanel({
         round === 1
           ? `${state.goal}\n\n${budgetNotice(round, MAX_LOOP_ITERATIONS)}`
           : goalContinuationPrompt(state.goal, state.lastReason ?? "", state.evaluations);
+      await takeAutoCheckpoint("goal", state.goal, round === 1);
       const before = messagesRef.current.length;
       const reply = await runTurn(directive);
       // An empty reply is a cancelled or failed turn; both already spoke.
@@ -1813,6 +2213,18 @@ export function AgentPanel({
     // Out of budget: hand back a summary and keep the goal so it can resume.
     say(`goal budget spent after ${MAX_LOOP_ITERATIONS} turns — summarizing.`, "tool");
     await runTurn(exhaustionPrompt(remaining.goal, MAX_LOOP_ITERATIONS));
+  };
+
+  // Every way a goal pursuit ends — met, paused, stalled, out of budget — is a
+  // `return` inside the rounds above, so the closing restore-point line hangs
+  // off the wrapper rather than being repeated at each of them.
+  const pursueGoal = async () => {
+    runCheckpointsRef.current = 0;
+    try {
+      await pursueGoalRounds();
+    } finally {
+      announceRestorePoints();
+    }
   };
 
   const runGoalCommand = async (command: GoalCommand) => {
@@ -1858,20 +2270,47 @@ export function AgentPanel({
   // turns in the session file, and rewrites core's in-memory transcript in
   // place. The client transcript is untouched — the `agent.compacted` event
   // renders the notice for both this manual path and core's auto-trigger.
-  const compact = async () => {
+  const compact = async (instructions?: string) => {
     if (busy || looping) return;
-    if (!sessionId) {
-      say("Nothing to compact yet. Send a message first.");
-      return;
+    // Setting a steer before the first turn is a normal thing to do — it is
+    // exactly when you know what this chat must not lose. Without a session
+    // there is nothing to store it on, so make one rather than dropping the
+    // instruction on the floor.
+    let target = sessionId;
+    if (!target) {
+      if (instructions === undefined) {
+        say("Nothing to compact yet. Send a message first.");
+        return;
+      }
+      try {
+        target = (await ensureEditorSession()).id;
+      } catch (error) {
+        say(`Could not start a chat to remember that: ${error instanceof Error ? error.message : String(error)}`);
+        return;
+      }
     }
     setBusy(true);
     try {
       const result = await rpc<{ compacted: boolean; reason?: string; estimatedTokens?: number }>(
         "session_compact",
-        { sessionId },
+        // Omitted rather than null when nothing was said: core reads an absent
+        // key as "keep the standing instructions" and an empty string as
+        // "forget them".
+        instructions === undefined ? { sessionId: target } : { sessionId: target, instructions },
       );
+      if (instructions !== undefined) {
+        say(
+          instructions
+            ? `Compaction instructions set — this and every automatic compaction in this chat will keep: ${instructions}`
+            : "Compaction instructions cleared.",
+          "tool",
+        );
+      }
       if (!result.compacted) {
-        say(`Nothing to compact: ${result.reason ?? "context already fits the budget"}.`, "tool");
+        // Core's reason is a machine string ("nothing to compact"); echoing it
+        // after the same words read as "Nothing to compact: nothing to compact".
+        const reason = result.reason && result.reason !== "nothing to compact" ? ` (${result.reason})` : "";
+        say(`Nothing to compact — the context already fits the budget${reason}.`, "tool");
       }
     } catch (error) {
       say(`Compact failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1888,7 +2327,7 @@ export function AgentPanel({
       say("No token usage yet. Send a message first.");
       return;
     }
-    const window = contextWindowOf(coreConfig);
+    const window = contextWindowOf(coreConfig, activeContextLimit);
     const percent = Math.min(999, Math.round((usage.lastPromptTokens / window) * 100));
     const compaction = coreConfig?.compaction;
     const autoLine =
@@ -1958,11 +2397,12 @@ export function AgentPanel({
   // Autonomous loop: drive the agent toward a goal, feeding a "continue" each
   // turn, until it replies DONE, the cap is reached, or the user hits Stop.
   // History is threaded locally because setState lands after the closure reads it.
-  const runLoop = async (goal: string) => {
+  const runLoop = async (goal: string, intervalMs: number | null = null) => {
     if (busy || looping) return;
     setLooping(true);
     setBusy(true);
     cancelLoopRef.current = false;
+    runCheckpointsRef.current = 0;
     const controller = new AbortController();
     turnAbortRef.current = controller;
     const activityTurnId = beginActivityTurn();
@@ -1978,6 +2418,11 @@ export function AgentPanel({
       return;
     }
     const loopStartedAtMs = Date.now();
+    setActiveLoop({
+      objective: goal,
+      startedAtMs: loopStartedAtMs,
+      every: intervalMs ? formatInterval(intervalMs) : null,
+    });
     const loopId = `loop-${loopStartedAtMs.toString(36)}`;
     const fetchLoopReportProof = async (): Promise<LoopGraphProof> => {
       try {
@@ -2019,7 +2464,24 @@ export function AgentPanel({
     let history = messagesRef.current
       .filter((message) => message.role === "user" || message.role === "assistant")
       .map((message) => ({ role: message.role, content: message.content }));
-    say(`▶ loop started: ${goal}`, "tool");
+    say(
+      intervalMs
+        ? `▶ loop started: ${goal} — re-checking every ${formatInterval(intervalMs)} until you stop it`
+        : `▶ loop started: ${goal}`,
+      "tool",
+    );
+    // Stop aborts the controller, so a paced loop wakes immediately rather
+    // than sitting out the rest of its wait.
+    const waitBetweenIterations = (ms: number) =>
+      new Promise<void>((resolve) => {
+        const done = () => {
+          window.clearTimeout(timer);
+          controller.signal.removeEventListener("abort", done);
+          resolve();
+        };
+        const timer = window.setTimeout(done, ms);
+        controller.signal.addEventListener("abort", done);
+      });
     const persistLoopTranscript = async () => {
       try {
         await saveSession({
@@ -2065,6 +2527,7 @@ export function AgentPanel({
         say(`■ loop stopped after ${iteration - 1} iterations`, "tool");
         break;
       }
+      await takeAutoCheckpoint("loop", goal, iteration === 1);
       // A failed read must not stall the loop: without a carry the prompt
       // falls back to telling the model to open the report itself.
       let carry = "";
@@ -2208,9 +2671,21 @@ export function AgentPanel({
             },
             reportFailure,
           );
-          say(`✔ loop complete in ${iteration} iterations`, "tool");
-          completed = true;
-          break;
+          if (!intervalMs) {
+            say(`✔ loop complete in ${iteration} iterations`, "tool");
+            completed = true;
+            break;
+          }
+          // A paced loop is a watch: the goal being met right now is the
+          // answer to this check, not a reason to stop checking.
+          say(
+            `✔ goal met at iteration ${iteration} — watching again in ${formatInterval(intervalMs)}`,
+            "tool",
+          );
+        }
+        if (intervalMs && !cancelLoopRef.current && iteration < MAX_LOOP_ITERATIONS) {
+          say(`⏸ next check in ${formatInterval(intervalMs)}`, "tool");
+          await waitBetweenIterations(intervalMs);
         }
       } catch (error) {
         // Stop aborts the in-flight iteration: that is a cancellation, not a
@@ -2259,7 +2734,12 @@ export function AgentPanel({
         reportFailure,
       );
     } else if (!completed && !cancelLoopRef.current) {
-      say(`loop hit the ${MAX_LOOP_ITERATIONS}-iteration cap`, "tool");
+      say(
+        intervalMs
+          ? `loop hit the ${MAX_LOOP_ITERATIONS}-check cap — the watch stops here`
+          : `loop hit the ${MAX_LOOP_ITERATIONS}-iteration cap`,
+        "tool",
+      );
       await reportLoopBestEffort(
         "loop_report_update",
         {
@@ -2290,26 +2770,36 @@ export function AgentPanel({
         reportFailure,
       );
     }
+    announceRestorePoints();
     // Every exit path says its terminal lines (gate messages, ✔/■/cap markers)
     // after the last pre-agent_chat save; only the blocked path re-saved. Persist
     // once here so completed, capped, and stopped loops keep their tail on reload.
     await persistLoopTranscript();
-    completeActivityTurn(activityTurnId);
+    completeActivityTurn(activityTurnId, Date.now(), controller.signal.aborted ? "stopped" : "done");
     loopStartedAtRef.current = null;
     loopBaselineAvailableRef.current = false;
     loopKnownGraphIdsRef.current = new Set();
     loopObservedGraphIdsRef.current = new Set();
     if (turnAbortRef.current === controller) turnAbortRef.current = null;
+    setActiveLoop(null);
     setLooping(false);
     setBusy(false);
   };
 
   // Stop has to be legible in the frame it is clicked: `stopping` re-renders
-  // the control, the transcript acknowledges the click immediately, and the
-  // in-flight agent_chat is aborted so the turn ends after one round-trip
-  // instead of running out core's remaining turn budget. Core has no
-  // `agent_cancel` RPC yet, so a tool it already dispatched may still finish —
-  // `noteTurnCancelled` says exactly that once the request unwinds.
+  // the control and the transcript acknowledges the click immediately.
+  //
+  // Two things then happen, and both are needed. `agent_cancel` is the one
+  // that reaches the loop: aborting the request only closes this end of the
+  // socket, and core would otherwise keep spending its remaining turn budget
+  // on tools, writes and tokens with nobody reading the reply. The local abort
+  // is what makes the panel free in the same round-trip rather than waiting
+  // for the cancelled turn to unwind. Cancel is sent first so the abort cannot
+  // race it away.
+  //
+  // A tool already dispatched still finishes — core refuses the *rest* of the
+  // batch but does not kill work in flight — which is what `noteTurnCancelled`
+  // says once the request unwinds.
   //
   // What Stop deliberately does NOT do is answer a pending approval. Stopping
   // a turn is a statement about this panel's waiting, not a decision about a
@@ -2321,7 +2811,16 @@ export function AgentPanel({
     if (!busy || stopping) return;
     cancelLoopRef.current = true;
     setStopping(true);
-    say("■ Stopping — finishing the current step, then halting.", "tool");
+    // No literal glyph: the tool row draws its own ■, so spelling one here
+    // rendered "■ ■ Stopping…".
+    say("Stopping — finishing the current step, then halting.", "tool");
+    const sessionToCancel = sessionIdRef.current;
+    if (sessionToCancel) {
+      // Best-effort by design: a stop that lands after the turn already
+      // returned answers `found: false`, which is not a failure worth
+      // surfacing to someone who just asked the run to end.
+      void rpc("agent_cancel", { sessionId: sessionToCancel }).catch(() => {});
+    }
     turnAbortRef.current?.abort();
   };
 
@@ -2386,7 +2885,24 @@ export function AgentPanel({
     }
   };
 
-  const resumeLast = async () => {
+  const resumeLast = async (target?: string) => {
+    if (target) {
+      // Ids are long, and /sessions prints them in full — a prefix is enough
+      // as long as it is unambiguous.
+      const matches = sessions.filter(
+        (session) => session.id === target || session.id.startsWith(target),
+      );
+      if (matches.length === 0) {
+        say(`No saved chat matches "${target}". /sessions lists them.`);
+        return;
+      }
+      if (matches.length > 1) {
+        say(`"${target}" matches ${matches.length} chats. Use more of the id — /sessions lists them.`);
+        return;
+      }
+      await resumeSession(matches[0].id);
+      return;
+    }
     const candidate = sessions.find((session) => session.id !== sessionId) ?? sessions[0];
     if (!candidate) {
       say("No saved sessions yet.");
@@ -2510,8 +3026,23 @@ export function AgentPanel({
     say("Requested graph cancel. The current node finishes first.", "tool");
   };
 
+  // Built-ins first: a skill cannot take a command name the composer owns.
+  const allCommands: readonly SlashCommand[] = useMemo(
+    () => [...SLASH_COMMANDS, ...skillCommands(skills)],
+    [skills],
+  );
+
+  // Running a skill is a normal turn with a normal prompt — core's system
+  // prompt already indexes the installed skills, so naming one is enough for
+  // the agent to pull its body in with skill_load.
+  const runSkill = async (name: string, task: string) => {
+    await runTurn(task ? `Use the ${name} skill: ${task}` : `Use the ${name} skill.`);
+  };
+
   const slashContext: SlashContext = {
     say,
+    runSkill,
+    commands: allCommands,
     clear: () => setMessages([]),
     newSession: () => {
       activeTurnRef.current = null;
@@ -2529,17 +3060,47 @@ export function AgentPanel({
     fork: forkCurrent,
     listSessions: listSessionsCommand,
     spawnSubagent,
+    openSideChat: (draft) => {
+      if (!onOpenSideChat) {
+        say("Side chat is not available here.");
+        return;
+      }
+      onOpenSideChat(draft, undefined, { fresh: true });
+      say(
+        draft
+          ? "Opened a side chat with your question waiting in its composer, unsent."
+          : "Opened a side chat. It reads this transcript but cannot change the run.",
+        "tool",
+      );
+    },
     runGraphGoal,
     stopGraph,
     runGoalCommand,
+    listCheckpoints,
+    restoreCheckpoint,
+  };
+
+  /**
+   * Run a command picked from the menu, clearing the composer the way sending
+   * does. Enter on a row that needs no argument runs it here rather than
+   * completing the word and waiting for a second Enter — `/side` is a whole
+   * instruction already.
+   */
+  const runPickedCommand = async (command: SlashCommand) => {
+    if (busy || looping) return;
+    setInput("");
+    setCaret(0);
+    setMenuIndex(0);
+    await command.run("", slashContext);
   };
 
   const send = async () => {
     const text = input.trim();
     if (!text || busy || looping) return;
     setInput("");
+    setCaret(0);
     setMenuIndex(0);
-    const parsed = parseSlash(text);
+    const parsed = parseSlashIn(text, allCommands);
     if (parsed) {
       if (!parsed.command) {
         say(`Unknown command /${parsed.name}. Type /help for the list.`);
@@ -2560,7 +3121,11 @@ export function AgentPanel({
   // the button the human pressed and from nowhere else. No transport failure,
   // no state transition, and no run ending reaches an `agent_approval_response`
   // call anywhere in this file.
-  const respondToApproval = async (entry: ApprovalEntry, approved: boolean): Promise<void> => {
+  const respondToApproval = async (
+    entry: ApprovalEntry,
+    approved: boolean,
+    always = false,
+  ): Promise<void> => {
     const before = approvalsRef.current;
     const after = dispatchApproval({
       kind: "UserAnswered",
@@ -2574,11 +3139,23 @@ export function AgentPanel({
         requestId: entry.requestId,
         clientId: editorClientIdRef.current,
         approved,
+        // Only ever widens, so it rides along with an approval and is ignored
+        // on a denial. Core grants the exact tool name, never the server or a
+        // prefix, and refuses outright if config denies it.
+        ...(always ? { always: true } : {}),
       });
       dispatchApproval({ kind: "SendAccepted", requestId: entry.requestId });
       setMessages((current) => [
         ...current,
-        { role: "tool", content: approved ? `Approved ${entry.tool}` : `Denied ${entry.tool}`, tool: entry.tool },
+        {
+          role: "tool",
+          content: approved
+            ? always
+              ? `Approved ${entry.tool}, and won't ask again for it this session`
+              : `Approved ${entry.tool}`
+            : `Denied ${entry.tool}`,
+          tool: entry.tool,
+        },
       ]);
     } catch (error) {
       // The only classifier in this file, with exactly one call site, and its
@@ -2595,10 +3172,10 @@ export function AgentPanel({
 
   // Context meter: occupancy = the last model call's prompt size against the
   // window core's compaction budget measures (see /usage).
-  const contextWindow = contextWindowOf(coreConfig);
+  const contextWindow = contextWindowOf(coreConfig, activeContextLimit);
   const contextPercent = usage ? Math.min(100, Math.round((usage.lastPromptTokens / contextWindow) * 100)) : 0;
 
-  const commandMenu = matchCommands(input);
+  const commandMenu = matchCommandsIn(input, allCommands, caret);
   const menuActive = commandMenu.length > 0;
   const activeMenuIndex = Math.min(menuIndex, commandMenu.length - 1);
   const workedMs = sessionWorkedMs(messages, activityClockMs);
@@ -2631,8 +3208,38 @@ export function AgentPanel({
               : ("pending" as const),
     }));
 
+  /**
+   * Open the side chat pinned to one step. The question is left to the
+   * operator: the anchor names what they are asking about, which is the part
+   * the transcript excerpt cannot be relied on to make unambiguous.
+   */
+  const askAboutStep = onOpenSideChat
+    ? (message: AgentMessage) => {
+        const label = `${message.status === "running" ? "Running" : "Ran"} ${message.tool}`;
+        const detail = [message.content, message.detail]
+          .filter(Boolean)
+          .join("\n")
+          .slice(0, ANCHOR_DETAIL_CHARS);
+        onOpenSideChat(undefined, { label, detail });
+      }
+    : undefined;
+
+  // Ghost text for a command's parameters — `/loop ` shows `[interval] <goal>`
+  // where the argument will go, the way codex and opencode's `argument-hint`
+  // does. Only while the composer holds exactly the command and its trailing
+  // space: once anything is typed the hint would be describing text that is
+  // already there.
+  const argumentHint = (() => {
+    const parsed = parseSlashIn(input, allCommands);
+    if (!parsed?.command?.usage || parsed.args) return null;
+    return input === `/${parsed.name} ` ? parsed.command.usage : null;
+  })();
+
   const completeCommand = (name: string) => {
-    setInput(`/${name} `);
+    const completed = completeSlashToken(input, caret, name);
+    setInput(completed.text);
+    setCaret(completed.caret);
+    pendingCaretRef.current = completed.caret;
     setMenuIndex(0);
   };
 
@@ -2735,7 +3342,7 @@ export function AgentPanel({
                 </div>
               );
             }
-            if (message.role === "tool") return <ToolRow key={index} message={message} />;
+            if (message.role === "tool") return <ToolRow key={index} message={message} onAsk={askAboutStep} />;
             return (
               <div key={index} data-role="assistant" className="max-w-[94%] self-start">
                 <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-ink-subtle">CALICODE</div>
@@ -2794,9 +3401,22 @@ export function AgentPanel({
                     {entry.state.approved ? "Approved." : "Denied."}
                   </p>
                 ) : (
-                  <div className="mt-2.5 flex gap-2">
+                  <div className="mt-2.5 flex flex-wrap gap-2">
                     <Button size="sm" disabled={answering} onClick={() => void respondToApproval(entry, true)}>
                       <ShieldCheck className="mr-1 h-3.5 w-3.5" /> Approve
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      disabled={answering}
+                      onClick={() => void respondToApproval(entry, true, true)}
+                      title={`Stop asking about ${entry.tool} for the rest of this chat`}
+                    >
+                      {/* Not ShieldCheck: sharing Approve's icon made two
+                          buttons with very different consequences look alike at
+                          a glance, which is the moment the wrong one gets
+                          clicked. */}
+                      <ShieldPlus className="mr-1 h-3.5 w-3.5" /> Always
                     </Button>
                     <Button
                       size="sm"
@@ -2831,6 +3451,14 @@ export function AgentPanel({
 
       <div className="shrink-0 bg-surface-0 px-3.5 pb-3.5 pt-2.5">
         <div className="mx-auto w-full max-w-[760px]">
+        <RunStatusPill
+          goal={goal}
+          loop={activeLoop}
+          onStop={(mode) => {
+            if (mode === "loop") stopAgent();
+            else void runGoalCommand({ action: "clear" });
+          }}
+        />
         {messages.some((message) => isTurnMarker(message)) ? (
           <div
             data-session-worked-time
@@ -2842,35 +3470,33 @@ export function AgentPanel({
           </div>
         ) : null}
         {menuActive && (
-          <div className="mb-2 overflow-hidden rounded-[10px] border border-line-strong bg-popover">
-            {commandMenu.map((command, index) => (
-              <button
-                key={command.name}
-                type="button"
-                onMouseDown={(event) => {
-                  event.preventDefault();
-                  completeCommand(command.name);
-                }}
-                className={`flex min-h-[28px] w-full items-baseline gap-2 px-3 py-1.5 text-left text-xs transition-colors active:bg-surface-3 ${
-                  index === activeMenuIndex ? "bg-surface-2" : "hover:bg-surface-2"
-                }`}
-              >
-                <span className="font-mono text-ink-strong">/{command.name}</span>
-                {command.usage && <span className="font-mono text-[10px] text-ink-faint">{command.usage}</span>}
-                <span className="ml-auto truncate text-ink-subtle">{command.summary}</span>
-              </button>
-            ))}
-          </div>
+          <SlashMenu commands={commandMenu} activeIndex={activeMenuIndex} onPick={completeCommand} />
         )}
 
         <div
           data-agent-composer
-          className="@container min-w-0 rounded-[20px] border border-line-strong bg-raised p-1.5 shadow-[0_14px_34px_rgba(0,0,0,0.18)] transition-[border-color,box-shadow] duration-200 focus-within:border-ink-faint focus-within:shadow-[0_16px_38px_rgba(0,0,0,0.24)]"
+          className="@container relative min-w-0 rounded-[20px] border border-line-strong bg-raised p-1.5 shadow-[0_14px_34px_rgba(0,0,0,0.18)] transition-[border-color,box-shadow] duration-200 focus-within:border-ink-faint focus-within:shadow-[0_16px_38px_rgba(0,0,0,0.24)]"
         >
+          {/* Mirrors the textarea's typography and padding so the hint sits
+              exactly where the next character will land. */}
+          {argumentHint ? (
+            <div
+              aria-hidden
+              data-argument-hint
+              className="pointer-events-none absolute left-1.5 right-1.5 top-1.5 px-3 py-2.5 text-[13px] leading-[1.55]"
+            >
+              <span className="invisible whitespace-pre">{input}</span>
+              <span className="text-ink-faint">{argumentHint}</span>
+            </div>
+          ) : null}
           <Textarea
             ref={inputRef}
             value={input}
-            onChange={(event) => setInput(event.target.value)}
+            onChange={(event) => {
+              setInput(event.target.value);
+              setCaret(event.target.selectionStart ?? event.target.value.length);
+            }}
+            onSelect={(event) => setCaret(event.currentTarget.selectionStart ?? 0)}
             onKeyDown={(event) => {
               if (menuActive) {
                 if (event.key === "ArrowDown") {
@@ -2888,9 +3514,24 @@ export function AgentPanel({
                   completeCommand(commandMenu[activeMenuIndex].name);
                   return;
                 }
-                if (event.key === "Enter" && !event.shiftKey && !parseSlash(input)?.command) {
+                if (event.key === "Enter" && !event.shiftKey) {
                   event.preventDefault();
-                  completeCommand(commandMenu[activeMenuIndex].name);
+                  // A fully-typed name beats the highlighted row: `/graph` also
+                  // prefixes graph-template and graph-stop, and Enter must run
+                  // what was actually typed.
+                  const picked = parseSlashIn(input, allCommands)?.command ?? commandMenu[activeMenuIndex];
+                  // Run it only when the command is the whole message. Picked
+                  // out of the middle of a sentence, Enter completes instead:
+                  // running would clear the composer and take the rest of the
+                  // message with it. Tab always completes, which is how a
+                  // question gets typed after `/side`.
+                  const token = slashTokenAt(input, caret);
+                  const alone =
+                    token !== null &&
+                    input.slice(0, token.start).trim() === "" &&
+                    input.slice(token.end).trim() === "";
+                  if (!alone || !runsBare(picked)) completeCommand(picked.name);
+                  else void runPickedCommand(picked);
                   return;
                 }
               }
@@ -2905,31 +3546,12 @@ export function AgentPanel({
             className="min-h-[56px] resize-none border-0 bg-transparent px-3 py-2.5 text-[13px] leading-[1.55] text-ink-strong shadow-none placeholder:text-ink-faint focus-ring-inset"
           />
           <div className="flex min-h-10 items-center gap-1.5 px-1.5 pb-0.5">
-            <Select value={permissionMode} onValueChange={setPermissionMode}>
-              <SelectTrigger
-                className={`h-8 w-[132px] shrink-0 justify-start gap-1.5 whitespace-nowrap rounded-full border-0 bg-transparent px-2 text-[11px] tracking-normal shadow-none transition-colors hover:bg-surface-2 ${
-                  permissionMode === "full-access" ? "text-[#e58a52]" : "text-ink-subtle"
-                }`}
-                aria-label="Permission mode"
-              >
-                <ShieldCheck aria-hidden className="h-3.5 w-3.5 shrink-0" strokeWidth={1.8} />
-                {/* Manual label instead of <SelectValue />: SelectItem portals
-                    its whole children (label + hint) into the value slot. */}
-                <span className="truncate">
-                  {PERMISSION_OPTIONS.find((option) => option.value === permissionMode)?.label ?? permissionMode}
-                </span>
-              </SelectTrigger>
-              <SelectContent className="min-w-[300px]">
-                {PERMISSION_OPTIONS.map((option) => (
-                  <SelectItem key={option.value} value={option.value}>
-                    <span className="flex flex-col items-start gap-1 py-0.5">
-                      <span className="text-[13px] leading-none text-ink-strong">{option.label}</span>
-                      <span className="text-[11px] leading-snug text-ink-faint">{option.hint}</span>
-                    </span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <PermissionPicker
+              value={permissionMode}
+              onChange={setPermissionMode}
+              projectSlug={projectSlug}
+              sandboxNote={sandboxSummary(coreConfig?.sandboxStatus)}
+            />
 
             {/* Compact tokens/context meter — driven by agent.usage events;
                 hidden until the first model call reports usage. The bar warns
@@ -2961,110 +3583,26 @@ export function AgentPanel({
               </Tooltip>
             ) : null}
 
-            {/* Model + effort as one control: the trigger reads
-                "model · effort" and sizes to its text; each model in the menu
-                opens an effort submenu on hover, so picking an effort picks
-                the model with it. */}
-            <DropdownMenu.Root>
-              <DropdownMenu.Trigger asChild>
-                <button
-                  type="button"
-                  aria-label="Active model"
-                  disabled={!modelList || modelChoices.length === 0 || busy || looping}
-                  title={modelList ? `${modelList.active.provider} · ${modelList.active.model}${effort ? ` · ${effort}` : ""}` : "No model"}
-                  className="ml-auto flex h-8 max-w-[320px] shrink items-center gap-1.5 rounded-full px-2 text-[10.5px] text-ink-subtle transition-colors enabled:hover:bg-surface-2 enabled:hover:text-ink disabled:opacity-50 data-[state=open]:bg-surface-2"
-                >
-                  <Zap aria-hidden className="h-3.5 w-3.5 shrink-0 text-ink" strokeWidth={1.8} />
-                  {/* In a narrow composer the model name is the first thing to
-                      go: the trigger collapses to the bolt icon alone (the
-                      title/aria-label still carry the full model). */}
-                  <span className="hidden min-w-0 truncate @[360px]:inline">
-                    {activeModelId ? `${activeModelId}${effort ? ` · ${effort}` : ""}` : "No model"}
-                  </span>
-                </button>
-              </DropdownMenu.Trigger>
-              <DropdownMenu.Portal>
-                <DropdownMenu.Content
-                  align="end"
-                  sideOffset={6}
-                  collisionPadding={8}
-                  className="z-50 max-h-[min(480px,60vh)] min-w-[300px] max-w-[420px] overflow-y-auto rounded-[14px] border border-line bg-popover p-1.5 text-[13px] text-popover-foreground shadow-[0_18px_45px_rgba(0,0,0,0.28)] outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
-                >
-                  {modelChoices.map((choice) => {
-                    const active = choice.value === activeModelValue;
-                    const levels = effortLevelsFor(effortIndex, choice.label);
-                    const rowBody = (
-                      <>
-                        <Check
-                          aria-hidden
-                          className={`h-3.5 w-3.5 shrink-0 ${active ? "text-ink-strong" : "opacity-0"}`}
-                          strokeWidth={2}
-                        />
-                        <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5">
-                          <span className="max-w-full truncate font-mono text-[12.5px] leading-tight text-ink-strong">
-                            {choice.label}
-                          </span>
-                          <span className="text-[10.5px] leading-tight text-ink-faint">{choice.hint}</span>
-                        </span>
-                      </>
-                    );
-                    // Registry says this model has no effort control: a plain
-                    // row that just switches the model.
-                    if (levels.length === 0) {
-                      return (
-                        <DropdownMenu.Item
-                          key={choice.value}
-                          onSelect={() => {
-                            if (!active) void switchModel(choice.value);
-                          }}
-                          className="flex min-h-8 w-full cursor-default select-none items-center gap-2 rounded-lg px-2 py-1.5 outline-none transition-colors data-[highlighted]:bg-surface-2"
-                        >
-                          {rowBody}
-                        </DropdownMenu.Item>
-                      );
-                    }
-                    const chosen = effortByModel[choice.label];
-                    const modelEffort = chosen && levels.includes(chosen) ? chosen : defaultEffort(levels);
-                    return (
-                      <DropdownMenu.Sub key={choice.value}>
-                        <DropdownMenu.SubTrigger className="flex min-h-8 w-full cursor-default select-none items-center gap-2 rounded-lg px-2 py-1.5 outline-none transition-colors data-[highlighted]:bg-surface-2 data-[state=open]:bg-surface-2">
-                          {rowBody}
-                          <ChevronRight aria-hidden className="h-3.5 w-3.5 shrink-0 text-ink-faint" strokeWidth={1.8} />
-                        </DropdownMenu.SubTrigger>
-                        <DropdownMenu.Portal>
-                          <DropdownMenu.SubContent
-                            sideOffset={6}
-                            collisionPadding={8}
-                            className="z-50 min-w-[150px] rounded-[12px] border border-line bg-popover p-1 text-[12px] text-popover-foreground shadow-[0_18px_45px_rgba(0,0,0,0.28)] outline-none data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0"
-                          >
-                            <DropdownMenu.Label className="px-2 py-1 text-[10px] font-medium text-ink-faint">
-                              Reasoning effort
-                            </DropdownMenu.Label>
-                            {levels.map((level) => (
-                              <DropdownMenu.Item
-                                key={level}
-                                onSelect={() => {
-                                  selectEffort(choice.label, level);
-                                  if (!active) void switchModel(choice.value);
-                                }}
-                                className="flex min-h-7 cursor-default select-none items-center gap-2 rounded-md px-2 py-1 capitalize outline-none transition-colors data-[highlighted]:bg-surface-2 data-[highlighted]:text-ink-strong"
-                              >
-                                <Check
-                                  aria-hidden
-                                  className={`h-3 w-3 shrink-0 ${modelEffort === level ? "text-ink-strong" : "opacity-0"}`}
-                                  strokeWidth={2}
-                                />
-                                {level}
-                              </DropdownMenu.Item>
-                            ))}
-                          </DropdownMenu.SubContent>
-                        </DropdownMenu.Portal>
-                      </DropdownMenu.Sub>
-                    );
-                  })}
-                </DropdownMenu.Content>
-              </DropdownMenu.Portal>
-            </DropdownMenu.Root>
+            <ModelPicker
+              choices={modelChoices}
+              activeValue={activeModelValue}
+              activeLabel={activeModelId}
+              effort={effort}
+              effortIndex={effortIndex}
+              effortOf={effortFor}
+              disabled={!modelList || busy || looping}
+              label="Active model"
+              title={
+                modelList
+                  ? `${modelList.active.provider} · ${modelList.active.model}${effort ? ` · ${effort}` : ""}`
+                  : "No model"
+              }
+              onSelect={(value, level) => {
+                const modelId = value.split(":").slice(1).join(":");
+                if (level) selectEffort(modelId, level);
+                if (value !== activeModelValue) void switchModel(value);
+              }}
+            />
 
             {/* Every busy turn is stoppable, not just a /loop: a plain prompt
                 can spend twenty tool round-trips and used to leave closing the

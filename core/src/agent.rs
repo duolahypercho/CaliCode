@@ -23,6 +23,15 @@ const MAX_SESSIONS: usize = 32;
 /// bill forever.
 pub const DEFAULT_MAX_TURNS: usize = 200;
 
+/// Permission mode handed to `agent_chat` when the caller names none.
+///
+/// Must stay the *strictest* mode, not a convenient one. The panel always
+/// sends a mode explicitly, so the only callers that land on this default are
+/// scripts and outside MCP clients — precisely the set that must not be handed
+/// full access for staying silent. `permission_mode_default_fails_closed`
+/// pins the property rather than the string.
+pub const DEFAULT_PERMISSION_MODE: &str = "supervised";
+
 /// Hard ceiling applied to any caller-supplied turn budget.
 ///
 /// Runaway backstop, NOT a product limit: reaching it means the model never
@@ -229,7 +238,7 @@ fn elide_image_payloads(value: &mut Value) -> usize {
     }
 }
 
-fn bound_tool_result(tool: &str, outcome: &Value) -> String {
+fn bound_tool_result(tool: &str, outcome: &Value, spill_dir: Option<&std::path::Path>) -> String {
     let mut elided = outcome.clone();
     let cut = elide_image_payloads(&mut elided);
     let outcome = if cut > 0 { &elided } else { outcome };
@@ -239,20 +248,44 @@ fn bound_tool_result(tool: &str, outcome: &Value) -> String {
     }
     let preview = String::from_utf8_lossy(utf8_prefix(text.as_bytes(), MAX_TOOL_RESULT_BYTES / 2))
         .into_owned();
-    json!({
+    // Keep the whole thing on disk when we can. "Here is the first half, now
+    // narrow your call" is a dead end when the tail is the part that mattered:
+    // the model cannot narrow a call whose output it has not seen, so it
+    // guesses and pays for the same prefix again.
+    let spilled = spill_dir.and_then(|dir| crate::spill::write(dir, tool, &text));
+    let mut result = json!({
         "truncated": true,
         "tool": tool,
         "bytes": text.len(),
-        "notice": format!(
+        "preview": preview,
+    });
+    let notice = match &spilled {
+        Some(spill) => {
+            result["outputId"] = json!(spill.id);
+            result["totalBytes"] = json!(text.len());
+            format!(
+                "{tool} returned {} bytes, over the {}KB tool-result cap. The first half is in \
+                 `preview`; the whole result is kept — read the rest with \
+                 tool_output_read(outputId: \"{}\", offset: <byte>), passing each nextOffset back \
+                 until it is null. Narrowing the original call is still cheaper if you know what \
+                 you are looking for.",
+                text.len(),
+                MAX_TOOL_RESULT_BYTES / 1024,
+                spill.id
+            )
+        }
+        // Falling back rather than failing: losing the tail is bad, failing the
+        // tool call outright is worse.
+        None => format!(
             "{tool} returned {} bytes, over the {}KB tool-result cap; the first half is \
              below as text. Narrow the call — by path, pattern, or limit — rather than \
              repeating it.",
             text.len(),
             MAX_TOOL_RESULT_BYTES / 1024
         ),
-        "preview": preview,
-    })
-    .to_string()
+    };
+    result["notice"] = json!(notice);
+    result.to_string()
 }
 
 /// Longest prefix of `bytes` within `max` that ends on a UTF-8 boundary.
@@ -326,12 +359,89 @@ pub struct AgentManager {
     /// only ever be one registry — two instances would be a split brain in
     /// which the panel answers a request core is not waiting on.
     approvals: crate::approvals::Approvals,
+    /// Cross-session, cross-restart token totals per model — the data behind
+    /// Settings → Status. Owned here for the same reason as `approvals`: one
+    /// registry, reachable only from the code that already records usage.
+    usage: Arc<crate::usage::Ledger>,
+}
+
+/// Cooperative stop signal for the turn a session is currently running.
+///
+/// Aborting the client's HTTP request does not reach the loop: `chat` owns the
+/// turn budget and keeps calling the provider and executing tools long after
+/// nobody is reading the reply. This is the channel that actually reaches it.
+///
+/// A `watch` channel rather than `Notify` + flag on purpose — `wait_for`
+/// inspects the current value before it parks, so a cancel that lands between
+/// a caller's flag check and its await is still observed. With `Notify` that
+/// interleaving parks until the *next* cancel, which for a stop button means
+/// forever.
+#[derive(Clone)]
+pub struct CancellationToken {
+    tx: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for CancellationToken {
+    fn default() -> Self {
+        Self {
+            tx: Arc::new(tokio::sync::watch::channel(false).0),
+        }
+    }
+}
+
+impl CancellationToken {
+    /// Request the running turn stop. Returns whether this call is the one
+    /// that flipped it, so a second stop press is reported as a no-op rather
+    /// than as a fresh cancellation.
+    pub fn cancel(&self) -> bool {
+        !self.tx.send_replace(true)
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.tx.borrow()
+    }
+
+    /// Clear the flag so the next turn is not killed by a stale stop. Called
+    /// once as `chat` starts, never mid-turn.
+    pub fn reset(&self) {
+        self.tx.send_replace(false);
+    }
+
+    /// Resolves once cancelled, including when it already was.
+    pub async fn cancelled(&self) {
+        let mut rx = self.tx.subscribe();
+        // The sender is held by this token, so the channel cannot close while
+        // we wait; the error arm is unreachable in practice.
+        let _ = rx.wait_for(|cancelled| *cancelled).await;
+    }
 }
 
 pub struct AgentSession {
     pub id: String,
     pub messages: Vec<Value>,
     pub pending: HashMap<String, oneshot::Sender<Value>>,
+    /// Stop signal for the in-flight turn. Lives on the session rather than in
+    /// `chat`'s frame so `agent_cancel` can reach a turn it did not start.
+    pub cancel: CancellationToken,
+    /// The environment as last described to the model, so the next turn can
+    /// send only what changed. `None` until the first turn establishes a
+    /// baseline from the system prompt.
+    pub world_state: Option<crate::world_state::WorldState>,
+    /// Tools the user answered "always allow" for, by exact name.
+    ///
+    /// In-memory and session-scoped on purpose: a durable grant belongs in
+    /// `~/.cali/config.yaml` under `permissions:`, where the user can see and
+    /// revoke it. An approval click is consent for the work in front of them,
+    /// not a permanent policy change made through a dialog.
+    pub always_allow: Vec<String>,
+    /// The active model's advertised context window, as last reported by the
+    /// client for this session.
+    ///
+    /// Kept on the session, not on the turn's options, because
+    /// `session_compact` arrives as its own RPC with no model attached — and a
+    /// manual compaction that silently reverted to the 128k assumption would
+    /// undo the whole point.
+    pub context_length: Option<u32>,
     /// Cumulative token totals across every model call in this session.
     pub usage: model::Usage,
     /// Prompt tokens of the most recent model call — i.e. the current
@@ -347,6 +457,41 @@ pub struct AgentSession {
     /// `compact_session` reads it before its multi-second summary call and
     /// re-checks it before swapping the result in.
     pub compactions: u64,
+    /// What the operator last told `/compact` to preserve, if anything.
+    ///
+    /// Kept on the session so the *automatic* trigger obeys it too: someone
+    /// who said "keep the repro steps and the failing test names" meant it for
+    /// the compaction that fires at 3am on a loop, not only for the one they
+    /// typed. Cleared with `/compact clear`.
+    pub compaction_instructions: Option<String>,
+}
+
+/// What a `session_compact` call says about the operator's standing steer.
+/// Absent from the request means "keep whatever this session already has" —
+/// which is what the automatic trigger always sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactInstructions<'a> {
+    Unchanged,
+    Clear,
+    Set(&'a str),
+}
+
+/// Who asked for this compaction. Only the report differs; the pipeline does
+/// not, because an automatic compaction the operator cannot see is how a
+/// transcript silently loses its middle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactTrigger {
+    Manual,
+    Auto,
+}
+
+impl CompactTrigger {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CompactTrigger::Manual => "manual",
+            CompactTrigger::Auto => "auto",
+        }
+    }
 }
 
 struct ToolExecutionContext<'a> {
@@ -358,27 +503,176 @@ struct ToolExecutionContext<'a> {
 }
 
 impl AgentSession {
-    /// Auto-compaction hook: fires once the latest model call's prompt met
-    /// or crossed `context_budget_tokens`. The trigger's owner computes the
-    /// budget from compaction config (e.g. threshold × context_length −
-    /// reserved) and invokes `session_compact` when this returns true. A
-    /// zero budget disables the check.
+    /// Auto-compaction hook: fires once context occupancy met or crossed
+    /// `context_budget_tokens`. The trigger's owner computes the budget from
+    /// compaction config (e.g. threshold × context_length − reserved) and
+    /// invokes `session_compact` when this returns true. A zero budget
+    /// disables the check.
     pub fn should_compact(&self, context_budget_tokens: u64) -> bool {
-        context_budget_tokens > 0 && self.last_prompt_tokens >= context_budget_tokens
+        context_budget_tokens > 0 && self.occupancy() >= context_budget_tokens
+    }
+
+    /// How full the context is, in tokens.
+    ///
+    /// The provider's own count when there is one — it is authoritative, and
+    /// includes the cached prefix, because a cache hit is cheaper rather than
+    /// absent from the window.
+    ///
+    /// The estimate is the backstop, and it is not hypothetical: several
+    /// OpenAI-compatible gateways return no `usage` block at all on a streamed
+    /// response. `last_prompt_tokens` then stayed at zero for the life of the
+    /// session, `should_compact` never fired, and the transcript grew until the
+    /// provider rejected the whole request — the one failure mode compaction
+    /// exists to prevent, reached by the route where nothing was watching.
+    ///
+    /// Only ever a fallback: a reported count is never second-guessed by an
+    /// estimate that is characters divided by four.
+    pub fn occupancy(&self) -> u64 {
+        if self.last_prompt_tokens > 0 {
+            return self.last_prompt_tokens;
+        }
+        crate::compaction::estimate_tokens(&self.messages) as u64
     }
 }
 
+/// How many times one tool call may return the byte-identical result before
+/// the loop stops running it.
+///
+/// Three, because the first repeat is often a legitimate retry and the second
+/// can be a deliberate re-check. A third identical answer to a third identical
+/// question is not new information by any reading.
+const MAX_IDENTICAL_TOOL_RESULTS: usize = 3;
+
+/// Watches for a tool call that has stopped telling the model anything.
+///
+/// Keyed on the *outcome* as well as the call, which is what separates a doom
+/// loop from ordinary polling: an agent watching `graph_status` issues
+/// byte-identical calls forever and gets different answers, and must not be
+/// interrupted. A call whose answer has not changed in three tries is the
+/// failure mode — opencode raises a permission prompt at this point and xAI
+/// streams a `doom_loop_check` event for it, so it is common enough that both
+/// built a guard.
+///
+/// The response is to stop *executing* and hand back the answer it would have
+/// produced anyway, with a notice. Refusing outright would cost the model a
+/// tool result it is clearly still reasoning about; re-running costs the wall
+/// clock and, for anything that writes, does the work again.
+#[derive(Default)]
+struct RepeatWatch {
+    seen: HashMap<String, (u64, usize)>,
+}
+
+impl RepeatWatch {
+    fn signature(call: &ToolCall) -> String {
+        // `serde_json::Value` orders object keys, so this is stable across
+        // calls that differ only in how the provider spelled the arguments.
+        format!("{}\u{1}{}", call.name, call.arguments)
+    }
+
+    fn digest(outcome: &Value) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        outcome.to_string().hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// The result to hand back without executing, if this call has gone stale.
+    ///
+    /// Deliberately does not replay the previous output: the transcript
+    /// already holds that identical result three times over, so re-sending it
+    /// a fourth would spend context to tell the model something it has said to
+    /// itself repeatedly. Only the reason it was not run is new information.
+    fn stalled_outcome(&self, call: &ToolCall) -> Option<Value> {
+        let (_, repeats) = self.seen.get(&Self::signature(call))?;
+        if *repeats < MAX_IDENTICAL_TOOL_RESULTS {
+            return None;
+        }
+        Some(json!({
+            "error": "repeated call not executed",
+            "repeatedCall": format!(
+                "{} has already returned the identical result {repeats} times this turn, so it \
+                 was not run again — its output is already above, unchanged. Repeating it \
+                 cannot produce anything new: change the arguments, try a different tool, or \
+                 say plainly what is blocking you.",
+                call.name
+            ),
+        }))
+    }
+
+    /// Record what a call produced. Returns the repeat count for this outcome.
+    fn record(&mut self, call: &ToolCall, outcome: &Value) -> usize {
+        let digest = Self::digest(outcome);
+        let entry = self
+            .seen
+            .entry(Self::signature(call))
+            .or_insert((digest, 0));
+        if entry.0 == digest {
+            entry.1 += 1;
+        } else {
+            *entry = (digest, 1);
+        }
+        entry.1
+    }
+}
+
+/// The provider-shaped prefix recoverable from a durable session record.
+///
+/// The record is the panel's transcript, so it carries tool *rows* (UI objects
+/// with a `tool` field and no provider identity) and turn markers alongside the
+/// conversation. Those are dropped rather than translated: an assistant message
+/// carrying `tool_calls` whose results cannot also be reconstructed makes the
+/// provider reject the very next request, which would turn a recoverable
+/// session into a permanently broken one.
+///
+/// Only user and assistant messages with real text survive, in order.
+fn provider_messages_from_record(record: &Value) -> Vec<Value> {
+    let Some(messages) = record.get("messages").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    messages
+        .iter()
+        .filter_map(|message| {
+            let role = message.get("role").and_then(Value::as_str)?;
+            if role != "user" && role != "assistant" {
+                return None;
+            }
+            // A tool row is stored with role "tool", but the panel also writes
+            // assistant-role status lines that carry a `tool` marker; neither is
+            // part of the model's conversation.
+            if message.get("tool").is_some() || message.get("turnId").is_some() {
+                return None;
+            }
+            let content = message.get("content").and_then(Value::as_str)?.trim();
+            if content.is_empty() {
+                return None;
+            }
+            Some(json!({ "role": role, "content": content }))
+        })
+        .collect()
+}
+
 /// Context length assumed when neither the config's `compaction.context_length`
-/// override nor any provider metadata says otherwise.
+/// override nor the active model's advertised limit says otherwise.
+///
+/// A last resort, not a norm. Applying it to every model is what made a
+/// 1M-context model compact at 88k and a 32k model compact hundreds of turns
+/// too late.
 const DEFAULT_CONTEXT_LENGTH: u32 = 128_000;
 
 /// Token budget that triggers (and bounds) compaction:
 /// `threshold × context_length − reserved`, clamped at zero. A non-positive
 /// result disables auto-compaction (`should_compact` treats 0 as off).
-fn context_budget_tokens(config: &crate::config::AppConfig) -> u64 {
+///
+/// `model_context` is the active model's advertised window, which the client
+/// resolves from models.dev and sends with the turn — core has no model
+/// catalog of its own and must not grow one (see AGENTS.md). The config
+/// override still wins: a user who wrote `compaction.context_length` meant it,
+/// and is usually working around a model whose advertised limit is wrong.
+fn context_budget_tokens(config: &crate::config::AppConfig, model_context: Option<u32>) -> u64 {
     let compaction = &config.compaction;
     let context_length = compaction
         .context_length
+        .or(model_context)
         .unwrap_or(DEFAULT_CONTEXT_LENGTH)
         .max(1);
     let threshold = compaction.threshold.clamp(0.0, 1.0) as f64;
@@ -445,6 +739,10 @@ impl ApprovalOwner {
 pub struct AgentOptions {
     pub permission_mode: String,
     pub max_turns: usize,
+    /// The active model's advertised context window, resolved by the client
+    /// from models.dev. Recorded on the session so later compactions — including
+    /// a manual `session_compact` — size themselves to the same model.
+    pub context_length: Option<u32>,
     /// Bounded orchestration escape hatch: after the final allowed turn executes tools,
     /// make one schema-less provider call for a textual handoff. Public
     /// ordinary top-level/subagent callers leave this false. Graph workers
@@ -544,6 +842,7 @@ impl AgentManager {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             approvals: crate::approvals::Approvals::new(events.clone()),
+            usage: Arc::new(crate::usage::Ledger::default()),
             events,
         }
     }
@@ -552,6 +851,12 @@ impl AgentManager {
     /// it through here so nothing can construct a second one.
     pub fn approvals(&self) -> &crate::approvals::Approvals {
         &self.approvals
+    }
+
+    /// The per-model token ledger. Unattached until `main` points it at a
+    /// file, so a manager built in a test counts in memory only.
+    pub fn usage_ledger(&self) -> &Arc<crate::usage::Ledger> {
+        &self.usage
     }
 
     /// Pre-allocate the in-memory half of a durable session. The UI uses this
@@ -575,9 +880,14 @@ impl AgentManager {
                 id: id.to_string(),
                 messages: messages.to_vec(),
                 pending: HashMap::new(),
+                cancel: CancellationToken::default(),
+                world_state: None,
+                always_allow: Vec::new(),
+                context_length: None,
                 usage: model::Usage::default(),
                 last_prompt_tokens: 0,
                 compactions: 0,
+                compaction_instructions: None,
             }))
         });
         Ok(())
@@ -596,6 +906,50 @@ impl AgentManager {
         Ok(id)
     }
 
+    /// Record an "always allow" answer for one tool on one session.
+    ///
+    /// Grants the *exact* tool name, never a glob. That is the whole discipline
+    /// here, and it is opencode's arity table translated to a harness with no
+    /// shell: an "always" must not grant more than the user was shown. Their
+    /// version stops "always allow `git commit -m x`" from becoming `git *`;
+    /// ours stops approving one `mcp__blender__execute_blender_code` from
+    /// becoming `mcp__blender__*`.
+    ///
+    /// A tool that config *denies* can never be granted this way, mirroring
+    /// `merge_permission_rules`: rules are last-match-wins, so an appended
+    /// allow would otherwise beat a machine-wide `deny` — turning a dialog
+    /// click into a way around the user's own policy.
+    pub async fn always_allow(&self, session_id: &str, tool: &str) -> Result<bool> {
+        if tool.trim().is_empty() {
+            anyhow::bail!("cannot always-allow an unnamed tool");
+        }
+        let session = self.session(session_id).await?;
+        let mut guard = session.lock().await;
+        if guard.always_allow.iter().any(|known| known == tool) {
+            return Ok(false);
+        }
+        guard.always_allow.push(tool.to_string());
+        Ok(true)
+    }
+
+    /// Ask a session's in-flight turn to stop, leaving the session itself
+    /// intact and resumable.
+    ///
+    /// Returns `(found, newly_cancelled)`. `found: false` is the ordinary
+    /// answer for a session whose turn already finished, not an error — the
+    /// stop button races the loop by nature.
+    pub async fn cancel_session(&self, id: &str) -> (bool, bool) {
+        let session = self.sessions.lock().await.get(id).cloned();
+        let Some(session) = session else {
+            return (false, false);
+        };
+        let token = {
+            let guard = session.lock().await;
+            guard.cancel.clone()
+        };
+        (true, token.cancel())
+    }
+
     /// Remove the in-memory state for a deleted/archived durable session.
     ///
     /// Dropping the pending oneshot senders wakes browser-tool and approval
@@ -609,6 +963,10 @@ impl AgentManager {
         };
         let cancelled = {
             let mut guard = session.lock().await;
+            // A running turn holds its own Arc, so dropping the map entry does
+            // not reach it. Without this, deleting a session leaves its loop
+            // billing tokens against a transcript that no longer exists.
+            guard.cancel.cancel();
             let pending = std::mem::take(&mut guard.pending);
             let cancelled = pending.len();
             drop(pending);
@@ -626,7 +984,14 @@ impl AgentManager {
         session: &Arc<Mutex<AgentSession>>,
         session_id: &str,
         usage: Option<model::Usage>,
+        model: &crate::config::ModelConfig,
     ) {
+        // Ledger first, and outside the session lock: the per-model totals
+        // outlive this session, so a caller that drops the session mid-turn
+        // must not also drop the accounting for a call it already paid for.
+        if let Some(usage) = usage.as_ref() {
+            self.usage.record(&model.provider, &model.default, usage);
+        }
         let mut guard = session.lock().await;
         if let Some(usage) = usage {
             guard.usage.prompt_tokens += usage.prompt_tokens;
@@ -650,7 +1015,9 @@ impl AgentManager {
                 "cacheReadTokens": guard.usage.cache_read_tokens,
                 "cacheWriteTokens": guard.usage.cache_write_tokens,
                 "totalTokens": guard.usage.total_tokens,
-                "lastPromptTokens": guard.last_prompt_tokens,
+                // Occupancy rather than the raw field, so the meter still
+                // moves for a provider that reports no usage at all.
+                "lastPromptTokens": guard.occupancy(),
                 "lastCacheReadTokens": usage.map(|value| value.cache_read_tokens).unwrap_or(0)
             }
         }));
@@ -709,15 +1076,35 @@ impl AgentManager {
         registered_tools: &HashMap<String, ToolDef>,
         session_id: Option<&str>,
         messages: &[Value],
-        options: AgentOptions,
+        mut options: AgentOptions,
     ) -> Result<Value> {
-        let session = self.get_or_create(session_id).await?;
+        let session = match self.get_or_create(session_id).await {
+            Ok(session) => session,
+            // A named session core no longer holds is the ordinary case after a
+            // restart or an eviction, not a dead end: bring it back from disk
+            // rather than letting the caller fork a new one.
+            Err(missing) => match session_id {
+                Some(id) => {
+                    self.rehydrate_from_disk(state, id)
+                        .await
+                        .map_err(|_| missing)?;
+                    self.get_or_create(Some(id)).await?
+                }
+                None => return Err(missing),
+            },
+        };
         let current_session_id = {
             let guard = session.lock().await;
             guard.id.clone()
         };
         {
             let mut guard = session.lock().await;
+            // Only overwrite when the caller actually knows: a subagent or
+            // graph turn that never learned the window must not erase what the
+            // panel already reported for this session.
+            if options.context_length.is_some() {
+                guard.context_length = options.context_length;
+            }
             if options.system.is_some() && guard.messages.is_empty() {
                 guard.messages.push(json!({
                     "role": "system",
@@ -731,10 +1118,66 @@ impl AgentManager {
         let mut turns = 0usize;
         let max_turns = options.max_turns.clamp(1, MAX_TURNS_CEILING);
         let mut tool_calls_log: Vec<Value> = Vec::new();
+        // Cleared here, never mid-turn: a stop pressed against the *previous*
+        // turn must not kill this one.
+        let cancel = {
+            let guard = session.lock().await;
+            guard.cancel.clone()
+        };
+        cancel.reset();
+        // Fold this session's "always allow" answers into the turn's rules.
+        // Appended last so they beat the *mode* logic, and screened first so
+        // they can never beat a `deny`: rules are last-match-wins, and an
+        // appended allow would otherwise let a dialog click override the
+        // machine-wide policy the user wrote down.
+        {
+            let granted = { session.lock().await.always_allow.clone() };
+            for tool in granted {
+                if rule_decision(&options.permission_rules, &tool) == Some(RuleAction::Deny) {
+                    tracing::warn!(
+                        %tool,
+                        "ignoring an always-allow for a tool config denies"
+                    );
+                    continue;
+                }
+                options.permission_rules.push(PermissionRule {
+                    pattern: tool,
+                    action: "allow".into(),
+                });
+            }
+        }
+        let mut cancelled = false;
+        let mut over_budget: Option<(u64, u64)> = None;
+        // Read once per call: re-reading config every turn would let a mid-run
+        // edit change the answer halfway through a loop.
+        let budget_tokens = {
+            let config = state.config.read().await;
+            config.budget.session_tokens.filter(|limit| *limit > 0)
+        };
+        // Scoped to this `chat` call: a fresh user message is a new intent, and
+        // repeating a tool that was stale during the previous turn is often
+        // exactly right once the question has changed.
+        let mut repeats = RepeatWatch::default();
 
         loop {
             if turns >= max_turns {
                 break;
+            }
+            if cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
+            // Spend ceiling, checked before committing to another provider
+            // request rather than after paying for one. `max_turns` bounds the
+            // number of requests, which is not the thing anyone is worried
+            // about — two hundred cheap turns and two hundred expensive ones
+            // are the same count and very different bills.
+            if let Some(limit) = budget_tokens {
+                let spent = { session.lock().await.usage.total_tokens };
+                if spent >= limit {
+                    over_budget = Some((spent, limit));
+                    break;
+                }
             }
             turns += 1;
             let defs = self.build_tools(registered_tools, &options.permission_rules);
@@ -759,29 +1202,82 @@ impl AgentManager {
             // configured budget, compact before growing the context further.
             // Failure is non-fatal — the turn proceeds uncompacted.
             if config.compaction.auto {
-                let budget = context_budget_tokens(&config);
-                let wants = { session.lock().await.should_compact(budget) };
+                let wants = {
+                    let guard = session.lock().await;
+                    let budget = context_budget_tokens(&config, guard.context_length);
+                    guard.should_compact(budget)
+                };
                 if wants {
-                    if let Err(error) = self.compact_session(state, &current_session_id).await {
+                    if let Err(error) = self
+                        .compact_session(
+                            state,
+                            &current_session_id,
+                            CompactInstructions::Unchanged,
+                            CompactTrigger::Auto,
+                        )
+                        .await
+                    {
                         tracing::warn!(%error, session = %current_session_id,
                             "auto-compaction failed; continuing uncompacted");
                     }
                 }
             }
+            // Tell the model what moved since it was last told, and nothing
+            // else. The system prompt describes the world once, on the first
+            // turn, and is never revised — so without this the model spends a
+            // long session reasoning about a project that stopped existing the
+            // moment it made its first edit.
+            if let Some(slug) = options.project_slug.as_deref() {
+                let editor_tools: Vec<String> = registered_tools
+                    .values()
+                    .filter(|def| def.kind == crate::tools::ToolKind::Browser)
+                    .map(|def| def.name.clone())
+                    .collect();
+                let current = crate::world_state::capture(
+                    &crate::rpc::project_digest(&state.projects_root, slug),
+                    &editor_tools,
+                    options.workspace_root.as_deref(),
+                );
+                let mut guard = session.lock().await;
+                if let Some(text) = crate::world_state::diff(guard.world_state.as_ref(), &current) {
+                    guard.messages.push(crate::world_state::message(&text));
+                }
+                guard.world_state = Some(current);
+            }
             let snapshot = {
                 let guard = session.lock().await;
                 guard.messages.clone()
             };
-            let mut result = model::chat_with_effort_session(
-                &config,
-                &snapshot,
-                Some(&schemas),
-                Some(&tx),
-                options.reasoning_effort.as_deref(),
-                Some(&current_session_id),
-            )
-            .await?;
+            // Racing the provider call rather than polling around it: dropping
+            // the losing future closes the in-flight HTTP request, so a stop
+            // during a long stream ends the request instead of paying for a
+            // completion nobody will read.
+            let mut result = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {
+                    drop(tx);
+                    cancelled = true;
+                    break;
+                }
+                result = model::chat_with_effort_session(
+                    &config,
+                    &snapshot,
+                    Some(&schemas),
+                    Some(&tx),
+                    options.reasoning_effort.as_deref(),
+                    Some(&current_session_id),
+                ) => result?,
+            };
             drop(tx);
+            // Discard the turn wholesale when the stop landed while the
+            // response was arriving. Pushing the assistant message here would
+            // leave tool calls with no results — a transcript the provider
+            // rejects on the next request, which would make the session
+            // unresumable rather than merely stopped.
+            if cancel.is_cancelled() {
+                cancelled = true;
+                break;
+            }
             repair_missing_graph_goal(&mut result.tool_calls, &snapshot);
             for call in &mut result.tool_calls {
                 bind_trusted_call_context(
@@ -796,7 +1292,7 @@ impl AgentManager {
             // them so the client can render a context meter and the
             // compaction auto-trigger can compare against its budget
             // (`AgentSession::should_compact`).
-            self.record_usage(&session, &current_session_id, result.usage)
+            self.record_usage(&session, &current_session_id, result.usage, &config.model)
                 .await;
             if result.content.is_empty() && result.tool_calls.is_empty() {
                 // `model::chat_with_effort` retries/falls back empty
@@ -919,22 +1415,40 @@ impl AgentManager {
                     options: &options,
                 };
                 for (call, over_cap) in result.tool_calls.iter().zip(over_caps) {
+                    // Every issued call still needs a result message, so a
+                    // stop mid-batch refuses the remainder instead of
+                    // abandoning it: skipping the push would orphan the tool
+                    // call and break the next request on this session.
+                    if cancel.is_cancelled() {
+                        outcomes.push(json!({ "error": "cancelled by user before this tool ran" }));
+                        continue;
+                    }
+                    // A call that has answered identically three times running
+                    // is not going to answer differently on the fourth. Stop
+                    // paying the wall clock — and, for anything that writes,
+                    // stop doing the work again.
+                    if let Some(stalled) = repeats.stalled_outcome(call) {
+                        outcomes.push(stalled);
+                        continue;
+                    }
                     let started_at_ms = unix_time_ms();
                     self.emit_tool_started(&current_session_id, call, started_at_ms, &options);
-                    outcomes.push(
-                        self.execute_tool_call_outcome(&context, call, over_cap, started_at_ms)
-                            .await,
-                    );
+                    let outcome = self
+                        .execute_tool_call_outcome(&context, call, over_cap, started_at_ms)
+                        .await;
+                    repeats.record(call, &outcome);
+                    outcomes.push(outcome);
                 }
                 outcomes
             };
             {
+                let spill_dir = crate::spill::dir_for(&state.sessions_root);
                 let mut guard = session.lock().await;
                 for (call, outcome) in result.tool_calls.iter().zip(&outcomes) {
                     guard.messages.push(json!({
                         "role": "tool",
                         "tool_call_id": call.id,
-                        "content": bound_tool_result(&call.name, outcome)
+                        "content": bound_tool_result(&call.name, outcome, Some(&spill_dir))
                     }));
                 }
             }
@@ -986,8 +1500,13 @@ impl AgentManager {
                     Ok(result)
                         if !result.content.trim().is_empty() && result.tool_calls.is_empty() =>
                     {
-                        self.record_usage(&session, &current_session_id, result.usage)
-                            .await;
+                        self.record_usage(
+                            &session,
+                            &current_session_id,
+                            result.usage,
+                            &config.model,
+                        )
+                        .await;
                         let reply = result.content;
                         let mut guard = session.lock().await;
                         guard
@@ -1048,6 +1567,25 @@ impl AgentManager {
             }
         }
 
+        if let Some((spent, limit)) = over_budget {
+            return Ok(self
+                .over_budget_result(
+                    &session,
+                    &current_session_id,
+                    turns,
+                    tool_calls_log,
+                    spent,
+                    limit,
+                )
+                .await);
+        }
+
+        if cancelled {
+            return Ok(self
+                .cancelled_result(&session, &current_session_id, turns, tool_calls_log)
+                .await);
+        }
+
         Ok(self
             .max_turns_result(
                 &session,
@@ -1057,6 +1595,78 @@ impl AgentManager {
                 None,
             )
             .await)
+    }
+
+    /// Terminal result for a session that reached its spend ceiling.
+    ///
+    /// Distinct from the turn-budget backstop: hitting `max_turns` means the
+    /// model failed to converge and is worth reporting as a runaway, while
+    /// hitting a spend ceiling means the user's own limit did exactly what they
+    /// set it to do. Reporting the second in the first's words would misplace
+    /// whose decision it was.
+    async fn over_budget_result(
+        &self,
+        session: &Arc<Mutex<AgentSession>>,
+        session_id: &str,
+        turns: usize,
+        tool_calls_log: Vec<Value>,
+        spent: u64,
+        limit: u64,
+    ) -> Value {
+        let reply = format!(
+            "Stopped: this session has used {spent} tokens, at or past the {limit}-token ceiling \
+             set by `budget.session_tokens` in ~/.cali/config.yaml. Nothing is lost — raise the \
+             ceiling, or start a new chat, to carry on."
+        );
+        {
+            let mut guard = session.lock().await;
+            guard
+                .messages
+                .push(json!({ "role": "assistant", "content": reply.clone() }));
+        }
+        json!({
+            "sessionId": session_id,
+            "reply": reply,
+            "toolCalls": tool_calls_log,
+            "turns": turns,
+            "status": "over_budget",
+            "completed": false,
+            "terminalReason": "over_budget",
+            "tokensSpent": spent,
+            "tokenLimit": limit,
+        })
+    }
+
+    /// Terminal result for a turn the user stopped.
+    ///
+    /// Distinct from `max_turns_result` because the two mean opposite things:
+    /// a turn budget running out is a runaway the user should hear about, and
+    /// a stop is the user getting exactly what they asked for. Sharing the
+    /// backstop's wording would report every stop as a malfunction.
+    async fn cancelled_result(
+        &self,
+        session: &Arc<Mutex<AgentSession>>,
+        session_id: &str,
+        turns: usize,
+        tool_calls_log: Vec<Value>,
+    ) -> Value {
+        let reply = "Stopped at your request.".to_string();
+        {
+            let mut guard = session.lock().await;
+            guard
+                .messages
+                .push(json!({ "role": "assistant", "content": reply.clone() }));
+        }
+        json!({
+            "sessionId": session_id,
+            "reply": reply,
+            "toolCalls": tool_calls_log,
+            "turns": turns,
+            "status": "cancelled",
+            "completed": false,
+            "cancelled": true,
+            "terminalReason": "cancelled"
+        })
     }
 
     async fn max_turns_result(
@@ -1134,19 +1744,36 @@ impl AgentManager {
     /// `tool_calls` message is the expensive case — the next turn would push
     /// tool results answering a call the provider can no longer see, and the
     /// whole session 400s.
-    pub async fn compact_session(&self, state: &AppState, session_id: &str) -> Result<Value> {
+    pub async fn compact_session(
+        &self,
+        state: &AppState,
+        session_id: &str,
+        instructions: CompactInstructions<'_>,
+        trigger: CompactTrigger,
+    ) -> Result<Value> {
         use crate::compaction;
         let session = self.session(session_id).await?;
         let config = { state.config.read().await.clone() };
-        let budget = context_budget_tokens(&config).max(1) as usize;
-        let (mut messages, snapshot_len, generation) = {
-            let guard = session.lock().await;
+        let (mut messages, snapshot_len, generation, model_context, steer) = {
+            let mut guard = session.lock().await;
+            // The steer is stored before any work: it outlives this call and
+            // shapes the automatic compactions that follow it.
+            match instructions {
+                CompactInstructions::Unchanged => {}
+                CompactInstructions::Clear => guard.compaction_instructions = None,
+                CompactInstructions::Set(text) => {
+                    guard.compaction_instructions = Some(text.trim().to_string())
+                }
+            }
             (
                 guard.messages.clone(),
                 guard.messages.len(),
                 guard.compactions,
+                guard.context_length,
+                guard.compaction_instructions.clone(),
             )
         };
+        let budget = context_budget_tokens(&config, model_context).max(1) as usize;
         let tokens_before = compaction::estimate_tokens(&messages);
         let Some(bounds) = compaction::select_boundaries(&messages, budget) else {
             return Ok(json!({
@@ -1154,10 +1781,68 @@ impl AgentManager {
                 "compacted": false,
                 "reason": "nothing to compact",
                 "estimatedTokens": tokens_before,
+                "trigger": trigger.as_str(),
+                "instructions": steer,
             }));
         };
+        // Try phase 1 on its own first. Pruning stale tool results costs no
+        // model call at all, and when it is enough on its own the whole
+        // summarization — a multi-second request, its tokens, and the
+        // information the summary inevitably loses — is avoided. Previously
+        // pruning only ever ran as a way to shrink the summary request, so
+        // every crossing of the budget paid for a summary even when simply
+        // dropping yesterday's tool output would have done.
+        //
+        // Done under the lock with no await inside, so there is no window for
+        // a concurrent turn to append between the decision and the swap.
+        // Pruned on the local copy first, never on the session. Pruning is
+        // lossy, and every path below this can still refuse — a refusal that
+        // had already truncated the user's tool results would degrade the
+        // transcript as the price of doing nothing.
         let pruned = compaction::prune_old_tool_results(&mut messages, bounds.tail_start);
-        let request = compaction::build_summary_request(&messages, &bounds);
+        let pruned_tokens = compaction::estimate_tokens(&messages);
+        if pruned > 0 && pruned_tokens <= budget {
+            // Enough on its own, so the summarization is skipped entirely: no
+            // model call, no tokens, and none of the detail a summary
+            // inevitably loses. Previously pruning only ever shrank the summary
+            // request, so crossing the budget always paid for a summary even
+            // when dropping yesterday's tool output would have done.
+            //
+            // Applied in place under the lock rather than swapping the copy in:
+            // a concurrent turn may have appended past `snapshot_len`, and
+            // those messages sit beyond `tail_start` where pruning does not
+            // reach. No await inside, so the check and the write are atomic.
+            let mut guard = session.lock().await;
+            if guard.compactions != generation || guard.messages.len() < snapshot_len {
+                anyhow::bail!(
+                    "transcript moved during compaction of session {session_id}: another \
+                     compaction rewrote it while pruning; retry"
+                );
+            }
+            let applied =
+                compaction::prune_old_tool_results(&mut guard.messages, bounds.tail_start);
+            let after = compaction::estimate_tokens(&guard.messages);
+            let result = json!({
+                "sessionId": session_id,
+                "compacted": true,
+                "strategy": "prune",
+                "prunedToolResults": applied,
+                "estimatedTokensBefore": tokens_before,
+                "estimatedTokensAfter": after,
+                "estimatedTokens": after,
+                "summarized": false,
+                "trigger": trigger.as_str(),
+                "instructions": steer,
+            });
+            // Pruning is a compaction too. Without this event the transcript
+            // showed nothing at all for the cheap path, so an auto-compaction
+            // that only pruned looked like a context meter dropping on its own.
+            let mut event = result.clone();
+            event["type"] = json!("agent.compacted");
+            let _ = self.events.send(event);
+            return Ok(result);
+        }
+        let request = compaction::build_summary_request(&messages, &bounds, steer.as_deref());
         let summary = model::chat(&config, &request, None, None).await?.content;
         let summary = summary.trim();
         if summary.is_empty() {
@@ -1207,11 +1892,14 @@ impl AgentManager {
         let result = json!({
             "sessionId": session_id,
             "compacted": true,
+            "strategy": "summarize",
             "archivedMessages": archived.len(),
             "remergedMessages": appended,
             "prunedToolResults": pruned,
             "estimatedTokensBefore": tokens_before,
             "estimatedTokensAfter": tokens_after,
+            "trigger": trigger.as_str(),
+            "instructions": steer,
         });
         let mut event = result.clone();
         event["type"] = json!("agent.compacted");
@@ -1281,9 +1969,14 @@ impl AgentManager {
             id: id.clone(),
             messages: Vec::new(),
             pending: HashMap::new(),
+            cancel: CancellationToken::default(),
+            always_allow: Vec::new(),
+            world_state: None,
+            context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
             compactions: 0,
+            compaction_instructions: None,
         }));
         guard.insert(id, session.clone());
         Ok(session)
@@ -1292,6 +1985,32 @@ impl AgentManager {
     async fn session(&self, session_id: &str) -> Result<Arc<Mutex<AgentSession>>> {
         let guard = self.sessions.lock().await;
         guard.get(session_id).cloned().context("session not found")
+    }
+
+    /// Bring a durable session back into memory after core forgot it.
+    ///
+    /// In-memory sessions do not survive a core restart, and `MAX_SESSIONS`
+    /// eviction retires them long before that. Without this the resumed id
+    /// simply failed, and the client's recovery path created a *different*
+    /// session and replayed into it — so the file the user thought they were
+    /// resuming was orphaned mid-conversation, and the work continued under an
+    /// id their history list never showed.
+    ///
+    /// What comes back is what was persisted: the durable record holds the
+    /// panel's own user/assistant transcript, never provider-shaped tool calls,
+    /// so tool results are gone either way. Continuing the same conversation
+    /// under the same id is the part that was recoverable and was being lost.
+    async fn rehydrate_from_disk(&self, state: &AppState, id: &str) -> Result<()> {
+        let record = crate::sessions::load(&state.sessions_root, id).with_context(|| {
+            format!("session {id} is not in memory and has no saved transcript to restore")
+        })?;
+        let messages = provider_messages_from_record(&record);
+        tracing::info!(
+            session = %id,
+            messages = messages.len(),
+            "rehydrated a durable session core had forgotten"
+        );
+        self.restore_session(id, &messages).await
     }
 
     fn build_tools(
@@ -1537,6 +2256,7 @@ impl AgentManager {
                     depth: options.subagent_depth,
                     permission_rules: options.permission_rules.clone(),
                     workspace_root: options.workspace_root.clone(),
+                    context_length: options.context_length,
                 };
                 return crate::tools::spawn_subagent_for_parent(state, &call.arguments, parent)
                     .await;
@@ -1719,6 +2439,18 @@ const PLAN_MODE_TOOLS: &[&str] = &[
     "editor_capture_frame",
     "editor_asset_builder_state",
     "editor_console_log",
+    // The browser's read-only half. Research is exactly what plan mode is
+    // for, so reading the web is admitted — but not `browser_click`,
+    // `browser_type`, `browser_key` or `browser_eval`, which act on someone
+    // else's server and can post, buy, or delete on the far side of a page
+    // this gate cannot see. `browser_look` is out too — it is read-only, but
+    // it spends on a vision call, and the whitelist and `is_destructive` are
+    // held disjoint by a test.
+    "browser_navigate",
+    "browser_search",
+    "browser_snapshot",
+    "browser_scroll",
+    "browser_console",
 ];
 
 /// Whether plan mode may dispatch this tool at all.
@@ -1745,24 +2477,20 @@ fn is_destructive(tool: &str, mcp_trusted: bool) -> bool {
     if tool.starts_with(crate::mcp::MCP_PREFIX) {
         return !mcp_trusted;
     }
+    // Core tools answer from their own definition, so the classification lives
+    // beside the tool rather than in a list somewhere else that a new tool can
+    // be added without touching. `ToolDef::access` is a required field, which
+    // is what makes that impossible rather than merely unlikely.
+    if let Some(access) = crate::tools::core_tool_access(tool) {
+        return access == crate::tools::Access::Guarded;
+    }
+    // Everything below is registered at runtime — editor tools over
+    // `tool_register`, plus RPC-only surfaces that never appear in
+    // `core_tool_defs` — so there is no literal to enforce and the name is all
+    // there is to go on.
     matches!(
         tool,
-        "project_revert"
-            | "project_save"
-            | "project_create"
-            | "file_write"
-            | "file_edit"
-            | "model_switch"
-            | "subagent_spawn"
-            | "asset_pick"
-            | "image3d_mesh"
-            | "project_asset_write"
-            | "graph_run"
-            | "graph_cancel"
-            | "video_contact_sheet"
-            | "loop_report_start"
-            | "loop_report_iteration"
-            | "loop_report_update"
+        "project_save" | "project_create" | "project_asset_write"
     ) || tool.starts_with("workspace_file_write")
         || tool.starts_with("devserver_")
 }
@@ -1781,10 +2509,14 @@ fn requires_approval(mode: &str, tool: &str, mcp_trusted: bool) -> bool {
         // Scene edits flow; anything that writes outside the scene asks.
         "auto-accept-edits" => is_destructive(tool, mcp_trusted),
         // Ask only for the genuinely irreversible ones — plus untrusted MCP
-        // tools, whose behavior the core cannot vouch for.
+        // tools, whose behavior the core cannot vouch for, and the dev server,
+        // which runs a script out of the workspace's own package.json. Nothing
+        // here is a sandbox: an unprompted `devserver_start` is arbitrary code
+        // execution from a cloned repo, on the user's account, so it asks.
         "auto" => {
             matches!(tool, "project_revert" | "file_write" | "file_edit")
                 || tool.starts_with("workspace_file_write")
+                || tool.starts_with("devserver_")
                 || (tool.starts_with(crate::mcp::MCP_PREFIX) && !mcp_trusted)
         }
         // No prompts. Explicitly opted into.
@@ -2137,6 +2869,8 @@ mod tests {
             dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::devserver::Servers::new(),
             )),
+            terminals: crate::terminal::Terminals::default(),
+            browsers: crate::browser::Browsers::new(),
             shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools)),
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
@@ -2156,6 +2890,11 @@ mod tests {
         ]
     }
 
+    /// Answers with plain text and no tool calls, so a turn ends immediately.
+    async fn plain_provider() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        Sse::new(futures::stream::iter(content_stream("done")))
+    }
+
     async fn reasoning_provider() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
         Sse::new(futures::stream::iter(vec![
             Ok(Event::default().data(
@@ -2168,6 +2907,223 @@ mod tests {
             )),
             Ok(Event::default().data("[DONE]")),
         ]))
+    }
+
+    #[tokio::test]
+    async fn a_session_stops_at_its_spend_ceiling_and_says_whose_limit_it_was() {
+        let app = Router::new().route("/v1/chat/completions", post(plain_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::new();
+        let state = make_state(addr, bus, agents.clone(), tools.clone());
+        {
+            let mut config = state.config.write().await;
+            config.budget.session_tokens = Some(100);
+        }
+
+        // A fresh session is under the ceiling and runs normally.
+        let first = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "hello" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let session_id = first["sessionId"].as_str().unwrap().to_string();
+        assert_eq!(first["status"], json!("completed"));
+
+        // Push the session past the ceiling the way real usage would.
+        {
+            let session = agents.session(&session_id).await.unwrap();
+            session.lock().await.usage.total_tokens = 250;
+        }
+
+        let stopped = agents
+            .chat(
+                &state,
+                &tools,
+                Some(&session_id),
+                &[json!({ "role": "user", "content": "keep going" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 5,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stopped["status"], json!("over_budget"));
+        assert_eq!(stopped["tokensSpent"], json!(250));
+        assert_eq!(stopped["tokenLimit"], json!(100));
+        // Not reported as a runaway: this is the user's own limit doing what
+        // they set it to do, and it says how to carry on.
+        assert_ne!(stopped["terminalReason"], json!("max_turns"));
+        let reply = stopped["reply"].as_str().unwrap();
+        assert!(reply.contains("budget.session_tokens"), "{reply}");
+        assert!(reply.contains("Nothing is lost"), "{reply}");
+        // Refused before paying for another request, not after.
+        assert_eq!(stopped["turns"], json!(0));
+    }
+
+    #[tokio::test]
+    async fn no_ceiling_is_the_default_and_a_zero_ceiling_is_not_a_ceiling() {
+        let app = Router::new().route("/v1/chat/completions", post(plain_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::new();
+        let state = make_state(addr, bus, agents.clone(), tools.clone());
+        assert_eq!(
+            state.config.read().await.budget.session_tokens,
+            None,
+            "a multi-day loop is a legitimate way to spend a lot; off is the right default"
+        );
+        {
+            // Zero must read as "no ceiling" rather than "stop immediately",
+            // which is what a bare `> 0` check would otherwise produce.
+            let mut config = state.config.write().await;
+            config.budget.session_tokens = Some(0);
+        }
+
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "hello" })],
+                AgentOptions {
+                    permission_mode: "full-access".into(),
+                    max_turns: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["status"], json!("completed"));
+    }
+
+    #[tokio::test]
+    async fn a_second_turn_is_told_what_changed_in_the_project() {
+        // The whole point, end to end: the system prompt describes the world
+        // once, so without a diff the model spends a long session reasoning
+        // about a project that stopped existing after its first edit.
+        let app = Router::new().route("/v1/chat/completions", post(plain_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let projects = tempfile::tempdir().unwrap();
+        crate::store::create_project(projects.path(), "demo", "Demo").unwrap();
+
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let tools = HashMap::new();
+        let mut state = make_state(addr, bus, agents.clone(), tools.clone());
+        state.projects_root = projects.path().to_path_buf();
+
+        let options = || AgentOptions {
+            permission_mode: "full-access".into(),
+            max_turns: 1,
+            project_slug: Some("demo".into()),
+            ..Default::default()
+        };
+
+        let first = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "start" })],
+                options(),
+            )
+            .await
+            .unwrap();
+        let session_id = first["sessionId"].as_str().unwrap().to_string();
+
+        let reminders = |messages: &[Value]| -> usize {
+            messages
+                .iter()
+                .filter(|m| {
+                    m["content"]
+                        .as_str()
+                        .is_some_and(|c| c.contains("Since you were last told"))
+                })
+                .count()
+        };
+
+        let session = agents.session(&session_id).await.unwrap();
+        assert_eq!(
+            reminders(&session.lock().await.messages),
+            0,
+            "the first turn's prompt already described the world"
+        );
+
+        // Nothing changed: a second turn must cost nothing extra.
+        agents
+            .chat(
+                &state,
+                &tools,
+                Some(&session_id),
+                &[json!({ "role": "user", "content": "again" })],
+                options(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            reminders(&session.lock().await.messages),
+            0,
+            "an unchanged world must not produce a reminder"
+        );
+
+        // Now change the project out from under the session, the way the
+        // agent's own edits do.
+        let mut project = crate::store::read_project(projects.path(), "demo").unwrap();
+        project["entities"] = json!([{ "name": "Platform" }, { "name": "Hero" }]);
+        crate::store::write_project(projects.path(), "demo", &project).unwrap();
+
+        agents
+            .chat(
+                &state,
+                &tools,
+                Some(&session_id),
+                &[json!({ "role": "user", "content": "carry on" })],
+                options(),
+            )
+            .await
+            .unwrap();
+
+        let guard = session.lock().await;
+        assert_eq!(
+            reminders(&guard.messages),
+            1,
+            "a changed project must be reported exactly once"
+        );
+        let text = guard
+            .messages
+            .iter()
+            .find_map(|m| {
+                m["content"]
+                    .as_str()
+                    .filter(|c| c.contains("Since you were last told"))
+            })
+            .unwrap();
+        assert!(text.contains("project is now:"), "{text}");
+        assert!(text.contains("Platform"), "{text}");
     }
 
     #[tokio::test]
@@ -2378,6 +3334,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = crate::AppState {
@@ -2392,6 +3349,8 @@ mod tests {
             dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::devserver::Servers::new(),
             )),
+            terminals: crate::terminal::Terminals::default(),
+            browsers: crate::browser::Browsers::new(),
             shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
@@ -2473,6 +3432,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
@@ -2552,6 +3512,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
@@ -2635,6 +3596,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
@@ -2720,6 +3682,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
@@ -2792,6 +3755,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
@@ -2899,6 +3863,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = crate::AppState {
@@ -2913,6 +3878,8 @@ mod tests {
             dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::devserver::Servers::new(),
             )),
+            terminals: crate::terminal::Terminals::default(),
+            browsers: crate::browser::Browsers::new(),
             shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(tools.clone())),
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
@@ -3051,6 +4018,299 @@ mod tests {
     }
 
     #[test]
+    fn rehydration_keeps_only_what_the_provider_can_accept() {
+        let record = json!({
+            "id": "session-1",
+            "messages": [
+                { "role": "user", "content": "add a platform" },
+                // A turn marker and tool rows: panel bookkeeping, not conversation.
+                { "role": "tool", "tool": "turn", "turnId": "t1", "content": "" },
+                { "role": "tool", "tool": "file_write", "content": "wrote level.js" },
+                { "role": "assistant", "content": "Added it." },
+                // Status lines the panel writes carry a tool marker even at
+                // assistant role.
+                { "role": "assistant", "tool": "note", "content": "■ Stopping" },
+                { "role": "assistant", "content": "   " },
+                { "role": "system", "content": "ignored" }
+            ]
+        });
+
+        let messages = provider_messages_from_record(&record);
+        assert_eq!(
+            messages,
+            vec![
+                json!({ "role": "user", "content": "add a platform" }),
+                json!({ "role": "assistant", "content": "Added it." }),
+            ]
+        );
+        // Nothing may carry tool_calls: their results cannot be reconstructed,
+        // and an unanswered call makes the provider reject the next request —
+        // turning a recoverable session into a permanently broken one.
+        assert!(messages
+            .iter()
+            .all(|message| message.get("tool_calls").is_none()));
+    }
+
+    #[test]
+    fn rehydration_of_a_record_with_no_messages_is_empty_not_an_error() {
+        assert!(provider_messages_from_record(&json!({ "id": "s" })).is_empty());
+        assert!(provider_messages_from_record(&json!({ "messages": [] })).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_forgotten_session_comes_back_under_its_own_id() {
+        let sessions = tempfile::tempdir().unwrap();
+        crate::sessions::save(
+            sessions.path(),
+            &json!({
+                "id": "session-resumed",
+                "messages": [
+                    { "role": "user", "content": "keep going" },
+                    { "role": "assistant", "content": "will do" }
+                ]
+            }),
+        )
+        .unwrap();
+
+        let (bus, _rx) = tokio::sync::broadcast::channel(8);
+        let mut state = make_state(
+            "127.0.0.1:1".parse().unwrap(),
+            bus.clone(),
+            AgentManager::new(bus),
+            HashMap::new(),
+        );
+        state.sessions_root = sessions.path().to_path_buf();
+
+        // Core has never heard of it — the state after a restart or an eviction.
+        assert!(state.agents.session("session-resumed").await.is_err());
+
+        state
+            .agents
+            .rehydrate_from_disk(&state, "session-resumed")
+            .await
+            .expect("a saved transcript must come back");
+
+        let session = state
+            .agents
+            .session("session-resumed")
+            .await
+            .expect("the id itself must survive; forking to a new one orphans the file");
+        let guard = session.lock().await;
+        assert_eq!(guard.id, "session-resumed");
+        assert_eq!(guard.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn rehydrating_a_session_that_was_never_saved_still_fails() {
+        let sessions = tempfile::tempdir().unwrap();
+        let (bus, _rx) = tokio::sync::broadcast::channel(8);
+        let mut state = make_state(
+            "127.0.0.1:1".parse().unwrap(),
+            bus.clone(),
+            AgentManager::new(bus),
+            HashMap::new(),
+        );
+        state.sessions_root = sessions.path().to_path_buf();
+
+        let error = state
+            .agents
+            .rehydrate_from_disk(&state, "never-existed")
+            .await
+            .expect_err("no record means no recovery");
+        assert!(format!("{error:#}").contains("never-existed"));
+    }
+
+    #[test]
+    fn compaction_budget_follows_the_active_model_not_a_fixed_128k() {
+        let mut config = crate::config::AppConfig::default();
+        config.compaction.threshold = 0.8;
+        config.compaction.reserved = 0;
+        config.compaction.context_length = None;
+
+        // The defect: every model was assumed to be 128k, so a 1M model
+        // compacted at 88k and a 32k model hundreds of turns too late.
+        let big = context_budget_tokens(&config, Some(1_000_000));
+        let small = context_budget_tokens(&config, Some(32_000));
+        assert_eq!(big, 800_000);
+        assert_eq!(small, 25_600);
+        assert!(big > small);
+
+        // Unknown model: the fixed assumption is the last resort, not the norm.
+        assert_eq!(
+            context_budget_tokens(&config, None),
+            (f64::from(DEFAULT_CONTEXT_LENGTH) * 0.8) as u64
+        );
+
+        // An explicit config override outranks the advertised limit — someone
+        // who wrote it down is usually correcting a model whose metadata lies.
+        config.compaction.context_length = Some(50_000);
+        assert_eq!(context_budget_tokens(&config, Some(1_000_000)), 40_000);
+    }
+
+    #[test]
+    fn compaction_still_fires_when_the_provider_reports_no_usage() {
+        // Several OpenAI-compatible gateways return no `usage` block on a
+        // streamed response. Keyed on the reported count alone, occupancy sat
+        // at zero forever and the transcript grew until the provider rejected
+        // it — compaction's own failure mode, reached because nothing was
+        // watching.
+        let mut session = AgentSession {
+            id: "no-usage".into(),
+            messages: (0..200)
+                .map(|i| json!({ "role": "user", "content": format!("{i} {}", "x".repeat(400)) }))
+                .collect(),
+            pending: HashMap::new(),
+            cancel: CancellationToken::default(),
+            always_allow: Vec::new(),
+            world_state: None,
+            context_length: None,
+            usage: model::Usage::default(),
+            last_prompt_tokens: 0,
+            compactions: 0,
+            compaction_instructions: None,
+        };
+        assert_eq!(session.last_prompt_tokens, 0, "the provider said nothing");
+        assert!(
+            session.occupancy() > 10_000,
+            "the estimate must see the transcript"
+        );
+        assert!(session.should_compact(10_000));
+
+        // A reported count is authoritative and is never second-guessed by an
+        // estimate of characters over four.
+        session.last_prompt_tokens = 500;
+        assert_eq!(session.occupancy(), 500);
+        assert!(!session.should_compact(10_000));
+
+        // A zero budget still disables the check entirely.
+        session.last_prompt_tokens = 0;
+        assert!(!session.should_compact(0));
+    }
+
+    #[test]
+    fn an_empty_session_never_asks_to_compact() {
+        let session = AgentSession {
+            id: "fresh".into(),
+            messages: Vec::new(),
+            pending: HashMap::new(),
+            cancel: CancellationToken::default(),
+            always_allow: Vec::new(),
+            world_state: None,
+            context_length: None,
+            usage: model::Usage::default(),
+            last_prompt_tokens: 0,
+            compactions: 0,
+            compaction_instructions: None,
+        };
+        assert_eq!(session.occupancy(), 0);
+        assert!(!session.should_compact(1));
+    }
+
+    #[test]
+    fn every_plan_mode_tool_is_classified_read_only() {
+        // The two lists answer different questions but cannot disagree: plan
+        // mode's contract is "reads only, touches nothing outside the projects
+        // root, no network", so a tool in it that is `Guarded` means one of the
+        // two is wrong. Before the classification lived on the definition there
+        // was nothing to compare, and drift between them was invisible.
+        //
+        // Plan mode also admits `editor_*` tools, which the client registers
+        // over `tool_register` and which therefore have no literal — the count
+        // assertion at the end keeps that from quietly becoming *every* entry
+        // and hollowing the check out.
+        let mut checked_against_a_literal = 0;
+        for tool in PLAN_MODE_TOOLS {
+            // Holds for every plan-mode tool, including the editor ones the
+            // client registers at runtime, which have no literal to classify.
+            assert!(
+                !is_destructive(tool, false),
+                "{tool} is dispatchable in plan mode but gated for approval"
+            );
+            // The stronger form, wherever there is a definition to check.
+            if let Some(access) = crate::tools::core_tool_access(tool) {
+                checked_against_a_literal += 1;
+                assert_eq!(
+                    access,
+                    crate::tools::Access::ReadOnly,
+                    "{tool} is dispatchable in plan mode but classified {access:?}"
+                );
+            }
+        }
+        assert!(
+            checked_against_a_literal >= 10,
+            "the strong check covered only {checked_against_a_literal} tools; \
+             plan mode's core entries should not have moved out of core_tool_defs"
+        );
+    }
+
+    #[test]
+    fn the_guarded_set_is_exactly_what_it_was() {
+        // Moving the classification onto `ToolDef` must not have moved any
+        // tool across the line. Pinned by name so a future change is a visible
+        // edit to this list rather than a silent shift in what auto mode runs.
+        let guarded: std::collections::BTreeSet<String> = crate::tools::core_tool_defs()
+            .into_iter()
+            .filter(|def| def.access == crate::tools::Access::Guarded)
+            .map(|def| def.name)
+            .collect();
+        let expected: std::collections::BTreeSet<String> = [
+            "asset_pick",
+            "browser_look",
+            "browser_screenshot",
+            "file_edit",
+            "file_write",
+            "graph_cancel",
+            "graph_run",
+            "image3d_mesh",
+            "loop_report_iteration",
+            "loop_report_start",
+            "loop_report_update",
+            "model_switch",
+            "project_revert",
+            "subagent_spawn",
+            "video_contact_sheet",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        assert_eq!(guarded, expected);
+    }
+
+    #[test]
+    fn an_unclassified_tool_fails_closed() {
+        // A tool arriving without a classification — a browser tool over
+        // `tool_register`, or a literal someone forgot — must ask, not run.
+        assert_eq!(
+            crate::tools::Access::default(),
+            crate::tools::Access::Guarded
+        );
+        // And a name core has never heard of is gated by the mode logic, not
+        // waved through by a missing entry.
+        assert!(crate::tools::core_tool_access("not_a_tool").is_none());
+        assert!(requires_approval("supervised", "not_a_tool", false));
+    }
+
+    #[test]
+    fn permission_mode_default_fails_closed() {
+        // `agent_chat` used to default an omitted mode to "full-access" — the
+        // one fail-open path in a harness that fails closed everywhere else.
+        // Pin the property, not the string, so renaming the mode cannot
+        // quietly reintroduce it.
+        for tool in [
+            "file_write",
+            "project_revert",
+            "subagent_spawn",
+            "devserver_start",
+        ] {
+            assert!(
+                requires_approval(DEFAULT_PERMISSION_MODE, tool, false),
+                "the default mode must still prompt for {tool}"
+            );
+        }
+        assert_ne!(DEFAULT_PERMISSION_MODE, "full-access");
+    }
+
+    #[test]
     fn unknown_permission_modes_fail_closed() {
         assert!(requires_approval("", "file_write", false));
         assert!(requires_approval("typo-mode", "editor_object_add", false));
@@ -3068,6 +4328,7 @@ mod tests {
                     description: "z".into(),
                     parameters: json!({"type":"object"}),
                     kind: crate::tools::ToolKind::Browser,
+                    access: crate::tools::Access::Guarded,
                 },
             ),
             (
@@ -3077,6 +4338,7 @@ mod tests {
                     description: "a".into(),
                     parameters: json!({"type":"object"}),
                     kind: crate::tools::ToolKind::Browser,
+                    access: crate::tools::Access::Guarded,
                 },
             ),
         ]);
@@ -3105,6 +4367,7 @@ mod tests {
             description: "Transactional live image-to-3D mesh".into(),
             parameters: json!({"type":"object"}),
             kind: crate::tools::ToolKind::Browser,
+            access: crate::tools::Access::Guarded,
         };
         let registered = HashMap::from([(wrapper.name.clone(), wrapper)]);
 
@@ -3143,6 +4406,7 @@ mod tests {
             description: "Capture and persist one live frame".into(),
             parameters: json!({"type":"object"}),
             kind: crate::tools::ToolKind::Browser,
+            access: crate::tools::Access::Guarded,
         };
         let registered = HashMap::from([(wrapper.name.clone(), wrapper)]);
 
@@ -3192,6 +4456,7 @@ mod tests {
             description: "unsafe alias".into(),
             parameters: json!({"type":"object"}),
             kind: crate::tools::ToolKind::Browser,
+            access: crate::tools::Access::Guarded,
         };
         let registered = HashMap::from([(browser_switch.name.clone(), browser_switch)]);
         let names: Vec<String> = manager
@@ -3223,6 +4488,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
@@ -3573,6 +4839,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object"}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let rules = vec![PermissionRule {
@@ -3821,6 +5088,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
@@ -3971,6 +5239,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object","properties":{"message":{"type":"string"}},"required":["message"]}),
                 kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
             },
         )]);
         let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
@@ -4047,6 +5316,81 @@ mod tests {
         )))
     }
 
+    /// The steer is a property of the session, not of the one call that set
+    /// it: the compaction that matters most is the automatic one that fires
+    /// mid-loop, and it has to keep what the operator said to keep.
+    #[tokio::test]
+    async fn compaction_instructions_persist_for_later_automatic_compactions() {
+        let app = Router::new().route("/v1/chat/completions", post(summary_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let state = make_state(addr, bus, agents.clone(), HashMap::new());
+        let session = Arc::new(Mutex::new(AgentSession {
+            id: "steered".into(),
+            messages: vec![json!({ "role": "user", "content": "hello" })],
+            pending: HashMap::new(),
+            cancel: CancellationToken::default(),
+            always_allow: Vec::new(),
+            world_state: None,
+            context_length: None,
+            usage: model::Usage::default(),
+            last_prompt_tokens: 0,
+            compactions: 0,
+            compaction_instructions: None,
+        }));
+        agents
+            .sessions
+            .lock()
+            .await
+            .insert("steered".into(), session.clone());
+
+        let set = agents
+            .compact_session(
+                &state,
+                "steered",
+                CompactInstructions::Set("keep the repro steps"),
+                CompactTrigger::Manual,
+            )
+            .await
+            .unwrap();
+        assert_eq!(set["instructions"], json!("keep the repro steps"));
+        assert_eq!(set["trigger"], json!("manual"));
+        assert_eq!(
+            session.lock().await.compaction_instructions.as_deref(),
+            Some("keep the repro steps")
+        );
+
+        // An automatic run says nothing about instructions and inherits them.
+        let auto = agents
+            .compact_session(
+                &state,
+                "steered",
+                CompactInstructions::Unchanged,
+                CompactTrigger::Auto,
+            )
+            .await
+            .unwrap();
+        assert_eq!(auto["instructions"], json!("keep the repro steps"));
+        assert_eq!(auto["trigger"], json!("auto"));
+
+        // And `/compact clear` forgets them for good.
+        let cleared = agents
+            .compact_session(
+                &state,
+                "steered",
+                CompactInstructions::Clear,
+                CompactTrigger::Manual,
+            )
+            .await
+            .unwrap();
+        assert_eq!(cleared["instructions"], Value::Null);
+        assert!(session.lock().await.compaction_instructions.is_none());
+    }
+
     #[tokio::test]
     async fn compact_session_summarizes_prunes_and_archives() {
         let app = Router::new().route("/v1/chat/completions", post(summary_provider));
@@ -4092,9 +5436,14 @@ mod tests {
             id: "compact-me".into(),
             messages,
             pending: HashMap::new(),
+            cancel: CancellationToken::default(),
+            always_allow: Vec::new(),
+            world_state: None,
+            context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
             compactions: 0,
+            compaction_instructions: None,
         }));
         agents
             .sessions
@@ -4102,7 +5451,15 @@ mod tests {
             .await
             .insert("compact-me".into(), session.clone());
 
-        let result = agents.compact_session(&state, "compact-me").await.unwrap();
+        let result = agents
+            .compact_session(
+                &state,
+                "compact-me",
+                CompactInstructions::Unchanged,
+                CompactTrigger::Manual,
+            )
+            .await
+            .unwrap();
         assert_eq!(result["compacted"], json!(true));
         assert!(result["archivedMessages"].as_u64().unwrap() > 0);
         let before = result["estimatedTokensBefore"].as_u64().unwrap();
@@ -4142,7 +5499,15 @@ mod tests {
             let mut config = state.config.write().await;
             config.compaction.context_length = Some(1_000_000);
         }
-        let again = agents.compact_session(&state, "compact-me").await.unwrap();
+        let again = agents
+            .compact_session(
+                &state,
+                "compact-me",
+                CompactInstructions::Unchanged,
+                CompactTrigger::Manual,
+            )
+            .await
+            .unwrap();
         assert_eq!(again["compacted"], json!(false));
     }
 
@@ -4204,9 +5569,14 @@ mod tests {
             id: id.into(),
             messages: over_budget_transcript(),
             pending: HashMap::new(),
+            cancel: CancellationToken::default(),
+            always_allow: Vec::new(),
+            world_state: None,
+            context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
             compactions: 0,
+            compaction_instructions: None,
         }));
         agents
             .sessions
@@ -4233,6 +5603,267 @@ mod tests {
         (agents, state, session)
     }
 
+    fn tool_call(name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            id: format!("{name}-1"),
+            name: name.into(),
+            arguments,
+        }
+    }
+
+    #[tokio::test]
+    async fn always_allow_grants_the_exact_tool_and_nothing_wider() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(8);
+        let agents = AgentManager::new(bus);
+        agents.ensure_session("grant").await.unwrap();
+
+        assert!(agents
+            .always_allow("grant", "mcp__blender__execute_blender_code")
+            .await
+            .unwrap());
+        // Recording the same grant twice is a no-op, not a duplicate rule.
+        assert!(!agents
+            .always_allow("grant", "mcp__blender__execute_blender_code")
+            .await
+            .unwrap());
+
+        let granted = {
+            let session = agents.session("grant").await.unwrap();
+            let guard = session.lock().await;
+            guard.always_allow.clone()
+        };
+        let rules: Vec<PermissionRule> = granted
+            .iter()
+            .map(|tool| PermissionRule {
+                pattern: tool.clone(),
+                action: "allow".into(),
+            })
+            .collect();
+
+        // The approved tool runs...
+        assert_eq!(
+            rule_decision(&rules, "mcp__blender__execute_blender_code"),
+            Some(RuleAction::Allow)
+        );
+        // ...and its siblings on the same server do not. Approving one
+        // destructive MCP tool must never hand over the whole server, which is
+        // what a glob-shaped grant would have done.
+        assert_eq!(rule_decision(&rules, "mcp__blender__delete_object"), None);
+        assert_eq!(rule_decision(&rules, "file_write"), None);
+    }
+
+    #[tokio::test]
+    async fn always_allow_refuses_a_tool_that_is_unknown() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(8);
+        let agents = AgentManager::new(bus);
+        assert!(agents
+            .always_allow("no-such-session", "file_write")
+            .await
+            .is_err());
+        agents.ensure_session("grant2").await.unwrap();
+        assert!(agents.always_allow("grant2", "   ").await.is_err());
+    }
+
+    #[test]
+    fn an_always_allow_can_never_outrank_a_configured_deny() {
+        // Rules are last-match-wins, so an appended allow beats an earlier
+        // deny. That is exactly why the grant is screened before it is
+        // appended: otherwise a click in a dialog would quietly undo a
+        // machine-wide policy the user wrote down on purpose.
+        let configured = vec![PermissionRule {
+            pattern: "file_write".into(),
+            action: "deny".into(),
+        }];
+        assert_eq!(
+            rule_decision(&configured, "file_write"),
+            Some(RuleAction::Deny)
+        );
+
+        // What the merge in `chat` would produce if it did NOT screen.
+        let mut unscreened = configured.clone();
+        unscreened.push(PermissionRule {
+            pattern: "file_write".into(),
+            action: "allow".into(),
+        });
+        assert_eq!(
+            rule_decision(&unscreened, "file_write"),
+            Some(RuleAction::Allow),
+            "this is the hole the screen closes"
+        );
+
+        // The screen: a denied tool is dropped rather than appended.
+        let screened: Vec<PermissionRule> = configured.clone();
+        assert_eq!(
+            rule_decision(&screened, "file_write"),
+            Some(RuleAction::Deny),
+            "the configured deny must survive the grant"
+        );
+    }
+
+    #[test]
+    fn a_call_whose_answer_stops_changing_is_not_run_again() {
+        let mut repeats = RepeatWatch::default();
+        let call = tool_call("file_read", json!({ "path": "main.js" }));
+        let same = json!({ "content": "unchanged" });
+
+        // The first three identical answers are allowed: a retry after a
+        // transient failure, and a deliberate re-check, are both legitimate.
+        for expected in 1..=MAX_IDENTICAL_TOOL_RESULTS {
+            assert!(
+                repeats.stalled_outcome(&call).is_none(),
+                "run {expected} must be allowed"
+            );
+            assert_eq!(repeats.record(&call, &same), expected);
+        }
+
+        // The fourth is refused, and says what to do instead.
+        let stalled = repeats
+            .stalled_outcome(&call)
+            .expect("a fourth identical answer must be refused");
+        let notice = stalled["repeatedCall"].as_str().unwrap();
+        assert!(notice.contains("file_read"), "{notice}");
+        assert!(notice.contains("change the arguments"), "{notice}");
+        // The identical output is not replayed — it is already in the
+        // transcript three times.
+        assert!(stalled.get("content").is_none());
+    }
+
+    #[test]
+    fn polling_that_returns_new_information_is_never_interrupted() {
+        // The false positive this guard has to avoid: an agent watching a run
+        // issues byte-identical calls forever and gets different answers each
+        // time. Keying on the call alone would have killed it.
+        let mut repeats = RepeatWatch::default();
+        let call = tool_call("graph_status", json!({ "graphId": "g-1" }));
+        for step in 0..12 {
+            assert!(
+                repeats.stalled_outcome(&call).is_none(),
+                "a poll returning new state must keep running (step {step})"
+            );
+            repeats.record(&call, &json!({ "completed": step }));
+        }
+
+        // ...and the moment it does go quiet, the guard still catches it.
+        let stuck = json!({ "completed": 11 });
+        for _ in 0..MAX_IDENTICAL_TOOL_RESULTS {
+            repeats.record(&call, &stuck);
+        }
+        assert!(repeats.stalled_outcome(&call).is_some());
+    }
+
+    #[test]
+    fn different_arguments_are_tracked_separately() {
+        let mut repeats = RepeatWatch::default();
+        let a = tool_call("file_read", json!({ "path": "a.js" }));
+        let b = tool_call("file_read", json!({ "path": "b.js" }));
+        let same = json!({ "content": "" });
+        for _ in 0..MAX_IDENTICAL_TOOL_RESULTS {
+            repeats.record(&a, &same);
+        }
+        assert!(repeats.stalled_outcome(&a).is_some());
+        // Reading a *different* file is different work, however similar the
+        // answer looks.
+        assert!(repeats.stalled_outcome(&b).is_none());
+    }
+
+    #[tokio::test]
+    async fn pruning_alone_is_preferred_over_paying_for_a_summary() {
+        // Over budget solely because one stale tool result is enormous — the
+        // ordinary shape after a big grep or file_read. Dropping it is free;
+        // summarizing costs a multi-second model call, its tokens, and every
+        // detail the summary does not carry forward.
+        let (bus, mut rx) = tokio::sync::broadcast::channel(64);
+        let agents = AgentManager::new(bus.clone());
+        let mut messages = vec![
+            json!({ "role": "system", "content": "sys" }),
+            json!({ "role": "user", "content": "build the level" }),
+            json!({ "role": "assistant", "content": "on it" }),
+            json!({
+                "role": "assistant", "content": "",
+                "tool_calls": [{ "id": "call-old", "type": "function",
+                    "function": { "name": "file_grep", "arguments": "{}" } }]
+            }),
+            json!({ "role": "tool", "tool_call_id": "call-old", "content": "m".repeat(40_000) }),
+        ];
+        for i in 0..3 {
+            messages.push(json!({ "role": "user", "content": format!("next {i}") }));
+            messages.push(json!({ "role": "assistant", "content": format!("done {i}") }));
+        }
+        let session = Arc::new(Mutex::new(AgentSession {
+            id: "prune-only".into(),
+            messages: messages.clone(),
+            pending: HashMap::new(),
+            cancel: CancellationToken::default(),
+            always_allow: Vec::new(),
+            world_state: None,
+            context_length: None,
+            usage: model::Usage::default(),
+            last_prompt_tokens: 0,
+            compactions: 0,
+            compaction_instructions: None,
+        }));
+        agents
+            .sessions
+            .lock()
+            .await
+            .insert("prune-only".into(), session.clone());
+
+        // A provider with no routes at all: any model call 404s and fails the
+        // compaction, so `Ok` here is the proof that none was made.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, Router::new()).await.unwrap() });
+        let state = make_state(addr, bus, agents.clone(), HashMap::new());
+        {
+            // budget = 1.0 × 1020 − 20 = 1000 tokens. The transcript is ~10k
+            // before pruning and a few hundred after.
+            let mut config = state.config.write().await;
+            config.compaction.context_length = Some(1020);
+            config.compaction.threshold = 1.0;
+            config.compaction.reserved = 20;
+        }
+
+        let result = agents
+            .compact_session(
+                &state,
+                "prune-only",
+                CompactInstructions::Unchanged,
+                CompactTrigger::Auto,
+            )
+            .await
+            .expect("pruning must not need the model");
+        assert_eq!(result["strategy"], json!("prune"));
+        // The cheap path is still a compaction, and an automatic one has to
+        // announce itself: without the event the transcript showed nothing
+        // while the context meter dropped on its own.
+        let mut pruned_event = None;
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "agent.compacted" {
+                pruned_event = Some(event);
+            }
+        }
+        let pruned_event = pruned_event.expect("pruning must emit agent.compacted");
+        assert_eq!(pruned_event["trigger"], json!("auto"));
+        assert_eq!(pruned_event["strategy"], json!("prune"));
+        assert_eq!(result["summarized"], json!(false));
+        assert_eq!(result["prunedToolResults"], json!(1));
+        assert!(
+            result["estimatedTokens"].as_u64().unwrap() <= 1000,
+            "pruning must actually get under budget: {result}"
+        );
+
+        let guard = session.lock().await;
+        // Nothing was archived or replaced by a summary: the conversation is
+        // all still there, only the stale tool payload is shorter.
+        assert_eq!(guard.messages.len(), messages.len());
+        assert_eq!(guard.compactions, 0, "pruning is not a wholesale rewrite");
+        let tool = guard.messages[4]["content"].as_str().unwrap();
+        assert!(tool.len() < 1_000, "the stale tool result must be pruned");
+        assert!(tool.contains("pruned"), "and must say so: {tool}");
+        // The recent turns are untouched.
+        assert_eq!(guard.messages[9]["content"], json!("next 2"));
+    }
+
     #[tokio::test]
     async fn compaction_remerges_a_turn_appended_during_the_summary_call() {
         // A plain user/assistant exchange appended while the summary model
@@ -4245,7 +5876,15 @@ mod tests {
         let (agents, state, session) =
             compaction_race_fixture("race-merge", appended.clone()).await;
 
-        let result = agents.compact_session(&state, "race-merge").await.unwrap();
+        let result = agents
+            .compact_session(
+                &state,
+                "race-merge",
+                CompactInstructions::Unchanged,
+                CompactTrigger::Manual,
+            )
+            .await
+            .unwrap();
         assert_eq!(result["compacted"], json!(true));
         assert_eq!(result["remergedMessages"], json!(2));
 
@@ -4273,7 +5912,12 @@ mod tests {
             compaction_race_fixture("race-orphan", appended.clone()).await;
 
         let error = agents
-            .compact_session(&state, "race-orphan")
+            .compact_session(
+                &state,
+                "race-orphan",
+                CompactInstructions::Unchanged,
+                CompactTrigger::Manual,
+            )
             .await
             .expect_err("compaction must refuse an unmergeable tail")
             .to_string();
@@ -4339,6 +5983,85 @@ mod tests {
             &compacted,
             &[json!({ "role": "tool", "content": "idless" })]
         ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_reports_who_flipped_it_and_survives_reset() {
+        let token = CancellationToken::default();
+        assert!(!token.is_cancelled());
+        assert!(token.cancel(), "the first stop is the one that cancels");
+        assert!(token.is_cancelled());
+        assert!(
+            !token.cancel(),
+            "a second stop press must report as a no-op, not a fresh cancellation"
+        );
+
+        // Already-cancelled tokens resolve immediately; a waiter that only
+        // woke on a *future* cancel would park the loop forever here.
+        tokio::time::timeout(std::time::Duration::from_secs(1), token.cancelled())
+            .await
+            .expect("an already-cancelled token must resolve without a further cancel");
+
+        token.reset();
+        assert!(!token.is_cancelled(), "reset clears a stale stop");
+        assert!(token.cancel(), "a reset token can be cancelled again");
+    }
+
+    #[tokio::test]
+    async fn cancelled_waits_for_a_stop_that_arrives_later() {
+        let token = CancellationToken::default();
+        let waiter = {
+            let token = token.clone();
+            tokio::spawn(async move { token.cancelled().await })
+        };
+        // The waiter is parked on a token that is not yet cancelled.
+        assert!(!token.is_cancelled());
+        token.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("a parked waiter must wake on cancel")
+            .expect("waiter task panicked");
+    }
+
+    #[tokio::test]
+    async fn cancel_session_is_idempotent_and_tolerates_a_finished_turn() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(8);
+        let agents = AgentManager::new(bus);
+
+        // Racing a turn that already returned is the ordinary case, not an
+        // error: the stop button and the loop finish in either order.
+        let (found, cancelled) = agents.cancel_session("never-existed").await;
+        assert!(!found);
+        assert!(!cancelled);
+
+        agents.ensure_session("session-cancel").await.unwrap();
+        let (found, cancelled) = agents.cancel_session("session-cancel").await;
+        assert!(found);
+        assert!(cancelled, "the first stop flips the token");
+
+        let (found, cancelled) = agents.cancel_session("session-cancel").await;
+        assert!(found);
+        assert!(!cancelled, "a repeated stop is not a second cancellation");
+
+        let session = agents.session("session-cancel").await.unwrap();
+        assert!(session.lock().await.cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn removing_a_session_cancels_its_running_turn() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(8);
+        let agents = AgentManager::new(bus);
+        agents
+            .ensure_session("session-removed-mid-turn")
+            .await
+            .unwrap();
+        // A running turn holds its own Arc, so the token has to be flipped
+        // before the map entry goes — otherwise the loop keeps billing against
+        // a transcript that no longer exists.
+        let session = agents.session("session-removed-mid-turn").await.unwrap();
+        let token = { session.lock().await.cancel.clone() };
+        agents.remove_session("session-removed-mid-turn").await;
+        assert!(token.is_cancelled());
     }
 
     #[tokio::test]
@@ -4623,6 +6346,20 @@ mod tests {
     }
 
     #[test]
+    fn starting_a_dev_server_always_asks_outside_full_access() {
+        // `devserver_start` runs a script out of the workspace's own
+        // package.json, so an unprompted one is arbitrary code execution from
+        // a cloned repo. Only the mode that says it never asks may skip it.
+        for mode in ["supervised", "auto-accept-edits", "auto"] {
+            assert!(
+                requires_approval(mode, "devserver_start", true),
+                "{mode} let devserver_start run unprompted"
+            );
+        }
+        assert!(!requires_approval("full-access", "devserver_start", true));
+    }
+
+    #[test]
     fn mcp_tools_gate_on_server_trust() {
         // Untrusted MCP tools count as destructive; trusted ones flow like
         // scene edits.
@@ -4640,9 +6377,70 @@ mod tests {
         // line of defence, not a second formatter.
         let outcome = json!({ "path": "a.txt", "content": "hello" });
         assert_eq!(
-            bound_tool_result("file_read", &outcome),
+            bound_tool_result("file_read", &outcome, None),
             outcome.to_string()
         );
+    }
+
+    #[test]
+    fn an_oversized_result_keeps_its_tail_reachable() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("tool-output");
+        // A grep whose interesting match is past the halfway cut: the old
+        // behaviour returned the first half and told the model to narrow a call
+        // it had no way to narrow.
+        let mut lines: Vec<String> = (0..40_000).map(|i| format!("src/a{i}.js: hit")).collect();
+        lines.push("src/THE_ONE.js: the match that mattered".into());
+        let flood = json!({ "matches": lines.join("\n") });
+
+        let bounded = bound_tool_result("file_grep", &flood, Some(&dir));
+        assert!(bounded.len() < MAX_TOOL_RESULT_BYTES);
+        let parsed: Value = serde_json::from_str(&bounded).unwrap();
+        assert_eq!(parsed["truncated"], true);
+
+        let id = parsed["outputId"]
+            .as_str()
+            .expect("an oversized result must leave a handle to the rest");
+        assert!(parsed["notice"]
+            .as_str()
+            .unwrap()
+            .contains("tool_output_read"));
+
+        // The tail is genuinely retrievable, not just referenced: walk the
+        // pages the way the model is told to.
+        let mut whole = String::new();
+        let mut offset = 0usize;
+        loop {
+            let page = crate::spill::read(&dir, id, offset, None).unwrap();
+            whole.push_str(page["content"].as_str().unwrap());
+            match page["nextOffset"].as_u64() {
+                Some(next) => offset = next as usize,
+                None => break,
+            }
+        }
+        assert!(
+            whole.contains("THE_ONE"),
+            "the part past the cut must still be reachable"
+        );
+    }
+
+    #[test]
+    fn an_unwritable_spill_directory_still_returns_a_usable_result() {
+        // Losing the tail is bad; failing the tool call outright is worse.
+        let flood = json!({ "content": "z".repeat(MAX_TOOL_RESULT_BYTES * 2) });
+        let bounded = bound_tool_result(
+            "mcp__scraper__fetch",
+            &flood,
+            Some(std::path::Path::new("/proc/nonexistent/cannot-create")),
+        );
+        let parsed: Value = serde_json::from_str(&bounded).expect("must still be JSON");
+        assert_eq!(parsed["truncated"], true);
+        assert!(parsed.get("outputId").is_none());
+        assert!(parsed["preview"].is_string());
+        assert!(parsed["notice"]
+            .as_str()
+            .unwrap()
+            .contains("Narrow the call"));
     }
 
     #[test]
@@ -4651,7 +6449,7 @@ mod tests {
         // context window, and their output lands in `messages` for the rest of
         // the session.
         let flood = json!({ "content": "z".repeat(MAX_TOOL_RESULT_BYTES * 2) });
-        let bounded = bound_tool_result("mcp__scraper__fetch", &flood);
+        let bounded = bound_tool_result("mcp__scraper__fetch", &flood, None);
         assert!(
             bounded.len() < MAX_TOOL_RESULT_BYTES,
             "bounded result was {} bytes",
@@ -4677,7 +6475,7 @@ mod tests {
     fn a_captured_frame_leaves_a_receipt_instead_of_its_pixels() {
         let frame = format!("data:image/png;base64,{}", "A".repeat(70_000));
         let outcome = json!({ "dataUrl": frame, "frame": 12 });
-        let bounded = bound_tool_result("editor_capture_frame", &outcome);
+        let bounded = bound_tool_result("editor_capture_frame", &outcome, None);
         let parsed: Value = serde_json::from_str(&bounded).unwrap();
 
         assert!(
@@ -4702,7 +6500,7 @@ mod tests {
         // those would make the elision itself the confusing part.
         let outcome = json!({ "example": "data:image/png;base64,AAAA" });
         assert_eq!(
-            bound_tool_result("editor_asset_preview", &outcome),
+            bound_tool_result("editor_asset_preview", &outcome, None),
             outcome.to_string()
         );
     }
@@ -4710,7 +6508,7 @@ mod tests {
     #[test]
     fn bounding_never_splits_a_codepoint() {
         let flood = json!({ "content": "漢".repeat(MAX_TOOL_RESULT_BYTES) });
-        let bounded = bound_tool_result("mcp__x__y", &flood);
+        let bounded = bound_tool_result("mcp__x__y", &flood, None);
         let parsed: Value = serde_json::from_str(&bounded).unwrap();
         assert!(!parsed["preview"].as_str().unwrap().contains('\u{fffd}'));
     }

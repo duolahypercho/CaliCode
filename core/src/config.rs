@@ -45,6 +45,34 @@ pub struct AppConfig {
     /// Auto-compaction tuning (consumed by `compaction.rs` / the agent loop).
     #[serde(default)]
     pub compaction: CompactionConfig,
+    /// macOS Seatbelt confinement for spawned processes. Enabled by default;
+    /// see `sandbox.rs` for what it does and does not cover.
+    #[serde(default)]
+    pub sandbox: crate::sandbox::SandboxConfig,
+    /// Spend ceiling for a single chat session. Off unless configured.
+    #[serde(default)]
+    pub budget: BudgetConfig,
+}
+
+/// `budget:` — a ceiling on what one session may spend before it stops.
+///
+/// A turn budget bounds the number of provider *requests*, which is not what
+/// anyone is actually worried about: two hundred cheap turns and two hundred
+/// expensive ones are the same number and wildly different bills. Codex has no
+/// iteration counter at all for this reason, and terminates on cost.
+///
+/// Tokens rather than currency because tokens are what this harness measures.
+/// Pricing lives in models.dev, on the client (`modelMeta.ts`); teaching core a
+/// price table would be the same hardcoded model list AGENTS.md exists to keep
+/// out, and it would be wrong the week a provider changes a price.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct BudgetConfig {
+    /// Total tokens one session may accumulate before further turns are
+    /// refused. `None` — the default — means no ceiling, which is the right
+    /// default: a multi-day `/loop` is a legitimate way to spend a great deal,
+    /// and a surprise stop halfway through is worse than the bill.
+    pub session_tokens: Option<u64>,
 }
 
 /// One entry under `permissions:` — `{pattern: "file_*", action: allow}`.
@@ -340,6 +368,54 @@ pub fn load_project_config(base: &std::path::Path) -> ProjectConfig {
 ///
 /// The merged list is re-validated, so the output is always safe to hand to
 /// `McpManager`.
+/// Combine a global tool filter with a project's, keeping only the narrower.
+///
+/// The filter's semantics (see [`crate::mcp::tool_filter_allows`]) are: a
+/// non-empty `include` is an allowlist; otherwise `exclude` is a denylist. So
+/// narrowing means:
+///
+/// * **exclude** unions — a project may forbid more, never less.
+/// * **include** intersects. With no global allowlist, the project's is pure
+///   narrowing and is adopted. With one already in place, a project pattern is
+///   kept only if the global filter would have allowed it as a name, which is
+///   what stops `["*"]` from reopening a server the user restricted.
+///
+/// A project allowlist that survives none of that is dropped rather than
+/// applied: an empty `include` would mean "allowlist everything", i.e. the
+/// widening this function exists to prevent.
+fn narrow_tool_filter(global: &McpToolFilter, project: &McpToolFilter, id: &str) -> McpToolFilter {
+    let mut exclude = global.exclude.clone();
+    for pattern in &project.exclude {
+        if !exclude.contains(pattern) {
+            exclude.push(pattern.clone());
+        }
+    }
+
+    let include = if project.include.is_empty() {
+        global.include.clone()
+    } else if global.include.is_empty() {
+        project.include.clone()
+    } else {
+        let kept: Vec<String> = project
+            .include
+            .iter()
+            .filter(|pattern| crate::mcp::tool_filter_allows(global, pattern))
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            tracing::warn!(
+                id = %id,
+                "project config tried to widen mcp tool filter for '{id}'; keeping the global allowlist"
+            );
+            global.include.clone()
+        } else {
+            kept
+        }
+    };
+
+    McpToolFilter { include, exclude }
+}
+
 pub fn merge_mcp_servers(
     global: &[McpServerConfig],
     project: &[McpServerConfig],
@@ -356,10 +432,16 @@ pub fn merge_mcp_servers(
                     entry.id
                 );
             }
-            existing.enabled = entry.enabled;
-            if entry.tools != McpToolFilter::default() {
-                existing.tools = entry.tools.clone();
-            }
+            // A repo's config may only ever *narrow* a global server, which is
+            // what the doc above already promised and what the code did not
+            // enforce. Both directions were reachable: a checked-in
+            // `enabled: true` switched a server the user had globally turned
+            // off back on, and a checked-in `tools: ["*"]` widened a *trusted*
+            // server's allowlist — and trusted servers run with no approval
+            // prompt, so the widening was invisible. Cloning a repository is
+            // not consent to run more of the user's machine.
+            existing.enabled = existing.enabled && entry.enabled;
+            existing.tools = narrow_tool_filter(&existing.tools, &entry.tools, &entry.id);
         } else if !stub {
             let mut adopted = entry.clone();
             adopted.trust = false;
@@ -636,12 +718,30 @@ pub fn default_providers() -> Vec<ProviderPreset> {
     ]
 }
 
+/// Parse the global config, refusing to fall back to `Default` on bad YAML.
+///
+/// This file is where `deny` permission rules live and the defaults carry
+/// none, so swallowing a parse error turns one mistyped line into a config
+/// with every restriction removed — invisibly, because the agent then runs
+/// perfectly happily. Refusing to start is recoverable; a session that quietly
+/// runs unrestricted is not, and nobody discovers it until after the damage.
+fn parse_config(text: &str, path: &std::path::Path) -> Result<AppConfig> {
+    serde_yaml::from_str(text).with_context(|| {
+        format!(
+            "config {} is not valid YAML. Fix or remove it — refusing to start \
+             on defaults, which would silently drop every permission rule the \
+             file defines.",
+            path.display()
+        )
+    })
+}
+
 pub fn load() -> Result<AppConfig> {
     let path = config_path();
     let mut config = if path.exists() {
         let text = std::fs::read_to_string(&path)
             .with_context(|| format!("failed to read config {}", path.display()))?;
-        serde_yaml::from_str(&text).unwrap_or_default()
+        parse_config(&text, &path)?
     } else {
         AppConfig::default()
     };
@@ -735,6 +835,31 @@ pub fn router_key() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_malformed_config_refuses_rather_than_silently_dropping_every_rule() {
+        // The failure this guards: `unwrap_or_default()` here meant one bad
+        // line produced a config with no `deny` rules at all, and said nothing.
+        let path = std::path::Path::new("/home/u/.cali/config.yaml");
+        let error = parse_config("model:\n  default: \"unclosed\n", path)
+            .expect_err("bad YAML must not resolve to defaults");
+        let rendered = format!("{error:#}");
+        assert!(
+            rendered.contains("/home/u/.cali/config.yaml"),
+            "the message must name the file to fix, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("permission rule"),
+            "the message must say what silently falling back would have cost, got: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_valid_config_still_parses_through_the_same_path() {
+        let path = std::path::Path::new("/home/u/.cali/config.yaml");
+        let config = parse_config("model:\n  default: test-model\n", path).unwrap();
+        assert_eq!(config.model.default, "test-model");
+    }
 
     #[test]
     fn config_roundtrip() {
@@ -1062,6 +1187,128 @@ mod tests {
         assert!(!merged[0].enabled);
         // Everything else from the global entry survives the stub.
         assert_eq!(merged[0].command, "uvx");
+    }
+
+    #[test]
+    fn project_stub_cannot_re_enable_a_globally_disabled_server() {
+        // Cloning a repository is not consent to run more of the user's
+        // machine. This mirrors `merge_permission_rules`, which has always
+        // refused project `allow` rules for the same reason.
+        let mut global = named("blender", "uvx");
+        global.enabled = false;
+        let stub = McpServerConfig {
+            id: "blender".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let merged = merge_mcp_servers(&[global], &[stub]);
+        assert!(
+            !merged[0].enabled,
+            "a repo's config must not switch a server the user turned off back on"
+        );
+    }
+
+    #[test]
+    fn a_project_stub_can_still_disable_a_globally_enabled_server() {
+        // Narrowing is the whole point; only widening is refused.
+        let global = named("blender", "uvx");
+        assert!(global.enabled, "fixture must start enabled");
+        let stub = McpServerConfig {
+            id: "blender".into(),
+            enabled: false,
+            ..Default::default()
+        };
+        let merged = merge_mcp_servers(&[global], &[stub]);
+        assert!(!merged[0].enabled);
+    }
+
+    #[test]
+    fn project_stub_cannot_widen_a_restricted_tool_filter() {
+        // The dangerous shape: a *trusted* server runs with no approval
+        // prompt, so widening its allowlist from a checked-in file is invisible.
+        let mut global = named("blender", "uvx");
+        global.trust = true;
+        global.tools = McpToolFilter {
+            include: vec!["get_*".into()],
+            exclude: Vec::new(),
+        };
+        let stub = McpServerConfig {
+            id: "blender".into(),
+            tools: McpToolFilter {
+                include: vec!["*".into()],
+                exclude: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let merged = merge_mcp_servers(&[global], &[stub]);
+        assert_eq!(
+            merged[0].tools.include,
+            vec!["get_*"],
+            "the global allowlist must survive an attempt to reopen it"
+        );
+        assert!(!crate::mcp::tool_filter_allows(
+            &merged[0].tools,
+            "execute_blender_code"
+        ));
+    }
+
+    #[test]
+    fn project_stub_narrows_an_existing_allowlist_by_intersection() {
+        let mut global = named("blender", "uvx");
+        global.tools = McpToolFilter {
+            include: vec!["get_*".into(), "search_*".into()],
+            exclude: Vec::new(),
+        };
+        let stub = McpServerConfig {
+            id: "blender".into(),
+            tools: McpToolFilter {
+                // One the global allows, one it never did.
+                include: vec!["get_scene_info".into(), "execute_blender_code".into()],
+                exclude: Vec::new(),
+            },
+            ..Default::default()
+        };
+        let merged = merge_mcp_servers(&[global], &[stub]);
+        assert_eq!(merged[0].tools.include, vec!["get_scene_info"]);
+        assert!(crate::mcp::tool_filter_allows(
+            &merged[0].tools,
+            "get_scene_info"
+        ));
+        assert!(!crate::mcp::tool_filter_allows(
+            &merged[0].tools,
+            "get_object_info"
+        ));
+    }
+
+    #[test]
+    fn project_excludes_add_to_the_global_ones() {
+        let mut global = named("blender", "uvx");
+        global.tools = McpToolFilter {
+            include: Vec::new(),
+            exclude: vec!["execute_*".into()],
+        };
+        let stub = McpServerConfig {
+            id: "blender".into(),
+            tools: McpToolFilter {
+                include: Vec::new(),
+                exclude: vec!["download_*".into()],
+            },
+            ..Default::default()
+        };
+        let merged = merge_mcp_servers(&[global], &[stub]);
+        // A project may forbid more, never less: the global exclude survives.
+        assert!(!crate::mcp::tool_filter_allows(
+            &merged[0].tools,
+            "execute_blender_code"
+        ));
+        assert!(!crate::mcp::tool_filter_allows(
+            &merged[0].tools,
+            "download_polyhaven_asset"
+        ));
+        assert!(crate::mcp::tool_filter_allows(
+            &merged[0].tools,
+            "get_scene_info"
+        ));
     }
 
     #[test]

@@ -17,6 +17,7 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
+use crate::sandbox;
 use crate::workspace::Workspace;
 
 /// Ports reserved for workspace dev servers. 5199 is CaliCode's own client and
@@ -72,6 +73,12 @@ fn free_port() -> Result<u16> {
 /// Resolves a script *name* to a command. A raw command string is never
 /// accepted: `agent_chat` can reach core tools, so taking one would hand the
 /// model arbitrary code execution.
+///
+/// Refusing arbitrary commands is not enough on its own — the script itself
+/// comes from a cloned repo's `package.json`, so `npm run dev` is already
+/// running someone else's code. The result is confined to the workspace with
+/// loopback-only networking (see `sandbox.rs`); a dev server has no business
+/// reaching the internet, and none at all writing to `.git`.
 fn resolve_command(root: &Path, script: &str, port: u16) -> Result<Command> {
     let manifest: Value = serde_json::from_str(
         &std::fs::read_to_string(root.join("package.json"))
@@ -93,16 +100,18 @@ fn resolve_command(root: &Path, script: &str, port: u16) -> Result<Command> {
     .map(str::to_string);
 
     let local_vite = root.join("node_modules/.bin/vite");
-    let mut command = if local_vite.exists() {
-        let mut c = Command::new(&local_vite);
-        c.args(port_args);
-        c
+    let (program, args) = if local_vite.exists() {
+        (local_vite.to_string_lossy().to_string(), port_args.to_vec())
     } else {
-        let mut c = Command::new("npm");
-        c.arg("run").arg(script).arg("--");
-        c.args(port_args);
-        c
+        let mut args = vec!["run".to_string(), script.to_string(), "--".to_string()];
+        args.extend(port_args);
+        ("npm".to_string(), args)
     };
+
+    let policy = sandbox::workspace_policy(root, sandbox::Network::Loopback);
+    let (program, args) = sandbox::confine(&policy, &program, &args);
+    let mut command = Command::new(program);
+    command.args(args);
 
     command.current_dir(root);
     // Scrub the environment so CALI_*_API_KEY and friends never reach a child.
@@ -333,6 +342,34 @@ mod tests {
             .any(|(k, _)| k.to_string_lossy().starts_with("CALI_"));
         std::env::remove_var("CALI_OPENAI_API_KEY");
         assert!(!leaked, "API keys must not reach a spawned dev server");
+    }
+
+    /// The dev server is the highest-risk spawn in core: the script it runs is
+    /// declared by a cloned repo's own `package.json`.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn resolve_command_confines_the_dev_server() {
+        if !crate::sandbox::settings().enabled {
+            return;
+        }
+        let (_dir, workspace) = workspace_with(r#"{"scripts":{"dev":"vite"}}"#);
+        let command = resolve_command(&workspace.root, "dev", 5300).unwrap();
+        let std = command.as_std();
+        assert_eq!(std.get_program(), crate::sandbox::SANDBOX_EXEC);
+        let args: Vec<String> = std
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        assert!(args
+            .iter()
+            .any(|a| a == &format!("WRITABLE_ROOT_0={}", workspace.root.display())));
+        assert!(args
+            .iter()
+            .any(|a| a.ends_with(&format!("{}/.git", workspace.root.display()))));
+        // Loopback only: a dev server needs to bind, not to phone home.
+        let profile = &args[1];
+        assert!(profile.contains(r#"(allow network-bind (local ip "localhost:*"))"#));
+        assert!(!profile.contains("(allow network*)"));
     }
 
     #[test]

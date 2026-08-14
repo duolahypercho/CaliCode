@@ -240,6 +240,61 @@ pub fn get<'a>(registry: &'a Registry, id: &str) -> Result<&'a Workspace> {
 /// Unlike `store::safe_join`, this canonicalizes. The lexical `..` check alone
 /// is not enough for a real repository: a symlink inside the tree would
 /// otherwise be followed straight out of it.
+/// Symlink hops followed before a path is treated as hostile. Linux's own
+/// limit is 40; this is a workspace path, not a filesystem, and anything
+/// beyond a handful is a loop or an attempt to exhaust the resolver.
+const MAX_SYMLINK_HOPS: usize = 8;
+
+/// The nearest existing ancestor of `path`, canonicalized.
+///
+/// `None` only when nothing on the path exists at all, which cannot happen for
+/// a path anchored under a root that was itself canonicalized.
+pub(crate) fn deepest_existing(path: &Path) -> Option<PathBuf> {
+    let mut probe = path;
+    loop {
+        if let Ok(real) = probe.canonicalize() {
+            return Some(real);
+        }
+        probe = probe.parent()?;
+    }
+}
+
+/// Refuse a leaf that is a symlink out of `root_real`, dangling or not.
+///
+/// Shared by both resolvers — the workspace one and the project one — because
+/// they had the same hole and fixing only the one that was reported would leave
+/// the other reachable through `asset_import_file` and the project file tools.
+///
+/// The gap it closes: a deepest-existing-ancestor walk is right for a file that
+/// does not exist yet, and exactly wrong for a symlink whose *target* does not
+/// exist. `canonicalize` fails on a dangling link, the walk falls back to the
+/// parent, finds it inside the root, and allows the write — which then follows
+/// the link and creates the file at its target.
+pub(crate) fn reject_symlink_escape(root_real: &Path, candidate: &Path) -> Result<()> {
+    let mut hop = candidate.to_path_buf();
+    for _ in 0..MAX_SYMLINK_HOPS {
+        let Ok(meta) = std::fs::symlink_metadata(&hop) else {
+            return Ok(());
+        };
+        if !meta.file_type().is_symlink() {
+            return Ok(());
+        }
+        let target = std::fs::read_link(&hop).context("cannot read symlink")?;
+        hop = match (target.is_absolute(), hop.parent()) {
+            (true, _) => target,
+            (false, Some(parent)) => parent.join(target),
+            (false, None) => anyhow::bail!("path escapes the workspace"),
+        };
+        // Every hop is contained, not just the last, so a chain cannot step
+        // outside and back in.
+        if !deepest_existing(&hop).is_some_and(|real| real.starts_with(root_real)) {
+            anyhow::bail!("path escapes the workspace");
+        }
+    }
+    // A chain this long is a loop or an attempt to exhaust the resolver.
+    anyhow::bail!("path escapes the workspace")
+}
+
 pub fn safe_resolve(root: &Path, rel: &str) -> Result<PathBuf> {
     // Reject absolute paths rather than silently reinterpreting them as
     // workspace-relative — `/etc/passwd` quietly becoming `<root>/etc/passwd`
@@ -271,18 +326,25 @@ pub fn safe_resolve(root: &Path, rel: &str) -> Result<PathBuf> {
         .context("workspace root is unavailable")?;
     let candidate = root_real.join(trimmed);
 
+    // Follow a symlink at the leaf explicitly, before the ancestor walk below.
+    //
+    // The walk resolves the deepest *existing* ancestor, which is right for a
+    // file that does not exist yet — but it is exactly wrong for a symlink
+    // whose target does not exist. `canonicalize` fails on a dangling link, so
+    // the walk fell back to the parent, found it inside the workspace, and
+    // allowed the write; `std::fs::write` then followed the link and created
+    // the file at its target, outside the tree. A workspace is somebody else's
+    // repository, and a checked-in `config.json -> ~/.ssh/authorized_keys` is
+    // the cheapest escape there is.
+    //
+    // Each hop is contained, not just the last, so a chain cannot step out and
+    // back in. The hop cap ends a symlink loop, which `read_link` alone would
+    // follow forever.
+    reject_symlink_escape(&root_real, &candidate)?;
+
     // The leaf may not exist yet on a write, so resolve the deepest existing
     // ancestor and check containment against that.
-    let mut probe = candidate.as_path();
-    let resolved = loop {
-        match probe.canonicalize() {
-            Ok(real) => break real,
-            Err(_) => match probe.parent() {
-                Some(parent) => probe = parent,
-                None => anyhow::bail!("path escapes the workspace"),
-            },
-        }
-    };
+    let resolved = deepest_existing(&candidate).context("path escapes the workspace")?;
     if !resolved.starts_with(&root_real) {
         anyhow::bail!("path escapes the workspace");
     }
@@ -396,6 +458,12 @@ pub fn write_file(
         anyhow::bail!("refusing to write more than {MAX_WRITE_BYTES} bytes");
     }
     let path = safe_resolve(&workspace.root, rel)?;
+    // Guarded here rather than at the RPC arm so every caller of `write_file`
+    // inherits it. `safe_resolve` confines the write to the workspace but says
+    // nothing about `.git` inside it, so this path could rewrite
+    // `.git/hooks/pre-commit` — arranging for code to run on the user's next
+    // commit — or corrupt the history that is the way back from a bad run.
+    crate::tools::reject_protected_write(&workspace.root, &path)?;
 
     // Optimistic concurrency: a stale editor buffer must not clobber a file
     // that HMR, git, or another tool changed underneath it.
@@ -454,6 +522,68 @@ mod tests {
             root,
         };
         (dir, workspace)
+    }
+
+    #[test]
+    fn write_file_refuses_to_reach_into_git() {
+        let (dir, workspace) = fixture();
+        std::fs::create_dir_all(dir.path().join(".git/hooks")).unwrap();
+
+        // A hook is code the user's next commit runs, and the history is the
+        // way back from a bad run — `safe_resolve` confines writes to the
+        // workspace but has nothing to say about `.git` inside it.
+        let error = write_file(
+            &workspace,
+            ".git/hooks/pre-commit",
+            "#!/bin/sh\nrm -rf /\n",
+            None,
+        )
+        .expect_err("a write into .git must be refused");
+        assert!(
+            format!("{error:#}").contains(".git"),
+            "the refusal must name what it protected: {error:#}"
+        );
+        assert!(!dir.path().join(".git/hooks/pre-commit").exists());
+
+        // Worktree metadata is protected for the same reason.
+        assert!(write_file(&workspace, ".wt/config", "x", None).is_err());
+    }
+
+    #[test]
+    fn a_checked_in_dangling_symlink_cannot_plant_a_file_outside() {
+        // The whole exploit, end to end through the write path rather than the
+        // resolver: a cloned repository ships a link whose target does not
+        // exist yet, the agent writes to that innocuous-looking name, and
+        // `std::fs::write` follows the link and creates the file wherever it
+        // points.
+        let (dir, workspace) = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let planted = outside.path().join("authorized_keys");
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&planted, dir.path().join("config.json")).unwrap();
+            let error = write_file(&workspace, "config.json", "ssh-rsa AAAA...", None)
+                .expect_err("a dangling symlink out of the workspace must be refused");
+            assert!(
+                format!("{error:#}").contains("escapes the workspace"),
+                "{error:#}"
+            );
+            assert!(
+                !planted.exists(),
+                "nothing may be created outside the workspace"
+            );
+        }
+    }
+
+    #[test]
+    fn write_file_still_writes_ordinary_source() {
+        let (dir, workspace) = fixture();
+        write_file(&workspace, "src/level.js", "export const x = 1;\n", None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("src/level.js")).unwrap(),
+            "export const x = 1;\n"
+        );
     }
 
     #[test]
@@ -517,6 +647,64 @@ mod tests {
         {
             std::os::unix::fs::symlink(outside.path(), workspace.root.join("link")).unwrap();
             assert!(safe_resolve(&workspace.root, "link/secret.txt").is_err());
+        }
+    }
+
+    #[test]
+    fn safe_resolve_blocks_a_symlink_at_the_leaf_not_only_an_ancestor() {
+        // The agent's own file writes are confined by this function and not by
+        // Seatbelt — Seatbelt wraps *spawned* processes, and core writes these
+        // files in-process. So every escape this function does not catch is an
+        // escape, full stop. The existing coverage symlinks a directory; a
+        // symlink at the leaf is a different path through the resolver, since
+        // the loop canonicalizes the candidate itself before any parent.
+        let (_dir, workspace) = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("stolen.txt");
+        std::fs::write(&target, "outside").unwrap();
+
+        #[cfg(unix)]
+        {
+            // An existing file symlinked straight out of the workspace.
+            std::os::unix::fs::symlink(&target, workspace.root.join("leaf.txt")).unwrap();
+            assert!(
+                safe_resolve(&workspace.root, "leaf.txt").is_err(),
+                "a leaf symlink pointing outside must be refused"
+            );
+
+            // A *dangling* symlink out of the workspace: the leaf does not
+            // resolve, so the loop falls back to the parent — which is inside.
+            // Without resolving the link itself this would be permitted, and
+            // the subsequent write would follow it out.
+            std::os::unix::fs::symlink(
+                outside.path().join("does-not-exist-yet.txt"),
+                workspace.root.join("dangling.txt"),
+            )
+            .unwrap();
+            assert!(
+                safe_resolve(&workspace.root, "dangling.txt").is_err(),
+                "a dangling symlink pointing outside must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_resolve_refuses_a_null_byte_and_an_empty_path() {
+        let (_dir, workspace) = fixture();
+        assert!(safe_resolve(&workspace.root, "").is_err());
+        assert!(safe_resolve(&workspace.root, "src/ma\0in.js").is_err());
+    }
+
+    #[test]
+    fn secret_refusal_is_case_insensitive() {
+        // macOS filesystems are case-insensitive by default, so a refusal that
+        // only matched lowercase would be bypassed by spelling.
+        let (_dir, workspace) = fixture();
+        for path in [".ENV", "keys/ID_RSA", "certs/Server.PEM"] {
+            assert!(
+                safe_resolve(&workspace.root, path).is_err(),
+                "{path} must be refused"
+            );
         }
     }
 

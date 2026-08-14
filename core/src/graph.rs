@@ -3267,6 +3267,9 @@ async fn spawn_critic_with_frames(
     let options = crate::agent::AgentOptions {
         permission_mode: "full-access".into(),
         max_turns: JUDGE_MAX_TURNS,
+        // A graph run has no panel reporting a window; the judge falls back to
+        // the config override, else the default.
+        context_length: None,
         final_response_drain: true,
         reasoning_effort: graph.reasoning_effort.clone(),
         system: Some(system),
@@ -5460,6 +5463,8 @@ mod tests {
             bus,
             workspaces: Arc::new(tokio::sync::RwLock::new(crate::workspace::Registry::new())),
             dev_servers: Arc::new(tokio::sync::RwLock::new(crate::devserver::Servers::new())),
+            terminals: crate::terminal::Terminals::default(),
+            browsers: crate::browser::Browsers::new(),
             shutdown: Arc::new(tokio::sync::watch::channel(false).0),
             tools: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             editor_bridge: crate::editor_bridge::EditorBridge::new(
@@ -6724,6 +6729,8 @@ mod tests {
             bus: bus.clone(),
             workspaces: Arc::new(tokio::sync::RwLock::new(crate::workspace::Registry::new())),
             dev_servers: Arc::new(tokio::sync::RwLock::new(crate::devserver::Servers::new())),
+            terminals: crate::terminal::Terminals::default(),
+            browsers: crate::browser::Browsers::new(),
             shutdown: Arc::new(tokio::sync::watch::channel(false).0),
             tools: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
