@@ -887,16 +887,14 @@ pub fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     let root_real = root
         .canonicalize()
         .with_context(|| format!("project root {} is unavailable", root.display()))?;
-    let mut probe = path.as_path();
-    let resolved = loop {
-        match probe.canonicalize() {
-            Ok(real) => break real,
-            Err(_) => match probe.parent() {
-                Some(parent) => probe = parent,
-                None => anyhow::bail!("path escapes project root"),
-            },
-        }
-    };
+    // A symlink at the leaf needs resolving before the ancestor walk: when its
+    // target does not exist the walk falls back to the parent and allows a
+    // write that then follows the link out of the root. Shared with the
+    // workspace resolver so the two cannot drift apart.
+    crate::workspace::reject_symlink_escape(&root_real, &path)
+        .map_err(|_| anyhow::anyhow!("path escapes project root"))?;
+    let resolved =
+        crate::workspace::deepest_existing(&path).context("path escapes project root")?;
     if !resolved.starts_with(&root_real) {
         anyhow::bail!("path escapes project root");
     }

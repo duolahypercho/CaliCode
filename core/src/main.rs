@@ -1,13 +1,18 @@
+mod advisor;
 mod agent;
 mod approvals;
 mod asset_search;
 mod assets;
 mod baselines;
 mod blender;
+mod browser;
 mod capture_persist;
+mod checkpoints;
 mod compaction;
 mod config;
 mod devserver;
+mod diagnostics;
+mod edit_match;
 mod editor_bridge;
 mod fileread;
 mod goal;
@@ -19,12 +24,18 @@ mod mcp;
 mod model;
 mod pathlock;
 mod rpc;
+mod sandbox;
 mod sessions;
 mod skills;
+mod spill;
+mod staleness;
 mod store;
+mod terminal;
 mod tools;
+mod usage;
 pub(crate) mod video_analysis;
 mod workspace;
+mod world_state;
 
 use agent::AgentManager;
 use axum::extract::State;
@@ -74,6 +85,11 @@ pub struct AppState {
     pub asset_catalog: Arc<RwLock<Vec<Value>>>,
     pub workspaces: Arc<RwLock<workspace::Registry>>,
     pub dev_servers: Arc<RwLock<devserver::Servers>>,
+    /// One-shot commands and pty sessions the user started from the Terminal
+    /// tab. Never reachable from an agent tool — see `terminal.rs`.
+    pub terminals: terminal::Terminals,
+    /// The agent-driven browser. Started lazily on first `browser_*` call.
+    pub browsers: browser::Browsers,
     /// Flips to true once shutdown starts. Long-lived responses subscribe and
     /// end themselves; without that, axum's graceful shutdown waits on an SSE
     /// stream that never completes. Held as the sender so any state — including
@@ -88,6 +104,10 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let config = load()?;
+    // Resolved once, before anything can spawn: seatbelt applies at exec, and
+    // the "no confinement available" warning belongs here rather than at every
+    // spawn site.
+    sandbox::init(&config.sandbox);
     let projects_root = config::projects_root(&config);
     std::fs::create_dir_all(&projects_root)?;
     if !projects_root.join("starter").exists() {
@@ -130,8 +150,18 @@ async fn main() -> anyhow::Result<()> {
         asset_catalog: Arc::new(RwLock::new(Vec::new())),
         workspaces: Arc::new(RwLock::new(workspace::Registry::new())),
         dev_servers: Arc::new(RwLock::new(devserver::Servers::new())),
+        terminals: terminal::Terminals::default(),
+        browsers: browser::Browsers::new(),
         shutdown: shutdown.clone(),
     };
+
+    // Give the per-model token ledger its file. Attached here rather than in
+    // `AgentManager::new` so a manager built in a test stays in memory and
+    // cannot overwrite real usage history.
+    state
+        .agents
+        .usage_ledger()
+        .attach(state.sessions_root.join("usage.json"));
 
     // Start configured MCP servers in the background (non-fatal): a broken
     // entry shows up in mcp_list as failed, it must never block startup.
@@ -202,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
     // reach the running dev servers and MCP children.
     let dev_servers = state.dev_servers.clone();
     let mcp_for_shutdown = state.mcp.clone();
+    let terminals_for_shutdown = state.terminals.clone();
+    let browsers_for_shutdown = state.browsers.clone();
     // Static project files (downloaded glTF models etc.) for the client's
     // loaders, e.g. /projects/<slug>/assets/polyhaven/<id>/<file>.gltf.
     let projects_dir_service = state.projects_root.clone();
@@ -283,6 +315,17 @@ async fn main() -> anyhow::Result<()> {
             }
             // MCP children are real processes too; leave none behind.
             mcp_for_shutdown.shutdown_all().await;
+            // Terminal children — one-shot commands and the interactive shell
+            // behind every pty session — run in their own process groups, so
+            // nothing drops them implicitly the way `kill_on_drop` does above.
+            terminals_for_shutdown.kill_all();
+            // The agent browser is a chrome that outlives core otherwise:
+            // `kill_on_drop` only fires if the runtime gets to drop the child,
+            // which a signal-driven shutdown does not guarantee. A leaked
+            // chrome keeps the profile's `SingletonLock`, and the next core
+            // then spends its whole launch timeout failing to open the profile
+            // it just lost.
+            browsers_for_shutdown.shutdown().await;
 
             tokio::spawn(async {
                 tokio::time::sleep(SHUTDOWN_GRACE).await;
@@ -365,8 +408,15 @@ fn core_port() -> u16 {
         .unwrap_or(8765)
 }
 
+/// `sandbox` is reported so the UI can say whether spawned processes are
+/// actually confined. Claiming confinement that silently degraded would be
+/// worse than not having it.
 async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "version": env!("CARGO_PKG_VERSION") }))
+    Json(json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "sandbox": sandbox::status(),
+    }))
 }
 
 async fn events(

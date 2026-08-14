@@ -31,6 +31,18 @@ const modelList: ModelList = {
   ],
 };
 
+let archivedSessions: {
+  id: string;
+  title: string;
+  projectSlug: string;
+  provider: null;
+  model: null;
+  createdAt: number;
+  updatedAt: number;
+  archivedAt: number;
+  messageCount: number;
+}[] = [];
+
 const defaultProps = (): SettingsPageProps => ({
   open: true,
   onClose: vi.fn(),
@@ -42,6 +54,19 @@ const defaultProps = (): SettingsPageProps => ({
 });
 
 beforeEach(() => {
+  archivedSessions = [
+    {
+      id: "sess-archived",
+      title: "Tune jump physics",
+      projectSlug: "starter",
+      provider: null,
+      model: null,
+      createdAt: Math.floor(Date.now() / 1000) - 900,
+      updatedAt: Math.floor(Date.now() / 1000) - 600,
+      archivedAt: Math.floor(Date.now() / 1000) - 120,
+      messageCount: 4,
+    },
+  ];
   Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
   Object.defineProperty(navigator, "platform", { configurable: true, value: "MacIntel" });
   mockRpc.mockImplementation(async (method: string) => {
@@ -52,8 +77,16 @@ beforeEach(() => {
         return { skills: [] };
       case "mcp_list":
         return { servers: [] };
+      case "usage_stats":
+        return { since: 0, models: [], totals: {} };
       case "config.read":
         return { mcp_servers: [] };
+      case "session_list":
+        return archivedSessions;
+      case "session_restore":
+        return archivedSessions[0];
+      case "session_delete":
+        return { id: archivedSessions[0]?.id, deleted: true };
       case "model_provider_upsert":
         return { ...modelList, apiKeyEnv: "CALI_MY_ROUTER_API_KEY", keyApplied: true };
       default:
@@ -71,7 +104,7 @@ afterEach(() => {
 });
 
 describe("SettingsPage", () => {
-  it("renders a full-page settings surface with all five accessible sections", async () => {
+  it("renders a full-page settings surface with all seven accessible sections", async () => {
     const props = defaultProps();
     const { container } = render(<SettingsPage {...props} />);
 
@@ -92,9 +125,9 @@ describe("SettingsPage", () => {
     expect(settingsMain.className).toContain("[scrollbar-width:none]");
 
     const tabs = screen.getByRole("tablist", { name: "Settings sections" });
-    expect(within(tabs).getAllByRole("tab")).toHaveLength(5);
+    expect(within(tabs).getAllByRole("tab")).toHaveLength(7);
 
-    for (const section of ["General", "Providers", "Skills", "MCP", "Theme"]) {
+    for (const section of ["General", "Status", "Providers", "Skills", "MCP", "Archive", "Theme"]) {
       const tab = within(tabs).getByRole("tab", { name: section });
       expect(tab.getAttribute("id")).toBe(`settings-tab-${section.toLowerCase()}`);
       expect(tab.getAttribute("aria-controls")).toBe(`settings-panel-${section.toLowerCase()}`);
@@ -112,7 +145,7 @@ describe("SettingsPage", () => {
     const props = defaultProps();
     render(<SettingsPage {...props} />);
 
-    for (const section of ["Providers", "Skills", "MCP", "Theme", "General"]) {
+    for (const section of ["Status", "Providers", "Skills", "MCP", "Archive", "Theme", "General"]) {
       fireEvent.click(screen.getByRole("tab", { name: section }));
       const id = section.toLowerCase();
       const panel = screen.getByRole("tabpanel");
@@ -214,5 +247,48 @@ describe("SettingsPage", () => {
     expect(
       within(screen.getByRole("group", { name: "Theme" })).getByRole("button", { name: /Light/ }).getAttribute("aria-pressed"),
     ).toBe("true");
+  });
+
+  /* The archive is the only home for an archived chat: the sidebar hides it,
+     so if these two actions are missing it is unreachable and undeletable. */
+  it("lists archived chats and restores one back into the sidebar", async () => {
+    const props = defaultProps();
+    const onSessionsChanged = vi.fn();
+    props.onSessionsChanged = onSessionsChanged;
+    render(<SettingsPage {...props} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Archive" }));
+    await waitFor(() => expect(mockRpc).toHaveBeenCalledWith("session_list", { archived: true }));
+    expect(await screen.findByText("Tune jump physics")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "Restore Tune jump physics" }));
+    await waitFor(() => expect(mockRpc).toHaveBeenCalledWith("session_restore", { id: "sess-archived" }));
+    await waitFor(() => expect(onSessionsChanged).toHaveBeenCalled());
+    expect(screen.queryByText("Tune jump physics")).toBeNull();
+  });
+
+  it("deletes an archived chat for good only after the confirmation", async () => {
+    render(<SettingsPage {...defaultProps()} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Archive" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Delete Tune jump physics" }));
+    expect(mockRpc).not.toHaveBeenCalledWith("session_delete", expect.anything());
+
+    // Cancelling leaves the chat archived rather than half-deleted.
+    fireEvent.click(screen.getByRole("button", { name: "Keep Tune jump physics archived" }));
+    expect(mockRpc).not.toHaveBeenCalledWith("session_delete", expect.anything());
+
+    fireEvent.click(screen.getByRole("button", { name: "Delete Tune jump physics" }));
+    fireEvent.click(screen.getByRole("button", { name: "Delete Tune jump physics permanently" }));
+    await waitFor(() => expect(mockRpc).toHaveBeenCalledWith("session_delete", { id: "sess-archived" }));
+    await waitFor(() => expect(screen.queryByText("Tune jump physics")).toBeNull());
+  });
+
+  it("says the archive is empty rather than showing a bare panel", async () => {
+    archivedSessions = [];
+    render(<SettingsPage {...defaultProps()} />);
+
+    fireEvent.click(screen.getByRole("tab", { name: "Archive" }));
+    expect(await screen.findByText("Nothing archived")).toBeTruthy();
   });
 });

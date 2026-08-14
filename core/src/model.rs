@@ -1340,13 +1340,26 @@ fn marks_anthropic_cache_control(config: &AppConfig) -> bool {
     is_openrouter && is_anthropic_model(&config.model.default)
 }
 
-/// Two breakpoints, mirroring the layout Pi uses: one closing the system
-/// prompt, one rolling on the newest user turn so every earlier turn is a
-/// cache read. Anthropic allows four, so this stays clear of the ceiling.
+/// How many rolling breakpoints trail the system prompt. One closes the system
+/// prompt; Anthropic allows four per request, so three may roll.
+const ROLLING_CACHE_BREAKPOINTS: usize = 3;
+
+/// Four breakpoints: one closing the system prompt, three rolling over the
+/// newest markable turns.
+///
+/// Anchoring the tail on the newest *user* turn — the earlier layout — leaves
+/// every assistant and tool message produced since that turn uncached. A goal
+/// run spends most of its turns inside one tool loop with no new user message,
+/// so that whole growing tail was re-billed at full price every turn. A rolling
+/// window makes each turn's output a cache read on the next turn, and keeping
+/// two older marks behind the newest means a shifted tail still lands on a
+/// live prefix instead of rebuilding from the system prompt.
 ///
 /// `role: "tool"` messages are never marked — OpenRouter hangs on a marker
 /// there rather than rejecting it — and empty content is left alone because
-/// Anthropic rejects an empty text block.
+/// Anthropic rejects an empty text block. Both are skipped without spending a
+/// breakpoint, so an assistant turn that only carried tool calls does not
+/// silently cost one of the three.
 fn apply_anthropic_cache_control(messages: &[Value], retention: CacheRetention) -> Vec<Value> {
     let marker = if retention == CacheRetention::Long {
         json!({ "type": "ephemeral", "ttl": "1h" })
@@ -1354,12 +1367,26 @@ fn apply_anthropic_cache_control(messages: &[Value], retention: CacheRetention) 
         json!({ "type": "ephemeral" })
     };
     let mut out = messages.to_vec();
-    let last_of = |role: &str| -> Option<usize> {
-        out.iter()
-            .rposition(|message| message.get("role").and_then(Value::as_str) == Some(role))
-    };
-    for index in [last_of("system"), last_of("user")].into_iter().flatten() {
+    let system = out
+        .iter()
+        .rposition(|message| message.get("role").and_then(Value::as_str) == Some("system"));
+    if let Some(index) = system {
         mark_cache_control(&mut out[index], &marker);
+    }
+    let mut remaining = ROLLING_CACHE_BREAKPOINTS;
+    for index in (0..out.len()).rev() {
+        if remaining == 0 {
+            break;
+        }
+        if matches!(
+            out[index].get("role").and_then(Value::as_str),
+            Some("system") | Some("tool")
+        ) {
+            continue;
+        }
+        if mark_cache_control(&mut out[index], &marker) {
+            remaining -= 1;
+        }
     }
     out
 }
@@ -2550,12 +2577,13 @@ mod tests {
     }
 
     #[test]
-    fn anthropic_cache_control_marks_the_system_and_newest_user_turn() {
+    fn anthropic_cache_control_marks_the_system_and_a_rolling_window() {
         let messages = vec![
             json!({ "role": "system", "content": "you are cali" }),
             json!({ "role": "user", "content": "build a level" }),
             json!({ "role": "assistant", "content": "", "tool_calls": [] }),
             json!({ "role": "tool", "tool_call_id": "c1", "content": "{\"ok\":true}" }),
+            json!({ "role": "assistant", "content": "placed the floor" }),
             json!({ "role": "user", "content": "continue" }),
         ];
         let marked = apply_anthropic_cache_control(&messages, CacheRetention::Short);
@@ -2563,12 +2591,41 @@ mod tests {
         let ephemeral = json!({ "type": "ephemeral" });
         assert_eq!(marked[0]["content"][0]["cache_control"], ephemeral);
         assert_eq!(marked[0]["content"][0]["text"], json!("you are cali"));
-        // Only the newest user turn rolls forward; the earlier one is plain.
-        assert_eq!(marked[1], messages[1]);
-        assert_eq!(marked[4]["content"][0]["cache_control"], ephemeral);
+        // The three newest markable turns, so a tool loop's own output is a
+        // cache read next turn instead of a full re-bill.
+        for index in [1, 4, 5] {
+            assert_eq!(
+                marked[index]["content"][0]["cache_control"], ephemeral,
+                "message {index} should carry a rolling breakpoint"
+            );
+        }
         // A marker on a tool result hangs OpenRouter, so that role stays bare.
         assert_eq!(marked[3], messages[3]);
+        // An assistant turn carrying only tool calls has no markable content;
+        // it is skipped without spending one of the three breakpoints.
         assert_eq!(marked[2], messages[2]);
+    }
+
+    #[test]
+    fn anthropic_cache_control_never_exceeds_the_four_breakpoint_ceiling() {
+        let mut messages = vec![json!({ "role": "system", "content": "you are cali" })];
+        for turn in 0..20 {
+            messages.push(json!({ "role": "user", "content": format!("turn {turn}") }));
+            messages.push(json!({ "role": "assistant", "content": format!("done {turn}") }));
+        }
+        let marked = apply_anthropic_cache_control(&messages, CacheRetention::Short);
+        let breakpoints = marked
+            .iter()
+            .filter(|message| {
+                message["content"].as_array().is_some_and(|parts| {
+                    parts.iter().any(|part| part.get("cache_control").is_some())
+                })
+            })
+            .count();
+        assert_eq!(
+            breakpoints, 4,
+            "Anthropic rejects a request carrying more than four breakpoints"
+        );
     }
 
     #[test]

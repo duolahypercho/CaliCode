@@ -38,7 +38,6 @@
   --success-soft: #168447;
   --raised: #ffffff; /* elevated cards: the composer, floating panels */
   /* keyboard focus ring — 5.2:1 on --surface-0, clears WCAG 1.4.11 */
-  --focus-ring: #6b6b6b;
   /*
    * PIE viewport stage — deliberately NOT redefined under .dark.
    *
@@ -98,7 +97,6 @@
   --success-soft: #63bd82;
   --raised: #242423;
   /* 9.4:1 on --surface-0 */
-  --focus-ring: #b3b3b3;
   --color-text-subtle: #949494;
   --color-text-default: #bdbdbd;
   --color-text-strong: #e6e6e6;
@@ -140,7 +138,6 @@
   --color-danger-soft: var(--danger-soft);
   --color-success-soft: var(--success-soft);
   --color-raised: var(--raised);
-  --color-focus-ring: var(--focus-ring);
   --radius-DEFAULT: var(--radius);
 }
 
@@ -222,29 +219,18 @@ select {
   border-radius: 4px;
 }
 
-/* One focus treatment for the whole app: a token-driven ring on keyboard focus
-   only, never on a mouse click. `.focus-ring` is the same ring as an opt-in
-   class, used by the ui/ primitives so every consumer inherits it. Elements
-   with tabindex="-1" (Radix dialog and popover containers, which take focus
-   programmatically) are left alone.
+/* No focus rings, by product decision: hover tints, active fills and selected
+   backgrounds carry the affordance instead. This also silences the UA default
+   ring, which is what "no rings" has to mean in practice.
 
-   What makes this block win is the cascade LAYER, not specificity. Tailwind v4
-   sorts everything it generates into `@layer theme, base, components,
-   utilities`; these rules are unlayered, and normal unlayered declarations
-   outrank every normal layered one regardless of how specific the layered
-   selector is. So a stray `focus-visible:outline-none` utility loses here —
-   keep this block outside `@layer` and it stays that way.
+   `.focus-ring` / `.focus-ring-inset` survive as inert hooks. A dozen files in
+   ui/ and workspace/ still spell them, and deleting the classes would mean
+   editing every one of those to change nothing visible — while leaving the
+   hook here keeps restoring the ring a one-block edit.
 
-   Being unlayered is not immunity. Importance is weighed before layer order,
-   and for author styles `!important` reverses the layer ranking outright: an
-   important layered declaration beats an unlayered normal one. Tailwind's
-   `focus-visible:!outline-none` emits exactly that, and it suppresses this
-   ring from anywhere. Nothing in CSS stops it — only not writing it does, and
-   focusRing.test.tsx scans src/ for both spellings.
-
-   The `:where()` wrapper is a separate, narrower promise: it pins the selector
-   list at zero specificity so the *unlayered* rules below (`.focus-ring-inset`,
-   `[data-no-focus-ring]`) override it on specificity and source order alone. */
+   Unlayered on purpose: Tailwind sorts its output into `@layer utilities`, and
+   a normal unlayered declaration outranks every normal layered one, so no
+   utility can reintroduce an outline past this. */
 :where(
     a[href],
     button,
@@ -256,37 +242,23 @@ select {
     [role="tab"],
     [role="option"],
     [role="menuitem"],
-    [tabindex]:not([tabindex="-1"])
+    [tabindex]
+  ):focus,
+:where(
+    a[href],
+    button,
+    input,
+    textarea,
+    select,
+    summary,
+    [role="button"],
+    [role="tab"],
+    [role="option"],
+    [role="menuitem"],
+    [tabindex]
   ):focus-visible,
-.focus-ring:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-}
-
-/* Radix menu and listbox items are flush children of a popover with 4px of
-   padding, so an outset ring lands on the popover's padding instead of hugging
-   the row it belongs to — and it collides with the data-[highlighted] fill.
-   Same ring, drawn inside the row. Zero specificity like the rule above, so
-   source order decides and this wins. */
-:where([role="option"], [role="menuitem"]):focus-visible {
-  outline-offset: -2px;
-}
-
-/* Same ring, drawn inside the control — for anything sitting in a scrolling or
-   clipping container, where an outset ring would be cut off.
-
-   This states the whole ring, not just the offset, because its other job is
-   the focus-return targets: ArtTab's scroll panel and EntityProperties' empty
-   state take focus programmatically at tabindex="-1", which the shared
-   selector above deliberately skips. Inheriting an offset from a rule that
-   never matches would promise a ring nothing draws. */
-.focus-ring-inset:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: -2px;
-}
-
-/* Narrow opt-out for controls whose container already carries the affordance
-   (the search dialog input). Declared last so it wins at equal specificity. */
+.focus-ring:focus-visible,
+.focus-ring-inset:focus-visible,
 [data-no-focus-ring]:focus-visible {
   outline: none;
 }

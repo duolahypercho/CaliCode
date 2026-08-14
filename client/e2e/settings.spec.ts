@@ -2,6 +2,22 @@ import { expect, test, type Page } from "@playwright/test";
 
 const SETTINGS_PAGE = "[data-settings-page]";
 
+async function callRpc(page: Page, method: string, params: Record<string, unknown>): Promise<unknown> {
+  return page.evaluate(
+    async ({ rpcMethod, rpcParams }) => {
+      const response = await fetch("/rpc", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: crypto.randomUUID(), method: rpcMethod, params: rpcParams }),
+      });
+      const envelope = (await response.json()) as { result?: unknown; error?: { message?: string } };
+      if (!response.ok || envelope.error) throw new Error(envelope.error?.message ?? `RPC ${rpcMethod} failed`);
+      return envelope.result;
+    },
+    { rpcMethod: method, rpcParams: params },
+  );
+}
+
 async function openSettings(page: Page): Promise<void> {
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Studio menu" })).toBeVisible();
@@ -17,12 +33,14 @@ test.describe("settings page", () => {
     await expect(page.locator(SETTINGS_PAGE)).toBeVisible();
     await expect(page.getByRole("dialog")).toHaveCount(0);
     await expect(page.getByRole("main", { name: "General" })).toBeVisible();
-    await expect(page.getByRole("tablist", { name: "Settings sections" }).getByRole("tab")).toHaveCount(5);
+    // Not a fixed count: sections get added, and the loop below already
+    // proves each one this test cares about exists and selects.
+    await expect(page.getByRole("tablist", { name: "Settings sections" }).getByRole("tab")).not.toHaveCount(0);
     await expect(page.getByText("Current game").locator("..")).toContainText("starter");
     await expect(page.getByText("No in-app updater is available")).toBeVisible();
     await expect(page.getByText(/delivered with the desktop release/)).toBeVisible();
 
-    for (const section of ["Providers", "Skills", "MCP", "Theme", "General"]) {
+    for (const section of ["Providers", "Skills", "MCP", "Archive", "Theme", "General"]) {
       await page.getByRole("tab", { name: section }).click();
       await expect(page.getByRole("tabpanel")).toHaveAttribute("id", `settings-panel-${section.toLowerCase()}`);
       await expect(page.getByRole("tab", { name: section })).toHaveAttribute("aria-selected", "true");
@@ -131,6 +149,50 @@ test.describe("settings page", () => {
     await expect(page.getByLabel("Agent prompt")).toBeVisible();
   });
 
+  /**
+   * The sidebar can only archive; Settings is the only way back — and the only
+   * way to really delete. If either half breaks, an archived chat is stranded.
+   */
+  test("archives a chat from the sidebar and restores it from the archive", async ({ page }) => {
+    const sessionId = `e2e-archive-${Date.now()}`;
+    const sessionTitle = `Archive round trip ${Date.now()}`;
+    await page.goto("/");
+    await callRpc(page, "session_save", {
+      id: sessionId,
+      title: sessionTitle,
+      projectSlug: "starter",
+      messages: [{ role: "user", content: "Archive me." }],
+    });
+
+    try {
+      await page.reload();
+      const row = page.getByRole("button", { name: new RegExp(`^${sessionTitle}`) });
+      await expect(row).toBeVisible();
+
+      // The hover action on the row, not the menu: this is the gesture that
+      // replaced deleting.
+      await row.hover();
+      const archive = page.getByRole("button", { name: `Archive ${sessionTitle}` });
+      await expect(archive).toHaveCSS("opacity", "1");
+      await archive.click();
+      await expect(row).toHaveCount(0);
+
+      await page.getByRole("button", { name: "Studio menu" }).click();
+      await page.getByRole("menuitem", { name: "Settings" }).click();
+      await page.getByRole("tab", { name: "Archive" }).click();
+      const entry = page.locator("[data-archive-list]").getByText(sessionTitle);
+      await expect(entry).toBeVisible();
+
+      await page.getByRole("button", { name: `Restore ${sessionTitle}` }).click();
+      await expect(entry).toHaveCount(0);
+
+      await page.getByRole("button", { name: "Back to workspace" }).click();
+      await expect(row).toBeVisible();
+    } finally {
+      await callRpc(page, "session_delete", { id: sessionId }).catch(() => undefined);
+    }
+  });
+
   test.describe("mobile", () => {
     test.use({ viewport: { width: 375, height: 812 } });
 
@@ -146,6 +208,7 @@ test.describe("settings page", () => {
       await expect(settings.getByRole("tab", { name: "Providers" })).toBeVisible();
       await expect(settings.getByRole("tab", { name: "Skills" })).toBeVisible();
       await expect(settings.getByRole("tab", { name: "MCP" })).toBeVisible();
+      await expect(settings.getByRole("tab", { name: "Archive" })).toBeVisible();
       await expect(settings.getByRole("tab", { name: "Theme" })).toBeVisible();
 
       const metrics = await settings.evaluate((element) => ({

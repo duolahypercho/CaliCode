@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActivityTurnRow, activityAnchorIndexes, ownsBrowserToolEvent } from "./AgentPanel";
+import { ActivityTurnRow, ToolRow, activityAnchorIndexes, ownsBrowserToolEvent } from "./AgentPanel";
 import { createTurnMarker } from "../../lib/activity";
 import type { TaskGraph } from "../../lib/graph";
 import type { AgentMessage } from "../../lib/types";
@@ -290,5 +290,35 @@ describe("ownsBrowserToolEvent", () => {
         ownership,
       ),
     ).toBe(false);
+  });
+});
+
+describe("ToolRow", () => {
+  const ran: AgentMessage = {
+    role: "tool",
+    tool: "run_tests",
+    status: "error",
+    content: "3 failed",
+    detail: "Jump.test.ts: expected 1 got 0",
+  };
+
+  it("offers a step to the side chat with its name and output", () => {
+    const onAsk = vi.fn();
+    render(<ToolRow message={ran} onAsk={onAsk} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Ask about run_tests in side chat" }));
+    expect(onAsk).toHaveBeenCalledWith(ran);
+  });
+
+  it("offers nothing on this panel's own informational lines", () => {
+    // Slash-command output and session notes carry no tool or status: they are
+    // the panel talking, not the run working.
+    render(<ToolRow message={{ role: "tool", content: "Started a new session.", tool: "session" }} onAsk={vi.fn()} />);
+    expect(screen.queryByRole("button", { name: /Ask about/ })).toBeNull();
+  });
+
+  it("offers nothing when no side chat is available to ask in", () => {
+    render(<ToolRow message={ran} />);
+    expect(screen.queryByRole("button", { name: /Ask about/ })).toBeNull();
   });
 });

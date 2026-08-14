@@ -33,6 +33,7 @@ vi.mock("../../lib/sessions", () => ({
 }));
 
 vi.mock("../../lib/modelMeta", () => ({
+  contextLimitFor: vi.fn(() => null),
   defaultEffort: vi.fn((levels: string[]) => levels[0] ?? null),
   effortLevelsFor: vi.fn(() => []),
   loadModelDev: mocks.loadModelDev,
@@ -42,6 +43,7 @@ vi.mock("../../lib/coreConfig", () => ({
   contextWindowOf: vi.fn(() => 100_000),
   formatTokens: vi.fn((value: number) => String(value)),
   readCoreConfig: mocks.readCoreConfig,
+  sandboxSummary: vi.fn(() => null),
 }));
 
 vi.mock("../../lib/graph", () => ({
@@ -102,7 +104,7 @@ beforeEach(() => {
   mocks.listGraphs.mockResolvedValue([]);
   mocks.graphStatus.mockResolvedValue({});
   mocks.openLoopReport.mockResolvedValue({ report: null });
-  mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {} });
+  mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {}, contextLimits: {} });
   mocks.readCoreConfig.mockResolvedValue(null);
   stubRpc([]);
 });
@@ -161,5 +163,27 @@ describe("/goal", () => {
 
     await type("/goal clear");
     await waitFor(() => expect(screen.getByText(/no goal was set/)).toBeTruthy());
+  });
+
+  it("keeps a live goal named above the composer until the pill clears it", async () => {
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === "agent_chat") return { sessionId: "session-1", reply: "did a thing", toolCalls: [] };
+      if (method === "goal_evaluate") throw new Error("core offline");
+      return {};
+    });
+    renderPanel();
+    expect(document.querySelector("[data-run-status-pill]")).toBeNull();
+
+    await type("/goal make the starter tests pass");
+    await waitFor(() => expect(screen.getByText(/verifier unavailable/)).toBeTruthy());
+    const pill = document.querySelector("[data-run-status-pill]");
+    expect(pill?.textContent).toContain("Goal");
+    expect(pill?.textContent).toContain("make the starter tests pass");
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Clear goal" }));
+    });
+    await waitFor(() => expect(document.querySelector("[data-run-status-pill]")).toBeNull());
+    expect(screen.getByText(/goal cleared/)).toBeTruthy();
   });
 });

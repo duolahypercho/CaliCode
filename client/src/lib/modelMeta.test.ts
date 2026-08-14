@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import snapshot from "@opencode-ai/models/snapshot";
-import { defaultEffort, effortLevelsFor, heuristicLevels, reduceCatalog, reduceRegistry } from "./modelMeta";
+import {
+  contextLimitFor,
+  defaultEffort,
+  effortLevelsFor,
+  heuristicLevels,
+  reduceCatalog,
+  reduceContextLimits,
+  reduceRegistry,
+} from "./modelMeta";
 
 // The reducer runs over the package's bundled snapshot — the same data shape
 // `Models.make().providers()` returns live — so these tests exercise the real
@@ -78,5 +86,33 @@ describe("reduceCatalog over the models.dev snapshot", () => {
       expect(models).not.toContain("gpt-image-2");
       expect(models).not.toContain("gpt-realtime-2.1");
     }
+  });
+});
+
+describe("reduceContextLimits over the models.dev snapshot", () => {
+  const limits = reduceContextLimits(snapshot.providers);
+
+  it("reports each model's real window, not one shared assumption", () => {
+    // The defect this replaces: every model was treated as 128k, so a 1M model
+    // compacted at 88k and a small one hundreds of turns late.
+    expect(contextLimitFor(limits, "claude-fable-5")).toBe(1_000_000);
+    expect(contextLimitFor(limits, "claude-haiku-4-5")).toBe(200_000);
+    expect(contextLimitFor(limits, "gpt-3.5-turbo")).toBe(16_385);
+  });
+
+  it("resolves a provider-prefixed id by falling back to the bare one", () => {
+    expect(contextLimitFor(limits, "anthropic/claude-haiku-4-5")).toBe(200_000);
+    // Aggregator-style triples still reach the model.
+    expect(contextLimitFor(limits, "openrouter/anthropic/claude-haiku-4-5")).toBe(200_000);
+  });
+
+  it("skips entries whose limit is 0 rather than recording no context", () => {
+    // Image/embedding entries carry `context: 0`, which means "not applicable".
+    expect(contextLimitFor(limits, "chatgpt-image-latest")).toBeNull();
+  });
+
+  it("answers null for an unknown model so callers can fall back", () => {
+    expect(contextLimitFor(limits, "not-a-real-model")).toBeNull();
+    expect(contextLimitFor(null, "claude-haiku-4-5")).toBeNull();
   });
 });

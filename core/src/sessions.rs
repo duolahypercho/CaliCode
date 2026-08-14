@@ -138,6 +138,9 @@ fn summary(record: &Value) -> Value {
         "branch": record.get("branch").cloned().unwrap_or(Value::Null),
         "createdAt": record.get("createdAt").cloned().unwrap_or(Value::Null),
         "updatedAt": record.get("updatedAt").cloned().unwrap_or(Value::Null),
+        // Null unless the chat sits in the archive; the sidebar lists sessions
+        // where this is absent, settings lists the ones where it is set.
+        "archivedAt": record.get("archivedAt").cloned().unwrap_or(Value::Null),
         "messageCount": record
             .get("messages")
             .and_then(Value::as_array)
@@ -224,6 +227,9 @@ pub fn save(root: &Path, params: &Value) -> Result<Value> {
         "branch": stable("branch"),
         "createdAt": created,
         "updatedAt": now_secs(),
+        // Autosave must not resurrect an archived chat into the sidebar, so
+        // the flag survives every re-save; `set_archived` is the only writer.
+        "archivedAt": stable("archivedAt"),
         "messages": messages,
         "archived": archived,
     });
@@ -252,7 +258,7 @@ pub fn resolve_workspace(root: &Path, path: &Path) -> Result<Value> {
     let requested = path
         .canonicalize()
         .with_context(|| format!("workspace path {} is unavailable", path.display()))?;
-    let listed = list(root)?;
+    let listed = list(root, false)?;
     for item in listed.as_array().into_iter().flatten() {
         let Some(bound) = item.get("workspaceRoot").and_then(Value::as_str) else {
             continue;
@@ -267,8 +273,10 @@ pub fn resolve_workspace(root: &Path, path: &Path) -> Result<Value> {
     anyhow::bail!("no CaliCode session is attached to {}", requested.display())
 }
 
-/// List session summaries, newest first.
-pub fn list(root: &Path) -> Result<Value> {
+/// List session summaries, newest first. `archived` selects which half of the
+/// store is returned: the live chats the sidebar shows, or the archive that
+/// settings offers to restore or delete for good.
+pub fn list(root: &Path, archived: bool) -> Result<Value> {
     let mut items = Vec::new();
     if root.exists() {
         for entry in std::fs::read_dir(root)? {
@@ -278,7 +286,18 @@ pub fn list(root: &Path) -> Result<Value> {
             }
             if let Ok(text) = std::fs::read_to_string(&path) {
                 if let Ok(record) = serde_json::from_str::<Value>(&text) {
-                    items.push(summary(&record));
+                    // The sessions directory is not exclusively sessions —
+                    // `usage.json`, the token ledger, lives here too. A record
+                    // with no id is not one: listing it puts a blank row in the
+                    // sidebar that cannot be opened, renamed or deleted,
+                    // because every one of those RPCs is keyed by id.
+                    let is_session = record
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| !id.trim().is_empty());
+                    if is_session && is_archived(&record) == archived {
+                        items.push(summary(&record));
+                    }
                 }
             }
         }
@@ -312,11 +331,14 @@ pub fn delete(root: &Path, id: &str) -> Result<Value> {
     Ok(json!({ "id": id, "deleted": true }))
 }
 
-/// Delete every persisted chat belonging to one project.
-pub fn archive_project(root: &Path, project_slug: &str) -> Result<Value> {
-    let _io = SESSION_IO_LOCK
-        .lock()
-        .map_err(|_| anyhow::anyhow!("session storage lock poisoned"))?;
+/// Whether a record carries an archive stamp.
+fn is_archived(record: &Value) -> bool {
+    record
+        .get("archivedAt")
+        .is_some_and(|value| !value.is_null())
+}
+
+fn clean_slug(project_slug: &str) -> Result<()> {
     if project_slug.is_empty()
         || !project_slug
             .chars()
@@ -324,6 +346,56 @@ pub fn archive_project(root: &Path, project_slug: &str) -> Result<Value> {
     {
         anyhow::bail!("invalid project slug");
     }
+    Ok(())
+}
+
+/// Move a chat into the archive, or bring it back.
+///
+/// Nothing but the stamp changes: the transcript, the bound worktree and any
+/// running agent are left alone, so restoring returns the chat exactly as it
+/// was. Deleting is the only operation that discards anything.
+pub fn set_archived(root: &Path, id: &str, archived: bool) -> Result<Value> {
+    let _io = SESSION_IO_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session storage lock poisoned"))?;
+    let path = session_file(root, id)?;
+    let text = std::fs::read_to_string(&path).with_context(|| format!("session {id} not found"))?;
+    let mut record: Value = serde_json::from_str(&text)?;
+    record["archivedAt"] = if archived {
+        json!(now_secs())
+    } else {
+        Value::Null
+    };
+    write_record(&path, &record)?;
+    Ok(summary(&record))
+}
+
+/// Archive every live chat belonging to one project. Returns how many moved.
+pub fn archive_project(root: &Path, project_slug: &str) -> Result<Value> {
+    clean_slug(project_slug)?;
+    let ids: Vec<String> = list(root, false)?
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|record| record.get("projectSlug").and_then(Value::as_str) == Some(project_slug))
+        .filter_map(|record| record.get("id").and_then(Value::as_str).map(str::to_string))
+        .collect();
+    let mut archived = 0usize;
+    for id in &ids {
+        set_archived(root, id, true)?;
+        archived += 1;
+    }
+    Ok(json!({ "projectSlug": project_slug, "archived": archived }))
+}
+
+/// Delete every persisted chat belonging to one project, archived ones
+/// included. Used when the project itself goes away — an archive entry whose
+/// game no longer exists cannot be restored into anything.
+pub fn delete_project(root: &Path, project_slug: &str) -> Result<Value> {
+    let _io = SESSION_IO_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session storage lock poisoned"))?;
+    clean_slug(project_slug)?;
 
     let mut deleted = 0usize;
     if root.exists() {
@@ -371,6 +443,8 @@ pub fn fork(root: &Path, id: &str, new_id: Option<&str>) -> Result<Value> {
     record["title"] = json!(format!("{title} (fork)"));
     record["createdAt"] = json!(now_secs());
     record["updatedAt"] = json!(now_secs());
+    // A fork is a new live chat even when its source sits in the archive.
+    record["archivedAt"] = Value::Null;
     // A fork is an independent task. RPC assigns it a fresh worktree; direct
     // callers still get a valid unbound record rather than sharing writes.
     record["workspaceRoot"] = Value::Null;
@@ -694,12 +768,31 @@ mod tests {
         let root = root();
         save(&root, &json!({ "id": "old", "messages": [] })).unwrap();
         save(&root, &json!({ "id": "new", "messages": [] })).unwrap();
-        let listed = list(&root).unwrap();
+        let listed = list(&root, false).unwrap();
         assert_eq!(listed.as_array().unwrap().len(), 2);
 
         delete(&root, "old").unwrap();
-        let after = list(&root).unwrap();
+        let after = list(&root, false).unwrap();
         assert_eq!(after.as_array().unwrap().len(), 1);
+    }
+
+    /// `usage.json` — the token ledger — shares this directory. Listed as a
+    /// session it became a blank sidebar row with no id, so nothing in the
+    /// chat menu could act on it.
+    #[test]
+    fn list_skips_files_that_are_not_sessions() {
+        let root = root();
+        save(&root, &json!({ "id": "real", "messages": [] })).unwrap();
+        std::fs::write(
+            root.join("usage.json"),
+            json!({ "models": { "openai/gpt-4.1": { "requests": 3 } } }).to_string(),
+        )
+        .unwrap();
+
+        let listed = list(&root, false).unwrap();
+        let items = listed.as_array().unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_eq!(items[0]["id"], "real");
     }
 
     #[test]
@@ -710,7 +803,66 @@ mod tests {
     }
 
     #[test]
-    fn archive_project_only_removes_matching_sessions() {
+    fn archiving_hides_a_chat_from_the_live_list_and_restoring_brings_it_back() {
+        let root = root();
+        save(
+            &root,
+            &json!({ "id": "chat", "messages": [{ "role": "user", "content": "hi" }] }),
+        )
+        .unwrap();
+
+        let archived = set_archived(&root, "chat", true).unwrap();
+        assert!(archived["archivedAt"].as_u64().is_some());
+        assert!(list(&root, false).unwrap().as_array().unwrap().is_empty());
+        assert_eq!(list(&root, true).unwrap()[0]["id"], "chat");
+        // The transcript is untouched: archiving is a visibility change.
+        assert_eq!(load(&root, "chat").unwrap()["messages"][0]["content"], "hi");
+
+        set_archived(&root, "chat", false).unwrap();
+        assert_eq!(list(&root, false).unwrap()[0]["id"], "chat");
+        assert!(list(&root, true).unwrap().as_array().unwrap().is_empty());
+    }
+
+    /// Autosave rewrites the whole record, so a chat archived mid-run would
+    /// pop back into the sidebar on the agent's next save without this.
+    #[test]
+    fn save_keeps_an_archived_chat_archived() {
+        let root = root();
+        save(&root, &json!({ "id": "chat", "messages": [] })).unwrap();
+        set_archived(&root, "chat", true).unwrap();
+
+        save(
+            &root,
+            &json!({ "id": "chat", "messages": [{ "role": "user", "content": "later" }] }),
+        )
+        .unwrap();
+
+        assert!(list(&root, false).unwrap().as_array().unwrap().is_empty());
+        assert_eq!(list(&root, true).unwrap()[0]["id"], "chat");
+    }
+
+    #[test]
+    fn archive_project_only_moves_matching_sessions() {
+        let root = root();
+        save(
+            &root,
+            &json!({ "id": "one", "projectSlug": "starter", "messages": [] }),
+        )
+        .unwrap();
+        save(
+            &root,
+            &json!({ "id": "two", "projectSlug": "other", "messages": [] }),
+        )
+        .unwrap();
+
+        let result = archive_project(&root, "starter").unwrap();
+        assert_eq!(result["archived"], 1);
+        assert_eq!(list(&root, true).unwrap()[0]["id"], "one");
+        assert_eq!(list(&root, false).unwrap()[0]["id"], "two");
+    }
+
+    #[test]
+    fn delete_project_only_removes_matching_sessions() {
         let root = root();
         save(
             &root,
@@ -728,7 +880,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = archive_project(&root, "starter").unwrap();
+        let result = delete_project(&root, "starter").unwrap();
         assert_eq!(result["deleted"], 2);
         assert!(load(&root, "one").is_err());
         assert!(load(&root, "three").is_err());

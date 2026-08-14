@@ -234,16 +234,66 @@ export function repairLegacyActivitySummary(tool: string | undefined, content: s
   return activitySummary(tool, classifyActivityOperation(tool));
 }
 
-export function formatDuration(durationMs: number): string {
+/**
+ * `compact` is the transcript's coarse reading ("4m", "2h 5m"): it drops units
+ * that would only add noise once a turn is long. `clock` is for a label that
+ * ticks in front of the user, where a second that never changes reads as a
+ * frozen UI — so every unit below the largest one stays, zero-padded.
+ */
+export type DurationStyle = "compact" | "clock";
+
+export function formatDuration(durationMs: number, style: DurationStyle = "compact"): string {
   const seconds = Math.max(0, Math.floor(durationMs / 1000));
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  const remainingSeconds = seconds % 60;
+  const remainingMinutes = minutes % 60;
+  if (style === "clock") {
+    const pad = (value: number) => String(value).padStart(2, "0");
+    if (hours > 0) return `${hours}h ${pad(remainingMinutes)}m ${pad(remainingSeconds)}s`;
+    if (minutes > 0) return `${minutes}m ${pad(remainingSeconds)}s`;
+    return `${seconds}s`;
+  }
   if (seconds < 1) return "<1s";
   if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  const remainingSeconds = seconds % 60;
   if (minutes < 60) return remainingSeconds ? `${minutes}m ${remainingSeconds}s` : `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  const remainingMinutes = minutes % 60;
   return remainingMinutes ? `${hours}h ${remainingMinutes}m` : `${hours}h`;
+}
+
+export interface ChangedFileSummary {
+  /** One entry per path, first-touched order, counts summed over the turn. */
+  files: ActivityFileChange[];
+  additions: number;
+  deletions: number;
+}
+
+/**
+ * Collapse a turn's activity into what it did to the workspace. Reads and
+ * searches are excluded — the summary answers "what changed", and a file the
+ * agent only looked at did not change. A path edited repeatedly appears once
+ * with its totals, so the count matches what a reviewer would see on disk.
+ */
+export function summariseChangedFiles(
+  files: ReadonlyArray<ActivityFileChange | undefined | null>,
+): ChangedFileSummary {
+  const byPath = new Map<string, ActivityFileChange>();
+  let additions = 0;
+  let deletions = 0;
+  for (const file of files) {
+    if (!file || (file.operation !== "edit" && file.operation !== "write")) continue;
+    additions += file.additions;
+    deletions += file.deletions;
+    const previous = byPath.get(file.path);
+    // The newest entry wins for the diff and operation so opening the row
+    // shows the latest state, but the summed counts describe the whole turn.
+    byPath.set(file.path, {
+      ...file,
+      additions: (previous?.additions ?? 0) + file.additions,
+      deletions: (previous?.deletions ?? 0) + file.deletions,
+      truncated: previous?.truncated || file.truncated,
+    });
+  }
+  return { files: [...byPath.values()], additions, deletions };
 }
 
 export function durationForTurn(startedAtMs?: number, completedAtMs?: number, nowMs = Date.now()): number {

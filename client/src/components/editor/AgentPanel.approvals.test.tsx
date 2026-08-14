@@ -55,6 +55,7 @@ vi.mock("../../lib/sessions", () => ({
 }));
 
 vi.mock("../../lib/modelMeta", () => ({
+  contextLimitFor: vi.fn(() => null),
   defaultEffort: vi.fn((levels: string[]) => levels[0] ?? null),
   effortLevelsFor: vi.fn(() => []),
   loadModelDev: mocks.loadModelDev,
@@ -64,6 +65,7 @@ vi.mock("../../lib/coreConfig", () => ({
   contextWindowOf: vi.fn(() => 100_000),
   formatTokens: vi.fn((value: number) => String(value)),
   readCoreConfig: mocks.readCoreConfig,
+  sandboxSummary: vi.fn(() => null),
 }));
 
 vi.mock("../../lib/graph", () => ({
@@ -124,10 +126,18 @@ function approvalRequest(overrides: Partial<AgentEvent> = {}): AgentEvent {
 }
 
 /** Every `agent_approval_response` this panel issued. */
-function approvalSends(): Array<{ requestId: string; approved: boolean; clientId?: string }> {
+function approvalSends(): Array<{
+  requestId: string;
+  approved: boolean;
+  clientId?: string;
+  always?: boolean;
+}> {
   return mocks.rpc.mock.calls
     .filter(([method]) => method === "agent_approval_response")
-    .map(([, params]) => params as { requestId: string; approved: boolean; clientId?: string });
+    .map(
+      ([, params]) =>
+        params as { requestId: string; approved: boolean; clientId?: string; always?: boolean },
+    );
 }
 
 /**
@@ -174,7 +184,7 @@ beforeEach(() => {
   mocks.saveSession.mockResolvedValue({});
   mocks.listGraphs.mockResolvedValue([]);
   mocks.graphStatus.mockResolvedValue({});
-  mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {} });
+  mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {}, contextLimits: {} });
   mocks.readCoreConfig.mockResolvedValue(null);
   mocks.rpc.mockImplementation(async (method: string) => {
     if (method === "editor_attach") return {};
@@ -192,6 +202,43 @@ afterEach(() => {
 // The invariant. Written first, and the test all nine previous rounds would
 // each have failed in a different way.
 // ---------------------------------------------------------------------------
+
+describe("always allow", () => {
+  it("sends `always` alongside the approval and says the asking has stopped", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    const clientId = attachedClientId();
+
+    await emit(approvalRequest({ targetClientId: clientId }));
+    expect(await screen.findByText(/Approve file_write\?/)).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Always/ }));
+    });
+
+    const sends = approvalSends();
+    expect(sends).toHaveLength(1);
+    // `always` rides along with an approval; core grants the exact tool name.
+    expect(sends[0]).toMatchObject({ approved: true, always: true });
+    // The user is told the scope of what they just did.
+    expect(await screen.findByText(/won't ask again for it this session/)).toBeTruthy();
+  });
+
+  it("never attaches `always` to a plain approval or to a denial", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    const clientId = attachedClientId();
+
+    await emit(approvalRequest({ targetClientId: clientId }));
+    expect(await screen.findByText(/Approve file_write\?/)).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Approve/ }));
+    });
+    expect(approvalSends()[0]?.always).toBeUndefined();
+  });
+});
 
 describe("the governing invariant", () => {
   it("core unreachable for an approval's whole life issues no denial from anyone", async () => {

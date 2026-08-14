@@ -52,15 +52,36 @@ function truncateFront(line: string, limit: number): string {
   return `${label}…${line.slice(line.length - budget)}`;
 }
 
-/** The excerpt handed to the evaluator: the tail of the transcript, capped. */
-export function buildEvaluatorTranscript(
+export interface TranscriptWindow {
+  /** The excerpt itself. */
+  text: string;
+  /** Entries that made the excerpt. */
+  kept: number;
+  /** Entries with content that could have. */
+  total: number;
+  /** True when the budget dropped an entry, or clipped the head of one. */
+  truncated: boolean;
+}
+
+/**
+ * The excerpt plus what it left out.
+ *
+ * The counts exist so a caller can say so: a reader who cannot tell that the
+ * head of a long run was dropped will read a confident answer about a step the
+ * model never saw as if it were grounded.
+ */
+export function buildTranscriptWindow(
   messages: Array<{ role: string; content: string; tool?: string }>,
   maxChars = DEFAULT_TRANSCRIPT_CHARS,
-): string {
+): TranscriptWindow {
+  const total = messages.filter((entry) => entry.content?.trim()).length;
   const limit = Math.floor(maxChars);
-  if (!Number.isFinite(limit) || limit <= 0) return "";
+  if (!Number.isFinite(limit) || limit <= 0) {
+    return { text: "", kept: 0, total, truncated: total > 0 };
+  }
   const kept: string[] = [];
   let used = 0;
+  let clipped = false;
   // Walk backwards: the recent turns decide whether the goal is met, so the
   // budget is spent from the newest entry outwards and the head is dropped.
   for (let index = messages.length - 1; index >= 0; index -= 1) {
@@ -74,10 +95,21 @@ export function buildEvaluatorTranscript(
       used += cost;
       continue;
     }
-    if (!kept.length) kept.push(truncateFront(line, limit));
+    if (!kept.length) {
+      kept.push(truncateFront(line, limit));
+      clipped = true;
+    }
     break;
   }
-  return kept.join("\n");
+  return { text: kept.join("\n"), kept: kept.length, total, truncated: clipped || kept.length < total };
+}
+
+/** The excerpt handed to the evaluator: the tail of the transcript, capped. */
+export function buildEvaluatorTranscript(
+  messages: Array<{ role: string; content: string; tool?: string }>,
+  maxChars = DEFAULT_TRANSCRIPT_CHARS,
+): string {
+  return buildTranscriptWindow(messages, maxChars).text;
 }
 
 /** The directive injected as the next turn's user message when a goal is unmet. */

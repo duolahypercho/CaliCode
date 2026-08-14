@@ -1,6 +1,7 @@
 use crate::agent::AgentOptions;
 use crate::assets;
 use crate::baselines;
+use crate::checkpoints;
 use crate::devserver;
 use crate::image3d;
 use crate::store;
@@ -115,11 +116,32 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         "ping" => Ok(json!({ "pong": true, "version": env!("CARGO_PKG_VERSION") })),
         "config.read" => {
             let config = state.config.read().await;
-            Ok(serde_json::to_value(&*config)?)
+            let mut value = serde_json::to_value(&*config)?;
+            // The *resolved* confinement state, not the configured one. The
+            // config says what was asked for; `sandbox::status()` says what
+            // this machine actually got — Seatbelt can be unavailable, or
+            // switched off by `CALI_SANDBOX`. The UI told the user "not
+            // sandboxed" from a hardcoded string, which is a claim that cannot
+            // be right in every case and was never checked against anything.
+            //
+            // Carried on `config.read` rather than a new method because the
+            // client already fetches it for the context meter; a second round
+            // trip to answer one line of dropdown text is not worth it.
+            if let Some(object) = value.as_object_mut() {
+                object.insert("sandboxStatus".into(), crate::sandbox::status());
+            }
+            Ok(value)
         }
         "model_list" => {
             let config = state.config.read().await;
             Ok(model_list(&config)?)
+        }
+        // Per-model token totals for Settings → Status. Read-only and cheap:
+        // the ledger is already in memory, so the page may poll it.
+        "usage_stats" => Ok(state.agents.usage_ledger().report()),
+        "usage_reset" => {
+            state.agents.usage_ledger().reset();
+            Ok(state.agents.usage_ledger().report())
         }
         "model_switch" => {
             let mut config = state.config.write().await;
@@ -234,7 +256,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             // Delete the project first so a failed "last project" guard or
             // other store error leaves every session/worktree recoverable.
             let project = store::delete_project(&state.projects_root, slug)?;
-            let sessions = archive_project_sessions(state, slug).await?;
+            let sessions = delete_project_sessions(state, slug).await?;
             Ok(json!({ "project": project, "sessions": sessions }))
         }
         "project_checkpoint" => Ok(store::checkpoint_project(
@@ -247,6 +269,28 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             str_param(&params, "checkpointId")?,
         )?),
         "project_starter" => Ok(serde_json::from_str(store::SAMPLE_PROJECT)?),
+
+        // Restore points. `project_checkpoint`/`project_revert` above remain
+        // the project-directory-only pair the agent's tools call; these four
+        // are the surface that also covers an attached repository, and the
+        // only one that can enumerate or bound what is on disk.
+        "checkpoint_create" => {
+            checkpoints::create(&state.projects_root, str_param(&params, "slug")?)
+        }
+        "checkpoint_list" => checkpoints::list(&state.projects_root, str_param(&params, "slug")?),
+        "checkpoint_restore" => checkpoints::restore(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+            str_param(&params, "id")?,
+        ),
+        "checkpoint_prune" => checkpoints::prune(
+            &state.projects_root,
+            str_param(&params, "slug")?,
+            params
+                .get("keep")
+                .and_then(Value::as_u64)
+                .context("missing required number keep")? as usize,
+        ),
 
         // Workspaces: a real folder on disk that CaliCode edits in place.
         // workspace_open is the only method that accepts an absolute path.
@@ -363,6 +407,143 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 limit.min(2000),
             ))
         }
+        // Terminal: shell work the *user* asked for, in their workspace.
+        // Deliberately outside the agent approval flow and absent from
+        // `tools.rs` — and the pty half is not confined to the workspace at
+        // all. Read the module comment in `terminal.rs` before changing that.
+        "terminal_run" => state.terminals.start(
+            &terminal_root(state, &params).await?,
+            str_param(&params, "command")?,
+            params.get("cwd").and_then(Value::as_str),
+            state.bus.clone(),
+        ),
+        // Browser: the BROWSER tab and the agent drive the same Chrome.
+        //
+        // The tab's URL bar goes through the agent's own tool defs (the
+        // `asset_search` parity pattern above) rather than a parallel handler,
+        // so a URL the user types and a URL the model navigates to are
+        // normalized, refused, and settled by exactly one code path.
+        "browser_navigate" | "browser_search" | "browser_snapshot" | "browser_click"
+        | "browser_type" | "browser_key" | "browser_scroll" | "browser_screenshot"
+        | "browser_look" | "browser_console" | "browser_eval" | "browser_close" => {
+            let def = crate::tools::core_tool_defs()
+                .into_iter()
+                .find(|tool| tool.name == method)
+                .with_context(|| format!("{method} tool is unavailable"))?;
+            crate::tools::execute_core_tool(&def, &params, state, &state.projects_root, None).await
+        }
+        // Deliberately never launches one: the tab polls this, and a poll that
+        // starts a browser would have every open editor spawn a Chrome.
+        "browser_status" => match state.browsers.current().await {
+            Some(browser) => {
+                let location = browser.location().await.unwrap_or_else(|_| json!({}));
+                let (width, height) = browser.shape();
+                Ok(json!({
+                    "running": true,
+                    "icon": browser.icon().await,
+                    "viewport": { "width": width, "height": height },
+                    "url": location.get("url").cloned().unwrap_or(Value::Null),
+                    "title": location.get("title").cloned().unwrap_or(Value::Null),
+                }))
+            }
+            None => Ok(json!({ "running": false })),
+        },
+        // The tab reports its own shape; core decides what to do with it.
+        "browser_viewport" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let shape = browser
+                .set_shape(
+                    params["width"].as_u64().unwrap_or(0) as u32,
+                    params["height"].as_u64().unwrap_or(0) as u32,
+                )
+                .await?;
+            // Reshaping changes the aspect of every future frame, but chrome
+            // emits one only on repaint — and a settled results page never
+            // repaints. The panel was left scaling its last frame, taken at
+            // the previous shape, into a box that no longer matches it: the
+            // page appeared zoomed and cropped, permanently. Pushing a capture
+            // is what makes the new shape visible.
+            if let Some(frame) = browser.current_frame().await {
+                let _ = state.bus.send(frame);
+            }
+            Ok(shape)
+        }
+        "browser_cast_start" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            // The panel reports the pixel width it will draw into; anything
+            // beyond that is decoded and scaled away on arrival.
+            if let Some(width) = params["width"].as_u64() {
+                browser.set_cast_size(width as u32).await?;
+            }
+            browser.start_cast().await?;
+            // The current frame rides back with the reply so a panel that just
+            // mounted paints immediately instead of waiting for a repaint —
+            // which on a still page never comes at all.
+            Ok(json!({ "casting": true, "frame": browser.current_frame().await }))
+        }
+        // Called when the tab is hidden or unmounted. Frames share the SSE bus
+        // with agent tokens, so an unwatched screencast is the loudest thing
+        // on it for no benefit.
+        // A panel that finds itself with no frame asks for one here rather
+        // than waiting on a repaint that may never come.
+        "browser_frame" => match state.browsers.current().await {
+            Some(browser) => Ok(json!({ "frame": browser.current_frame().await })),
+            None => Ok(json!({ "frame": Value::Null })),
+        },
+        "browser_cast_stop" => {
+            if let Some(browser) = state.browsers.current().await {
+                browser.stop_cast().await?;
+            }
+            Ok(json!({ "casting": false }))
+        }
+        "browser_input" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser_input(&browser, &params).await
+        }
+        "browser_history" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let delta = params["delta"].as_i64().unwrap_or(-1);
+            browser
+                .eval(&format!("history.go({delta}); true"))
+                .await
+                .map(|_| json!({ "moved": delta }))
+        }
+        "browser_reload" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser
+                .call("Page.reload", json!({ "ignoreCache": false }))
+                .await
+                .map(|_| json!({ "reloaded": true }))
+        }
+        "terminal_kill" => Ok(state.terminals.kill(str_param(&params, "runId")?)),
+        "terminal_runs" => Ok(state.terminals.list()),
+        "terminal_open" => {
+            state
+                .terminals
+                .open(
+                    &terminal_root(state, &params).await?,
+                    size_param(&params, "cols", crate::terminal::DEFAULT_COLS),
+                    size_param(&params, "rows", crate::terminal::DEFAULT_ROWS),
+                    state.bus.clone(),
+                )
+                .await
+        }
+        "terminal_input" => {
+            state
+                .terminals
+                .input(
+                    str_param(&params, "sessionId")?,
+                    str_param(&params, "data")?,
+                )
+                .await
+        }
+        "terminal_resize" => state.terminals.resize(
+            str_param(&params, "sessionId")?,
+            size_param(&params, "cols", crate::terminal::DEFAULT_COLS),
+            size_param(&params, "rows", crate::terminal::DEFAULT_ROWS),
+        ),
+        "terminal_close" => Ok(state.terminals.close(str_param(&params, "sessionId")?)),
+        "terminal_sessions" => Ok(state.terminals.sessions()),
         "file_read" => {
             let slug = str_param(&params, "slug")?;
             let (_, path) = crate::tools::resolve_game_file(
@@ -375,11 +556,12 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         }
         "file_write" => {
             let slug = str_param(&params, "slug")?;
-            let (_, path) = crate::tools::resolve_game_file(
+            let (base, path) = crate::tools::resolve_game_file(
                 &state.projects_root,
                 slug,
                 str_param(&params, "path")?,
             )?;
+            crate::tools::reject_protected_write(&base, &path)?;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -768,6 +950,12 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                             .cloned()
                             .unwrap_or_else(|| json!({"type":"object"})),
                         kind: crate::tools::ToolKind::Browser,
+                        // Editor tools are registered by the client at
+                        // runtime, so there is no literal to enforce and
+                        // `is_destructive` classifies them by name. Closed
+                        // here so a future reader of this field is never told
+                        // something reassuring that was never decided.
+                        access: crate::tools::Access::Guarded,
                     },
                 );
             }
@@ -970,16 +1158,32 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                     })
                 });
             let options = AgentOptions {
+                // Fail closed on an omitted mode. `requires_approval` already
+                // treats an unknown mode as "prompt for everything", so this
+                // default was the single place the harness chose the loosest
+                // setting for a caller who never asked for it — and the panel
+                // always sends one, so the only callers reaching this line are
+                // scripts and outside MCP clients, which is exactly the set
+                // that should not silently get full access.
                 permission_mode: params
                     .get("permissionMode")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("full-access")
+                    .unwrap_or(crate::agent::DEFAULT_PERMISSION_MODE)
                     .to_string(),
                 max_turns: params
                     .get("maxTurns")
                     .and_then(|v| v.as_u64())
                     .map(|value| value as usize)
                     .unwrap_or(crate::agent::DEFAULT_MAX_TURNS),
+                // The client owns model metadata (models.dev via
+                // `@opencode-ai/models`); core deliberately keeps no catalog,
+                // so the window arrives with the turn. A zero or absent value
+                // means "unknown", never "no context".
+                context_length: params
+                    .get("contextLength")
+                    .and_then(|v| v.as_u64())
+                    .filter(|value| *value > 0)
+                    .map(|value| value.min(u64::from(u32::MAX)) as u32),
                 final_response_drain: params
                     .get("finalResponseDrain")
                     .and_then(Value::as_bool)
@@ -1037,23 +1241,63 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         // `clientId` is the authorization: the request names the one window
         // that may answer it, and `respond` refuses every other caller. Without
         // that refusal the address is decoration.
-        "agent_approval_response" => Ok(state
-            .agents
-            .approvals()
-            .respond(
-                str_param(&params, "requestId")?,
-                params
-                    .get("clientId")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|client| !client.is_empty()),
-                params
-                    .get("approved")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false),
-            )
-            .await?),
+        "agent_approval_response" => {
+            let approved = params
+                .get("approved")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            // `always` only ever widens an approval, so a denial ignores it
+            // outright rather than recording a grant nobody gave.
+            let always = approved
+                && params
+                    .get("always")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+            let mut answer = state
+                .agents
+                .approvals()
+                .respond(
+                    str_param(&params, "requestId")?,
+                    params
+                        .get("clientId")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|client| !client.is_empty()),
+                    approved,
+                )
+                .await?;
+            if always {
+                let session = answer["sessionId"].as_str().unwrap_or_default().to_string();
+                let tool = answer["tool"].as_str().unwrap_or_default().to_string();
+                // Failure to record must not un-answer the approval the user
+                // just gave: the call itself has already been let through.
+                match state.agents.always_allow(&session, &tool).await {
+                    Ok(added) => answer["alwaysAllowed"] = json!(added),
+                    Err(error) => {
+                        tracing::warn!(%error, %session, %tool, "could not record always-allow");
+                        answer["alwaysAllowed"] = json!(false);
+                    }
+                }
+            }
+            Ok(answer)
+        }
         "agent_sessions" => Ok(json!(state.agents.sessions().await)),
+        // The stop button's actual reach into the loop. Aborting the client's
+        // HTTP request leaves `chat` running its full turn budget — tools,
+        // writes and tokens — with nobody reading the reply, so a stop has to
+        // be a request core receives rather than a connection the client drops.
+        //
+        // A stop that finds no running turn is reported, not raised: the press
+        // races the loop finishing, and both orders are ordinary.
+        "agent_cancel" => {
+            let session_id = str_param(&params, "sessionId")?;
+            let (found, newly_cancelled) = state.agents.cancel_session(session_id).await;
+            Ok(json!({
+                "sessionId": session_id,
+                "found": found,
+                "cancelled": newly_cancelled,
+            }))
+        }
         // Tool-less per-turn verifier behind the client's `/goal` command.
         // The evaluator judges only the evidence already in the transcript,
         // so it cannot confirm a goal by running something itself.
@@ -1066,13 +1310,92 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             )
             .await
         }
+        // Side conversation *about* a run. Unlike `agent_chat` this registers
+        // no tools and touches no session: the advisor can only read the
+        // transcript excerpt it is handed, so a question about a run can
+        // neither act on the project nor append to the transcript it is being
+        // asked about. The client owns the advisor's history and replays it.
+        "advisor_chat" => {
+            let messages = params
+                .get("messages")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            // The side chat carries its own model pick. It applies to this
+            // call only — nothing here rewrites the saved active model.
+            let model = params
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|model| {
+                    (
+                        params
+                            .get("provider")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .unwrap_or_default(),
+                        model,
+                    )
+                });
+            crate::advisor::advise(
+                state,
+                crate::advisor::AdvisorRequest {
+                    messages: &messages,
+                    transcript: params
+                        .get("transcript")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    project_slug: params.get("projectSlug").and_then(Value::as_str),
+                    effort: params
+                        .get("effort")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty() && value.len() <= 32),
+                    model,
+                    // Opt-in: only a client that minted a stream id gets deltas.
+                    stream_id: params
+                        .get("streamId")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty() && value.len() <= 64),
+                    // The step the question was opened from, when the client
+                    // anchored it to one.
+                    anchor: params
+                        .get("anchor")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                },
+            )
+            .await
+        }
         // Compact a live agent session: prune old tool results, summarize the
         // middle via one model call, soft-archive the replaced turns in the
         // session file, and rewrite the in-memory transcript.
-        "session_compact" => Ok(state
-            .agents
-            .compact_session(state, str_param(&params, "sessionId")?)
-            .await?),
+        "session_compact" => {
+            // Absent `instructions` keeps the session's standing steer; an
+            // empty string is how `/compact clear` drops it. The two cannot
+            // be collapsed: "I said nothing this time" and "forget what I
+            // said" are opposite instructions to every later auto-compaction.
+            let instructions = match params.get("instructions") {
+                None | Some(Value::Null) => crate::agent::CompactInstructions::Unchanged,
+                Some(Value::String(text)) if text.trim().is_empty() => {
+                    crate::agent::CompactInstructions::Clear
+                }
+                Some(Value::String(text)) => crate::agent::CompactInstructions::Set(text),
+                Some(_) => anyhow::bail!("instructions must be a string"),
+            };
+            Ok(state
+                .agents
+                .compact_session(
+                    state,
+                    str_param(&params, "sessionId")?,
+                    instructions,
+                    crate::agent::CompactTrigger::Manual,
+                )
+                .await?)
+        }
         "session_save" => crate::sessions::save(&state.sessions_root, &params),
         "session_create" => {
             let project_slug = str_param(&params, "projectSlug")?;
@@ -1129,8 +1452,24 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             }
             Ok(summary)
         }
-        "session_list" => crate::sessions::list(&state.sessions_root),
+        // `archived: true` asks for the archive settings shows; the default is
+        // the live list the sidebar renders.
+        "session_list" => crate::sessions::list(
+            &state.sessions_root,
+            params
+                .get("archived")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        ),
         "session_load" => crate::sessions::load(&state.sessions_root, str_param(&params, "id")?),
+        // Archiving leaves the transcript, the worktree and any running agent
+        // in place — only `session_delete` discards those.
+        "session_archive" => {
+            crate::sessions::set_archived(&state.sessions_root, str_param(&params, "id")?, true)
+        }
+        "session_restore" => {
+            crate::sessions::set_archived(&state.sessions_root, str_param(&params, "id")?, false)
+        }
         "session_delete" => {
             let id = str_param(&params, "id")?;
             let record = crate::sessions::load(&state.sessions_root, id).ok();
@@ -1142,7 +1481,10 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             Ok(result)
         }
         "session_archive_project" => {
-            archive_project_sessions(state, str_param(&params, "slug")?).await
+            crate::sessions::archive_project(&state.sessions_root, str_param(&params, "slug")?)
+        }
+        "session_delete_project" => {
+            delete_project_sessions(state, str_param(&params, "slug")?).await
         }
         "session_fork" => {
             let forked = crate::sessions::fork(
@@ -1419,16 +1761,87 @@ fn default_system_prompt(
         .filter_map(|template| template["id"].as_str().map(str::to_string))
         .collect::<Vec<_>>()
         .join(", ");
-    let mut prompt = format!(
-        "You are CaliCode — an AI game engineer for a three.js game workbench. You build\n\
+    let mut prompt = String::from(STATIC_SYSTEM_PROMPT);
+    // Only describe the editor workflow when there is an editor. Appended here,
+    // after the invariant base, so both renderings share that base as a prompt-
+    // cache prefix rather than diverging from the first byte.
+    if registered
+        .values()
+        .any(|def| def.kind == crate::tools::ToolKind::Browser)
+    {
+        prompt.push_str(EDITOR_TOOLING_PROMPT);
+    }
+    // Everything the model needs that varies by project, session, or connected
+    // editor lands here, after the static body. See STATIC_SYSTEM_PROMPT.
+    prompt.push_str(&format!(
+        "\n\n## This session\n\
+Project: {project_digest}\n\
+Templates: {template_ids}\n\
+Editor tools: {browser_tools}{mcp_tools}\n\
+Conventions: {skills_block}\n",
+        project_digest = project_digest(&state.projects_root, slug),
+        template_ids = template_ids,
+        browser_tools = browser_tools_block(registered),
+        mcp_tools = mcp_tools_block(registered),
+        skills_block = skills_block(&state.projects_root, slug),
+    ));
+    // Installed skills (global ~/.cali/skills + <project>/skills SKILL.md
+    // format) load on demand via skill_load; the index is appended so the
+    // agent knows what exists without paying for the bodies.
+    prompt.push_str(&crate::skills::prompt_index(
+        &state.projects_root,
+        Some(slug),
+        skills_disabled,
+    ));
+    prompt
+}
+
+/// The invariant half of the default system prompt.
+///
+/// This is a `const` rather than a `format!` deliberately: it is byte-identical
+/// for every project and every session on a given build, so a provider prefix
+/// cache serves the whole block as one shared read. Interpolating anything
+/// project- or session-specific into it re-bills roughly 2K tokens of static
+/// instruction on every turn of every session — the single most expensive
+/// mistake available in this file. Volatile state belongs in the `## This
+/// session` block that `default_system_prompt` appends after it.
+/// The half of the prompt that only makes sense with an editor attached.
+///
+/// Every tool it names — `editor_run_pie`, `editor_scene_inspect`,
+/// `editor_test_add` and the rest — is registered at runtime by a connected
+/// client. A subagent, a graph node, or a headless caller has none of them, and
+/// was still being told to run PIE and capture frames: instructions it cannot
+/// follow, which cost it turns discovering that.
+///
+/// grok-build's answer is a template that never names a tool and gates whole
+/// sections on availability. This is the same idea at the granularity that
+/// matters here, and it is a separate `const` for the same reason the base is:
+/// each rendering has to be byte-identical for the prompt cache. Appended
+/// *after* the invariant base, so a session without an editor still shares that
+/// base as a cache prefix with one that has it.
+const EDITOR_TOOLING_PROMPT: &str = "Verify everything you claim: before visual evidence, call editor_scene_inspect and\n\
+editor_camera_frame with gameplay foreground entity ids so decorative sky/backdrop\n\
+geometry cannot control or occlude the persisted evidence camera. After scene or script changes run editor_run_pie,\n\
+persist individual frames directly with editor_persist_capture(path), and read\n\
+editor_console_history for runtime errors. Never copy screenshot data URLs\n\
+through the model or use UTF-8 file_write for PNG bytes. For animation or\n\
+movement call editor_analyze_motion and attach every returned project-relative\n\
+evidence path to loop_report_iteration; after gameplay\n\
+changes add or run tests\n\
+(editor_test_add, editor_run_tests). Tests may read scene, entityFor(name), and\n\
+read-only state.world; `await step(frames)` refreshes snapshots. Always\n\
+`await assert(condition, positiveMessage)`.\n\
+Never use `|| true`; messages state expected positive behavior, not inverted failure.\n\n";
+
+const STATIC_SYSTEM_PROMPT: &str =
+    "You are CaliCode — an AI game engineer for a three.js game workbench. You build\n\
 real, playable scenes, scripts, assets, and tests, and for any goal with a\n\
 quality bar you do not stop at \"works\": you iterate until a harsh, independent\n\
 judge scores the result at or above a named world-class reference. That\n\
 substrate is fixed: everything ships inside this three.js editor and its tools —\n\
 never propose switching engines as a path to quality.\n\
 \n\
-## Project\n\
-{project_digest}\n\
+Project, templates, editor tools and conventions: '## This session', at the end.\n\
 \n\
 ## Match the ask to the machinery\n\
 - SMALL (one obvious edit, a question, a tweak — you can name the exact tool\n\
@@ -1444,7 +1857,7 @@ one-line fix must never spawn a graph.\n\
 ## The loop: name the bar -> decompose -> fan out -> judge blind -> iterate\n\
 1. NAME THE BAR. Restate the user's goal against a specific, named reference —\n\
    the best-in-class published game (or asset/scene) in the same genre. Prefer\n\
-   a matching template's reference (template_list shows: {template_ids}); else\n\
+   a matching template's reference (template_list; ids below); else\n\
    pick the obvious genre flagship and tell the user which you chose; if the\n\
    genre is genuinely ambiguous, ask. If you cannot name the reference you are\n\
    matching, you do not yet understand the goal.\n\
@@ -1497,33 +1910,19 @@ Skills: skill_list, skill_load\n\
 Orchestration: graph_plan, graph_run, graph_status, graph_list, graph_cancel,\n\
   template_list, subagent_spawn, loop_report_start, loop_report_iteration,\n\
   loop_report_update, loop_report_open\n\
-Editor (browser-registered, live scene access; set depends on the open\n\
-editor): {browser_tools}{mcp_tools}\n\
+Editor (browser-registered, live scene access): see below.\n\
 \n\
 Scripts: only owner `entity` is writable. `state.find(nameOrId)`/`state.scene`\n\
 are frozen snapshots. For cross-entity transforms call\n\
-`state.patch(nameOrId,{{position?,rotation?,scale?}})` merges finite partial\n\
-`{{x?,y?,z?}}`. Direct owner assignments require full\n\
-finite `{{x,y,z}}`; materials are static editor edits, never runtime writes.\n\
+`state.patch(nameOrId,{position?,rotation?,scale?})` merges finite partial\n\
+`{x?,y?,z?}`. Direct owner assignments require full\n\
+finite `{x,y,z}`; materials are static editor edits, never runtime writes.\n\
 \n\
-Verify everything you claim: before visual evidence, call editor_scene_inspect and\n\
-editor_camera_frame with gameplay foreground entity ids so decorative sky/backdrop\n\
-geometry cannot control or occlude the persisted evidence camera. After scene or script changes run editor_run_pie,\n\
-persist individual frames directly with editor_persist_capture(path), and read\n\
-editor_console_history for runtime errors. Never copy screenshot data URLs\n\
-through the model or use UTF-8 file_write for PNG bytes. For animation or\n\
-movement call editor_analyze_motion and attach every returned project-relative\n\
-evidence path to loop_report_iteration; after gameplay\n\
-changes add or run tests\n\
-(editor_test_add, editor_run_tests). Tests may read scene, entityFor(name), and\n\
-read-only state.world; `await step(frames)` refreshes snapshots. Always\n\
-`await assert(condition, positiveMessage)`.\n\
-Never use `|| true`; messages state expected positive behavior, not inverted failure.\n\
 Checkpoint (project_checkpoint) before\n\
 risky multi-step changes so project_revert can rescue you.\n\
 \n\
 ## Skills\n\
-Project-specific knowledge lives in the game folder. {skills_block}\n\
+Project-specific knowledge lives in the game folder; see below.\n\
 Read the relevant skill file with file_read BEFORE working in its area, and\n\
 follow it over your defaults. When you learn something durable about this\n\
 project, offer to record it in CALICODE.md.\n\
@@ -1533,23 +1932,7 @@ project, offer to record it in CALICODE.md.\n\
 clearly in a captured frame, and the judge scored it at or above threshold\n\
 against its named reference. Never present unverified work as finished; say\n\
 exactly what was verified and how, and what the judge scored. Be concise in\n\
-chat — put the effort into the work, not the narration.",
-        project_digest = project_digest(&state.projects_root, slug),
-        template_ids = template_ids,
-        browser_tools = browser_tools_block(registered),
-        mcp_tools = mcp_tools_block(registered),
-        skills_block = skills_block(&state.projects_root, slug),
-    );
-    // Installed skills (global ~/.cali/skills + <project>/skills SKILL.md
-    // format) load on demand via skill_load; the index is appended so the
-    // agent knows what exists without paying for the bodies.
-    prompt.push_str(&crate::skills::prompt_index(
-        &state.projects_root,
-        Some(slug),
-        skills_disabled,
-    ));
-    prompt
-}
+chat — put the effort into the work, not the narration.";
 
 /// How long to wait for a folder to prove it is readable.
 ///
@@ -1637,12 +2020,18 @@ async fn cleanup_session_record(
     })
 }
 
-/// Clean and archive every persisted chat for a project. Durable session
-/// records are user data, so only explicit archive/delete operations remove
-/// them; generated worktrees are removed only when their metadata is an exact,
-/// clean session worktree.
-async fn archive_project_sessions(state: &AppState, slug: &str) -> Result<Value> {
-    let listed = crate::sessions::list(&state.sessions_root)?;
+/// Clean and delete every persisted chat for a project, archived ones
+/// included. Durable session records are user data, so only explicit
+/// archive/delete operations remove them; generated worktrees are removed only
+/// when their metadata is an exact, clean session worktree.
+async fn delete_project_sessions(state: &AppState, slug: &str) -> Result<Value> {
+    let mut listed = crate::sessions::list(&state.sessions_root, false)?;
+    if let (Some(items), Some(archived)) = (
+        listed.as_array_mut(),
+        crate::sessions::list(&state.sessions_root, true)?.as_array(),
+    ) {
+        items.extend(archived.iter().cloned());
+    }
     let records: Vec<Value> = listed
         .as_array()
         .into_iter()
@@ -1661,11 +2050,81 @@ async fn archive_project_sessions(state: &AppState, slug: &str) -> Result<Value>
             cleanup.push(cleanup_session_record(state, session_id, Some(record)).await);
         }
     }
-    let archived = crate::sessions::archive_project(&state.sessions_root, slug)?;
+    let removed = crate::sessions::delete_project(&state.sessions_root, slug)?;
     Ok(json!({
-        "archived": archived,
+        "deleted": removed["deleted"],
         "cleanup": cleanup,
     }))
+}
+
+/// Translate one input event from the BROWSER tab into a devtools input
+/// command.
+///
+/// Narrow on purpose. Forwarding the client's JSON to `Input.dispatch*`
+/// verbatim would be less code, but the tab would then be an arbitrary-CDP
+/// hole: the same channel that carries a click could carry
+/// `Input.dispatchKeyEvent` for a file-download shortcut, or any other domain
+/// entirely. Each field is read and re-emitted instead.
+async fn browser_input(browser: &crate::browser::Browser, params: &Value) -> Result<Value> {
+    let x = params["x"].as_f64().unwrap_or(0.0);
+    let y = params["y"].as_f64().unwrap_or(0.0);
+    match params["kind"].as_str().unwrap_or_default() {
+        "move" | "down" | "up" => {
+            let kind = match params["kind"].as_str().unwrap_or_default() {
+                "down" => "mousePressed",
+                "up" => "mouseReleased",
+                _ => "mouseMoved",
+            };
+            browser
+                .call(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": kind,
+                        "x": x, "y": y,
+                        "button": if kind == "mouseMoved" { "none" } else { "left" },
+                        "buttons": if kind == "mousePressed" { 1 } else { 0 },
+                        "clickCount": params["clickCount"].as_u64().unwrap_or(1).clamp(1, 3),
+                    }),
+                )
+                .await?;
+            // A move also answers "what would the cursor look like here".
+            //
+            // The panel is an image, so its cursor never changed shape — it
+            // stayed an arrow over links, over buttons, over everything. That
+            // is a small thing that reads constantly as "this is a picture of
+            // a page, not a page". The move is already a round trip and the
+            // probe rides along inside it (measured: 8.4ms against 8.3ms for
+            // the move alone), so the shape can follow the pointer for free.
+            if kind == "mouseMoved" {
+                return Ok(json!({ "ok": true, "cursor": browser.cursor_at(x, y).await }));
+            }
+            Ok(json!({ "ok": true }))
+        }
+        "wheel" => {
+            browser
+                .call(
+                    "Input.dispatchMouseEvent",
+                    json!({
+                        "type": "mouseWheel",
+                        "x": x, "y": y,
+                        "deltaX": params["deltaX"].as_f64().unwrap_or(0.0),
+                        "deltaY": params["deltaY"].as_f64().unwrap_or(0.0),
+                    }),
+                )
+                .await
+        }
+        "text" => {
+            browser
+                .call(
+                    "Input.insertText",
+                    json!({ "text": str_param(params, "text")? }),
+                )
+                .await
+        }
+        "key" => browser.key(str_param(params, "key")?, 0, 1).await,
+        other => anyhow::bail!("unknown browser input kind '{other}'"),
+    }
+    .map(|_| json!({ "ok": true }))
 }
 
 fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
@@ -1673,6 +2132,40 @@ fn str_param<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("missing required string {}", key))
+}
+
+/// A pty dimension in cells. Missing, zero or absurd values fall back rather
+/// than failing the call: a client that mis-measures its canvas should still
+/// get a usable terminal, not an error dialog.
+fn size_param(params: &Value, key: &str, fallback: u16) -> u16 {
+    params
+        .get(key)
+        .and_then(Value::as_u64)
+        .filter(|value| *value > 0)
+        .map(|value| value.min(u16::MAX as u64) as u16)
+        .unwrap_or(fallback)
+}
+
+/// The folder a terminal starts in.
+///
+/// Resolved exactly the way the file tools resolve a game's root, so a command
+/// sees the same tree `file_read` does: the project's attached `workspaceRoot`
+/// when it has one, otherwise CaliCode's own project directory. A bare
+/// `workspaceId` is accepted too, for a folder opened without a project.
+///
+/// One of the two is required. For `terminal_run` there is otherwise nothing
+/// to confine an explicit `cwd` against; for `terminal_open` there is nowhere
+/// sensible to drop the user — a session that started in `/` would be a
+/// terminal attached to nothing.
+async fn terminal_root(state: &AppState, params: &Value) -> Result<std::path::PathBuf> {
+    if let Some(slug) = params.get("projectSlug").and_then(Value::as_str) {
+        return Ok(crate::tools::game_file_base(&state.projects_root, slug, None)?.base);
+    }
+    if let Some(id) = params.get("workspaceId").and_then(Value::as_str) {
+        let registry = state.workspaces.read().await;
+        return Ok(workspace::get(&registry, id)?.root.clone());
+    }
+    anyhow::bail!("a terminal needs a projectSlug or workspaceId to resolve its directory")
 }
 
 /// Mirrors the open-workspace set into the config file.
@@ -1732,6 +2225,8 @@ mod tests {
             dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::devserver::Servers::new(),
             )),
+            terminals: crate::terminal::Terminals::default(),
+            browsers: crate::browser::Browsers::new(),
             shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
         }
     }
@@ -1780,6 +2275,204 @@ mod tests {
         assert_eq!(result["version"], env!("CARGO_PKG_VERSION"));
     }
 
+    /// The terminal runs against the same tree `file_read` sees: a game with a
+    /// folder attached runs there, not in CaliCode's project directory.
+    #[tokio::test]
+    async fn terminal_run_streams_from_the_attached_workspace_and_kills_idempotently() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects.clone(), sessions.path().to_path_buf());
+        let mut events = state.bus.subscribe();
+
+        let started = dispatch(
+            &state,
+            "terminal_run",
+            json!({ "command": "pwd", "projectSlug": "demo" }),
+        )
+        .await
+        .unwrap();
+        let run_id = started["runId"].as_str().unwrap().to_string();
+        assert!(run_id.starts_with("term-"));
+        assert_eq!(
+            started["cwd"].as_str().unwrap(),
+            repo.canonicalize().unwrap().to_string_lossy()
+        );
+
+        let mut stdout = String::new();
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(20), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if event["runId"] != json!(run_id) {
+                continue;
+            }
+            if event["type"] == json!("terminal.exit") {
+                assert_eq!(event["code"], json!(0));
+                break;
+            }
+            stdout.push_str(event["chunk"].as_str().unwrap());
+        }
+        assert_eq!(
+            stdout.trim(),
+            repo.canonicalize().unwrap().to_string_lossy()
+        );
+
+        assert_eq!(
+            dispatch(&state, "terminal_kill", json!({ "runId": run_id }))
+                .await
+                .unwrap()["killed"],
+            json!(false)
+        );
+        assert!(
+            dispatch(&state, "terminal_runs", json!({})).await.unwrap()["runs"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// Without a root there is nothing to confine `cwd` against, and an
+    /// explicit `cwd` outside that root is refused rather than silently obeyed.
+    #[tokio::test]
+    async fn terminal_run_requires_a_root_and_confines_the_cwd_to_it() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, _repo) = git_fixture(home.path());
+        let state = test_state(projects, sessions.path().to_path_buf());
+
+        let rootless = dispatch(&state, "terminal_run", json!({ "command": "pwd" }))
+            .await
+            .unwrap_err();
+        assert!(rootless.to_string().contains("projectSlug"));
+
+        let escaped = dispatch(
+            &state,
+            "terminal_run",
+            json!({ "command": "pwd", "projectSlug": "demo", "cwd": "/etc" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            escaped.to_string().contains("outside the workspace root"),
+            "{escaped}"
+        );
+    }
+
+    /// A pty session opens in the attached workspace, is listed at the size the
+    /// client asked for, and closes idempotently. Nothing here waits on shell
+    /// output: this covers the RPC wiring, `terminal.rs` covers the shell.
+    #[tokio::test]
+    async fn terminal_open_lists_resizes_and_closes_a_session() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects, sessions.path().to_path_buf());
+
+        let opened = dispatch(
+            &state,
+            "terminal_open",
+            json!({ "projectSlug": "demo", "cols": 132, "rows": 43 }),
+        )
+        .await
+        .unwrap();
+        let session_id = opened["sessionId"].as_str().unwrap().to_string();
+        assert!(session_id.starts_with("pty-"));
+        assert_eq!(
+            opened["cwd"].as_str().unwrap(),
+            repo.canonicalize().unwrap().to_string_lossy()
+        );
+        assert!(std::path::Path::new(opened["shell"].as_str().unwrap()).exists());
+
+        let listed = dispatch(&state, "terminal_sessions", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(listed["sessions"][0]["sessionId"], json!(session_id));
+        assert_eq!(listed["sessions"][0]["cols"], json!(132));
+        assert_eq!(listed["sessions"][0]["rows"], json!(43));
+
+        assert_eq!(
+            dispatch(
+                &state,
+                "terminal_resize",
+                json!({ "sessionId": session_id, "cols": 90, "rows": 30 }),
+            )
+            .await
+            .unwrap(),
+            json!({ "ok": true })
+        );
+        assert_eq!(
+            dispatch(&state, "terminal_sessions", json!({}))
+                .await
+                .unwrap()["sessions"][0]["cols"],
+            json!(90)
+        );
+
+        let closed = dispatch(&state, "terminal_close", json!({ "sessionId": session_id }))
+            .await
+            .unwrap();
+        assert_eq!(closed["closed"], json!(true));
+        assert_eq!(
+            dispatch(&state, "terminal_close", json!({ "sessionId": session_id }),)
+                .await
+                .unwrap()["closed"],
+            json!(false)
+        );
+    }
+
+    /// A session needs somewhere to start, and keystrokes must not be
+    /// swallowed by a session that is no longer there.
+    #[tokio::test]
+    async fn terminal_open_requires_a_root_and_input_requires_a_live_session() {
+        let projects = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
+
+        let rootless = dispatch(&state, "terminal_open", json!({}))
+            .await
+            .unwrap_err();
+        assert!(rootless.to_string().contains("projectSlug"));
+
+        let orphan = dispatch(
+            &state,
+            "terminal_input",
+            json!({ "sessionId": "pty-gone", "data": "ls\r" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(orphan.to_string().contains("pty-gone"), "{orphan}");
+        // A resize, unlike input, races the close button and reports the loss.
+        assert_eq!(
+            dispatch(
+                &state,
+                "terminal_resize",
+                json!({ "sessionId": "pty-gone", "cols": 80, "rows": 24 }),
+            )
+            .await
+            .unwrap(),
+            json!({ "ok": false })
+        );
+    }
+
+    #[test]
+    fn a_missing_or_nonsensical_pty_size_falls_back() {
+        for params in [
+            json!({}),
+            json!({ "cols": 0 }),
+            json!({ "cols": "wide" }),
+            json!({ "cols": -5 }),
+        ] {
+            assert_eq!(size_param(&params, "cols", 80), 80);
+        }
+        assert_eq!(size_param(&json!({ "cols": 120 }), "cols", 80), 120);
+        // Clamped to something a winsize ioctl can survive by `terminal.rs`.
+        assert_eq!(
+            size_param(&json!({ "cols": 999_999 }), "cols", 80),
+            u16::MAX
+        );
+    }
+
     /// Both strings are required. Reaching the provider without a goal would
     /// spend a model call to verify nothing.
     #[tokio::test]
@@ -1797,6 +2490,23 @@ mod tests {
             .await
             .unwrap_err();
         assert!(missing_transcript.to_string().contains("transcript"));
+    }
+
+    /// `transcript` is optional — an advisor asked before anything happened is
+    /// legal — but a turn with nothing to answer would spend a model call on
+    /// silence.
+    #[tokio::test]
+    async fn advisor_chat_requires_a_history_and_nothing_else() {
+        let projects = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
+
+        for params in [json!({}), json!({ "transcript": "ran it", "messages": [] })] {
+            let error = dispatch(&state, "advisor_chat", params).await.unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("needs at least one user or assistant message"));
+        }
     }
 
     #[tokio::test]
@@ -1952,6 +2662,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_cancel_reaches_a_live_session_and_forgives_a_finished_one() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join("projects");
+        let sessions = home.path().join("sessions");
+        let state = test_state(projects, sessions);
+
+        // A stop aimed at a turn that already returned is answered, not
+        // raised — the press races the loop by nature.
+        let missing = dispatch(
+            &state,
+            "agent_cancel",
+            json!({ "sessionId": "not-running" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(missing["found"], json!(false));
+        assert_eq!(missing["cancelled"], json!(false));
+
+        state.agents.ensure_session("live").await.unwrap();
+        let stopped = dispatch(&state, "agent_cancel", json!({ "sessionId": "live" }))
+            .await
+            .unwrap();
+        assert_eq!(stopped["found"], json!(true));
+        assert_eq!(stopped["cancelled"], json!(true));
+
+        let again = dispatch(&state, "agent_cancel", json!({ "sessionId": "live" }))
+            .await
+            .unwrap();
+        assert_eq!(again["found"], json!(true));
+        assert_eq!(again["cancelled"], json!(false));
+
+        // The session survives its own stop: cancelling ends the turn, not
+        // the conversation. (That the token itself flipped is asserted in
+        // `agent`, which can see inside the session.)
+        assert!(state
+            .agents
+            .sessions()
+            .await
+            .iter()
+            .any(|session| session["id"] == json!("live")));
+    }
+
+    #[tokio::test]
     async fn deleting_a_session_removes_its_clean_generated_worktree() {
         let home = tempfile::tempdir().unwrap();
         let (projects, _repo) = git_fixture(home.path());
@@ -1974,6 +2727,70 @@ mod tests {
         assert!(crate::sessions::load(&sessions, &id).is_err());
     }
 
+    /// Archiving is the sidebar's reversible alternative to deleting, so it
+    /// must leave the worktree the chat is bound to alone — a restore that
+    /// came back to a missing workspace would not be a restore.
+    #[tokio::test]
+    async fn archiving_a_session_hides_it_but_keeps_its_worktree() {
+        let home = tempfile::tempdir().unwrap();
+        let (projects, _repo) = git_fixture(home.path());
+        let sessions = home.path().join("sessions");
+        let state = test_state(projects, sessions.clone());
+
+        let created = dispatch(&state, "session_create", json!({ "projectSlug": "demo" }))
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        let path = created["workspaceRoot"].as_str().unwrap().to_string();
+
+        let archived = dispatch(&state, "session_archive", json!({ "id": id }))
+            .await
+            .unwrap();
+        assert!(archived["archivedAt"].as_u64().is_some());
+        assert!(std::path::Path::new(&path).is_dir());
+        assert!(dispatch(&state, "session_list", json!({}))
+            .await
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let listed = dispatch(&state, "session_list", json!({ "archived": true }))
+            .await
+            .unwrap();
+        assert_eq!(listed[0]["id"], json!(id));
+
+        dispatch(&state, "session_restore", json!({ "id": id }))
+            .await
+            .unwrap();
+        let live = dispatch(&state, "session_list", json!({})).await.unwrap();
+        assert_eq!(live[0]["id"], json!(id));
+        assert_eq!(live[0]["workspaceRoot"], json!(path));
+    }
+
+    /// Removing the project takes its archive with it: an archived chat whose
+    /// game is gone has nothing to be restored into.
+    #[tokio::test]
+    async fn deleting_project_sessions_also_clears_the_archive() {
+        let home = tempfile::tempdir().unwrap();
+        let (projects, _repo) = git_fixture(home.path());
+        let sessions = home.path().join("sessions");
+        let state = test_state(projects, sessions.clone());
+
+        let created = dispatch(&state, "session_create", json!({ "projectSlug": "demo" }))
+            .await
+            .unwrap();
+        let id = created["id"].as_str().unwrap().to_string();
+        dispatch(&state, "session_archive", json!({ "id": id }))
+            .await
+            .unwrap();
+
+        let removed = dispatch(&state, "session_delete_project", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        assert_eq!(removed["deleted"], json!(1));
+        assert!(crate::sessions::load(&sessions, &id).is_err());
+    }
+
     #[tokio::test]
     async fn failed_session_create_rolls_back_the_preallocated_record() {
         let home = tempfile::tempdir().unwrap();
@@ -1989,7 +2806,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("unavailable"));
         assert_eq!(
-            crate::sessions::list(&sessions)
+            crate::sessions::list(&sessions, false)
                 .unwrap()
                 .as_array()
                 .unwrap()
@@ -2021,7 +2838,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("unavailable"));
-        let listed = crate::sessions::list(&sessions).unwrap();
+        let listed = crate::sessions::list(&sessions, false).unwrap();
         let ids: Vec<&str> = listed
             .as_array()
             .unwrap()
@@ -2032,9 +2849,32 @@ mod tests {
     }
 
     /// Build-order step 7 / system-prompt §3.1: the rendered prompt must stay
-    /// under 8 KB even for a large project, because the digest summarizes
-    /// instead of dumping raw project JSON (which used to inline base64 assets
-    /// and blow the context).
+    /// small even for a large project, because the digest summarizes instead
+    /// of dumping raw project JSON (which used to inline base64 assets and
+    /// blow the context).
+    ///
+    /// Budgeted in two halves rather than one total. The static body is the
+    /// shared prompt-cache prefix and moves only when someone edits the
+    /// instructions; the per-session tail is the half a runaway digest would
+    /// blow up. A single blended number could not say which half had grown,
+    /// and left the tail with whatever slack the instructions happened not to
+    /// use — which was, at one point, 2 bytes.
+    /// A registered editor tool, so capability-gated prompt sections render.
+    /// Editor tools reach core over `tool_register` at runtime, which is
+    /// exactly why the sections that name them cannot be unconditional.
+    fn with_editor() -> HashMap<String, crate::tools::ToolDef> {
+        HashMap::from([(
+            "editor_scene_inspect".to_string(),
+            crate::tools::ToolDef {
+                name: "editor_scene_inspect".into(),
+                description: "inspect".into(),
+                parameters: json!({"type":"object"}),
+                kind: crate::tools::ToolKind::Browser,
+                access: crate::tools::Access::Guarded,
+            },
+        )])
+    }
+
     #[test]
     fn default_system_prompt_stays_small_and_never_dumps_project_json() {
         let projects = tempfile::tempdir().unwrap();
@@ -2056,17 +2896,38 @@ mod tests {
         store::write_project(projects.path(), "big", &project).unwrap();
 
         let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
-        let prompt = default_system_prompt(&state, "big", &[], &HashMap::new());
+        // With an editor attached, the editor workflow is described.
+        let prompt = default_system_prompt(&state, "big", &[], &with_editor());
         assert!(prompt.contains("editor_persist_capture(path)"));
         assert!(prompt.contains("editor_camera_frame"));
+        // Without one it is not, because none of those tools exist. A subagent
+        // or graph node told to "run editor_run_pie" spends turns discovering
+        // it cannot.
+        let headless = default_system_prompt(&state, "big", &[], &HashMap::new());
+        assert!(!headless.contains("editor_persist_capture"), "{headless}");
+        assert!(!headless.contains("editor_run_pie"), "{headless}");
         assert!(prompt.contains("gameplay foreground entity ids"));
         assert!(prompt.contains("editor_console_history"));
         assert!(prompt.contains("Never copy screenshot data URLs"));
 
         assert!(
-            prompt.len() <= 8 * 1024,
-            "prompt is {} bytes, budget is 8192",
-            prompt.len()
+            STATIC_SYSTEM_PROMPT.len() <= 8 * 1024,
+            "static body is {} bytes, budget is 8192",
+            STATIC_SYSTEM_PROMPT.len()
+        );
+        // The gated editor section is instructions too, so it gets its own
+        // budget rather than being charged to the per-session tail below —
+        // otherwise attaching an editor would look like a runaway digest.
+        assert!(
+            EDITOR_TOOLING_PROMPT.len() <= 2 * 1024,
+            "editor section is {} bytes, budget is 2048",
+            EDITOR_TOOLING_PROMPT.len()
+        );
+        let instructions = STATIC_SYSTEM_PROMPT.len() + EDITOR_TOOLING_PROMPT.len();
+        let session_tail = prompt.len() - instructions;
+        assert!(
+            session_tail <= 2 * 1024,
+            "per-session block is {session_tail} bytes, budget is 2048"
         );
         assert!(
             !prompt.contains("RAWBASE64PAYLOAD"),
@@ -2092,7 +2953,9 @@ mod tests {
         store::create_project(projects.path(), "demo", "Demo").unwrap();
         let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
 
-        let prompt = default_system_prompt(&state, "demo", &[], &HashMap::new());
+        // These contracts govern the editor's script/test runtime, so they
+        // ride with the editor section rather than the invariant base.
+        let prompt = default_system_prompt(&state, "demo", &[], &with_editor());
         for contract in [
             "only owner `entity` is writable",
             "`state.find(nameOrId)`",
@@ -2512,5 +3375,401 @@ mod tests {
         let parsed: Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(parsed["id"], "ok-1");
         assert_eq!(parsed["result"]["pong"], true);
+    }
+
+    // ----------------------------------------------------------------------
+    // Restore points
+    //
+    // Against a real repository throughout. The whole feature is a claim about
+    // what `git stash create` and `git restore` do to a working tree, and a
+    // mock of git would only assert that the claim was restated.
+    // ----------------------------------------------------------------------
+
+    fn git_ok(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+    }
+
+    fn git_out(repo: &std::path::Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?} failed: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Ids are minted from the wall clock, so two taken in the same
+    /// millisecond only differ by a collision suffix. Ordering assertions are
+    /// about time, not about the suffix rule.
+    async fn tick() {
+        tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+    }
+
+    /// The point of a git-backed restore point: taking one during a run is
+    /// invisible. Nothing the user or the next tool call can see may move —
+    /// not the working tree, not the index, not HEAD.
+    #[tokio::test]
+    async fn checkpoint_create_leaves_the_working_tree_index_and_head_untouched() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects, sessions.path().to_path_buf());
+
+        std::fs::write(repo.join("README.md"), "edited mid-run").unwrap();
+        std::fs::write(repo.join("staged.txt"), "staged").unwrap();
+        git_ok(&repo, &["add", "staged.txt"]);
+        std::fs::write(repo.join("loose.txt"), "untracked").unwrap();
+
+        let status_before = git_out(&repo, &["status", "--porcelain"]);
+        let head_before = git_out(&repo, &["rev-parse", "HEAD"]);
+        let branch_before = git_out(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]);
+
+        let created = dispatch(&state, "checkpoint_create", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+
+        assert_eq!(created["kind"], "git");
+        assert!(created["id"].as_str().unwrap().starts_with("git-"));
+        assert_eq!(created["sha"].as_str().unwrap().len(), 40);
+        assert!(created["createdAtMs"].as_i64().unwrap() > 0);
+
+        assert_eq!(git_out(&repo, &["status", "--porcelain"]), status_before);
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            git_out(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            branch_before
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "edited mid-run"
+        );
+
+        // The commit has to survive a gc, or a three-day run loses the only
+        // object that could undo it.
+        let sha = created["sha"].as_str().unwrap();
+        let id = created["id"].as_str().unwrap();
+        assert_eq!(
+            git_out(
+                &repo,
+                &["rev-parse", &format!("refs/calicode/checkpoints/{id}")]
+            ),
+            sha
+        );
+    }
+
+    /// The case the whole feature exists for: the agent rewrote a source file
+    /// and then deleted it.
+    #[tokio::test]
+    async fn checkpoint_restore_brings_back_a_modified_then_deleted_file() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects, sessions.path().to_path_buf());
+
+        std::fs::write(repo.join("README.md"), "the version worth keeping").unwrap();
+        let created = dispatch(&state, "checkpoint_create", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join("README.md"), "ruined").unwrap();
+        std::fs::remove_file(repo.join("README.md")).unwrap();
+
+        let restored = dispatch(
+            &state,
+            "checkpoint_restore",
+            json!({ "slug": "demo", "id": created["id"] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(restored["restored"], true);
+        assert_eq!(restored["kind"], "git");
+        assert_eq!(restored["sha"], created["sha"]);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "the version worth keeping"
+        );
+        assert!(!restored["replaced"].as_array().unwrap().is_empty());
+    }
+
+    /// A restore rewinds the working tree and nothing else. The user's branch
+    /// and every commit made during the run stay exactly where they were —
+    /// otherwise the rescue costs more than the accident.
+    #[tokio::test]
+    async fn checkpoint_restore_does_not_move_head_or_change_the_branch() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects, sessions.path().to_path_buf());
+
+        git_ok(&repo, &["checkout", "-b", "loop-work"]);
+        std::fs::write(repo.join("README.md"), "before the loop").unwrap();
+        let created = dispatch(&state, "checkpoint_create", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+
+        std::fs::write(repo.join("later.txt"), "added during the run").unwrap();
+        git_ok(&repo, &["add", "later.txt"]);
+        git_ok(&repo, &["commit", "-m", "work done during the loop"]);
+        let head_before = git_out(&repo, &["rev-parse", "HEAD"]);
+
+        dispatch(
+            &state,
+            "checkpoint_restore",
+            json!({ "slug": "demo", "id": created["id"] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(git_out(&repo, &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(
+            git_out(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "loop-work"
+        );
+        // The commit is still reachable, so nothing was actually lost.
+        assert!(git_out(&repo, &["log", "-1", "--format=%s"]).contains("during the loop"));
+        // …and the file it added is out of the way in the working tree.
+        assert!(!repo.join("later.txt").exists());
+    }
+
+    /// `git stash create` prints nothing for a clean tree. The restore point
+    /// still has to exist and still has to work — the first iteration of a
+    /// loop almost always starts clean.
+    #[tokio::test]
+    async fn a_clean_tree_still_produces_a_usable_restore_point() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects, sessions.path().to_path_buf());
+
+        assert_eq!(git_out(&repo, &["status", "--porcelain"]), "");
+        let created = dispatch(&state, "checkpoint_create", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        assert_eq!(created["kind"], "git");
+        assert_eq!(created["sha"], git_out(&repo, &["rev-parse", "HEAD"]));
+
+        std::fs::write(repo.join("README.md"), "trashed").unwrap();
+        dispatch(
+            &state,
+            "checkpoint_restore",
+            json!({ "slug": "demo", "id": created["id"] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(repo.join("README.md")).unwrap(),
+            "demo"
+        );
+    }
+
+    /// Nothing enumerated restore points before this method, which is why the
+    /// client had to keep its own registry of the ids it had seen.
+    #[tokio::test]
+    async fn checkpoint_list_returns_git_and_project_entries_newest_first() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects, sessions.path().to_path_buf());
+
+        std::fs::write(repo.join("README.md"), "first").unwrap();
+        let first = dispatch(&state, "checkpoint_create", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        tick().await;
+        let copy = dispatch(&state, "project_checkpoint", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        tick().await;
+        std::fs::write(repo.join("README.md"), "second").unwrap();
+        let second = dispatch(&state, "checkpoint_create", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+
+        let listed = dispatch(&state, "checkpoint_list", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        let entries = listed["checkpoints"].as_array().unwrap();
+        assert_eq!(entries.len(), 3);
+
+        let ids: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                second["id"].as_str().unwrap(),
+                copy["id"].as_str().unwrap(),
+                first["id"].as_str().unwrap(),
+            ]
+        );
+        let kinds: Vec<&str> = entries
+            .iter()
+            .map(|entry| entry["kind"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["git", "project", "git"]);
+        assert_eq!(entries[0]["sha"], second["sha"]);
+        assert!(entries[0]["subject"].as_str().unwrap().contains("WIP on"));
+        assert!(entries[1].get("sha").is_none());
+    }
+
+    /// Unbounded, a three-day run at one restore point every fifteen minutes
+    /// leaves ~288 copies of the project directory behind.
+    #[tokio::test]
+    async fn checkpoint_prune_keeps_exactly_the_newest_requested() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects.clone(), sessions.path().to_path_buf());
+
+        let mut ids = Vec::new();
+        for round in 0..3 {
+            std::fs::write(repo.join("README.md"), format!("round {round}")).unwrap();
+            let created = dispatch(&state, "checkpoint_create", json!({ "slug": "demo" }))
+                .await
+                .unwrap();
+            ids.push(created["id"].as_str().unwrap().to_string());
+            tick().await;
+        }
+        let copy = dispatch(&state, "project_checkpoint", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        let newest = copy["id"].as_str().unwrap().to_string();
+
+        let pruned = dispatch(
+            &state,
+            "checkpoint_prune",
+            json!({ "slug": "demo", "keep": 2 }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(pruned["removed"], json!(2));
+        assert_eq!(pruned["kept"], json!(2));
+
+        let listed = dispatch(&state, "checkpoint_list", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        let remaining: Vec<&str> = listed["checkpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(remaining, [newest.as_str(), ids[2].as_str()]);
+
+        // Pruned entries are gone from disk, not merely hidden from the list.
+        assert!(!projects
+            .join("demo")
+            .join("checkpoints")
+            .join(&ids[0])
+            .exists());
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(["show-ref", "--verify", "--quiet"])
+            .arg(format!("refs/calicode/checkpoints/{}", ids[0]))
+            .status()
+            .unwrap()
+            .success()
+            .eq(&false));
+
+        assert!(dispatch(
+            &state,
+            "checkpoint_prune",
+            json!({ "slug": "demo", "keep": 0 })
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("at least 1"));
+    }
+
+    /// A game with no folder attached keeps the old mechanism, and the single
+    /// entry point picks it without the client having to ask.
+    #[tokio::test]
+    async fn a_game_without_a_workspace_falls_back_to_the_project_copy() {
+        let projects = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        store::create_project(projects.path(), "solo", "Solo").unwrap();
+        let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
+
+        let created = dispatch(&state, "checkpoint_create", json!({ "slug": "solo" }))
+            .await
+            .unwrap();
+        assert_eq!(created["kind"], "project");
+        assert!(created["id"].as_str().unwrap().starts_with("cp-"));
+        assert!(created["createdAtMs"].as_i64().unwrap() > 0);
+        assert!(created["notCovered"].as_array().unwrap().is_empty());
+
+        store::rename_project(projects.path(), "solo", "Renamed mid-run").unwrap();
+        let restored = dispatch(
+            &state,
+            "checkpoint_restore",
+            json!({ "slug": "solo", "id": created["id"] }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(restored["kind"], "project");
+        assert_eq!(restored["project"]["title"], "Solo");
+        assert_eq!(
+            store::read_project(projects.path(), "solo").unwrap()["title"],
+            "Solo"
+        );
+    }
+
+    /// `git stash create` never captured untracked files, and a restore that
+    /// silently half-covers the tree is worse than one that says so.
+    #[tokio::test]
+    async fn untracked_files_and_the_project_document_are_reported_as_not_covered() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let (projects, repo) = git_fixture(home.path());
+        let state = test_state(projects, sessions.path().to_path_buf());
+
+        std::fs::write(repo.join("generated.png"), "not committed").unwrap();
+        let created = dispatch(&state, "checkpoint_create", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        let notes = created["notCovered"].as_array().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("1 untracked file(s)")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("project document for demo")),
+            "{notes:?}"
+        );
+
+        let restored = dispatch(
+            &state,
+            "checkpoint_restore",
+            json!({ "slug": "demo", "id": created["id"] }),
+        )
+        .await
+        .unwrap();
+        let notes = restored["notCovered"].as_array().unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.as_str().unwrap().contains("1 untracked file(s)")),
+            "{notes:?}"
+        );
+        // Reported as not covered because it genuinely is: still there.
+        assert!(repo.join("generated.png").exists());
     }
 }

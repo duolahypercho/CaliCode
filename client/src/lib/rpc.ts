@@ -142,7 +142,16 @@ export type AgentEvent = {
   projectSlug?: string;
   workspaceRoot?: string;
   delta?: string;
+  /**
+   * `advisor.delta` / `advisor.tool` only: the client-minted id for one
+   * side-chat answer. The advisor has no session, so its stream is addressed
+   * by this and nothing else — a panel keeps only the events for the question
+   * it just asked.
+   */
+  streamId?: string;
   tool?: string;
+  /** `advisor.tool` only: the path or pattern the read is aimed at. */
+  detail?: string | null;
   /** Stable provider tool-call id used to pair start/finish events. */
   toolCallId?: string;
   /** Client-owned Enter-level group, when a producer already has one. */
@@ -180,6 +189,14 @@ export type AgentEvent = {
   outcome?: string;
   /** `agent.approval_request` only: the descendant session actually asking. */
   subagentSessionId?: string;
+  /** `terminal.*` events only. */
+  runId?: string;
+  /** `terminal.data` only: raw PTY bytes, ANSI escapes included. */
+  data?: string;
+  stream?: "stdout" | "stderr";
+  chunk?: string;
+  code?: number | null;
+  signal?: string | null;
   /** `agent.usage` events only. */
   usage?: UsageTotals;
   /** `agent.compacted` events only (mirrors the session_compact result). */
@@ -188,6 +205,12 @@ export type AgentEvent = {
   prunedToolResults?: number;
   estimatedTokensBefore?: number;
   estimatedTokensAfter?: number;
+  /** Who asked: `manual` is /compact, `auto` is core crossing its threshold. */
+  trigger?: "manual" | "auto";
+  /** `prune` skipped the summary call; `summarize` made one. */
+  strategy?: "prune" | "summarize";
+  /** The session's standing `/compact` instructions, if it has any. */
+  instructions?: string | null;
 };
 
 /**

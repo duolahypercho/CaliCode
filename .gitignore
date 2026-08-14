@@ -29,3 +29,12 @@ client/sessions/
 
 # playwright scratch worktrees (embedded git repos)
 client/worktrees/
+
+# Throwaway verification scripts and their screenshots. CLAUDE.md has agents
+# write these inside client/ (module resolution needs client/node_modules) and
+# delete them afterwards; ignoring them means a forgotten one is never
+# committed by accident.
+client/.shoot*
+client/.drive*
+client/.probe*
+client/*.tmp.mjs

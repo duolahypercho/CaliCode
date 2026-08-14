@@ -57,6 +57,37 @@ pub(crate) fn game_file_base(
     }
 }
 
+/// Directories a tool may read but must never write into.
+///
+/// `.git` is the one that matters. An unattended `/loop` can legitimately
+/// rewrite every source file in a game — that is the job — and the way back
+/// from a bad run is the repository history. A tool that can corrupt `.git`
+/// takes the undo with it, so the recovery path is protected even though the
+/// working tree is not. `.wt` holds worktree metadata for the same reason.
+///
+/// This is a write guard, not a search filter: `SEARCH_SKIP_DIRS` above keeps
+/// these out of listings for noise and speed, which stops nothing.
+const PROTECTED_WRITE_DIRS: &[&str] = &[".git", ".wt"];
+
+/// Refuse a write that lands inside a protected directory.
+///
+/// Checked on the *resolved* path rather than the caller's string, so a
+/// symlink or an odd spelling cannot walk in sideways.
+pub(crate) fn reject_protected_write(base: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(base).unwrap_or(path);
+    for component in relative.components() {
+        if let std::path::Component::Normal(name) = component {
+            let name = name.to_string_lossy();
+            if PROTECTED_WRITE_DIRS.iter().any(|guarded| name == *guarded) {
+                anyhow::bail!(
+                    "refusing to write inside {name}: it is the repository's history, which is how a bad run is undone"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn resolve_in_base(base: &GameFileBase, rel: &str) -> Result<PathBuf> {
     if base.is_workspace {
         crate::workspace::safe_resolve(&base.base, rel)
@@ -306,7 +337,9 @@ fn search_skipped_dir(name: &str, rel: &str) -> bool {
         .any(|skip| name == *skip || rel == *skip || rel.starts_with(&format!("{skip}/")))
 }
 
-fn search_secret_path(rel: &str) -> bool {
+/// Paths that look like credentials. Also consulted by the advisor, which
+/// refuses to open one even when asked for it by name.
+pub(crate) fn search_secret_path(rel: &str) -> bool {
     let lower = rel.to_ascii_lowercase();
     SEARCH_SECRET_PATTERNS
         .iter()
@@ -430,38 +463,79 @@ async fn apply_file_edit_request(
     }
     let base = game_file_base(root, slug, workspace_override)?;
     let (path, _) = resolve_existing(&base, rel)?;
+    reject_protected_write(&base.base, &path)?;
     let _write_lock = crate::pathlock::write_lock(&path).await;
     // `resolve_existing` already proved the file is there, so a failure here
     // is about its contents. Reporting it as "not found" would send the model
     // off to re-list a directory it has already seen.
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {rel} as UTF-8 text; it may be binary"))?;
-    let count = text.matches(old).count();
-    if count == 0 {
+    // Reading here counts as having seen it: an edit proves current knowledge
+    // of the file, so a later `file_write` should not be refused for it.
+    crate::staleness::remember(&path);
+    // Exact first, then layout-tolerant fallbacks. The fallbacks never accept
+    // text that is not in the file — see `crate::edit_match` — so the refusals
+    // below still mean what they always did.
+    let Some(found) = crate::edit_match::find(&text, old) else {
         anyhow::bail!(
             "old_string not found in {rel}; read the file and pass the exact current text"
         );
-    }
+    };
+    let count = found.spans.len();
     if count > 1 && !replace_all {
         anyhow::bail!(
             "old_string matches {count} times in {rel}; add surrounding context to make it \
              unique, or set replace_all to true"
         );
     }
-    let updated = if replace_all {
-        text.replace(old, new)
-    } else {
-        text.replacen(old, new, 1)
+    let matched_by = found.strategy;
+    let updated = {
+        // Spliced by byte span rather than by `str::replace`, because a
+        // fallback match is not literally equal to `old_string` — replacing by
+        // value would find nothing.
+        let mut spans = found.spans.clone();
+        spans.sort_by_key(|(from, _)| *from);
+        if !replace_all {
+            spans.truncate(1);
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut cursor = 0usize;
+        for (from, to) in &spans {
+            out.push_str(&text[cursor..*from]);
+            out.push_str(new);
+            cursor = *to;
+        }
+        out.push_str(&text[cursor..]);
+        out
     };
     if updated.len() > EDIT_MAX_WRITE_BYTES {
         anyhow::bail!("refusing to write more than {EDIT_MAX_WRITE_BYTES} bytes");
     }
     std::fs::write(&path, &updated)?;
-    let result = json!({
+    crate::staleness::remember(&path);
+    // See `file_write`: the cheapest moment to learn an edit broke the file is
+    // the result of that edit.
+    let mut result = json!({
         "path": rel,
         "replacements": if replace_all { count } else { 1 },
         "written": true
     });
+    if matched_by != crate::edit_match::Strategy::Exact {
+        // Said out loud rather than silently accepted: the model's picture of
+        // the file differs from the file, and the next edit it writes from the
+        // same memory will differ too.
+        result["matchedBy"] = json!(matched_by.label());
+        result["note"] = json!(format!(
+            "old_string did not match the file exactly — it was located {}. The file's own              formatting is unchanged; re-read {rel} before your next edit to it.",
+            matched_by.label()
+        ));
+    }
+    let result = crate::diagnostics::attach(
+        result,
+        &path,
+        &updated,
+        base.is_workspace.then_some(base.base.as_path()),
+    );
     if capture_activity {
         let mut activity = activity_metadata("edit", rel, Some(activity_text(&text)), &updated);
         // A preview of the beginning of a large file may be byte-for-byte
@@ -572,6 +646,37 @@ pub struct ToolDef {
     pub parameters: Value,
     #[serde(skip)]
     pub kind: ToolKind,
+    /// Whether this tool needs the user's yes in the ordinary permission
+    /// modes. Required on every literal, which is the point: a new core tool
+    /// cannot be added without someone deciding, and a reviewer cannot miss
+    /// the decision because it is not there to miss.
+    ///
+    /// `#[serde(default)]` covers browser tools, which arrive over
+    /// `tool_register` from the client and therefore have no literal to
+    /// enforce. Those are classified by name instead, so the default here is
+    /// never the thing that decides — and it fails closed regardless.
+    #[serde(default)]
+    pub access: Access,
+}
+
+/// The approval classification of a tool.
+///
+/// Named for what it governs rather than for what the tool does to the disk:
+/// several `ReadOnly` tools do write (`project_checkpoint`,
+/// `test_baseline_save`, `asset_import_file`), and they are deliberately not
+/// gated because what they write is additive and recoverable. The question
+/// this answers is only ever "must the user say yes first".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Access {
+    /// Runs without a prompt in `auto`: reads, searches, and writes the user
+    /// would not mind discovering.
+    ReadOnly,
+    /// Asks first in every mode short of full access — it writes over the
+    /// user's work, spends money, or starts something that outlives the turn.
+    ///
+    /// The default, so anything that arrives unclassified fails closed.
+    #[default]
+    Guarded,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -584,6 +689,26 @@ pub enum ToolKind {
     Mcp,
 }
 
+/// The approval classification of a core tool, or `None` when the name is not
+/// a core tool at all.
+///
+/// Built once: `core_tool_defs()` allocates ~54 definitions with their JSON
+/// schemas, and this is consulted on the approval path of every tool call.
+pub fn core_tool_access(name: &str) -> Option<Access> {
+    use std::collections::HashMap;
+    use std::sync::OnceLock;
+    static INDEX: OnceLock<HashMap<String, Access>> = OnceLock::new();
+    INDEX
+        .get_or_init(|| {
+            core_tool_defs()
+                .into_iter()
+                .map(|def| (def.name, def.access))
+                .collect()
+        })
+        .get(name)
+        .copied()
+}
+
 pub fn core_tool_defs() -> Vec<ToolDef> {
     vec![
         ToolDef {
@@ -591,24 +716,28 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             description: "List saved CaliCode projects.".into(),
             parameters: json!({"type":"object","properties":{}}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "project_open".into(),
             description: "Open a project by slug and return its full JSON state.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "project_checkpoint".into(),
             description: "Snapshot a project before a risky edit so it can be reverted.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "project_revert".into(),
             description: "Revert a project to a previous checkpoint.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"checkpointId":{"type":"string"}},"required":["slug","checkpointId"]}),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "file_read".into(),
@@ -624,18 +753,36 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["slug","path"]
             }),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "file_write".into(),
             description: "Write UTF-8 text into the active game's folder (scripts, tests, docs).".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["slug","path","content"]}),
             kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
+            name: "tool_output_read".into(),
+            description: "Read the rest of a tool result that was too large to return inline. Use the outputId from that result's notice. Pages by byte offset: pass each nextOffset back as offset until it is null.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "outputId":{"type":"string","description":"the outputId from the truncated tool result"},
+                    "offset":{"type":"integer","minimum":0,"description":"byte offset to start from; defaults to 0"},
+                    "limit":{"type":"integer","minimum":1,"maximum":49152,"description":"how many bytes to return; defaults to 32768"}
+                },
+                "required":["outputId"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "file_list".into(),
             description: "List files and folders in the active game's folder. Omit path for the root. Use this to explore before reading.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"path":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "file_edit".into(),
@@ -652,6 +799,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["slug","path","old_string","new_string"]
             }),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "file_grep".into(),
@@ -667,6 +815,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["slug","pattern"]
             }),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "file_glob".into(),
@@ -680,72 +829,84 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["slug","pattern"]
             }),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "asset_import_file".into(),
             description: "Import a file into the asset library as base64 data.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"data":{"type":"string"},"mime":{"type":"string"},"tags":{"type":"array","items":{"type":"string"}}},"required":["slug","name","data","mime"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "asset_hash_dedupe".into(),
             description: "Find duplicate asset files by SHA-256.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "asset_usage".into(),
             description: "Count entity references per asset.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "asset_export_gltf".into(),
             description: "Export an asset entry to a minimal glTF 2.0 file.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"assetId":{"type":"string"}},"required":["slug","assetId"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "blender_asset_export".into(),
             description: "Run Blender headlessly to rebuild a .blend-backed asset's GLB, waiting for the export to finish. Returns the written byte count.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"assetId":{"type":"string"}},"required":["slug","assetId"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "test_baseline_save".into(),
             description: "Save a screenshot baseline for a named test.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"image":{"type":"string"}},"required":["slug","name","image"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "test_baseline_compare".into(),
             description: "Compare a screenshot to a saved baseline with perceptual hashing.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"image":{"type":"string"},"threshold":{"type":"number"}},"required":["slug","name","image"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "image3d_ingest".into(),
             description: "Admit a reference image into the Rust image-to-3D pipeline.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"name":{"type":"string"},"image":{"type":"string"}},"required":["slug","name","image"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "image3d_validate".into(),
             description: "Strictly validate an image3d spec before generation.".into(),
             parameters: json!({"type":"object","properties":{"spec":{"type":"object"}},"required":["spec"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "model_list".into(),
             description: "List configured model providers and the active model.".into(),
             parameters: json!({"type":"object","properties":{}}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "model_switch".into(),
             description: "Switch the active provider and model.".into(),
             parameters: json!({"type":"object","properties":{"provider":{"type":"string"},"model":{"type":"string"}},"required":["provider","model"]}),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "subagent_spawn".into(),
@@ -761,18 +922,21 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["role","instructions"]
             }),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "skill_list".into(),
             description: "List available skills (name, description, scope) for this project.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string","description":"project slug"}}}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "skill_load".into(),
-            description: "Load the full instructions of a skill by name. Use when a listed skill is relevant to the current task.".into(),
-            parameters: json!({"type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string"}},"required":["name"]}),
+            description: "Load the full instructions of a skill by name. Use when a listed skill is relevant to the current task. A packaged skill also reports its support files under `files`; pass one of those paths as `file` to read it.".into(),
+            parameters: json!({"type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string"},"file":{"type":"string","description":"support file to read instead of the instructions, relative to the skill's own directory (e.g. references/game-feel.md)"}},"required":["name"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "asset_search".into(),
@@ -792,6 +956,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required": ["query"]
             }),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "asset_pick".into(),
@@ -808,6 +973,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required": ["slug", "source", "id"]
             }),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "image3d_mesh".into(),
@@ -827,6 +993,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required": ["slug", "name"]
             }),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "image3d_review".into(),
@@ -842,6 +1009,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required": ["slug", "assetId", "image", "passId"]
             }),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "graph_plan".into(),
@@ -885,36 +1053,42 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "additionalProperties": false
             }),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "graph_run".into(),
             description: "Execute a planned graph to completion: each ready node runs as a subagent, a monitor checks it against its acceptance criteria, judge nodes score 0-100 vs their AAA reference and re-queue builders with a punch list until the threshold is met. Streams graph.updated events; returns the final rollup. Long-running.".into(),
             parameters: json!({"type":"object","properties":{"graphId":{"type":"string"}},"required":["graphId"]}),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "graph_status".into(),
             description: "Read a graph's current state (nodes, statuses, scores, punch lists).".into(),
             parameters: json!({"type":"object","properties":{"graphId":{"type":"string"}},"required":["graphId"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "graph_list".into(),
             description: "List saved graphs, optionally filtered by project slug.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}}}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "graph_cancel".into(),
             description: "Cancel a running graph after the current node finishes.".into(),
             parameters: json!({"type":"object","properties":{"graphId":{"type":"string"}},"required":["graphId"]}),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "template_list".into(),
             description: "List goal templates (id, name, description) usable with graph_plan.".into(),
             parameters: json!({"type":"object","properties":{}}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "video_contact_sheet".into(),
@@ -945,6 +1119,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required": ["slug", "label", "frames"]
             }),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "loop_report_start".into(),
@@ -961,6 +1136,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["slug","loopId","objective"]
             }),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "loop_report_iteration".into(),
@@ -1020,6 +1196,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["slug","loopId","iteration"]
             }),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "loop_report_update".into(),
@@ -1041,18 +1218,21 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["slug","loopId","update"]
             }),
             kind: ToolKind::Core,
+            access: Access::Guarded,
         },
         ToolDef {
             name: "loop_report_list".into(),
             description: "List durable /loop reports for a project, newest first, without loading every iteration.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"}},"required":["slug"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "loop_report_open".into(),
             description: "Read a durable /loop report and return its data plus project-relative JSON, Markdown, and HTML paths.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"loopId":{"type":"string"}},"required":["slug","loopId"]}),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "capture_persist".into(),
@@ -1067,6 +1247,163 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                 "required":["slug","path","dataUrl"]
             }),
             kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        // The browser. Note this is a real Chrome driven over the devtools
+        // protocol (`browser.rs`), not the `editor_*` family that older
+        // comments in this repo also call "browser tools".
+        //
+        // Descriptions carry the workflow, not just the arguments: a model
+        // that has not been told to snapshot before clicking will guess a ref,
+        // and a guessed ref is a click on whatever happens to be first.
+        ToolDef {
+            name: "browser_navigate".into(),
+            description: "Open a URL in the agent's browser (a real Chrome, shared with the BROWSER tab the user is watching). Starts the browser on first use. Returns the settled URL and page title. Follow it with browser_snapshot to see what is on the page — this returns no page content by itself.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{"url":{"type":"string","description":"full https:// address; a bare host like example.com is accepted"}},
+                "required":["url"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_search".into(),
+            description: "Search the web and get back a list of results as titles and URLs. This is the way to find something online — prefer it over navigating to a search engine yourself, which costs three calls and lands on a bot wall at google.com. Follow up with browser_navigate on the URL you want.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "query":{"type":"string"},
+                    "limit":{"type":"integer","description":"how many results, 1-20 (default 8)"}
+                },
+                "required":["query"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_snapshot".into(),
+            description: "Read the current page as a short list of interactive elements, each tagged with a ref like [ref=e7]. This is the primary way to see a page — call it after every navigation or click, because refs are invalidated by both. Pass full=true to also include the page's visible text. Refs are the argument browser_click and browser_type expect.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "full":{"type":"boolean","description":"also include page text (default false: interactive elements only)"},
+                    "limit":{"type":"integer","description":"character ceiling, 500-12000 (default 12000)"}
+                }
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_click".into(),
+            description: "Click something. Either pass `ref` (the number from a [ref=eN] tag in the last browser_snapshot — pass 7 for e7) or an x/y viewport coordinate. Use coordinates only for a <canvas>, which has no refs at all: that is how you interact with a running CaliCode game. Take a fresh snapshot afterwards.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "ref":{"type":"integer","description":"the N from [ref=eN] in the last snapshot"},
+                    "x":{"type":"number","description":"viewport x, for canvas clicks"},
+                    "y":{"type":"number","description":"viewport y, for canvas clicks"},
+                    "clicks":{"type":"integer","description":"1 for a click, 2 for a double-click (default 1)"}
+                }
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_type".into(),
+            description: "Type text into the page. Pass `ref` to focus a field first (the usual case), and submit=true to press Enter afterwards — that is how you run a search in one call.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "text":{"type":"string"},
+                    "ref":{"type":"integer","description":"field to focus first, from the last snapshot"},
+                    "submit":{"type":"boolean","description":"press Enter after typing"}
+                },
+                "required":["text"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_key".into(),
+            description: "Press a key, optionally holding it down. Key names: a single character, or Enter, Tab, Escape, Space, ArrowUp/ArrowDown/ArrowLeft/ArrowRight, PageUp, PageDown, Home, End, Backspace, Delete. holdMs is what makes this different from typing: to drive a game, hold W for 1500ms rather than pressing it once.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "key":{"type":"string"},
+                    "holdMs":{"type":"integer","description":"how long to hold the key down, up to 10000"},
+                    "repeat":{"type":"integer","description":"press this many times (default 1)"}
+                },
+                "required":["key"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_scroll".into(),
+            description: "Scroll the page. Positive dy scrolls down. Elements below the fold are absent from a snapshot, so scroll and re-snapshot when what you want is not listed.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{"dy":{"type":"number","description":"vertical pixels (default 600)"},"dx":{"type":"number"}}
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_look".into(),
+            description: "Look at the page with a vision model and get a written answer. Use this when the answer is visual and therefore absent from a snapshot: what a 3D model preview actually looks like, whether a game rendered correctly, which of several thumbnails matches a reference. Ask a specific question.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "question":{"type":"string","description":"what you want to know about what is on screen"},
+                    "fullPage":{"type":"boolean","description":"capture past the fold (default false)"}
+                }
+            }),
+            kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
+            name: "browser_screenshot".into(),
+            description: "Save the current page as a JPEG inside the game's folder and return its project-relative path. Use it to keep evidence — a reference image to reconstruct, a before/after of a game view. The image bytes never pass through this conversation; only the path comes back.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "slug":{"type":"string"},
+                    "path":{"type":"string","description":"project-relative target ending in .jpg or .png"},
+                    "fullPage":{"type":"boolean"}
+                },
+                "required":["slug","path"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
+            name: "browser_console".into(),
+            description: "Read console output and uncaught exceptions from the page since the last read. This is how you find out why a game you built renders black: the error is in here, not in the snapshot.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{"clear":{"type":"boolean","description":"drain the buffer (default true)"}}
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_eval".into(),
+            description: "Run a JavaScript expression in the page and return its value. The escape hatch for what the other tools cannot express — reading a value out of a running game, querying an element the snapshot missed. Return JSON-serialisable values; use JSON.stringify for anything structured.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{"expression":{"type":"string"}},
+                "required":["expression"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_close".into(),
+            description: "Shut the browser down and free its memory. Optional — the browser is reused across calls and closing it discards nothing but the current page.".into(),
+            parameters: json!({"type":"object","properties":{}}),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
         },
     ]
 }
@@ -1136,6 +1473,11 @@ pub(crate) async fn execute_core_tool_with_activity(
                 crate::fileread::arg_count(args, "limit", crate::fileread::DEFAULT_LINE_LIMIT)?;
             let base = game_file_base(root, slug, workspace_override)?;
             let (path, repair) = resolve_existing(&base, rel)?;
+            // Baseline for the staleness guard on `file_write`. Recorded from
+            // the file on disk rather than from the window returned, so a
+            // paged read still establishes what the file looked like when the
+            // agent looked at it.
+            crate::staleness::remember(&path);
             let mut result = tokio::task::spawn_blocking({
                 let rel = rel.to_string();
                 move || crate::fileread::read_window(&path, &rel, offset, limit)
@@ -1171,6 +1513,7 @@ pub(crate) async fn execute_core_tool_with_activity(
             let rel = crate::fileread::arg_path(args)?;
             let base = game_file_base(root, required_str(args, "slug")?, workspace_override)?;
             let path = resolve_in_base(&base, rel)?;
+            reject_protected_write(&base.base, &path)?;
             let content = required_str(args, "content")?;
             // Parity with file_edit and the workspace path, both of which
             // already refuse this. Without it the agent tool was the one way
@@ -1182,6 +1525,17 @@ pub(crate) async fn execute_core_tool_with_activity(
             // landing in the middle of one: a whole-file write that overlaps
             // an edit's read-modify-write makes one of the two vanish.
             let _write_lock = crate::pathlock::write_lock(&path).await;
+            // A whole-file write replaces everything, so a file that moved
+            // since it was read means somebody's work is about to vanish
+            // without either of us noticing. `file_edit` needs no such guard —
+            // its exact-match requirement is its own proof of a current read.
+            if crate::staleness::changed_since_seen(&path) {
+                anyhow::bail!(
+                    "{rel} changed since you last read it, and file_write replaces the whole \
+                     file. Read it again and write from what is there now, or use file_edit to \
+                     change only the part you mean."
+                );
+            }
             let before = capture_activity
                 .then(|| read_activity_text(&path))
                 .flatten();
@@ -1189,7 +1543,16 @@ pub(crate) async fn execute_core_tool_with_activity(
                 std::fs::create_dir_all(parent)?;
             }
             std::fs::write(&path, content)?;
-            let result = json!({ "path": rel, "written": true, "bytes": content.len() });
+            crate::staleness::remember(&path);
+            // Answered here rather than left for the next PIE run: a file that
+            // no longer parses costs one tool result to learn about now, and a
+            // whole build-and-play round trip to learn about later.
+            let result = crate::diagnostics::attach(
+                json!({ "path": rel, "written": true, "bytes": content.len() }),
+                &path,
+                content,
+                base.is_workspace.then_some(base.base.as_path()),
+            );
             if capture_activity {
                 Ok(with_activity(
                     result,
@@ -1199,6 +1562,17 @@ pub(crate) async fn execute_core_tool_with_activity(
                 Ok(result)
             }
         }
+        // Reads nothing but core's own spill directory, addressed by id rather
+        // than by path — the model never names a filesystem location here, so
+        // this cannot become a way around `file_read`'s confinement.
+        "tool_output_read" => crate::spill::read(
+            &crate::spill::dir_for(&state.sessions_root),
+            required_str(args, "outputId")?,
+            args.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize,
+            args.get("limit")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize),
+        ),
         "file_list" => {
             let slug = required_str(args, "slug")?;
             let rel = args.get("path").and_then(Value::as_str).unwrap_or("");
@@ -1422,13 +1796,27 @@ pub(crate) async fn execute_core_tool_with_activity(
         }
         "skill_load" => {
             let slug = args.get("slug").and_then(Value::as_str);
-            let (info, body) = crate::skills::load_skill(
-                root,
-                slug,
-                required_str(args, "name")?,
-                &config.skills.disabled,
-            )?;
-            Ok(json!({ "name": info.name, "scope": info.scope, "instructions": body }))
+            let name = required_str(args, "name")?;
+            let disabled = &config.skills.disabled;
+            if let Some(file) = args.get("file").and_then(Value::as_str) {
+                let (info, contents) =
+                    crate::skills::load_skill_file(root, slug, name, file, disabled)?;
+                return Ok(json!({
+                    "name": info.name, "scope": info.scope, "file": file, "contents": contents
+                }));
+            }
+            let (info, body) = crate::skills::load_skill(root, slug, name, disabled)?;
+            let support = crate::skills::list_skill_files(&info);
+            let mut out = json!({
+                "name": info.name, "scope": info.scope, "instructions": body
+            });
+            // Only packaged skills carry this; a flat skill would otherwise
+            // advertise an empty list the agent might try to read from.
+            if !support.files.is_empty() {
+                out["files"] = json!(support.files);
+                out["filesTruncated"] = json!(support.truncated);
+            }
+            Ok(out)
         }
         "graph_plan" => crate::graph::plan_tool(state, args).await,
         "graph_run" => crate::graph::run(state, required_str(args, "graphId")?, None).await,
@@ -1520,6 +1908,146 @@ pub(crate) async fn execute_core_tool_with_activity(
                 workspace_override,
             )?;
             Ok(crate::capture_persist::as_json(&persisted))
+        }
+        // Every browser arm reaches the same lazily-launched Chrome. The
+        // launch is inside `ensure`, so the first tool the model happens to
+        // call is the one that pays for it and none of them have to be
+        // ordered after an explicit open.
+        "browser_navigate" => {
+            // Argument first, browser second, here and below: a misspelled
+            // argument should cost an error, not a Chrome launch.
+            let url = required_str(args, "url")?;
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser.navigate(url).await
+        }
+        "browser_search" => {
+            let query = required_str(args, "query")?;
+            let limit = args["limit"].as_u64().unwrap_or(8).clamp(1, 20) as usize;
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser.search(query, limit).await
+        }
+        "browser_snapshot" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let full = args["full"].as_bool().unwrap_or(false);
+            let limit = args["limit"].as_u64().unwrap_or(12_000) as usize;
+            let text = browser.snapshot(!full, limit).await?;
+            Ok(json!({ "snapshot": text }))
+        }
+        "browser_click" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let clicks = args["clicks"].as_u64().unwrap_or(1).clamp(1, 3) as u32;
+            let target = match (args["ref"].as_u64(), args["x"].as_f64(), args["y"].as_f64()) {
+                (Some(reference), _, _) => crate::browser::ClickTarget::Ref(reference as u32),
+                (None, Some(x), Some(y)) => crate::browser::ClickTarget::Point(x, y),
+                // A click with neither would otherwise land at (0,0) — the top
+                // left corner, which on most pages is the site logo, i.e. a
+                // navigation away from wherever the model meant to click.
+                _ => anyhow::bail!(
+                    "browser_click needs either `ref` (from a [ref=eN] tag in the last \
+                     browser_snapshot) or both `x` and `y`"
+                ),
+            };
+            browser.click(target, clicks).await
+        }
+        "browser_type" => {
+            let text = required_str(args, "text")?;
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser
+                .type_text(
+                    args["ref"].as_u64().map(|reference| reference as u32),
+                    text,
+                    args["submit"].as_bool().unwrap_or(false),
+                )
+                .await
+        }
+        "browser_key" => {
+            let key = required_str(args, "key")?;
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser
+                .key(
+                    key,
+                    args["holdMs"].as_u64().unwrap_or(0),
+                    args["repeat"].as_u64().unwrap_or(1).clamp(1, 50) as u32,
+                )
+                .await
+        }
+        "browser_scroll" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser
+                .scroll(
+                    args["dx"].as_f64().unwrap_or(0.0),
+                    args["dy"].as_f64().unwrap_or(600.0),
+                )
+                .await
+        }
+        "browser_look" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let frame = browser
+                .screenshot(args["fullPage"].as_bool().unwrap_or(false))
+                .await?;
+            let question = args["question"]
+                .as_str()
+                .map(str::trim)
+                .filter(|question| !question.is_empty())
+                .unwrap_or("Describe what is on this page and what can be done with it.");
+            // The main loop's tool results are text, so the frame cannot ride
+            // back with them. It goes to a vision model here instead and the
+            // model's words are what the agent reads — the same shape
+            // `image3d_review` uses, and the reason a provider without vision
+            // degrades to a clear refusal rather than a confident guess.
+            let message = json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": format!(
+                        "You are looking at a screenshot of a web page an agent is driving. \
+                         Answer concretely and briefly.\n\nQuestion: {question}"
+                    ) },
+                    { "type": "image_url", "image_url": { "url": crate::browser::data_url(&frame) } }
+                ]
+            });
+            match crate::model::chat(&config, &[message], None, None).await {
+                Ok(result) => Ok(json!({
+                    "answer": result.content,
+                    "model": config.model.default,
+                })),
+                Err(error) => Ok(json!({
+                    "error": format!("vision review unavailable: {error}"),
+                    "hint": "the active model may not accept images; use browser_snapshot instead",
+                })),
+            }
+        }
+        "browser_screenshot" => {
+            let slug = required_str(args, "slug")?;
+            let rel = crate::fileread::arg_path(args)?;
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let frame = browser
+                .screenshot(args["fullPage"].as_bool().unwrap_or(false))
+                .await?;
+            let persisted = crate::capture_persist::persist_capture(
+                root,
+                slug,
+                rel,
+                &crate::browser::data_url(&frame),
+                workspace_override,
+            )?;
+            Ok(crate::capture_persist::as_json(&persisted))
+        }
+        "browser_console" => {
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let lines = browser
+                .console(args["clear"].as_bool().unwrap_or(true))
+                .await;
+            Ok(json!({ "count": lines.len(), "lines": lines }))
+        }
+        "browser_eval" => {
+            let expression = required_str(args, "expression")?;
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let value = browser.eval(expression).await?;
+            Ok(json!({ "value": value }))
+        }
+        "browser_close" => {
+            state.browsers.shutdown().await;
+            Ok(json!({ "closed": true }))
         }
         "loop_report_start" => {
             let slug = required_str(args, "slug")?;
@@ -1686,6 +2214,10 @@ pub struct SpawnParent {
     /// child can never dodge a `deny` by being spawned.
     pub permission_rules: Vec<crate::agent::PermissionRule>,
     pub workspace_root: Option<String>,
+    /// The parent's model context window. A child runs the same model, so it
+    /// must size compaction to the same window rather than falling back to the
+    /// 128k assumption.
+    pub context_length: Option<u32>,
 }
 
 /// Direct spawns — the `subagent_spawn` RPC and graph build/judge nodes —
@@ -1971,6 +2503,10 @@ async fn spawn_subagent_with(
     let options = crate::agent::AgentOptions {
         permission_mode: permission_mode.clone(),
         max_turns,
+        // Inherited like the rest of the parent's turn shape: a subagent runs
+        // the same model, so sizing its compaction to a different window would
+        // make it compact at the wrong point.
+        context_length: parent.as_ref().and_then(|parent| parent.context_length),
         final_response_drain,
         reasoning_effort: parent
             .as_ref()
@@ -2192,6 +2728,7 @@ fn loop_report_result(
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::agent::AgentManager;
     use crate::config::{AppConfig, ModelConfig};
@@ -2202,6 +2739,70 @@ mod tests {
     use std::collections::HashMap;
     use std::convert::Infallible;
     use std::sync::Arc;
+
+    /// Every registered tool must have a dispatch arm.
+    ///
+    /// A tool def with no arm is worse than a missing tool: it is advertised
+    /// to the model in the schema, chosen, and then fails with "unknown core
+    /// tool" at the moment it is needed. This caught `browser_search` reaching
+    /// the agent before its arm existed.
+    #[tokio::test]
+    async fn every_core_tool_def_has_a_dispatch_arm() {
+        let dir = tempfile::tempdir().unwrap();
+        // Point the browser at a binary that does not exist. Every browser
+        // tool then fails at launch in microseconds instead of starting a real
+        // Chrome per tool — the error text is what this test reads anyway.
+        std::env::set_var("CALI_CHROME", dir.path().join("no-such-chrome"));
+        // Belt and braces: if that ever stops taking effect, a launched chrome
+        // must not reach the real profile, where contending for the lock costs
+        // this test the full 25s launch timeout instead of failing fast.
+        std::env::set_var("CALI_BROWSER_PROFILE", dir.path().join("profile"));
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        for def in core_tool_defs() {
+            let outcome = execute_core_tool(&def, &json!({}), &state, dir.path(), None).await;
+            if let Err(error) = outcome {
+                assert!(
+                    !error.to_string().contains("unknown core tool"),
+                    "{} is registered but has no dispatch arm",
+                    def.name
+                );
+            }
+        }
+    }
+
+    /// The browser's surface, as the model sees it.
+    #[test]
+    fn browser_tools_are_registered_with_usable_schemas() {
+        let defs = core_tool_defs();
+        let browser: Vec<&ToolDef> = defs
+            .iter()
+            .filter(|def| def.name.starts_with("browser_"))
+            .collect();
+        assert_eq!(
+            browser.len(),
+            12,
+            "browser surface changed; update the docs in AGENTS.md too"
+        );
+        for def in &browser {
+            assert!(
+                !def.description.is_empty() && def.description.len() > 60,
+                "{} needs a description that says when to use it, not just what it is",
+                def.name
+            );
+            assert_eq!(def.parameters["type"], "object", "{}", def.name);
+            // A model reads the schema, not the source. Required arguments
+            // that are not declared are the single most common reason a tool
+            // is called with an empty object.
+            assert!(def.parameters.get("properties").is_some(), "{}", def.name);
+        }
+        // The two the model reaches for first must not need a slug or any
+        // other project context: research happens before a project exists.
+        for name in ["browser_search", "browser_navigate"] {
+            let def = browser.iter().find(|def| def.name == name).unwrap();
+            let required = def.parameters["required"].as_array().unwrap();
+            assert!(!required.iter().any(|value| value == "slug"), "{name}");
+        }
+    }
 
     async fn final_provider() -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
         Sse::new(futures::stream::iter(vec![
@@ -2248,6 +2849,8 @@ mod tests {
             dev_servers: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::devserver::Servers::new(),
             )),
+            terminals: crate::terminal::Terminals::default(),
+            browsers: crate::browser::Browsers::new(),
             shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
@@ -2345,6 +2948,105 @@ mod tests {
         assert_eq!(result["sessionId"], session_id);
     }
 
+    /// Stands in for the model: asks for one `browser_search`, then reports
+    /// back whatever the tool returned so the test can read what the model
+    /// would have seen.
+    async fn searching_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let tool_result = body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|message| message["role"] == "tool")
+            .and_then(|message| message["content"].as_str())
+            .map(str::to_string);
+        match tool_result {
+            Some(seen) => {
+                let echoed = serde_json::to_string(&seen).unwrap();
+                Sse::new(futures::stream::iter(vec![
+                    Ok(Event::default()
+                        .data(format!(r#"{{"choices":[{{"delta":{{"content":{echoed}}}}}]}}"#))),
+                    Ok(Event::default().data("[DONE]")),
+                ]))
+            }
+            None => Sse::new(futures::stream::iter(vec![
+                Ok(Event::default().data(
+                    r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-search","function":{"name":"browser_search","arguments":"{\"query\":\"low poly spaceship 3d model\",\"limit\":5}"}}]}}]}"#,
+                )),
+                Ok(Event::default()
+                    .data(r#"{"choices":[{"finish_reason":"tool_calls","delta":{}}]}"#)),
+                Ok(Event::default().data("[DONE]")),
+            ])),
+        }
+    }
+
+    /// The agent loop actually driving the browser, end to end.
+    ///
+    /// Everything else about the browser is verified by calling
+    /// `execute_core_tool` directly, which proves the tool works but not that
+    /// an agent turn can reach it: the schema has to survive registration, the
+    /// call has to clear the approval policy, dispatch has to find an arm, and
+    /// the result has to come back into the transcript as something a model
+    /// can read. This covers that whole path with a scripted model, so the
+    /// only thing left unproven is the model's own judgement.
+    ///
+    /// Ignored because it needs Chrome and the network. Run with:
+    /// `cargo test browser_tool -- --ignored`
+    #[tokio::test]
+    #[ignore = "needs a real Chrome and network"]
+    async fn an_agent_turn_can_search_the_web_and_read_the_results() {
+        let app = Router::new().route("/v1/chat/completions", post(searching_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let state = mock_state(addr);
+        let registered: HashMap<String, ToolDef> = core_tool_defs()
+            .into_iter()
+            .filter(|def| def.name == "browser_search")
+            .map(|def| (def.name.clone(), def))
+            .collect();
+        assert_eq!(registered.len(), 1, "browser_search must be registered");
+
+        let result = state
+            .agents
+            .chat(
+                &state,
+                &registered,
+                None,
+                &[json!({ "role": "user", "content": "find me a low poly spaceship model" })],
+                crate::agent::AgentOptions {
+                    // `auto` rather than `full-access`: this must also prove the
+                    // browser is reachable without the user opting out of the
+                    // approval flow entirely.
+                    permission_mode: "auto".into(),
+                    max_turns: 4,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("agent turn should complete");
+
+        assert_eq!(result["status"], "completed");
+        let calls = result["toolCalls"].as_array().unwrap();
+        assert_eq!(calls.len(), 1, "expected one browser_search call");
+        assert_eq!(calls[0]["name"], "browser_search");
+        assert_eq!(calls[0]["status"], "done", "the tool call must not error");
+
+        // The reply is the tool result echoed back, so this is literally what
+        // the model received.
+        let seen = result["reply"].as_str().unwrap();
+        assert!(
+            seen.contains("results"),
+            "model saw no results field: {seen}"
+        );
+        assert!(seen.contains("http"), "model saw no usable urls: {seen}");
+        state.browsers.shutdown().await;
+    }
+
     async fn browser_call_provider(
         axum::Json(body): axum::Json<Value>,
     ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
@@ -2381,6 +3083,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object"}),
                 kind: ToolKind::Browser,
+                access: Access::Guarded,
             },
         );
         let owner = "session-owner";
@@ -2440,6 +3143,7 @@ mod tests {
                 depth: 0,
                 permission_rules: Vec::new(),
                 workspace_root: None,
+                context_length: None,
             },
         )
         .await
@@ -2461,6 +3165,7 @@ mod tests {
                 depth: 1,
                 permission_rules: Vec::new(),
                 workspace_root: None,
+                context_length: None,
             },
         )
         .await
@@ -2492,6 +3197,7 @@ mod tests {
                 depth: 0,
                 permission_rules: Vec::new(),
                 workspace_root: None,
+                context_length: None,
             },
         )
         .await
@@ -2602,6 +3308,7 @@ mod tests {
                 depth: MAX_SUBAGENT_DEPTH,
                 permission_rules: Vec::new(),
                 workspace_root: None,
+                context_length: None,
             },
         )
         .await
@@ -2795,6 +3502,361 @@ mod tests {
             std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs_after_epoch),
         ))
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_output_read_pages_a_spilled_result_and_refuses_to_escape() {
+        // Through `execute_core_tool`, so this covers the arm the model
+        // actually reaches — argument names included, which a direct call to
+        // `spill::read` would not catch.
+        let root = tempfile::tempdir().unwrap();
+        let state = mock_state("127.0.0.1:9".parse().unwrap());
+        let dir = crate::spill::dir_for(&state.sessions_root);
+        let text: String = (0..5_000).map(|i| format!("row {i}\n")).collect();
+        let spilled = crate::spill::write(&dir, "file_grep", &text).unwrap();
+
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "tool_output_read")
+            .unwrap();
+
+        let first = execute_core_tool(
+            &def,
+            &json!({ "outputId": spilled.id, "offset": 0, "limit": 2048 }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(first["totalBytes"], json!(text.len()));
+        assert!(first["content"].as_str().unwrap().starts_with("row 0\n"));
+
+        // Following nextOffset reaches the end the model was promised.
+        let mut whole = String::new();
+        let mut offset = 0u64;
+        loop {
+            let page = execute_core_tool(
+                &def,
+                &json!({ "outputId": spilled.id, "offset": offset }),
+                &state,
+                root.path(),
+                None,
+            )
+            .await
+            .unwrap();
+            whole.push_str(page["content"].as_str().unwrap());
+            match page["nextOffset"].as_u64() {
+                Some(next) => offset = next,
+                None => break,
+            }
+        }
+        assert_eq!(whole, text);
+
+        // The id is model-authored: it must never become a path.
+        let escaped = execute_core_tool(
+            &def,
+            &json!({ "outputId": "../../config" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await;
+        assert!(
+            escaped.is_err(),
+            "an id must not resolve outside the spill dir"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_edit_survives_a_formatting_difference_and_says_it_did() {
+        let (root, folder) = game_with_workspace();
+        // The file is indented with eight spaces and has a trailing space the
+        // model will not reproduce — the ordinary near-miss that used to cost a
+        // refusal, a re-read, and another turn.
+        std::fs::write(
+            folder.path().join("enemy.js"),
+            "class Enemy {\n        step() {   \n            this.x += 1;\n        }\n}\n",
+        )
+        .unwrap();
+
+        let result = apply_file_edit(
+            root.path(),
+            "demo",
+            "enemy.js",
+            "step() {\n    this.x += 1;\n}",
+            "step() {\n    this.x += 2;\n}",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result["written"], json!(true));
+        // The result says the quote was not exact, so the model knows its
+        // picture of the file is stale before it writes the next edit.
+        assert_eq!(result["matchedBy"], json!("ignoring indentation"));
+        assert!(result["note"].as_str().unwrap().contains("re-read"));
+
+        let text = std::fs::read_to_string(folder.path().join("enemy.js")).unwrap();
+        assert!(text.contains("this.x += 2;"), "{text}");
+        assert!(!text.contains("this.x += 1;"), "{text}");
+        // The surrounding class is untouched.
+        assert!(text.starts_with("class Enemy {\n"), "{text}");
+        assert!(text.ends_with("}\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn an_exact_edit_reports_no_fallback() {
+        let (root, folder) = game_with_workspace();
+        std::fs::write(folder.path().join("clean.js"), "const a = 1;\n").unwrap();
+        let result = apply_file_edit(
+            root.path(),
+            "demo",
+            "clean.js",
+            "const a = 1;",
+            "const a = 2;",
+            false,
+        )
+        .await
+        .unwrap();
+        // No note, no matchedBy: nothing happened worth telling the model.
+        assert!(result.get("matchedBy").is_none(), "{result}");
+        assert!(result.get("note").is_none(), "{result}");
+    }
+
+    #[tokio::test]
+    async fn a_whole_file_write_refuses_to_clobber_a_change_it_never_saw() {
+        // The shape this exists for: the agent reads a file, does other work,
+        // and writes it back — while the user, a `git pull`, or a second agent
+        // changed it in between. `file_write` replaces everything, so that
+        // change disappears with nobody noticing.
+        let root = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        store::create_project(root.path(), "demo", "Demo").unwrap();
+        store::set_workspace_root(root.path(), "demo", folder.path().to_str()).unwrap();
+        let state = mock_state("127.0.0.1:9".parse().unwrap());
+        let target = folder.path().join("shared.js");
+        std::fs::write(&target, "export const speed = 1;\n").unwrap();
+
+        let read = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "file_read")
+            .unwrap();
+        let write = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "file_write")
+            .unwrap();
+
+        // The agent looks at the file.
+        execute_core_tool(
+            &read,
+            &json!({ "slug": "demo", "path": "shared.js" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Somebody else changes it.
+        std::fs::write(&target, "export const speed = 99; // hand-tuned\n").unwrap();
+
+        let refused = execute_core_tool(
+            &write,
+            &json!({ "slug": "demo", "path": "shared.js", "content": "export const speed = 2;\n" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .expect_err("overwriting an unseen change must be refused");
+        let message = refused.to_string();
+        assert!(
+            message.contains("changed since you last read it"),
+            "{message}"
+        );
+        assert!(
+            message.contains("file_edit"),
+            "the way forward is named: {message}"
+        );
+        // The other change is still there.
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("hand-tuned"));
+
+        // Reading again is all it takes to proceed.
+        execute_core_tool(
+            &read,
+            &json!({ "slug": "demo", "path": "shared.js" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        execute_core_tool(
+            &write,
+            &json!({ "slug": "demo", "path": "shared.js", "content": "export const speed = 2;\n" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .expect("a re-read clears the staleness");
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("speed = 2"));
+    }
+
+    #[tokio::test]
+    async fn writing_a_brand_new_file_is_never_refused() {
+        // Nothing to protect: an unread file has no stale mental model, and
+        // refusing here would block the ordinary case of creating one.
+        let root = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        store::create_project(root.path(), "demo", "Demo").unwrap();
+        store::set_workspace_root(root.path(), "demo", folder.path().to_str()).unwrap();
+        let state = mock_state("127.0.0.1:9".parse().unwrap());
+        let write = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "file_write")
+            .unwrap();
+        execute_core_tool(
+            &write,
+            &json!({ "slug": "demo", "path": "brand-new.js", "content": "const a = 1;\n" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .expect("creating a file must not be refused");
+    }
+
+    #[tokio::test]
+    async fn an_edit_cannot_be_made_blind() {
+        // Claude Code enforces read-before-edit in the harness. We get the same
+        // guarantee structurally instead: `file_edit` requires exact text that
+        // matches exactly once, and you cannot quote a file you have not read.
+        // This test exists so that property is not weakened by accident — the
+        // replacer ladder in particular must not start guessing at near misses
+        // for text that was never in the file.
+        let (root, folder) = game_with_workspace();
+        std::fs::write(
+            folder.path().join("world.js"),
+            "const gravity = 9.8;\nconst drag = 0.1;\n",
+        )
+        .unwrap();
+
+        // Invented text is refused, and the message says what to do.
+        let error = apply_file_edit(
+            root.path(),
+            "demo",
+            "world.js",
+            "const gravity = 10;",
+            "const gravity = 1;",
+            false,
+        )
+        .await
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("not found"), "{message}");
+        assert!(message.contains("read the file"), "{message}");
+
+        // The file is untouched by a refused edit.
+        assert_eq!(
+            std::fs::read_to_string(folder.path().join("world.js")).unwrap(),
+            "const gravity = 9.8;\nconst drag = 0.1;\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_file_write_tool_arm_carries_diagnostics_too() {
+        // Through `execute_core_tool`, so this proves the tool arm's wiring
+        // rather than only the helper underneath it. Note the client's
+        // `file_write` RPC is a separate path and deliberately unchanged: this
+        // is the result the *model* reads.
+        let root = tempfile::tempdir().unwrap();
+        let folder = tempfile::tempdir().unwrap();
+        store::create_project(root.path(), "demo", "Demo").unwrap();
+        store::set_workspace_root(root.path(), "demo", folder.path().to_str()).unwrap();
+        let state = mock_state("127.0.0.1:9".parse().unwrap());
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "file_write")
+            .unwrap();
+
+        let broken = execute_core_tool(
+            &def,
+            &json!({ "slug": "demo", "path": "boot.js", "content": "function go( {\n" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(broken["written"], json!(true));
+        assert!(broken["diagnostics"].is_string(), "{broken}");
+
+        // An ES module written to a plain `.js` must not be flagged: the
+        // extension is not a defect in the file.
+        let esm = execute_core_tool(
+            &def,
+            &json!({
+                "slug": "demo",
+                "path": "level.js",
+                "content": "import { Mesh } from 'three';\nexport const make = () => new Mesh();\n"
+            }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(esm.get("diagnostics").is_none(), "false positive: {esm}");
+    }
+
+    #[tokio::test]
+    async fn an_edit_that_breaks_the_file_says_so_in_its_own_result() {
+        let (root, folder) = game_with_workspace();
+        std::fs::write(
+            folder.path().join("player.js"),
+            "export function jump() {\n  return 1;\n}\n",
+        )
+        .unwrap();
+
+        // Healthy edits stay quiet — a diagnostic on correct code is worse
+        // than none, because the model will "fix" it.
+        let clean = apply_file_edit(
+            root.path(),
+            "demo",
+            "player.js",
+            "return 1;",
+            "return 2;",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(clean["written"], json!(true));
+        assert!(clean.get("diagnostics").is_none(), "{clean}");
+
+        // Breaking it is reported in the same result, not left for the next
+        // build-and-play round trip to discover.
+        let broken = apply_file_edit(
+            root.path(),
+            "demo",
+            "player.js",
+            "export function jump() {",
+            "export function jump( {",
+            false,
+        )
+        .await
+        .unwrap();
+        // The write still happened; the result must not claim otherwise.
+        assert_eq!(broken["written"], json!(true));
+        assert!(
+            broken["diagnostics"].is_string(),
+            "a file that no longer parses must say so: {broken}"
+        );
     }
 
     #[tokio::test]
@@ -3093,6 +4155,10 @@ mod tests {
             "subagent_spawn",
             "project_revert",
             "video_contact_sheet",
+            // The only way to reach a spilled result: without it in the model's
+            // tool list, an oversized result's `outputId` is a handle to
+            // nothing.
+            "tool_output_read",
         ] {
             assert!(
                 names.iter().any(|n| n == reserved),
@@ -3780,6 +4846,30 @@ mod tests {
         assert!(small["notice"].is_null());
     }
 
+    #[test]
+    fn writes_into_the_repository_history_are_refused() {
+        // The working tree is the agent's to rewrite; `.git` is what makes a
+        // bad run undoable, so it is the one thing inside the workspace that
+        // stays read-only.
+        let base = Path::new("/tmp/game");
+        assert!(reject_protected_write(base, Path::new("/tmp/game/src/main.ts")).is_ok());
+        assert!(reject_protected_write(base, Path::new("/tmp/game/.gitignore")).is_ok());
+
+        for blocked in [
+            "/tmp/game/.git/config",
+            "/tmp/game/.git/objects/ab/cdef",
+            "/tmp/game/nested/.git/HEAD",
+            "/tmp/game/.wt/branch/file.ts",
+        ] {
+            let error = reject_protected_write(base, Path::new(blocked))
+                .expect_err(&format!("{blocked} should be refused"));
+            assert!(
+                error.to_string().contains("refusing to write inside"),
+                "unhelpful error for {blocked}: {error}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn file_write_refuses_an_unbounded_write() {
         // file_edit and the workspace path both already refused this; the
@@ -3825,7 +4915,14 @@ mod tests {
 
         // Agent calls opt into the out-of-band activity payload while holding
         // the same path lock as the write itself.
-        std::fs::write(folder.path().join("main.js"), "before\n").unwrap();
+        // Fixture, not a scenario: this direct write stands in for the file's
+        // current state as core already knows it. Without saying so, the
+        // staleness guard on `file_write` correctly refuses — it cannot tell a
+        // test's setup from a user editing the file behind the agent's back,
+        // and refusing the latter is the whole point.
+        let staged = folder.path().join("main.js");
+        std::fs::write(&staged, "before\n").unwrap();
+        crate::staleness::remember(&staged);
         let internal = execute_core_tool_with_activity(
             &def,
             &args,
@@ -4031,6 +5128,7 @@ mod tests {
                 description: "Echo".into(),
                 parameters: json!({"type":"object"}),
                 kind: ToolKind::Browser,
+                access: Access::Guarded,
             },
         );
         let mut rx = state.bus.subscribe();

@@ -16,6 +16,12 @@ export interface SessionSummary {
   branch?: string | null;
   createdAt: number;
   updatedAt: number;
+  /**
+   * When the chat was moved to the archive, in UNIX seconds. Null for a live
+   * chat. Archived chats leave the sidebar and are listed in Settings →
+   * Archive, which is the only place they can be restored or really deleted.
+   */
+  archivedAt?: number | null;
   messageCount: number;
 }
 
@@ -46,9 +52,38 @@ export const saveSession = (input: SaveSessionInput): Promise<SessionSummary> =>
 export const createSession = (projectSlug: string): Promise<SessionSummary> =>
   rpc<SessionSummary>("session_create", { projectSlug });
 
-export const listSessions = (): Promise<SessionSummary[]> => rpc<SessionSummary[]>("session_list", {});
+/**
+ * Saved transcripts, newest first.
+ *
+ * Entries without an id are dropped rather than shown. Every session RPC —
+ * open, rename, delete — is keyed by id, so an id-less row is a chat nothing
+ * can act on: it rendered as a blank, untouchable line in the sidebar when
+ * core listed a non-session file (see sessions.rs `list`). Filtering here as
+ * well keeps an older core from putting one back.
+ */
+export const listSessions = async (options: { archived?: boolean } = {}): Promise<SessionSummary[]> => {
+  const listed = await rpc<SessionSummary[]>("session_list", { archived: options.archived ?? false });
+  return (listed ?? []).filter((session) => typeof session?.id === "string" && session.id.trim() !== "");
+};
+
+/** The archive Settings shows: chats hidden from the sidebar but kept whole. */
+export const listArchivedSessions = (): Promise<SessionSummary[]> => listSessions({ archived: true });
+
+/**
+ * Move a chat out of the sidebar without discarding anything — the transcript,
+ * the worktree and any running agent survive, so a restore is exact.
+ */
+export const archiveSession = (id: string): Promise<SessionSummary> =>
+  rpc<SessionSummary>("session_archive", { id });
+
+export const restoreSession = (id: string): Promise<SessionSummary> =>
+  rpc<SessionSummary>("session_restore", { id });
 
 export const loadSession = (id: string): Promise<SessionRecord> => rpc<SessionRecord>("session_load", { id });
+
+/** Title-only save; core keeps the stored transcript when messages are absent. */
+export const renameSession = (id: string, title: string): Promise<SessionSummary> =>
+  rpc<SessionSummary>("session_save", { id, title });
 
 export const deleteSession = (id: string): Promise<{ id: string; deleted: boolean }> =>
   rpc<{ id: string; deleted: boolean }>("session_delete", { id });

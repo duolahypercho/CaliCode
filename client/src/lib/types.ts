@@ -101,6 +101,13 @@ export interface AgentMessage {
   startedAtMs?: number;
   /** Activity marker/tool completion timestamp (epoch milliseconds). */
   completedAtMs?: number;
+  /**
+   * Turn markers only: the turn ended because the user stopped it. Distinct
+   * from `status`, which reaches "done" either way — without this a cancelled
+   * turn rendered as "✔ Completed" directly above its own "Turn cancelled"
+   * line.
+   */
+  stopped?: boolean;
   /** Bounded file change metadata; raw before/after snapshots are omitted. */
   activity?: import("./activity").ActivityFileChange;
 }
@@ -120,4 +127,54 @@ export interface SubagentResult {
   reply: string;
   toolCalls: unknown[];
   turns: number;
+}
+
+/**
+ * One row of the per-model token ledger (`usage_stats`).
+ *
+ * The three prompt classes are disjoint — core subtracts cache reads and
+ * writes out of the provider's prompt total — so they sum to `promptTotal`.
+ */
+export interface ModelUsageRow {
+  /** `provider/model`, and the row's stable identity. */
+  key: string;
+  provider: string;
+  model: string;
+  requests: number;
+  /** Prompt tokens billed at full price. */
+  promptTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  /** `promptTokens + cacheReadTokens + cacheWriteTokens`. */
+  promptTotal: number;
+  /** Cache reads over `promptTotal`; null before the model is ever called. */
+  cacheHitRate: number | null;
+}
+
+/** One day's activity bucket. `date` is `YYYY-MM-DD` in core's local time. */
+export interface UsageDay extends Omit<ModelUsageRow, "key" | "provider" | "model"> {
+  date: string;
+}
+
+export interface UsageActivity {
+  /** Days that reported at least one token. */
+  activeDays: number;
+  /** Consecutive active days ending today, or yesterday if today is idle. */
+  currentStreak: number;
+  longestStreak: number;
+  busiestDay: { date: string; totalTokens: number } | null;
+}
+
+export interface UsageStats {
+  /** Unix seconds the ledger started counting; survives core restarts. */
+  since: number;
+  /** Core's local `YYYY-MM-DD`, so the heatmap ends on core's today. */
+  today: string;
+  models: ModelUsageRow[];
+  /** Date-ordered and sparse — idle days are absent, not zero-filled. */
+  days: UsageDay[];
+  activity: UsageActivity;
+  totals: Omit<ModelUsageRow, "key" | "provider" | "model">;
 }

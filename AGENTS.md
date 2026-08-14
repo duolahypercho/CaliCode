@@ -20,7 +20,7 @@ repo works.
 
 Core modules map to features one-to-one: `agent.rs`, `rpc.rs`, `store.rs`,
 `sessions.rs`, `assets.rs`, `image3d.rs`, `graph.rs`, `mcp.rs`, `skills.rs`,
-`workspace.rs`, `devserver.rs`, `config.rs`.
+`workspace.rs`, `devserver.rs`, `config.rs`, `browser.rs`.
 
 ## Run it
 
@@ -95,12 +95,15 @@ outside route-level components. Types shared with core live in
 `line|line-strong`, `raised`, `danger-soft`), never raw hex, so light and dark
 stay in sync. Chrome uses the system sans; `.font-mono` (Space Mono) is for
 code and the wordmark. **No hover border-colour changes** — hover is a
-background tint, selection is a background fill. **Keyboard focus is the one
-exception**: `index.css` draws a single unlayered `--focus-ring` outline for
-every control, so never add a `focus-visible:ring-*` utility beside it and
-never suppress it with `outline-none`; a control inside a clipping scroller
-takes `.focus-ring-inset`. `ui/focusRing.test.tsx` enforces both. Icons are
-`lucide-react` at `strokeWidth` ~1.7.
+background tint, selection is a background fill. **No focus rings either**:
+this is the owner's standing decision, taken twice, and `index.css` suppresses
+the outline in one unlayered rule so no utility can reintroduce it. Never add
+a `focus-visible:ring-*` utility. `.focus-ring` / `.focus-ring-inset` remain
+as inert hooks — a dozen files still spell them, and the classes stay so
+restoring rings is a one-block edit rather than a sweep. `ui/focusRing.test.tsx`
+enforces the absence; if you believe rings should return, change that test and
+this paragraph in the same commit, not the CSS alone. Icons are `lucide-react`
+at `strokeWidth` ~1.7.
 
 **Persistence is automatic.** There is no SAVE button: editing `project` state
 debounces into `project_save`. Anything that loads a project from core must
@@ -119,13 +122,61 @@ commit:
 - the search dialog exposes `textbox` named `Search games`
 - the sidebar resize separator is named `Resize games sidebar`
 - the composer exposes `Permission mode`, `Active model`, `Agent prompt`
+- the side chat exposes `Side chat prompt`, `Side chat model`, `Send side chat
+  message`, and `Stop side chat answer` while an answer is in flight. `/side`
+  opens a thread per run, so a second one names its controls `Side chat 2
+  prompt` and so on; the first keeps the bare names above, and its tab keeps
+  the bare `sidechat` id
+- a finished tool row offers `Ask about <tool> in side chat`; the step it opens
+  is pinned as `[data-side-anchor]` and dropped by `Stop asking about this step`
+- files the side chat opened while answering are listed as `[data-role="reads"]`
 - a per-game hover action named `New chat in <title>`
+- a per-chat hover action named `Archive <title>`. Archiving is how a chat
+  leaves the sidebar — there is no delete there; Settings > Archive is the only
+  place one is restored or destroyed
 - the empty transcript carries `[data-empty-game-hint]` containing the slug
+
+## The agent browser
+
+`browser.rs` drives a real Chrome over the devtools protocol and the
+`browser_*` tools are its surface. Note the name clash: older comments call
+the *client webview* tools (`editor_*`) "browser tools" — unrelated.
+
+- Chrome is the user's own install, found automatically on macOS, Windows and
+  Linux (chrome, then chromium, then edge, then a playwright cache);
+  `CALI_CHROME` overrides the path, `CALI_BROWSER_HEADED=1` shows the window
+  for debugging, `CALI_BROWSER_PROFILE` moves the profile off `~/.cali/browser`.
+- **Why a separate Chrome rather than an embedded webview.** Tauri's webview is
+  a different engine per platform — WKWebView, WebView2, WebKitGTK — and only
+  the Windows one speaks CDP. Embedding would mean three rendering behaviours
+  and an agent that can only drive the browser on one of the three. One found
+  Chrome behaves identically everywhere. The cost is that the tab is a
+  screencast, so it cannot select text or open devtools; the toolbar's
+  open-in-browser button is the way out.
+- The model reads pages as ref-tagged element lists (`browser_snapshot`), not
+  HTML or pixels, and clicks refs rather than coordinates. Coordinates exist
+  for `<canvas>`, which is the only way to reach a running game.
+- `browser_search` deliberately skips Google, which serves this browser an
+  interstitial instead of results.
+- The BROWSER tab renders the same page over a CDP screencast, so the user and
+  the agent share one browser rather than each having their own. The tab strip
+  shows that page's own favicon and title; its accessible name stays `browser`.
+- Chrome renders at `deviceScaleFactor: 2` and the cast is sized to the panel
+  in *device* pixels. Both matter: a 1x raster downscaled to the cast bound and
+  upscaled again by a retina panel is visibly blurry, and it compresses worse.
+- A chrome that outlives core keeps the profile's `SingletonLock`. Core clears
+  a lock whose pid is gone and diverts to a unique scratch profile when one is
+  genuinely held, so a leaked browser cannot wedge the next launch.
+- Live coverage is one `#[ignore]`d test: `cargo test browser::tests::live --
+  --ignored`. Run it after touching that module; CI cannot.
 
 ## Extending without touching source
 
 - **Skills** — markdown + YAML frontmatter (`name`, `description`) dropped in
-  the skills directory (`CALI_SKILLS_DIR`).
+  the skills directory (`CALI_SKILLS_DIR`). Each enabled one is also a slash
+  command: the composer lists them beside the built-ins (tagged `SKILL`) and
+  `/<skill> <task>` sends a turn naming it, which the agent pulls in with
+  `skill_load`. A skill may not take a built-in's name — the built-in wins.
 - **MCP servers** — configured in `~/.cali/config.yaml`; their tools join agent
   sessions automatically.
 - **Asset library** — one file in `client/src/lib/assetLibrary/repos/`
@@ -141,6 +192,7 @@ commit:
 | ----------------------------- | ----------------------------------------- |
 | `~/.cali/config.yaml`         | model/provider config, MCP servers        |
 | `~/.cali/projects/<slug>/`    | project documents                         |
+| `~/.cali/browser/`            | the agent browser's Chrome profile        |
 | `~/.cali/sessions/`           | saved transcripts                         |
 | `client/.e2e-projects/`       | throwaway; wiped by `pretest:e2e`         |
 

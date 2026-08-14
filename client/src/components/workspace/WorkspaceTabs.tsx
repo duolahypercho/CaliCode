@@ -1,33 +1,78 @@
+import { useEffect } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   Boxes,
   Code2,
   FileChartColumn,
   FlaskConical,
+  Globe,
   Hammer,
   Image,
   Maximize2,
   Minimize2,
+  MessageCircleQuestion,
   Minus,
   Play,
   Plus,
+  SquareTerminal,
   X,
 } from "lucide-react";
 
-export const WORKSPACE_TABS = ["play", "code", "art", "build", "scene", "test", "reports"] as const;
+export const WORKSPACE_TABS = ["play", "code", "art", "build", "scene", "test", "terminal", "browser", "sidechat", "reports"] as const;
 
 export type WorkspaceTab = (typeof WORKSPACE_TABS)[number];
 
+/**
+ * Views that can be open more than once at a time. A side chat is a thread,
+ * not a tool: asking a second question while the first answer is still being
+ * read means a second thread, the way `/side` twice reads as two of them.
+ */
+export const MULTI_INSTANCE_TABS: readonly WorkspaceTab[] = ["sidechat"];
+
+/**
+ * A tab in the strip. Single-instance views use their bare kind as the id;
+ * a repeatable view's extra instances carry a `-2`, `-3` … suffix. The first
+ * instance keeps the bare id, so the accessible name every keyboard user and
+ * e2e spec addresses a view by does not move when a second one opens.
+ */
+export type WorkspaceTabId = WorkspaceTab | `${WorkspaceTab}-${number}`;
+
+/** The view an instance id belongs to: `sidechat-3` → `sidechat`. */
+export function tabKind(id: WorkspaceTabId): WorkspaceTab {
+  const [kind] = id.split("-");
+  return WORKSPACE_TABS.includes(kind as WorkspaceTab) ? (kind as WorkspaceTab) : "play";
+}
+
+/** The next free id for a view: `sidechat`, then `sidechat-2`, `sidechat-3` … */
+export function nextTabId(kind: WorkspaceTab, open: readonly WorkspaceTabId[]): WorkspaceTabId {
+  if (!open.includes(kind)) return kind;
+  for (let instance = 2; ; instance += 1) {
+    const candidate = `${kind}-${instance}` as WorkspaceTabId;
+    if (!open.includes(candidate)) return candidate;
+  }
+}
+
 interface WorkspaceTabsProps {
   /** Views open as tabs, in strip order. Never empty. */
-  openTabs: readonly WorkspaceTab[];
-  active: WorkspaceTab;
-  onChange: (tab: WorkspaceTab) => void;
-  /** Open a view that is not currently a tab. */
+  openTabs: readonly WorkspaceTabId[];
+  active: WorkspaceTabId;
+  onChange: (tab: WorkspaceTabId) => void;
+  /** Open a view. Repeatable views open another instance. */
   onAdd: (tab: WorkspaceTab) => void;
   /** Close a tab. The last remaining tab cannot be closed. */
-  onClose: (tab: WorkspaceTab) => void;
+  onClose: (tab: WorkspaceTabId) => void;
   badges: Partial<Record<WorkspaceTab, number>>;
+  /**
+   * Per-tab display overrides. BROWSER uses them to show the page it has open,
+   * the way a browser tab does.
+   *
+   * Display only: the accessible name stays the bare view id below, so a page
+   * title can never move the handle that keyboard users and e2e specs address
+   * a view by.
+   */
+  tabTitles?: Partial<Record<WorkspaceTabId, string | undefined>>;
+  /** Icon image (a data url) shown in place of the view's glyph. */
+  tabIcons?: Partial<Record<WorkspaceTab, string | undefined>>;
   /** Dock fills the window. */
   expanded: boolean;
   onToggleExpand: () => void;
@@ -42,6 +87,9 @@ const TAB_META = {
   build: { label: "Build", icon: Hammer },
   scene: { label: "Scene", icon: Boxes },
   test: { label: "Test", icon: FlaskConical },
+  terminal: { label: "Terminal", icon: SquareTerminal },
+  browser: { label: "Browser", icon: Globe },
+  sidechat: { label: "Side chat", icon: MessageCircleQuestion },
   reports: { label: "Reports", icon: FileChartColumn },
 } satisfies Record<WorkspaceTab, { label: string; icon: typeof Play }>;
 
@@ -63,25 +111,41 @@ export function WorkspaceTabs({
   onAdd,
   onClose,
   badges,
+  tabTitles,
+  tabIcons,
   expanded,
   onToggleExpand,
   onCollapse,
 }: WorkspaceTabsProps) {
+  // Selecting a tab that sits past the fade leaves the strip showing only
+  // inactive tabs, so the view you are in is the one you cannot see. Opening a
+  // view from elsewhere in the app (the header's side-chat button, a badge)
+  // is exactly when that happens.
+  useEffect(() => {
+    document
+      .getElementById(`workspace-tab-${active}`)
+      ?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [active]);
+
   // Closing the last tab would leave the dock with nothing to show, so the
   // affordance disappears rather than failing on click.
   const closable = openTabs.length > 1;
-  const addable = WORKSPACE_TABS.filter((tab) => !openTabs.includes(tab));
+  // Views not currently in the strip. A repeatable view drops out once one is
+  // open: "Add view" is for reaching a view you do not have, and stacking a
+  // second side chat is a deliberate act — `/side` — not a menu pick that
+  // looks the same as the one that just focuses it.
+  const addable = WORKSPACE_TABS.filter((kind) => !openTabs.some((id) => tabKind(id) === kind));
 
   return (
     <div
       data-tauri-drag-region="deep"
-      className="flex h-[52px] shrink-0 select-none items-center gap-1 border-b border-line bg-surface-0 px-2"
+      className="flex h-10 shrink-0 select-none items-center gap-1 border-b border-line bg-surface-0 px-1.5"
     >
       <div
         role="tablist"
         aria-label="Workspace"
         aria-orientation="horizontal"
-        className="scrollbar-none flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+        className="scrollbar-none flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [mask-image:linear-gradient(to_right,#000_calc(100%-28px),transparent)]"
       >
         {openTabs.map((tab, index) => {
           const selected = tab === active;
@@ -89,9 +153,13 @@ export function WorkspaceTabs({
           // selected pill, where the fill already separates them and a rule
           // would read as a stray mark against the rounded edge.
           const divided = index > 0 && !selected && openTabs[index - 1] !== active;
-          const badge = badges[tab];
-          const meta = TAB_META[tab];
+          const kind = tabKind(tab);
+          const badge = badges[kind];
+          const meta = TAB_META[kind];
           const Icon = meta.icon;
+          const override = tabTitles?.[tab]?.trim();
+          const label = override || meta.label;
+          const iconUrl = tabIcons?.[kind];
           return (
             <div
               key={tab}
@@ -130,13 +198,26 @@ export function WorkspaceTabs({
                 // The accessible name stays the bare view id: it is the handle
                 // every keyboard user and e2e spec addresses a view by.
                 aria-label={tab}
-                title={meta.label}
-                className={`inline-flex min-w-0 items-center gap-1.5 rounded-md py-1.5 pl-2.5 text-[11.5px] font-medium transition-colors ${
-                  closable && selected ? "pr-1" : "pr-2.5"
+                // The tooltip carries the full title; the label below is
+                // clipped so one tab cannot eat the strip.
+                // "Side chat — Side chat 2" says the view twice; an override
+                // that already names the view stands on its own.
+                title={override && !override.startsWith(meta.label) ? `${meta.label} — ${override}` : override || meta.label}
+                className={`inline-flex min-w-0 items-center gap-1.5 rounded-md py-1 pl-2.5 text-[11.5px] font-medium transition-colors ${
+                  closable ? "pr-1" : "pr-2.5"
                 } ${selected ? "text-ink-strong" : "text-ink-subtle group-hover:text-ink"}`}
               >
-                <Icon aria-hidden className="h-3.5 w-3.5 shrink-0" strokeWidth={1.7} />
-                <span className="max-w-[84px] truncate">{meta.label}</span>
+                {iconUrl ? (
+                  <img
+                    aria-hidden
+                    alt=""
+                    src={iconUrl}
+                    className="h-3.5 w-3.5 shrink-0 rounded-[2px] object-contain"
+                  />
+                ) : (
+                  <Icon aria-hidden className="h-3.5 w-3.5 shrink-0" strokeWidth={1.7} />
+                )}
+                <span className={`truncate ${override ? "max-w-[120px]" : "max-w-[84px]"}`}>{label}</span>
                 {badge ? (
                   <span
                     className={`ml-0.5 shrink-0 rounded-full px-1.5 py-px text-[9px] font-bold text-surface-0 ${
@@ -147,12 +228,20 @@ export function WorkspaceTabs({
                   </span>
                 ) : null}
               </button>
-              {closable && selected ? (
+              {closable ? (
                 <button
                   type="button"
-                  aria-label={`Close ${meta.label} tab`}
+                  // The resolved label, not the view's: with two side chats
+                  // open, one "Close Side chat tab" button per instance is
+                  // ambiguous to anything that addresses controls by name.
+                  aria-label={`Close ${label} tab`}
                   onClick={() => onClose(tab)}
-                  className="mr-1 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-ink-faint transition-colors hover:bg-surface-3 hover:text-ink-strong"
+                  // Reserved space, revealed on hover — and kept visible on the
+                  // active tab and while focused, so a keyboard user can reach
+                  // a control that is otherwise only discoverable by pointer.
+                  className={`mr-1 inline-flex h-5 w-5 shrink-0 items-center justify-center rounded text-ink-faint transition-opacity hover:bg-surface-3 hover:text-ink-strong focus-visible:opacity-100 group-hover:opacity-100 ${
+                    selected ? "opacity-100" : "opacity-0"
+                  }`}
                 >
                   <X aria-hidden className="h-3 w-3" strokeWidth={2.2} />
                 </button>
@@ -170,7 +259,7 @@ export function WorkspaceTabs({
             title={addable.length === 0 ? "Every view is already open" : "Add view"}
             className={HEADER_BUTTON}
           >
-            <Plus aria-hidden className="h-4 w-4" strokeWidth={1.9} />
+            <Plus aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.9} />
           </button>
         </DropdownMenu.Trigger>
         <DropdownMenu.Portal>
@@ -204,15 +293,15 @@ export function WorkspaceTabs({
         className={HEADER_BUTTON}
       >
         {expanded ? (
-          <Minimize2 aria-hidden className="h-4 w-4" strokeWidth={1.7} />
+          <Minimize2 aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.7} />
         ) : (
-          <Maximize2 aria-hidden className="h-4 w-4" strokeWidth={1.7} />
+          <Maximize2 aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.7} />
         )}
       </button>
 
       {onCollapse ? (
         <button type="button" aria-label="Hide tools panel" onClick={onCollapse} className={HEADER_BUTTON}>
-          <Minus aria-hidden className="h-4 w-4" strokeWidth={1.9} />
+          <Minus aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.9} />
         </button>
       ) : null}
     </div>
