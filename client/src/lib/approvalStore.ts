@@ -21,10 +21,19 @@ export type LapsedReason =
   | "session-changed"
   | "panel-gone";
 
+/**
+ * Who produced the answer. Not decoration: a decision this window made is
+ * already written to the transcript as a permanent row, so its card is a
+ * duplicate the moment it settles and must stop rendering. An
+ * `always-allowed` settle has no row of its own — nobody clicked that card —
+ * so it is the one that has to stay up and say so.
+ */
+export type SettledVia = "this-window" | "always-allowed";
+
 export type RequestState =
   | { kind: "pending" }
   | { kind: "answering"; approved: boolean; startedAtMs: number }
-  | { kind: "settled"; approved: boolean }
+  | { kind: "settled"; approved: boolean; via: SettledVia }
   | { kind: "lapsed"; reason: LapsedReason };
 
 export type ApprovalEntry = {
@@ -194,7 +203,7 @@ export function reduce(store: ApprovalStore, event: ApprovalEvent): ApprovalStor
       const entries = new Map(store.entries);
       entries.set(event.requestId, {
         ...existing,
-        state: { kind: "settled", approved: existing.state.approved },
+        state: { kind: "settled", approved: existing.state.approved, via: "this-window" },
         finishedAtMs: existing.state.startedAtMs,
       });
       return withEntries(store, entries);
@@ -227,7 +236,7 @@ export function reduce(store: ApprovalStore, event: ApprovalEvent): ApprovalStor
       if (event.outcome === "always-allowed") {
         entries.set(event.requestId, {
           ...existing,
-          state: { kind: "settled", approved: true },
+          state: { kind: "settled", approved: true, via: "always-allowed" },
           finishedAtMs:
             existing.state.kind === "answering" ? existing.state.startedAtMs : null,
         });
@@ -241,7 +250,7 @@ export function reduce(store: ApprovalStore, event: ApprovalEvent): ApprovalStor
         entries.set(event.requestId, {
           ...existing,
           state: ours
-            ? { kind: "settled", approved: existing.state.approved }
+            ? { kind: "settled", approved: existing.state.approved, via: "this-window" }
             : { kind: "lapsed", reason: "resolved-elsewhere" },
           finishedAtMs: existing.state.startedAtMs,
         });
@@ -271,10 +280,20 @@ export function reduce(store: ApprovalStore, event: ApprovalEvent): ApprovalStor
           entries.set(id, entry);
           continue;
         }
+        // A card can finish without a timestamp: nothing was in flight when
+        // core announced it, so there was no `startedAtMs` to inherit. Stamp
+        // it on the first tick that sees it rather than leaving it null —
+        // `null ?? nowMs` makes the age permanently zero, and a card that can
+        // never age out never leaves the transcript.
+        if (entry.finishedAtMs === null) {
+          changed = true;
+          entries.set(id, { ...entry, finishedAtMs: event.nowMs });
+          continue;
+        }
         // Finished cards linger so the user can read the outcome, then go.
         // Measured from when they finished, so an early lapse and a late
         // expiry get the same reading window.
-        if (event.nowMs - (entry.finishedAtMs ?? event.nowMs) >= SETTLED_LINGER_MS) {
+        if (event.nowMs - entry.finishedAtMs >= SETTLED_LINGER_MS) {
           changed = true;
           continue;
         }
@@ -305,19 +324,65 @@ export function reduce(store: ApprovalStore, event: ApprovalEvent): ApprovalStor
  * `answering` entries are never head: a send that hangs must not hide the rest
  * of the queue behind it. Three parallel nodes prompt together and stay
  * independently answerable in any order.
+ *
+ * A decision this window made drops out here rather than out of the map: the
+ * transcript row written on the same click is the durable record, so keeping
+ * the card up renders one act twice, in two shapes, saying two different
+ * things. The entry survives so a re-delivered `Arrived` still finds it
+ * finished and does not resurrect an answered prompt.
  */
 export function visibleApprovals(store: ApprovalStore): ApprovalEntry[] {
-  return [...store.entries.values()].sort((left, right) => {
-    const leftBusy = left.state.kind === "answering" ? 1 : 0;
-    const rightBusy = right.state.kind === "answering" ? 1 : 0;
-    if (leftBusy !== rightBusy) return leftBusy - rightBusy;
-    return left.order - right.order;
-  });
+  return [...store.entries.values()]
+    .filter((entry) => !(entry.state.kind === "settled" && entry.state.via === "this-window"))
+    .sort((left, right) => {
+      const leftBusy = left.state.kind === "answering" ? 1 : 0;
+      const rightBusy = right.state.kind === "answering" ? 1 : 0;
+      if (leftBusy !== rightBusy) return leftBusy - rightBusy;
+      return left.order - right.order;
+    });
 }
 
 /** The card the promotion guard and keyboard focus apply to. */
 export function headApproval(store: ApprovalStore): ApprovalEntry | null {
   return visibleApprovals(store)[0] ?? null;
+}
+
+/**
+ * The one thing about a request a user has to see before answering it: which
+ * file, command or address it would touch. Without it two `file_write` prompts
+ * are the same four words twice, and the transcript rows they leave behind are
+ * indistinguishable from each other.
+ *
+ * Keys are tried in order and the first string wins; an unrecognised tool
+ * simply has no target, which is why the full arguments stay available below.
+ */
+export function approvalTarget(args: unknown): string | null {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  const record = args as Record<string, unknown>;
+  for (const key of ["path", "file_path", "file", "filename", "command", "url", "query", "pattern", "name"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.trim()) return value.trim();
+  }
+  return null;
+}
+
+/**
+ * Whether the full arguments say anything the target line did not.
+ *
+ * Two cases print nothing. A tool that takes no arguments arrives as `null` or
+ * `{}`, and `JSON.stringify` renders both as text the user then has to decide
+ * is not an error. A single-key `{ path }` is already the target line, and
+ * repeating it as JSON directly underneath is the same duplication in
+ * miniature.
+ */
+export function argumentsWorthShowing(args: unknown, target: string | null): boolean {
+  if (args === null || args === undefined) return false;
+  if (Array.isArray(args)) return args.length > 0;
+  if (typeof args === "object") {
+    const keys = Object.keys(args as object).length;
+    return target ? keys > 1 : keys > 0;
+  }
+  return true;
 }
 
 /** Plain-language reason a card is no longer answerable. */

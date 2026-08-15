@@ -120,6 +120,12 @@ export interface AgentMessage {
   status?: "running" | "done" | "error";
   /** Tool rows only: full output, shown when the row is expanded. */
   detail?: string;
+  /**
+   * This row records a permission the user granted or refused, not work the
+   * agent did. Carried explicitly rather than sniffed from `content`, so the
+   * row's icon cannot be changed by rewording a sentence.
+   */
+  decision?: "approved" | "denied";
   /** Provider tool-call identity; pairing must not rely on tool names. */
   toolCallId?: string;
   /** Client-owned Enter-level activity grouping identity. */

@@ -64,6 +64,8 @@ import { connectEvents, rpc, type AgentEvent, type UsageTotals } from "../../lib
 import { classifySendFailure, route } from "../../lib/approvalRouter";
 import {
   APPROVAL_TTL_MS,
+  approvalTarget,
+  argumentsWorthShowing,
   emptyStore,
   headApproval,
   lapsedExplanation,
@@ -721,14 +723,23 @@ export function ToolRow({ message, onAsk }: { message: AgentMessage; onAsk?: (me
           expandable ? "hover:bg-surface-2 active:bg-surface-3" : "cursor-default"
         }`}
       >
+        {/* One stroke weight across the set. The informational row used to
+            fall through to a filled square, which made the least significant
+            row in the transcript its heaviest mark. */}
         {message.status === "running" ? (
-          <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-ink-subtle" strokeWidth={2.2} />
+          <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-ink-subtle" strokeWidth={1.9} />
         ) : message.status === "error" ? (
-          <X aria-hidden className="h-3 w-3 shrink-0 text-danger-soft" strokeWidth={2.4} />
+          <X aria-hidden className="h-3 w-3 shrink-0 text-danger-soft" strokeWidth={1.9} />
         ) : message.status === "done" ? (
-          <Check aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={2.4} />
+          <Check aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.9} />
+        ) : message.decision === "approved" ? (
+          <ShieldCheck aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.7} />
+        ) : message.decision === "denied" ? (
+          <ShieldOff aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.7} />
         ) : (
-          <span aria-hidden className="h-2.5 w-2.5 shrink-0 border border-ink-subtle bg-ink-subtle" />
+          <span aria-hidden className="flex h-3 w-3 shrink-0 items-center justify-center">
+            <span className="h-1 w-1 rounded-full bg-ink-faint" />
+          </span>
         )}
         {heading ? (
           <span className={`shrink-0 font-medium ${message.status === "error" ? "text-danger-soft" : "text-ink"}`}>
@@ -777,15 +788,15 @@ function ActivityIcon({
   stopped?: boolean;
 }) {
   if (running) {
-    return <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-ink-subtle" strokeWidth={2.2} />;
+    return <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-ink-subtle" strokeWidth={1.9} />;
   }
   if (failed) {
-    return <X aria-hidden className="h-3 w-3 shrink-0 text-danger-soft" strokeWidth={2.4} />;
+    return <X aria-hidden className="h-3 w-3 shrink-0 text-danger-soft" strokeWidth={1.9} />;
   }
   // A stopped turn is neither done nor failed; a ✓ beside the word "Stopped"
   // reads as though the work finished.
   if (stopped) {
-    return <Square aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={2} />;
+    return <Square aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.7} />;
   }
   if (operation === "edit" || operation === "write") {
     return <FilePenLine aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.8} />;
@@ -799,7 +810,7 @@ function ActivityIcon({
   if (operation === "read") {
     return <BookOpen aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.8} />;
   }
-  return <Check aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={2} />;
+  return <Check aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.9} />;
 }
 
 export function ActivityDetailRow({
@@ -3181,20 +3192,26 @@ export function AgentPanel({
       // click and not because something dropped them.
       const cascaded = typeof answer?.alsoApproved === "number" ? answer.alsoApproved : 0;
       dispatchApproval({ kind: "SendAccepted", requestId: entry.requestId });
+      // The tool name alone is not an identity: four `file_write` grants in a
+      // turn leave four identical rows, and the transcript stops being a
+      // record of what was permitted.
+      const target = approvalTarget(entry.arguments);
+      const label = target ? `${entry.tool} · ${target}` : entry.tool;
       setMessages((current) => [
         ...current,
         {
           role: "tool",
           content: approved
             ? always
-              ? `Approved ${entry.tool}, and won't ask again for it this session${
-                  cascaded > 0 ? ` — cleared ${cascaded} waiting request${cascaded === 1 ? "" : "s"}` : ""
+              ? `Approved ${label} — won't ask again for ${entry.tool} this session${
+                  cascaded > 0 ? `, cleared ${cascaded} waiting request${cascaded === 1 ? "" : "s"}` : ""
                 }`
-              : `Approved ${entry.tool}`
+              : `Approved ${label}`
             : reason
-              ? `Denied ${entry.tool} — ${reason}`
-              : `Denied ${entry.tool}`,
+              ? `Denied ${label} — ${reason}`
+              : `Denied ${label}`,
           tool: entry.tool,
+          decision: approved ? "approved" : "denied",
         },
       ]);
       setDenyReasons(({ [entry.requestId]: _answered, ...rest }) => rest);
@@ -3346,8 +3363,13 @@ export function AgentPanel({
         )}
 
         {/* Now that the conversation is the app's center column, the readable
-            measure is capped and centered rather than filling the panel. */}
-        <div className="mx-auto flex w-full max-w-[760px] flex-col gap-[18px]">
+            measure is capped and centered rather than filling the panel.
+
+            The base gap is the tight one, because most rows in a long turn are
+            single-line tool steps: at a uniform 18px they read as unrelated
+            fragments rather than one run. Prose and prompts buy their own air
+            back with a top margin. */}
+        <div className="mx-auto flex w-full max-w-[760px] flex-col gap-2">
           {messages.map((message, index) => {
             if (message.turnId) {
               if (activityAnchors.get(message.turnId) !== index) return null;
@@ -3377,16 +3399,27 @@ export function AgentPanel({
                 <div
                   key={index}
                   data-role="user"
-                  className="max-w-[88%] self-end rounded-[9px_9px_2px_9px] bg-surface-3 px-3.5 py-2.5 text-[13px] leading-[1.55] text-ink-strong"
+                  className="mt-4 max-w-[88%] self-end rounded-[9px_9px_2px_9px] bg-surface-3 px-3.5 py-2.5 text-[13px] leading-[1.55] text-ink-strong"
                 >
                   {message.content}
                 </div>
               );
             }
             if (message.role === "tool") return <ToolRow key={index} message={message} onAsk={askAboutStep} />;
+            // The eyebrow names a speaker, and the speaker does not change
+            // between two consecutive blocks from the agent. Repeating it
+            // splits one answer into two that look like different turns.
+            const previous = messages[index - 1];
+            const continuation = previous?.role === "assistant" && !previous.turnId;
             return (
-              <div key={index} data-role="assistant" className="max-w-[94%] self-start">
-                <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-ink-subtle">CALICODE</div>
+              <div
+                key={index}
+                data-role="assistant"
+                className={`max-w-[94%] self-start ${continuation ? "" : "mt-3"}`}
+              >
+                {continuation ? null : (
+                  <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-ink-subtle">CALICODE</div>
+                )}
                 <div className="text-[13px] leading-[1.6] text-ink">
                   {message.panel ? (
                     <CommandPanelView panel={message.panel} />
@@ -3404,7 +3437,12 @@ export function AgentPanel({
                 <span className="cb-shimmer text-[12.5px] font-medium">
                   {messages.some((message) => message.status === "running") ? "Working…" : "Thinking…"}
                 </span>
-                {thinkingSeconds > 0 ? <span className="text-[10.5px] text-ink-faint">{thinkingSeconds}s</span> : null}
+                {/* Same formatter as the activity row's clock. Raw seconds
+                    here put "331s" and "5m 31s" on screen together, one
+                    duration written two ways. */}
+                {thinkingSeconds > 0 ? (
+                  <span className="text-[10.5px] text-ink-faint">{formatDuration(thinkingSeconds * 1000)}</span>
+                ) : null}
               </div>
             </div>
           )}
@@ -3419,31 +3457,61 @@ export function AgentPanel({
             const answering = entry.state.kind === "answering";
             const settled = entry.state.kind === "settled";
             const lapsed = entry.state.kind === "lapsed";
+            const finished = settled || lapsed;
+            const target = approvalTarget(entry.arguments);
+            // A finished card keeps its own past tense. Leaving the question
+            // form up is the defect that made a transcript of completed work
+            // read as a wall of unanswered prompts.
+            const title = settled
+              ? entry.state.kind === "settled" && entry.state.approved
+                ? `Approved ${entry.tool}`
+                : `Denied ${entry.tool}`
+              : lapsed
+                ? `Approval for ${entry.tool} lapsed`
+                : `Approve ${entry.tool}?`;
             return (
               <div
                 key={entry.requestId}
                 data-approval={entry.requestId}
                 data-approval-state={entry.state.kind}
-                className={`w-full self-start rounded-lg border p-3 ${
-                  lapsed || settled ? "border-line bg-surface-2 opacity-70" : "border-line-strong bg-surface-1"
+                className={`mt-2 w-full self-start rounded-lg border ${
+                  finished ? "border-line bg-surface-1 px-3 py-2" : "border-line-strong bg-surface-1 p-3"
                 }`}
               >
-                <p className="text-[13px] text-ink-strong">
-                  Approve {entry.tool}?
+                <p className={`text-[13px] ${finished ? "text-ink-subtle" : "text-ink-strong"}`}>
+                  {title}
                   {entry.graphLabel ? (
                     <span className="ml-1.5 text-[11px] text-ink-subtle">for run {entry.graphLabel}</span>
                   ) : null}
                 </p>
-                <pre className="mt-1.5 max-h-24 overflow-auto text-[11px] text-ink-subtle">
-                  {JSON.stringify(entry.arguments, null, 2)}
-                </pre>
+                {target ? (
+                  <p className="mt-0.5 truncate font-mono text-[11px] text-ink-faint" title={target}>
+                    {target}
+                  </p>
+                ) : null}
+                {/* Only when there is something the target line did not
+                    already say. `null` used to print verbatim, which reads as
+                    a bug in the request. */}
+                {!finished && argumentsWorthShowing(entry.arguments, target) ? (
+                  <pre className="mt-1.5 max-h-24 overflow-auto text-[11px] leading-[1.5] text-ink-subtle">
+                    {JSON.stringify(entry.arguments, null, 2)}
+                  </pre>
+                ) : null}
                 {lapsed && entry.state.kind === "lapsed" ? (
-                  <p className="mt-2 text-[11.5px] text-ink-subtle">
-                    No longer answerable — {lapsedExplanation(entry.state.reason)}.
+                  <p className="mt-1 text-[11.5px] text-ink-faint first-letter:uppercase">
+                    {lapsedExplanation(entry.state.reason)}.
                   </p>
                 ) : settled && entry.state.kind === "settled" ? (
-                  <p className="mt-2 text-[11.5px] text-ink-subtle">
-                    {entry.state.approved ? "Approved." : "Denied."}
+                  <p className="mt-1 text-[11.5px] text-ink-faint">
+                    {/* Only an always-allow can still be on screen once
+                        settled, and nobody clicked this card — saying
+                        "Approved." alone would credit the user with a decision
+                        they were never shown. */}
+                    {entry.state.via === "always-allowed"
+                      ? "Covered by the permission you just granted — this one was never asked."
+                      : entry.state.approved
+                        ? "Approved."
+                        : "Denied."}
                   </p>
                 ) : (
                   <div className="mt-2.5 flex flex-wrap gap-2">
@@ -3505,7 +3573,10 @@ export function AgentPanel({
               onClick={() =>
                 transcriptRef.current?.scrollTo({ top: transcriptRef.current.scrollHeight, behavior: "smooth" })
               }
-              className="pointer-events-auto inline-flex h-7 w-7 items-center justify-center rounded-full border border-line-strong bg-raised text-ink-subtle shadow-md transition-colors hover:text-ink-strong active:bg-surface-2"
+              /* The halo is what separates a floating control from whatever it
+                 happens to be over. Without it the button sits exactly on a
+                 card's top border and reads as part of the card. */
+              className="pointer-events-auto inline-flex h-7 w-7 items-center justify-center rounded-full border border-line-strong bg-raised text-ink-subtle shadow-[0_0_0_5px_var(--surface-0),0_2px_8px_rgba(0,0,0,0.14)] transition-colors hover:text-ink-strong active:bg-surface-2"
             >
               <ArrowDown aria-hidden className="h-3.5 w-3.5" strokeWidth={1.8} />
             </button>

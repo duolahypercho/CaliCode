@@ -228,8 +228,10 @@ describe("always allow", () => {
     expect(sends).toHaveLength(1);
     // `always` rides along with an approval; core grants the exact tool name.
     expect(sends[0]).toMatchObject({ approved: true, always: true });
-    // The user is told the scope of what they just did.
-    expect(await screen.findByText(/won't ask again for it this session/)).toBeTruthy();
+    // The user is told the scope of what they just did — naming the tool, not
+    // "it", because the row now also names the path this particular grant was
+    // about and the two are not the same scope.
+    expect(await screen.findByText(/won't ask again for file_write this session/)).toBeTruthy();
   });
 
   it("never attaches `always` to a plain approval or to a denial", async () => {
@@ -275,8 +277,14 @@ describe("an always-allow that covers cards already up", () => {
     await emit({ type: "agent.approval_resolved", requestId: "approval-2", outcome: "always-allowed" });
     const sibling = document.querySelector('[data-approval="approval-2"]');
     expect(sibling?.getAttribute("data-approval-state")).toBe("settled");
-    expect(sibling?.textContent).toContain("Approved.");
+    expect(sibling?.textContent).toContain("Approved file_write");
+    // And it says why it settled without being clicked. A bare "Approved."
+    // credits the user with a decision this card never showed them.
+    expect(sibling?.textContent).toContain("Covered by the permission you just granted");
     expect(sibling?.textContent).not.toContain("No longer answerable");
+    // The card the user actually clicked leaves its record in the transcript,
+    // not as a second card saying the same thing in a different shape.
+    expect(document.querySelector('[data-approval="approval-1"]')).toBeNull();
   });
 });
 
@@ -299,7 +307,10 @@ describe("denying with a reason", () => {
     const sends = approvalSends();
     expect(sends).toHaveLength(1);
     expect(sends[0]).toMatchObject({ approved: false, reason: "not that file, edit the config" });
-    expect(await screen.findByText(/Denied file_write — not that file, edit the config/)).toBeTruthy();
+    // The row names what was refused, not just which tool asked.
+    expect(
+      await screen.findByText(/Denied file_write · src\/game\.ts — not that file, edit the config/),
+    ).toBeTruthy();
   });
 
   it("denies on Enter so a reason costs no extra reach for the mouse", async () => {
@@ -411,7 +422,11 @@ describe("the governing invariant", () => {
       await vi.advanceTimersByTimeAsync(11_000);
     });
 
-    expect(screen.getByText(/no longer answerable/i).textContent).toMatch(/stopped waiting/i);
+    // The card stops asking a question it can no longer take an answer to,
+    // and says in its own words why.
+    expect(screen.getByText(/Approval for file_write lapsed/)).toBeTruthy();
+    expect(screen.queryByText(/Approve file_write\?/)).toBeNull();
+    expect(screen.getByText(/stopped waiting/i)).toBeTruthy();
     expect(deniedSends()).toEqual([]);
   });
 });
@@ -736,7 +751,8 @@ describe("defect 5 — the queue", () => {
     });
 
     expect(document.querySelector('[data-approval="approval-1"]')?.getAttribute("data-approval-state")).toBe("lapsed");
-    expect(screen.getByText(/no longer answerable/i).textContent).toMatch(/no longer waiting/i);
+    expect(screen.getByText(/Approval for file_write lapsed/)).toBeTruthy();
+    expect(screen.getByText(/no longer waiting/i)).toBeTruthy();
   });
 
   it("core announcing a resolution retires the card without a click", async () => {
