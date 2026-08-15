@@ -283,6 +283,8 @@ export interface NamedCommand {
   name: string;
   summary: string;
   usage?: string;
+  /** Menu label; defaults to the name title-cased (see [`commandLabel`]). */
+  label?: string;
   /** Skills are tagged so the menu can say where a row came from. */
   kind?: "skill";
   /**
@@ -366,7 +368,34 @@ export function runsBare(command: NamedCommand): boolean {
   return command.runsOnEnter === true;
 }
 
-/** Commands to show in the autocomplete menu for the token under the caret. */
+/** Words that must not be sentence-cased when a label is derived. */
+const ACRONYMS: Record<string, string> = { mcp: "MCP", ui: "UI", qa: "QA" };
+
+/**
+ * The human label for a menu row: `graph-template` reads as "Graph template".
+ *
+ * Derived rather than authored so a label can never drift from the name the
+ * user actually types — the menu shows no slash, and a label that said
+ * something else would leave no way to guess the command.
+ */
+export function commandLabel(command: NamedCommand): string {
+  if (command.label) return command.label;
+  return command.name
+    .split("-")
+    .map((word, index) =>
+      ACRONYMS[word] ?? (index === 0 ? word.charAt(0).toUpperCase() + word.slice(1) : word),
+    )
+    .join(" ");
+}
+
+/**
+ * Commands to show in the autocomplete menu for the token under the caret,
+ * ordered the way the menu draws them.
+ *
+ * Sorted here rather than in the menu component because the caller indexes
+ * this same array to decide what Enter runs; sorting only the view would point
+ * the highlight at one row and fire another.
+ */
 export function matchCommandsIn<Command extends NamedCommand>(
   input: string,
   commands: readonly Command[],
@@ -374,7 +403,9 @@ export function matchCommandsIn<Command extends NamedCommand>(
 ): Command[] {
   const token = slashTokenAt(input, caret);
   if (!token) return [];
-  return commands.filter((command) => command.name.startsWith(token.prefix));
+  return commands
+    .filter((command) => command.name.startsWith(token.prefix))
+    .sort((a, b) => commandLabel(a).localeCompare(commandLabel(b)));
 }
 
 /**

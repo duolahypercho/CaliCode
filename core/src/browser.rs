@@ -99,7 +99,7 @@ const CAST_MAX_WIDTH: u32 = 3840;
 /// a frame — some 5 MB/s of base64 — to make motion marginally crisper, which
 /// nobody can see. So motion streams cheap and the page sharpens the moment it
 /// stops, which is the trade every remote-display protocol makes.
-const CAST_STREAM_MAX_WIDTH: u32 = 1400;
+const CAST_STREAM_MAX_WIDTH: u32 = CAST_MAX_WIDTH;
 const CAST_MIN_WIDTH: u32 = 320;
 /// JPEG quality for streamed motion frames.
 ///
@@ -114,7 +114,7 @@ const CAST_MIN_WIDTH: u32 = 320;
 /// visible the snap when a scroll ends. 45 was measurably cheap and read as a
 /// quality pop; this is the point where motion is still a third of the
 /// original cost and the transition stops announcing itself.
-const CAST_QUALITY: u32 = 62;
+const CAST_QUALITY: u32 = 82;
 
 /// Quality for a capture rather than a cast frame.
 ///
@@ -788,6 +788,25 @@ impl Browser {
     /// A JPEG of the current viewport, base64 encoded.
     pub async fn screenshot(&self, full_page: bool) -> Result<String> {
         self.capture(full_page, STILL_QUALITY).await
+    }
+
+    /// Capture losslessly, as a `data:image/png` url.
+    ///
+    /// For evidence rather than for viewing. A reference image the user will
+    /// look at closely — or that `image3d_mesh` will reconstruct from — should
+    /// not carry jpeg ringing baked in, and it certainly should not be jpeg
+    /// bytes inside a file named `.png`, which is what asking for one used to
+    /// produce.
+    pub async fn screenshot_png(&self, full_page: bool) -> Result<String> {
+        let mut params = json!({ "format": "png" });
+        if full_page {
+            params["captureBeyondViewport"] = json!(true);
+        }
+        let result = self.call("Page.captureScreenshot", params).await?;
+        result["data"]
+            .as_str()
+            .map(|data| format!("data:image/png;base64,{data}"))
+            .context("browser returned no image data")
     }
 
     async fn capture(&self, full_page: bool, quality: u32) -> Result<String> {
@@ -2236,6 +2255,27 @@ mod tests {
                 "{engine} must end ready for a query"
             );
             assert!(normalize_url(&format!("{engine}test")).is_ok());
+        }
+    }
+
+    #[test]
+    fn a_capture_is_encoded_as_the_extension_promises() {
+        // Asking for `.png` used to write jpeg bytes into it: a file that lied
+        // about its format, and lossy when the caller had asked for lossless.
+        // The choice is made from the path, so this pins the rule the tool
+        // arm applies.
+        for (path, png) in [
+            ("refs/shot.png", true),
+            ("refs/SHOT.PNG", true),
+            ("refs/shot.jpg", false),
+            ("refs/shot.jpeg", false),
+        ] {
+            assert_eq!(
+                path.to_ascii_lowercase().ends_with(".png"),
+                png,
+                "{path} should {} be encoded as png",
+                if png { "" } else { "not" }
+            );
         }
     }
 

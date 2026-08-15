@@ -13,6 +13,10 @@ const PROJECTS_DIR = resolve(E2E_STATE_DIR, "projects");
 // view, so the suite silently started testing a different app. Isolating the
 // projects directory alone was not enough.
 const CONFIG_PATH = resolve(E2E_STATE_DIR, "config.yaml");
+// Skills default to reading the other harnesses' roots (~/.claude/skills and
+// friends), so without this the slash menu differs between a developer's
+// machine and CI. Setting it also switches those external roots off.
+const SKILLS_DIR = resolve(E2E_STATE_DIR, "skills");
 
 /**
  * The suite writes real projects through core, so it gets its own projects
@@ -44,7 +48,7 @@ export default defineConfig({
       // against. Stop your dev core before running the suite.
       reuseExistingServer: false,
       timeout: 180_000,
-      env: { CALI_PROJECTS_DIR: PROJECTS_DIR, CALI_CONFIG: CONFIG_PATH },
+      env: { CALI_PROJECTS_DIR: PROJECTS_DIR, CALI_CONFIG: CONFIG_PATH, CALI_SKILLS_DIR: SKILLS_DIR },
     },
     {
       command: "pnpm dev",

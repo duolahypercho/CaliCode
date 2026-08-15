@@ -1379,7 +1379,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "browser_screenshot".into(),
-            description: "Save the current page as a JPEG inside the game's folder and return its project-relative path. Use it to keep evidence — a reference image to reconstruct, a before/after of a game view. The image bytes never pass through this conversation; only the path comes back.".into(),
+            description: "Save the current page as an image inside the game's folder and return its project-relative path. Use a .png path for a lossless capture — a reference you will look at closely or reconstruct from — and .jpg when a smaller file matters more than exactness. Use it to keep evidence — a reference image to reconstruct, a before/after of a game view. The image bytes never pass through this conversation; only the path comes back.".into(),
             parameters: json!({
                 "type":"object",
                 "properties":{
@@ -1809,21 +1809,20 @@ pub(crate) async fn execute_core_tool_with_activity(
         "skill_list" => {
             let slug = args.get("slug").and_then(Value::as_str);
             Ok(json!({
-                "skills": crate::skills::list_skills(root, slug, &config.skills.disabled)
+                "skills": crate::skills::list_skills(root, slug, &config.skills)
             }))
         }
         "skill_load" => {
             let slug = args.get("slug").and_then(Value::as_str);
             let name = required_str(args, "name")?;
-            let disabled = &config.skills.disabled;
             if let Some(file) = args.get("file").and_then(Value::as_str) {
                 let (info, contents) =
-                    crate::skills::load_skill_file(root, slug, name, file, disabled)?;
+                    crate::skills::load_skill_file(root, slug, name, file, &config.skills)?;
                 return Ok(json!({
                     "name": info.name, "scope": info.scope, "file": file, "contents": contents
                 }));
             }
-            let (info, body) = crate::skills::load_skill(root, slug, name, disabled)?;
+            let (info, body) = crate::skills::load_skill(root, slug, name, &config.skills)?;
             let support = crate::skills::list_skill_files(&info);
             let mut out = json!({
                 "name": info.name, "scope": info.scope, "instructions": body
@@ -2038,14 +2037,20 @@ pub(crate) async fn execute_core_tool_with_activity(
             let slug = required_str(args, "slug")?;
             let rel = crate::fileread::arg_path(args)?;
             let browser = state.browsers.ensure(state.bus.clone()).await?;
-            let frame = browser
-                .screenshot(args["fullPage"].as_bool().unwrap_or(false))
-                .await?;
+            let full_page = args["fullPage"].as_bool().unwrap_or(false);
+            // The requested extension decides the encoding. Writing jpeg bytes
+            // into a `.png` produced a file that lied about its format and
+            // threw away detail the caller had explicitly asked to keep.
+            let data_url = if rel.to_ascii_lowercase().ends_with(".png") {
+                browser.screenshot_png(full_page).await?
+            } else {
+                crate::browser::data_url(&browser.screenshot(full_page).await?)
+            };
             let persisted = crate::capture_persist::persist_capture(
                 root,
                 slug,
                 rel,
-                &crate::browser::data_url(&frame),
+                &data_url,
                 workspace_override,
             )?;
             Ok(crate::capture_persist::as_json(&persisted))
@@ -2448,11 +2453,11 @@ async fn spawn_subagent_with(
         args.get("system").and_then(Value::as_str),
         slug.as_deref(),
     );
-    let disabled = { state.config.read().await.skills.disabled.clone() };
+    let skills_cfg = { state.config.read().await.skills.clone() };
     system.push_str(&crate::skills::prompt_index(
         &state.projects_root,
         slug.as_deref(),
-        &disabled,
+        &skills_cfg,
     ));
     let permission_mode = parent
         .as_ref()

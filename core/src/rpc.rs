@@ -656,21 +656,27 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             str_param(&params, "content")?,
         )?),
         "skill_list" => {
-            let disabled = { state.config.read().await.skills.disabled.clone() };
+            let skills_cfg = { state.config.read().await.skills.clone() };
             let slug = params.get("projectSlug").and_then(Value::as_str);
             Ok(json!({
-                "skills": crate::skills::list_skills(&state.projects_root, slug, &disabled)
+                "skills": crate::skills::list_skills(&state.projects_root, slug, &skills_cfg)
             }))
         }
         "skill_read" => {
             // UI preview: a disabled skill is still readable, so the empty
             // disabled slice is deliberate.
             let slug = params.get("projectSlug").and_then(Value::as_str);
+            // UI preview reads a disabled skill too, so the disabled list is
+            // cleared while the roots are kept.
+            let skills_cfg = crate::config::SkillsConfig {
+                disabled: Vec::new(),
+                ..state.config.read().await.skills.clone()
+            };
             let (info, body) = crate::skills::load_skill(
                 &state.projects_root,
                 slug,
                 str_param(&params, "name")?,
-                &[],
+                &skills_cfg,
             )?;
             Ok(json!({
                 "name": info.name,
@@ -1141,10 +1147,10 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             registered.extend(state.mcp.tool_defs().await);
             // Clone-then-drop; the config lock must never be held across
             // chat().await (fair RwLock starvation, see agent.rs).
-            let (skills_disabled, permission_rules) = {
+            let (skills_cfg, permission_rules) = {
                 let config = state.config.read().await;
                 (
-                    config.skills.disabled.clone(),
+                    config.skills.clone(),
                     agent_permission_rules(&config.permissions),
                 )
             };
@@ -1153,9 +1159,9 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| {
-                    project_slug.as_deref().map(|slug| {
-                        default_system_prompt(state, slug, &skills_disabled, &registered)
-                    })
+                    project_slug
+                        .as_deref()
+                        .map(|slug| default_system_prompt(state, slug, &skills_cfg, &registered))
                 });
             let options = AgentOptions {
                 // Fail closed on an omitted mode. `requires_approval` already
@@ -1768,7 +1774,7 @@ fn mcp_tools_block(registered: &std::collections::HashMap<String, ToolDef>) -> S
 fn default_system_prompt(
     state: &AppState,
     slug: &str,
-    skills_disabled: &[String],
+    skills_cfg: &crate::config::SkillsConfig,
     registered: &std::collections::HashMap<String, ToolDef>,
 ) -> String {
     let template_ids = crate::graph::list_templates(&state.sessions_root)
@@ -1806,7 +1812,7 @@ Conventions: {skills_block}\n",
     prompt.push_str(&crate::skills::prompt_index(
         &state.projects_root,
         Some(slug),
-        skills_disabled,
+        skills_cfg,
     ));
     prompt
 }
@@ -2986,6 +2992,16 @@ mod tests {
     /// A registered editor tool, so capability-gated prompt sections render.
     /// Editor tools reach core over `tool_register` at runtime, which is
     /// exactly why the sections that name them cannot be unconditional.
+    /// A skills config with no external roots: these assertions are about the
+    /// prompt's own shape, and must not vary with what the person running the
+    /// suite happens to have installed under ~/.claude or ~/.codex.
+    fn isolated_skills() -> crate::config::SkillsConfig {
+        crate::config::SkillsConfig {
+            disabled: Vec::new(),
+            extra_dirs: Vec::new(),
+        }
+    }
+
     fn with_editor() -> HashMap<String, crate::tools::ToolDef> {
         HashMap::from([(
             "editor_scene_inspect".to_string(),
@@ -3021,13 +3037,13 @@ mod tests {
 
         let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
         // With an editor attached, the editor workflow is described.
-        let prompt = default_system_prompt(&state, "big", &[], &with_editor());
+        let prompt = default_system_prompt(&state, "big", &isolated_skills(), &with_editor());
         assert!(prompt.contains("editor_persist_capture(path)"));
         assert!(prompt.contains("editor_camera_frame"));
         // Without one it is not, because none of those tools exist. A subagent
         // or graph node told to "run editor_run_pie" spends turns discovering
         // it cannot.
-        let headless = default_system_prompt(&state, "big", &[], &HashMap::new());
+        let headless = default_system_prompt(&state, "big", &isolated_skills(), &HashMap::new());
         assert!(!headless.contains("editor_persist_capture"), "{headless}");
         assert!(!headless.contains("editor_run_pie"), "{headless}");
         assert!(prompt.contains("gameplay foreground entity ids"));
@@ -3079,7 +3095,7 @@ mod tests {
 
         // These contracts govern the editor's script/test runtime, so they
         // ride with the editor section rather than the invariant base.
-        let prompt = default_system_prompt(&state, "demo", &[], &with_editor());
+        let prompt = default_system_prompt(&state, "demo", &isolated_skills(), &with_editor());
         for contract in [
             "only owner `entity` is writable",
             "`state.find(nameOrId)`",
@@ -3363,13 +3379,13 @@ mod tests {
 
         // No editor connected: the browser-tools slot says so explicitly
         // instead of rendering empty.
-        let prompt = default_system_prompt(&state, "bare", &[], &HashMap::new());
+        let prompt = default_system_prompt(&state, "bare", &isolated_skills(), &HashMap::new());
         assert!(prompt.contains("none registered — no editor is connected"));
         // No CALICODE.md or skills/ folder: the skills slot falls back.
         assert!(prompt.contains("No CALICODE.md or skills/ found"));
 
         // A slug with no readable project still renders a full prompt.
-        let prompt = default_system_prompt(&state, "missing", &[], &HashMap::new());
+        let prompt = default_system_prompt(&state, "missing", &isolated_skills(), &HashMap::new());
         assert!(prompt.contains("project not readable yet"));
         assert!(prompt.contains("Match the ask to the machinery"));
     }
