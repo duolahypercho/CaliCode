@@ -5494,7 +5494,10 @@ mod tests {
                             // including this probe with no client id — is
                             // refused by `respond`, which is the point.
                             Some(client) => {
-                                let _ = agents.approvals().respond(&rid, Some(client), true).await;
+                                let _ = agents
+                                    .approvals()
+                                    .respond(&rid, Some(client), true, None)
+                                    .await;
                             }
                             // Unaddressed: answerable by nobody, so it would
                             // park for core's full 300s timer. The probe plays

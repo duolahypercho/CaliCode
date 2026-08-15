@@ -1253,17 +1253,19 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                     .get("always")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+            let client_id = params
+                .get("clientId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|client| !client.is_empty());
             let mut answer = state
                 .agents
                 .approvals()
                 .respond(
                     str_param(&params, "requestId")?,
-                    params
-                        .get("clientId")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|client| !client.is_empty()),
+                    client_id,
                     approved,
+                    params.get("reason").and_then(Value::as_str),
                 )
                 .await?;
             if always {
@@ -1277,6 +1279,19 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                         tracing::warn!(%error, %session, %tool, "could not record always-allow");
                         answer["alwaysAllowed"] = json!(false);
                     }
+                }
+                // Cascade regardless of whether the grant was newly recorded:
+                // "already granted" is exactly the state where sibling cards
+                // are still up, because the turn's rules were snapshotted
+                // before the grant existed.
+                if let Some(client) = client_id {
+                    answer["alsoApproved"] = json!(
+                        state
+                            .agents
+                            .approvals()
+                            .grant_pending(&session, &tool, client)
+                            .await
+                    );
                 }
             }
             Ok(answer)
@@ -2229,6 +2244,115 @@ mod tests {
             browsers: crate::browser::Browsers::new(),
             shutdown: std::sync::Arc::new(tokio::sync::watch::channel(false).0),
         }
+    }
+
+    /// An "always allow" has to answer the cards it already covers.
+    ///
+    /// The grant is folded into a turn's permission rules when the turn
+    /// *starts*, so the siblings of a parallel tool batch keep their cards up
+    /// after the user grants the tool — which reads as the grant having failed
+    /// and costs a click per sibling.
+    #[tokio::test]
+    async fn an_always_allow_clears_the_pending_cards_it_covers() {
+        let home = tempfile::tempdir().unwrap();
+        let state = test_state(home.path().join("projects"), home.path().join("sessions"));
+        let mut events = state.bus.subscribe();
+
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let approvals = state.agents.approvals().clone();
+            waiters.push(tokio::spawn(async move {
+                approvals
+                    .request(crate::approvals::ApprovalRequest {
+                        answer_session: "session-1",
+                        target_client_id: Some("window-a".into()),
+                        owner_session: Some("session-1".into()),
+                        owner_graph: None,
+                        asking_session: "session-1",
+                        tool: "file_write",
+                        arguments: json!({ "path": "a.txt" }),
+                    })
+                    .await
+            }));
+        }
+        let mut ids = Vec::new();
+        while ids.len() < 3 {
+            let event = events.recv().await.unwrap();
+            if event["type"] == "agent.approval_request" {
+                ids.push(event["requestId"].as_str().unwrap().to_string());
+            }
+        }
+
+        let answer = dispatch(
+            &state,
+            "agent_approval_response",
+            json!({
+                "requestId": ids[0],
+                "clientId": "window-a",
+                "approved": true,
+                "always": true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(answer["alsoApproved"], 2);
+        for waiter in waiters {
+            assert_eq!(
+                waiter.await.unwrap(),
+                crate::approvals::ApprovalOutcome::Approved
+            );
+        }
+        assert_eq!(state.agents.approvals().pending_count().await, 0);
+    }
+
+    /// The reason the user typed reaches the tool error, and only on a denial.
+    #[tokio::test]
+    async fn a_denial_forwards_the_users_words_to_the_waiting_call() {
+        let home = tempfile::tempdir().unwrap();
+        let state = test_state(home.path().join("projects"), home.path().join("sessions"));
+        let mut events = state.bus.subscribe();
+
+        let waiter = {
+            let approvals = state.agents.approvals().clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(crate::approvals::ApprovalRequest {
+                        answer_session: "session-1",
+                        target_client_id: Some("window-a".into()),
+                        owner_session: Some("session-1".into()),
+                        owner_graph: None,
+                        asking_session: "session-1",
+                        tool: "file_write",
+                        arguments: json!({ "path": "a.txt" }),
+                    })
+                    .await
+            })
+        };
+        let request_id = loop {
+            let event = events.recv().await.unwrap();
+            if event["type"] == "agent.approval_request" {
+                break event["requestId"].as_str().unwrap().to_string();
+            }
+        };
+
+        dispatch(
+            &state,
+            "agent_approval_response",
+            json!({
+                "requestId": request_id,
+                "clientId": "window-a",
+                "approved": false,
+                "reason": "not that file, edit the config",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            waiter.await.unwrap(),
+            crate::approvals::ApprovalOutcome::Denied(Some(
+                "not that file, edit the config".into()
+            ))
+        );
     }
 
     fn git_fixture(home: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {

@@ -2273,9 +2273,17 @@ impl AgentManager {
                 crate::approvals::ApprovalOutcome::Approved => {}
                 // A human clicked Deny. The only sentence in core that may say
                 // "denied".
-                crate::approvals::ApprovalOutcome::Denied => {
-                    anyhow::bail!("approval denied for {}", def.name)
-                }
+                crate::approvals::ApprovalOutcome::Denied(reason) => match reason {
+                    // The words are the point. A bare denial teaches the model
+                    // only that the door is shut, so it tries the same door;
+                    // "not that file, edit the config instead" redirects it.
+                    Some(reason) => anyhow::bail!(
+                        "approval denied for {}. The user said: {reason}. Treat that as the \
+                         instruction — do not retry this call unchanged.",
+                        def.name
+                    ),
+                    None => anyhow::bail!("approval denied for {}", def.name),
+                },
                 // Nobody answered. Naming the real cause keeps a cancelled run
                 // and a timeout from being reported to the model — and read
                 // back by a human in the transcript — as a decision somebody
@@ -3966,7 +3974,7 @@ mod tests {
                         .to_string();
                     responder_agents
                         .approvals()
-                        .respond(&request_id, Some(&client_id), true)
+                        .respond(&request_id, Some(&client_id), true, None)
                         .await
                         .unwrap();
                 }
@@ -4609,7 +4617,7 @@ mod tests {
                         .to_string();
                     responder_agents
                         .approvals()
-                        .respond(&rid, Some(&client_id), true)
+                        .respond(&rid, Some(&client_id), true, None)
                         .await
                         .unwrap();
                 }
@@ -6285,7 +6293,7 @@ mod tests {
         // And the approval is still there, still answerable, still not denied.
         agents
             .approvals()
-            .respond(&request_id, Some("window-a"), true)
+            .respond(&request_id, Some("window-a"), true, None)
             .await
             .expect("the approval survived the crossed submission");
         assert_eq!(
@@ -6344,7 +6352,7 @@ mod tests {
 
         agents
             .approvals()
-            .respond(&request_id, Some("window-a"), true)
+            .respond(&request_id, Some("window-a"), true, None)
             .await
             .expect("the parked approval must still be answerable");
     }
