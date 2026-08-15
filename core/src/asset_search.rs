@@ -187,7 +187,8 @@ pub async fn search_with<F: Fetch>(
         }
     }
     if want("library") {
-        let library = search_library(catalog, &q, types);
+        let installed = installed_repos(root, slug);
+        let library = search_library(catalog, &installed, &q, types);
         counts.insert("library".into(), json!(library.len()));
         hits.extend(library);
     }
@@ -293,7 +294,31 @@ fn search_local(root: &Path, slug: &str, q: &Query, types: &[String]) -> Result<
     Ok(hits)
 }
 
-fn search_library(catalog: &[Value], q: &Query, types: &[String]) -> Vec<Value> {
+/// What this game has installed, repo id -> attachment. Empty when there is no
+/// project in context, which correctly leaves every catalogue entry uninstalled.
+fn installed_repos(root: &Path, slug: Option<&str>) -> serde_json::Map<String, Value> {
+    let Some(slug) = slug else {
+        return serde_json::Map::new();
+    };
+    let Ok(project) = crate::store::read_project(root, slug) else {
+        return serde_json::Map::new();
+    };
+    project["settings"]["assetRepos"]
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The catalogue is a storefront: every game can *see* every repo, but only one
+/// it has installed carries a usable `url`. Repos are metadata-only pointers, so
+/// the url is the actionable payload — handing it out for an uninstalled repo
+/// would let the agent build against something this project never took on.
+fn search_library(
+    catalog: &[Value],
+    installed: &serde_json::Map<String, Value>,
+    q: &Query,
+    types: &[String],
+) -> Vec<Value> {
     let mut hits = Vec::new();
     for entry in catalog {
         let category = entry["category"].as_str().unwrap_or("");
@@ -308,21 +333,38 @@ fn search_library(catalog: &[Value], q: &Query, types: &[String]) -> Vec<Value> 
             continue;
         };
         let id = entry["id"].as_str().unwrap_or("");
-        hits.push(json!({
+        let attachment = installed.get(id);
+        let mut detail = json!({
+            "license": entry["license"],
+            "description": description,
+            "settings": entry["settings"]
+        });
+        if let Some(attachment) = attachment {
+            detail["url"] = entry["url"].clone();
+            // This game's tuned values. Reporting the catalogue defaults here
+            // would misdescribe every project that changed one.
+            detail["currentSettings"] = attachment
+                .get("settings")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+        }
+        let mut hit = json!({
             "source": "library",
             "id": id,
             "name": name,
             "type": category,
             "score": round3(score),
             "tags": tags,
-            "detail": {
-                "url": entry["url"],
-                "license": entry["license"],
-                "description": description,
-                "settings": entry["settings"]
-            },
+            "installed": attachment.is_some(),
+            "detail": detail,
             "pick": { "source": "library", "id": id }
-        }));
+        });
+        if attachment.is_none() {
+            hit["hint"] = json!(format!(
+                "not installed in this game; asset_pick source=library id={id} installs it and returns the url"
+            ));
+        }
+        hits.push(hit);
     }
     hits
 }
@@ -784,19 +826,65 @@ mod tests {
     #[test]
     fn library_search_scores_the_catalogue() {
         let catalog = canned_catalog();
+        let none = serde_json::Map::new();
         let q = Query::parse("barrel");
-        let hits = search_library(&catalog, &q, &[]);
+        let hits = search_library(&catalog, &none, &q, &[]);
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0]["id"], "props-pack");
         assert_eq!(hits[0]["detail"]["license"], "CC0");
 
         // Category filter uses the types list.
         let q = Query::parse("trail");
-        assert_eq!(search_library(&catalog, &q, &["vfx".to_string()]).len(), 1);
         assert_eq!(
-            search_library(&catalog, &q, &["props".to_string()]).len(),
+            search_library(&catalog, &none, &q, &["vfx".to_string()]).len(),
+            1
+        );
+        assert_eq!(
+            search_library(&catalog, &none, &q, &["props".to_string()]).len(),
             0
         );
+    }
+
+    #[test]
+    fn library_search_withholds_the_url_until_the_game_installs_it() {
+        let catalog = canned_catalog();
+        let q = Query::parse("barrel");
+
+        // Uninstalled: discoverable, but nothing the agent can build against.
+        let hits = search_library(&catalog, &serde_json::Map::new(), &q, &[]);
+        assert_eq!(hits[0]["installed"], false);
+        assert!(hits[0]["detail"]["url"].is_null());
+        assert!(hits[0]["hint"].as_str().unwrap().contains("asset_pick"));
+
+        // Installed: url appears, and the settings reported are this game's.
+        let installed = serde_json::Map::from_iter([(
+            "props-pack".to_string(),
+            json!({ "settings": { "density": 4 } }),
+        )]);
+        let hits = search_library(&catalog, &installed, &q, &[]);
+        assert_eq!(hits[0]["installed"], true);
+        assert_eq!(hits[0]["detail"]["url"], "https://example.com/props");
+        assert_eq!(hits[0]["detail"]["currentSettings"]["density"], 4);
+        assert!(hits[0]["hint"].is_null());
+    }
+
+    #[test]
+    fn installed_repos_reads_the_games_own_attachments() {
+        let root = tempfile::tempdir().unwrap();
+        create_project(root.path(), "demo", "Demo").unwrap();
+        let catalog = canned_catalog();
+
+        // Nothing installed, and an absent project is simply "nothing installed".
+        assert!(installed_repos(root.path(), Some("demo")).is_empty());
+        assert!(installed_repos(root.path(), None).is_empty());
+        assert!(installed_repos(root.path(), Some("no-such-game")).is_empty());
+
+        pick_library(&catalog, root.path(), "demo", "props-pack").unwrap();
+        let installed = installed_repos(root.path(), Some("demo"));
+        assert!(installed.contains_key("props-pack"));
+        // One game installing it leaves another game untouched.
+        create_project(root.path(), "other", "Other").unwrap();
+        assert!(installed_repos(root.path(), Some("other")).is_empty());
     }
 
     #[tokio::test]

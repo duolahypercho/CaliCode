@@ -955,12 +955,12 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "asset_search".into(),
-            description: "Search for assets across the project's local store, the attached asset-repo library catalogue, and PolyHaven's free CC0 catalogue. Returns scored hits with ready-made asset_pick arguments.".into(),
+            description: "Search for assets across the project's local store, the asset-repo library catalogue, and PolyHaven's free CC0 catalogue. Returns scored hits with ready-made asset_pick arguments. Library hits are marked `installed`: the whole catalogue is browsable, but a repo carries a usable `detail.url` only once this game has installed it — asset_pick installs it and returns the url.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "query":   {"type": "string", "description": "keywords, e.g. 'wooden barrel'"},
-                    "slug":    {"type": "string", "description": "project slug; required for local hits"},
+                    "query": {"type": "string", "description": "keywords, e.g. 'wooden barrel'"},
+                    "slug": {"type": "string", "description": "project slug; required for local hits, and decides which library repos count as installed"},
                     "sources": {"type": "array", "items": {"type": "string",
                                 "enum": ["local", "library", "polyhaven"]},
                                 "description": "default: all three"},
