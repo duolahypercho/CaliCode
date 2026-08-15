@@ -182,10 +182,35 @@ pub fn parse_skill(text: &str) -> Result<(Frontmatter, String)> {
 pub fn list_skills(
     projects_root: &Path,
     slug: Option<&str>,
-    disabled: &[String],
+    skills: &crate::config::SkillsConfig,
 ) -> Vec<SkillInfo> {
     let project_dir = slug.and_then(|slug| project_skills_dir(projects_root, slug));
-    list_from_dirs(&global_skills_dir(), project_dir.as_deref(), disabled)
+    list_from_roots(
+        &extra_skill_dirs(skills),
+        &global_skills_dir(),
+        project_dir.as_deref(),
+        &skills.disabled,
+    )
+}
+
+/// The configured external roots, tilde-expanded, in precedence order.
+///
+/// A root that does not exist is kept rather than filtered: `scan_dir` already
+/// treats an unreadable directory as empty, and dropping it here would make a
+/// skills folder created later invisible until restart.
+pub fn extra_skill_dirs(skills: &crate::config::SkillsConfig) -> Vec<PathBuf> {
+    // `CALI_SKILLS_DIR` means "this run is isolated" — the same reason it
+    // exists for the global root. External roots are the developer's real
+    // machine too, and a suite whose skill list depends on whether the person
+    // running it happens to use Claude Code is not a suite.
+    if std::env::var_os("CALI_SKILLS_DIR").is_some() {
+        return Vec::new();
+    }
+    skills
+        .extra_dirs
+        .iter()
+        .map(|dir| crate::config::expand_tilde(dir))
+        .collect()
 }
 
 /// Full body of one enabled, valid skill (project scope preferred on a name
@@ -196,10 +221,16 @@ pub fn load_skill(
     projects_root: &Path,
     slug: Option<&str>,
     name: &str,
-    disabled: &[String],
+    skills: &crate::config::SkillsConfig,
 ) -> Result<(SkillInfo, String)> {
     let project_dir = slug.and_then(|slug| project_skills_dir(projects_root, slug));
-    load_from_dirs(&global_skills_dir(), project_dir.as_deref(), name, disabled)
+    load_from_roots(
+        &extra_skill_dirs(skills),
+        &global_skills_dir(),
+        project_dir.as_deref(),
+        name,
+        &skills.disabled,
+    )
 }
 
 /// Support files a packaged skill ships, relative to its root and sorted.
@@ -262,18 +293,22 @@ pub fn load_skill_file(
     slug: Option<&str>,
     name: &str,
     rel: &str,
-    disabled: &[String],
+    skills: &crate::config::SkillsConfig,
 ) -> Result<(SkillInfo, String)> {
     let project_dir = slug.and_then(|slug| project_skills_dir(projects_root, slug));
-    load_file_from_dirs(
+    load_file_from_roots(
+        &extra_skill_dirs(skills),
         &global_skills_dir(),
         project_dir.as_deref(),
         name,
         rel,
-        disabled,
+        &skills.disabled,
     )
 }
 
+/// Test-only shorthand for the no-external-roots case, which is what most
+/// of the scoping tests are about.
+#[cfg(test)]
 fn load_file_from_dirs(
     global: &Path,
     project: Option<&Path>,
@@ -281,7 +316,18 @@ fn load_file_from_dirs(
     rel: &str,
     disabled: &[String],
 ) -> Result<(SkillInfo, String)> {
-    let (info, _) = load_from_dirs(global, project, name, disabled)?;
+    load_file_from_roots(&[], global, project, name, rel, disabled)
+}
+
+fn load_file_from_roots(
+    extras: &[PathBuf],
+    global: &Path,
+    project: Option<&Path>,
+    name: &str,
+    rel: &str,
+    disabled: &[String],
+) -> Result<(SkillInfo, String)> {
+    let (info, _) = load_from_roots(extras, global, project, name, disabled)?;
     let Some(dir) = info.dir.as_deref().map(Path::new) else {
         bail!("skill '{name}' is a single file and ships no support files");
     };
@@ -308,8 +354,12 @@ fn load_file_from_dirs(
 }
 
 /// Compact system-prompt index of enabled skills; `""` when there are none.
-pub fn prompt_index(projects_root: &Path, slug: Option<&str>, disabled: &[String]) -> String {
-    render_index(&list_skills(projects_root, slug, disabled))
+pub fn prompt_index(
+    projects_root: &Path,
+    slug: Option<&str>,
+    skills: &crate::config::SkillsConfig,
+) -> String {
+    render_index(&list_skills(projects_root, slug, skills))
 }
 
 fn render_index(skills: &[SkillInfo]) -> String {
@@ -329,7 +379,27 @@ fn render_index(skills: &[SkillInfo]) -> String {
     index
 }
 
+/// Test-only shorthand for the no-external-roots case, which is what most
+/// of the scoping tests are about.
+#[cfg(test)]
 fn list_from_dirs(global: &Path, project: Option<&Path>, disabled: &[String]) -> Vec<SkillInfo> {
+    list_from_roots(&[], global, project, disabled)
+}
+
+/// As `list_from_dirs`, plus external roots that rank below `~/.cali/skills`.
+///
+/// External roots are absorbed in reverse so that, with later scans winning,
+/// the *first* configured root takes a name clash — `caliber-skill` exists
+/// under both `~/.claude` and `~/.codex`, and the order in the config is what
+/// should decide. A clash across roots resolves silently; only a duplicate
+/// *within* one directory is worth reporting as a broken row, because that one
+/// is a mistake rather than a choice.
+fn list_from_roots(
+    extras: &[PathBuf],
+    global: &Path,
+    project: Option<&Path>,
+    disabled: &[String],
+) -> Vec<SkillInfo> {
     let mut valid: BTreeMap<String, SkillInfo> = BTreeMap::new();
     let mut broken: Vec<SkillInfo> = Vec::new();
     let mut absorb = |infos: Vec<SkillInfo>| {
@@ -343,6 +413,9 @@ fn list_from_dirs(global: &Path, project: Option<&Path>, disabled: &[String]) ->
             }
         }
     };
+    for extra in extras.iter().rev() {
+        absorb(scan_dir(extra, SkillScope::Global));
+    }
     absorb(scan_dir(global, SkillScope::Global));
     if let Some(project) = project {
         absorb(scan_dir(project, SkillScope::Project));
@@ -359,13 +432,26 @@ fn list_from_dirs(global: &Path, project: Option<&Path>, disabled: &[String]) ->
     out
 }
 
+/// Test-only shorthand for the no-external-roots case, which is what most
+/// of the scoping tests are about.
+#[cfg(test)]
 fn load_from_dirs(
     global: &Path,
     project: Option<&Path>,
     name: &str,
     disabled: &[String],
 ) -> Result<(SkillInfo, String)> {
-    let all = list_from_dirs(global, project, disabled);
+    load_from_roots(&[], global, project, name, disabled)
+}
+
+fn load_from_roots(
+    extras: &[PathBuf],
+    global: &Path,
+    project: Option<&Path>,
+    name: &str,
+    disabled: &[String],
+) -> Result<(SkillInfo, String)> {
+    let all = list_from_roots(extras, global, project, disabled);
     let Some(info) = all
         .iter()
         .find(|skill| skill.name == name && skill.error.is_none())
@@ -664,6 +750,87 @@ mod tests {
         assert_eq!(skills.len(), 1);
         assert_eq!(skills[0].name, "threejs-shaders");
         assert!(skills[0].error.is_some());
+    }
+
+    #[test]
+    fn external_roots_are_read_but_rank_below_the_global_dir() {
+        let claude = tempfile::tempdir().unwrap();
+        let codex = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        write_package(claude.path(), "fusion", "fusion", "from claude", "C");
+        write_package(claude.path(), "caliber", "caliber", "claude copy", "C");
+        write_package(codex.path(), "caliber", "caliber", "codex copy", "X");
+        write_package(codex.path(), "watch", "watch", "from codex", "X");
+        write_skill(global.path(), "fusion.md", "fusion", "mine wins", "G");
+
+        let extras = vec![claude.path().to_path_buf(), codex.path().to_path_buf()];
+        let skills = list_from_roots(&extras, global.path(), None, &[]);
+        let by_name: BTreeMap<&str, &SkillInfo> =
+            skills.iter().map(|s| (s.name.as_str(), s)).collect();
+
+        assert_eq!(
+            by_name.keys().copied().collect::<Vec<_>>(),
+            vec!["caliber", "fusion", "watch"]
+        );
+        // ~/.cali/skills outranks every external root.
+        assert_eq!(by_name["fusion"].description, "mine wins");
+        // Earlier root wins a clash between two external roots.
+        assert_eq!(by_name["caliber"].description, "claude copy");
+        // A clash across roots is a choice, not a mistake: no broken rows.
+        assert!(skills.iter().all(|s| s.error.is_none()));
+    }
+
+    #[test]
+    fn a_missing_external_root_is_simply_empty() {
+        let global = tempfile::tempdir().unwrap();
+        write_skill(global.path(), "a.md", "mine", "d", "G");
+        let extras = vec![PathBuf::from("/nope/does/not/exist")];
+
+        let skills = list_from_roots(&extras, global.path(), None, &[]);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "mine");
+    }
+
+    #[test]
+    fn an_external_skill_loads_its_body_and_support_files() {
+        let claude = tempfile::tempdir().unwrap();
+        let global = tempfile::tempdir().unwrap();
+        write_package(claude.path(), "fusion", "fusion", "d", "panel of models");
+        let refs = claude.path().join("fusion").join("references");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::write(refs.join("panel.md"), "judge prompt").unwrap();
+
+        let extras = vec![claude.path().to_path_buf()];
+        let (info, body) = load_from_roots(&extras, global.path(), None, "fusion", &[]).unwrap();
+        assert!(body.contains("panel of models"));
+        assert_eq!(list_skill_files(&info).files, vec!["references/panel.md"]);
+
+        let (_, contents) = load_file_from_roots(
+            &extras,
+            global.path(),
+            None,
+            "fusion",
+            "references/panel.md",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(contents, "judge prompt");
+    }
+
+    #[test]
+    fn default_roots_are_the_conventional_harness_dirs() {
+        // A config file with no `skills:` block must still see them, so the
+        // serde default and the Rust default have to agree.
+        let from_rust = crate::config::SkillsConfig::default();
+        let from_yaml: crate::config::AppConfig =
+            serde_yaml::from_str("model:\n  default: m\n").expect("config without a skills block");
+        assert_eq!(from_rust.extra_dirs, from_yaml.skills.extra_dirs);
+        assert!(from_rust.extra_dirs.iter().any(|d| d.contains(".claude")));
+
+        // And an explicit empty list opts out rather than re-seeding.
+        let opted_out: crate::config::AppConfig =
+            serde_yaml::from_str("model:\n  default: m\nskills:\n  extra_dirs: []\n").unwrap();
+        assert!(opted_out.skills.extra_dirs.is_empty());
     }
 
     #[test]

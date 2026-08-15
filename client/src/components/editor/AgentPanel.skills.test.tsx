@@ -130,12 +130,12 @@ describe("skills in the slash menu", () => {
     renderPanel();
     await typeInput("/");
 
-    await waitFor(() => expect(screen.getByText("/playtest")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Playtest")).toBeTruthy());
     expect(screen.getByText("Drive the game and report what broke")).toBeTruthy();
-    expect(screen.getByText("/loop")).toBeTruthy();
+    expect(screen.getByText("Loop")).toBeTruthy();
     // A disabled skill is not in core's prompt index either — the agent could
     // not load it, so the menu must not offer it.
-    expect(screen.queryByText("/shipcheck")).toBeNull();
+    expect(screen.queryByText("Shipcheck")).toBeNull();
   });
 
   it("runs the picked skill as a turn that names it", async () => {
@@ -164,7 +164,7 @@ describe("Enter on a bare command", () => {
   it("completes a skill instead of spending a turn on an empty task", async () => {
     renderPanel();
     const prompt = await typeInput("/playtest");
-    await waitFor(() => expect(screen.getAllByText("/playtest").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("Playtest").length).toBeGreaterThan(0));
 
     await pressEnter(prompt);
 
@@ -187,7 +187,7 @@ describe("Enter on a bare command", () => {
   it("completes a command that is missing a required argument", async () => {
     renderPanel();
     const prompt = await typeInput("/loop");
-    await waitFor(() => expect(screen.getAllByText("/loop").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("Loop").length).toBeGreaterThan(0));
 
     await pressEnter(prompt);
 
@@ -200,7 +200,7 @@ describe("Enter on a bare command", () => {
     // instructions it takes. Every command but /side now waits.
     renderPanel();
     const prompt = await typeInput("/compact");
-    await waitFor(() => expect(screen.getAllByText("/compact").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("Compact").length).toBeGreaterThan(0));
 
     await pressEnter(prompt);
 
@@ -228,7 +228,7 @@ describe("Enter on a bare command", () => {
     const onOpenSideChat = vi.fn();
     renderPanel({ onOpenSideChat });
     const prompt = await typeInput("/side");
-    await waitFor(() => expect(screen.getAllByText("/side").length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getAllByText("Side").length).toBeGreaterThan(0));
 
     await pressEnter(prompt);
 
@@ -244,16 +244,16 @@ describe("the slash menu follows the caret", () => {
     renderPanel();
     await typeInput("add a double jump then /play");
 
-    await waitFor(() => expect(screen.getByText("/playtest")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Playtest")).toBeTruthy());
   });
 
   it("completes in place instead of replacing the message", async () => {
     renderPanel();
     const prompt = await typeInput("add a double jump then /play");
-    await waitFor(() => expect(screen.getByText("/playtest")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText("Playtest")).toBeTruthy());
 
     await act(async () => {
-      fireEvent.mouseDown(screen.getByText("/playtest"));
+      fireEvent.mouseDown(screen.getByText("Playtest"));
     });
     expect(prompt.value).toBe("add a double jump then /playtest ");
   });

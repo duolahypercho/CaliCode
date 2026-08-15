@@ -237,12 +237,44 @@ impl Default for McpServerConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SkillsConfig {
     /// Keys of disabled skills, formatted "<scope>:<name>", scope = global |
     /// project (see `skills::disabled_key`).
     pub disabled: Vec<String>,
+    /// Skill roots owned by other harnesses, read but never written. Agent
+    /// skills are a shared format, and the same packages are already installed
+    /// under `~/.claude`, `~/.codex` and `~/.agents`; without this CaliCode is
+    /// the only tool on the machine that cannot see them.
+    ///
+    /// Earlier entries win a name clash, and `~/.cali/skills` outranks all of
+    /// them. Writing `extra_dirs: []` opts out entirely.
+    #[serde(default = "default_extra_skill_dirs")]
+    pub extra_dirs: Vec<String>,
+}
+
+// Hand-written so a config built in Rust and one deserialized from a file with
+// no `skills:` block agree on the roots; a derived Default would give an empty
+// list and silently hide every external skill.
+impl Default for SkillsConfig {
+    fn default() -> Self {
+        Self {
+            disabled: Vec::new(),
+            extra_dirs: default_extra_skill_dirs(),
+        }
+    }
+}
+
+/// The conventional agent-skill roots, in precedence order. These are the same
+/// paths published skills use in their own lookup ladders, so a package that
+/// expects to find a sibling under `~/.claude/skills` still resolves.
+pub fn default_extra_skill_dirs() -> Vec<String> {
+    vec![
+        "~/.claude/skills".to_string(),
+        "~/.codex/skills".to_string(),
+        "~/.agents/skills".to_string(),
+    ]
 }
 
 fn valid_mcp_id(id: &str) -> bool {

@@ -3249,12 +3249,12 @@ async fn spawn_critic_with_frames(
 ) -> Result<Value> {
     let mut registered = state.tools.read().await.clone();
     registered.extend(state.mcp.tool_defs().await);
-    let disabled = { state.config.read().await.skills.disabled.clone() };
+    let skills_cfg = { state.config.read().await.skills.clone() };
     let mut system = system.to_string();
     system.push_str(&crate::skills::prompt_index(
         &state.projects_root,
         graph.project_slug.as_deref(),
-        &disabled,
+        &skills_cfg,
     ));
     // Mirrors a graph direct spawn: depth 0 and global + game-scoped rules,
     // but the editor/workspace route stays bound to the graph owner.
@@ -6716,6 +6716,13 @@ mod tests {
                 temperature: 0.0,
                 max_tokens: Some(128),
                 roles: Default::default(),
+            },
+            // No external skill roots: this test matches the judge's system
+            // prompt exactly, and the default roots would splice in whatever
+            // the person running the suite has under ~/.claude or ~/.codex.
+            skills: crate::config::SkillsConfig {
+                disabled: Vec::new(),
+                extra_dirs: Vec::new(),
             },
             ..Default::default()
         };
