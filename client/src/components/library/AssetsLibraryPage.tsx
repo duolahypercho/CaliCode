@@ -74,7 +74,7 @@ function RepoVisual({ repo, tall }: { repo: AssetRepo; tall?: boolean }) {
   return (
     <div
       aria-hidden
-      className={`relative w-full ${tall ? "h-40 rounded-lg" : "h-24"}`}
+      className={`relative w-full shrink-0 ${tall ? "h-40 rounded-lg" : "h-24"}`}
       style={{ background: repoGradient(repo.id) }}
     >
       <span className="absolute bottom-2 left-2.5 font-mono text-[10px] font-bold uppercase tracking-[0.16em] text-white/85">
@@ -176,7 +176,10 @@ export function AssetsLibraryPage({ installedRepoIds, onInstall, onUninstall, pr
                   aria-label={repo.name}
                   data-asset-card={repo.id}
                   onClick={() => setOpenRepoId(repo.id)}
-                  className="group overflow-hidden rounded-lg border border-line bg-surface-0 text-left transition-colors hover:bg-surface-2"
+                  // A bare button centres its content box, so a card whose tags wrap to a
+                  // second row overflows top and bottom into overflow-hidden instead of
+                  // growing the grid row. Flex column makes content flow from the top.
+                  className="group flex flex-col overflow-hidden rounded-lg border border-line bg-surface-0 text-left transition-colors hover:bg-surface-2"
                 >
                   <RepoVisual repo={repo} />
                   <div className="flex flex-col gap-1.5 p-3">
