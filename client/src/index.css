@@ -336,3 +336,25 @@ select {
     opacity: 1;
   }
 }
+
+/* Window dragging in the Electron shell.
+ *
+ * Tauri reads `data-tauri-drag-region` itself; Electron drags on the CSS
+ * property below. Mapping one to the other here keeps a single source of truth
+ * for "this region drags the window" and avoids touching the five components
+ * that carry the attribute. Both other shells ignore the property — WKWebView
+ * does not implement it and a plain browser has no window to move — so this is
+ * inert everywhere except Electron.
+ */
+[data-tauri-drag-region] {
+  -webkit-app-region: drag;
+}
+
+/* A drag region swallows clicks on everything inside it, so every interactive
+ * descendant has to opt back out. Without this the workspace tab strip would
+ * drag the window instead of switching tabs — the controls would look alive
+ * and do nothing.
+ */
+[data-tauri-drag-region] :is(button, a, input, select, textarea, [role="tab"], [role="button"], [role="menuitem"], [tabindex]) {
+  -webkit-app-region: no-drag;
+}

@@ -1,9 +1,9 @@
 # Electron shell
 
-Status: **plan only, nothing built.** Browser-pipeline measurements taken 2026-08-14; §1.
-Recommendation: **§3 — prove the CDP attach first, in a throwaway app, and let that
-one result decide the whole thing.** Everything downstream is mechanical; that one
-assumption is not.
+Status: **P0 spike run 2026-08-15 and it passed — see §3. Nothing built in the repo.**
+Browser-pipeline measurements taken 2026-08-14; §1.
+Recommendation: **proceed to P1.** The one assumption that could have killed this is
+now measured, and it also settled the capture question in our favour (§5).
 
 ---
 
@@ -86,10 +86,38 @@ carry over. If it does not, this plan is dead and we keep the stream.
 **Kill criterion:** if the view cannot be attached, or input dispatch does not reach
 it, stop. Report and keep Tauri.
 
-Secondary unknowns the spike should also answer, because they are cheap to check once
-it is running: does `Page.captureScreenshot` on a view work while the window is
-minimised (Codex [#30605](https://github.com/openai/codex/issues/30605) says theirs
-does not — see §5), and does `captureBeyondViewport` give full-page.
+### Result — 2026-08-15, passed
+
+Electron exposes every `WebContentsView` as an ordinary CDP `page` target, so core
+enumerates them exactly as it enumerates Chrome's today. Attached from a separate
+process and ran the full set of operations `browser.rs` needs:
+
+```
+attached to the panel view: yes
+1. navigate     -> Low poly - Wikipedia
+2. snapshot     -> 55 interactive refs      (the same injected walker)
+3. click        -> url changed: true        (trusted input, not synthetic events)
+4. screenshot   -> 264 KB
+5. console      -> captured "hello from the panel"
+```
+
+**And the capture question resolved better than expected.** Repeated against a window
+created with `show: false` — never displayed at all, the strongest form of the test:
+
+```
+capture on a hidden window -> 616 KB in 999ms
+full-page capture          -> 3145 KB in 461ms
+driving it while hidden    -> scrolled to 500
+```
+
+So an Electron view captures, full-page, while invisible. We do **not** need to keep a
+second headless Chrome for `browser_screenshot` (§5 assumed we might), and we do not
+inherit Codex's [#30605](https://github.com/openai/codex/issues/30605) /
+[#20146](https://github.com/openai/codex/issues/20146) limitations.
+
+Caveat on what was actually tested: a window that was *never shown*. Minimising a
+previously-visible window is a slightly different compositor path and is untested —
+worth re-checking at P2, when there is a real window to minimise.
 
 ## 3a. What actually breaks
 
@@ -123,26 +151,199 @@ option on `BrowserWindow`, but the offsets need re-tuning by eye.
 every agent tool, projects and sessions on disk, and the entire editor UI apart from
 the four items above.
 
+## 3b. How the browser should actually be built
+
+The spike settles the mechanism; this is the shape.
+
+**The panel is a `WebContentsView`, and core drives that same view over CDP.** One
+browser, as today — the property worth protecting is that the user and the agent are
+never looking at two different pages. What changes is that the user's half stops being
+a video of it.
+
+```
+Electron main ── creates the view, owns its geometry
+      │
+      ├─ renderer (React)  reports the panel's rect over IPC; renders nothing itself
+      │
+      └─ core (Rust) ───── attaches over --remote-debugging-port and drives it
+                            with browser.rs exactly as it drives Chrome now
+```
+
+**Core keeps ownership of the protocol.** Do not reimplement snapshot/click/capture in
+TypeScript because the main process happens to have `webContents` APIs to hand. The
+2292 lines in `browser.rs` are the single implementation, the tools stay identical,
+and the only change is where a target comes from: attach to the view instead of
+`Target.createTarget`. The main process should hand core the target id explicitly when
+it creates the view rather than leaving core to guess from url or title.
+
+**The hard part is that a native view floats above the DOM.** It is not in the React
+tree, so it does not clip, does not scroll, and has its own z-order. Concretely, in
+this app:
+
+- Radix dropdowns and dialogs (`WorkspaceTabs`, `SettingsDialog`, `SessionSearchDialog`,
+  `ModelPicker`, `GamesSidebar`) portal to `document.body` and would render *behind* the
+  view. **Hide the view whenever an overlay is open**, not just when the tab changes.
+- The panel has rounded corners and a border; a native view will not clip to them.
+  Either accept square corners inside the frame or inset the view by a pixel.
+- Dock resize animates. Positioning the view per frame will lag the CSS; either drive
+  it from the same `ResizeObserver` and accept a frame of skew, or hide during the
+  drag and place it on settle.
+- The view must be hidden — not destroyed — when the BROWSER tab is closed, so the
+  agent keeps browsing with the tab shut. The spike proves a hidden view still
+  captures and still drives.
+
+**Session isolation.** The view loads arbitrary web pages into our own app. Give it its
+own `session` partition so page cookies never touch the app's, and keep
+`contextIsolation: true` / `nodeIntegration: false` on it with no privileged preload.
+Tauri gave some of this by default; here it is explicit and must be written down.
+
+**What gets deleted at P3:** the screencast, `CAST_*` budgets, sharpen-on-idle,
+letterbox mapping, the cursor probe, `browser_input`, and all frame painting in
+`BrowserTab.tsx`. What survives unchanged: every `browser_*` tool, the snapshot
+walker, the ref scheme, `browser_search`, and capture-to-project.
+
 ## 4. Phases
 
 Each phase ends somewhere shippable. `src-tauri/` stays until phase 4 proves out, so
 there is always a way back.
 
 - **P0 — spike.** §3. Half a day. Decides everything.
-- **P1 — shell parity.** Electron main process: resolve the core binary, spawn it,
+- **P1 — shell parity. Done 2026-08-15.** Built and verified: the shell spawns or
+  attaches core, opens the window, loads the editor, and the editor renders
+  identically — all ten workspace tabs, sidebar, composer, and the three.js PLAY
+  scene. `window.cali` reaches the app, so `isDesktopShell()` is true and the
+  header still reserves space for the traffic lights. `src-tauri/` is untouched and
+  `pnpm desktop:build` still produces the Tauri app. Run it with
+  `pnpm desktop:electron`; `CALI_PORT` moves it off 8765 so it can run beside a
+  live app instead of stealing that core's `editor_attachment`.
+
+  Three things bit during integration and are worth remembering:
+
+  - **A sandboxed preload cannot `require` a local module.** Electron sandboxes
+    preloads by default, so `preload.js` importing `./ipc` for the channel names
+    failed *silently* — `window.cali` was simply undefined, which reads as "not a
+    desktop shell" rather than as an error. `sandbox: false` on this window is
+    safe because it only loads our own client; the panel view keeps `sandbox:
+    true` and no preload. Bundling the preload is the stricter fix and belongs
+    with P4.
+  - **`package.json` is `type: module`**, so the CommonJS output needs its own
+    `{"type":"commonjs"}` beside it or `require`/`__dirname` fail at launch.
+  - **Drag regions did not need the five component edits §3a predicted.** One CSS
+    rule maps `[data-tauri-drag-region]` to `-webkit-app-region`, with `no-drag`
+    on interactive descendants — otherwise the tab strip drags the window instead
+    of switching tabs. Both other shells ignore the property.
+
+  Still open from P1: traffic-light offsets are copied from `tauri.conf.json` and
+  want tuning by eye, and the panel view exists but shows `about:blank` until P2
+  wires it to the React panel.
+
+- **P1 — shell parity (original scope).** Electron main process: resolve the core binary, spawn it,
   wait for the port, create the window, load the client, wire the dialog. Ship it
   behind a script (`pnpm desktop:electron`) alongside the Tauri build. Done when the
   editor is fully usable in the Electron window with the Tauri build untouched.
-- **P2 — the panel becomes a view.** Position a `WebContentsView` over the BROWSER
+- **P2 — the panel becomes a view. Mechanism proven 2026-08-15, wiring partial.**
+  Core now attaches to a browser it did not launch (`browser_attach { endpoint,
+  targetId }`) and drives that exact view. Verified against the running shell:
+  attach, `browser_navigate` to Wikipedia, `browser_snapshot` returning 55 refs,
+  and a 645 KB capture — with the page living in the window as real DOM (235
+  links, selectable text), not a picture of one.
+
+  Two things learned:
+
+  - **`Browser` had to stop assuming it owns the browser.** `child` and
+    `profile` are now `Option`, and `close()` refuses to send `Browser.close`
+    when attached — otherwise shutting the agent's browser down would quit the
+    editor the user is working in.
+  - **Geometry is load-bearing, not cosmetic.** Capture failed outright until
+    the renderer reported the panel's rect: a view with no bounds has no
+    surface to composite, so `Page.captureScreenshot` returns nothing. The
+    client now reports its rect through `window.cali.setPanelBounds` and skips
+    the screencast entirely under Electron.
+
+  **Both remaining items landed the same day.** The shell now hands core the
+  panel itself on startup — verified by driving core with no manual attach call
+  — and the renderer hides the view whenever a portalled overlay appears, so a
+  dropdown cannot open behind it.
+
+  One gotcha worth keeping: **`contextBridge` freezes what it exposes**, so
+  `window.cali.setPanelBounds` cannot be wrapped to observe it from a live page.
+  A first attempt to test overlay-hiding that way reported nothing and looked
+  like a bug in the app; the calls were happening the whole time. The behaviour
+  is covered by a unit test instead, which also has to stub `ResizeObserver` —
+  jsdom has none, and the geometry effect guards on it.
+
+- **P2 — the panel becomes a view (original scope).** Position a `WebContentsView` over the BROWSER
   panel's rect; core attaches to it. Both paths exist at once here: the stream still
   works, so this is comparable side by side.
-- **P3 — delete the pipeline.** Remove the screencast, frame budget, sharpen, cursor
+- **P3 — delete the pipeline. MUST COME AFTER P4, not before.** The original
+  ordering was wrong: the Tauri shell is still the shipping one until P4
+  packages a signed Electron build, and the streaming pipeline is the only thing
+  that makes its BROWSER tab work. Deleting first would leave the app users
+  actually run without a browser panel for the whole gap. The pipeline is dead
+  weight *under Electron only*; it stays until Tauri retires.
+
+- **P3 (deferred) — delete the pipeline.** Remove the screencast, frame budget, sharpen, cursor
   probe, letterbox mapping, and the client-side painting. This is the payoff commit
   and it should be almost entirely deletions.
-- **P4 — packaging.** electron-builder, code signing, notarisation, the sidecar
+- **P4 — packaging. Done unsigned 2026-08-15; signing is the only piece left.**
+  `pnpm desktop:electron:build` produces `release-electron/mac-arm64/CaliCode.app`
+  (359 MB) with `cali-core` and the built client staged beside the asar, mirroring
+  what `scripts/desktop.sh` stages for Tauri. Verified by running the packaged
+  app: it spawned its own bundled core, loaded the editor, created the panel,
+  drove it (navigate, 55-ref snapshot, 603 KB capture), and killed its core on
+  quit rather than leaking it.
+
+  Three things settled here:
+
+  - **The `sandbox: false` workaround is gone.** `build:electron` now bundles the
+    preload with esbuild into a single file with no local requires, so
+    `sandbox: true` is back on the editor window. That was P1's one security
+    compromise.
+  - **`main` and `type` fight.** electron-builder reads the entry from `main`,
+    but this package is `type: module` and the shell compiles to CommonJS. The
+    `dist-electron/package.json` marker sits nearer the compiled files, so Node
+    resolves those as CJS while the client build stays ESM.
+  - **The core binary is staged outside the asar.** It has to be a real
+    executable on disk to spawn; an asar-packed binary is not.
+
+  Not done: **signing and notarisation.** Deliberately — a real identity belongs
+  in CI secrets, not a checked-in config, and the repo already has
+  `scripts/dev-signing-identity.sh` for local ones. Entitlements are written
+  (`build-electron/entitlements.mac.plist`) and kept minimal: spawning an
+  unsigned child under the hardened runtime, localhost networking, and
+  user-selected folders.
+
+- **P4 — packaging (original scope).** electron-builder, code signing, notarisation, the sidecar
   layout, `scripts/desktop.sh`. **This is the fiddly part, not the code.** Retire
   `src-tauri/` only when a signed build runs on a clean machine.
-- **P5 — test surfaces.** Regenerate every visual baseline (the editor is drawn by
+- **P5 — test surfaces. Done for macOS 2026-08-15; Linux baselines still blocked.**
+  The whole e2e suite passes unchanged against the Electron work — **71/71,
+  including every `@visual` spec**. That was the real risk and it did not
+  materialise: gating the LiveBar to PLAY, the drag-region CSS, the tab-strip
+  overrides and the view-state migration all left the baselines alone.
+
+  The reason is worth stating, because it inverts the original worry: the
+  baselines were always rendered by Playwright, which is **Chromium**. The
+  shipped Tauri app renders in WebKit. So the baselines have never described
+  what a macOS user actually sees — and moving to Electron makes the app match
+  the tests rather than diverge from them.
+
+  `client/scripts/compare-shells.mjs` walks all eleven surfaces in both shells
+  and passes against the dev shell *and* the packaged app. Its pixel budget is
+  6,000, set from measurement: cross-build antialiasing costs 2,666-3,023
+  differing pixels, so this catches gross layout breakage and not subtle
+  regressions — the `.diff.png` files it writes are the answer to those, and the
+  file says so.
+
+  Still blocked: **Linux visual baselines**, unchanged since before this work.
+  They can only come from the `visual-baselines` workflow, which checks out the
+  pushed branch, so nothing can be regenerated until this lands.
+
+  Open decision: whether the shell comparison belongs in CI. It needs Electron
+  and a virtual display on the Linux runner, which is real flakiness risk for a
+  check that today takes one command locally.
+
+- **P5 — test surfaces (original scope).** Regenerate every visual baseline (the editor is drawn by
   Chromium now, so all of them move — macOS locally, Linux via the
   `visual-baselines` workflow). Re-point the e2e suite. Check the `:8765` port rule
   still holds.
@@ -165,6 +366,33 @@ capture is compositor-bound, keep a headless Chrome purely for `browser_screensh
 and let the view serve the human. Two browsers is a cost we rejected for the *user's*
 view; for capture it may be the right answer, and the agent does not care which
 Chromium answered.
+
+## 5a. Prior art: GooeyPi
+
+[am-will/gooey-pi](https://github.com/am-will/gooey-pi) is a desktop workspace for the
+pi / OMP / Prime Agent harnesses — the same shape as CaliCode, and a useful check on
+this plan because it already shipped what we are proposing. It is **Electron + React +
+TypeScript, tested with Vitest and Playwright**, and it ships "an isolated in-app
+browser with an address bar, navigation history, downloads" running on a separate
+browser profile. That is §3b, independently arrived at, including the session
+partition.
+
+Two things worth taking from it rather than re-deriving:
+
+- **It builds with `electron-vite`** (`electron.vite.config.ts`), which bundles main,
+  preload and renderer together. That is the proper fix for the sandboxed-preload
+  problem P1 worked around with `sandbox: false`: a bundled preload has no local
+  `require` to fail on. Adopt it at P4 instead of the hand-rolled `tsc` + CommonJS
+  marker.
+- **Their browser handles downloads.** Ours does not, and for CaliCode that is not a
+  nicety: the whole point of the panel is finding assets, and "download this `.glb`"
+  is the flow it exists to serve. A native view has `session.on("will-download")`,
+  which the streamed panel could never have had — so this is a capability the move
+  unlocks rather than a gap it introduces. Worth its own item once P3 lands.
+
+GooeyPi also does voice (dictation via OpenAI/Groq/Deepgram/whisper.cpp, plus a
+realtime companion). Out of scope here, but it is evidence that this shell choice does
+not box the product in later.
 
 ## 6. Costs and risks
 

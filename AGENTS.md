@@ -36,6 +36,22 @@ pnpm desktop:build        # from client/ — packages CaliCode.app (+ .dmg)
 pnpm desktop:dev          # native shell against a live core
 ```
 
+**Two shells exist.** Tauri is the shipping one; an Electron shell is being
+brought up alongside it (`docs/plans/electron-shell.md`) because only a Chromium
+window can host the browser panel as a real view rather than a video stream.
+Nothing has been removed — `src-tauri/` and `desktop:build` are untouched.
+
+```bash
+pnpm desktop:electron         # run the Electron shell against a live core
+pnpm desktop:electron:build   # package it (unsigned) to release-electron/
+node scripts/compare-shells.mjs   # prove both shells render the same editor
+```
+
+`CALI_PORT` moves either shell off `:8765` so a second instance can run beside a
+live app — attaching two clients to one core is worse than a port collision,
+because `editor_attachment` is one owner per session and the newcomer silently
+steals tool routing.
+
 ## Verify before you claim done
 
 Run these from `client/` unless noted, in this order. Everything must be green.

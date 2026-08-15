@@ -1,0 +1,28 @@
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    // CommonJS, not ESM. Electron 43 can run an ESM main process, but a preload
+    // script under `contextIsolation` still loads most reliably as CJS, and the
+    // two must agree — a preload that fails to load is silent, and the only
+    // symptom is `window.cali` being undefined at render time.
+    "module": "CommonJS",
+    "moduleResolution": "Node",
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "esModuleInterop": true,
+    "types": ["node"],
+    // Without rootDir, tsc preserves `electron/` inside the output and the
+    // launch script's path no longer matches.
+    "rootDir": "./electron",
+    "outDir": "./dist-electron",
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
+  },
+  "include": ["electron/**/*.ts"]
+}
