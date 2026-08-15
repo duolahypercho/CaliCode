@@ -423,6 +423,13 @@ pub struct AgentSession {
     /// Stop signal for the in-flight turn. Lives on the session rather than in
     /// `chat`'s frame so `agent_cancel` can reach a turn it did not start.
     pub cancel: CancellationToken,
+    /// Consecutive auto-compaction failures. Reset by any success.
+    ///
+    /// A failing compaction used to be retried on every turn forever, which is
+    /// the worst shape available: the session keeps growing, and each turn pays
+    /// for a summary call that cannot succeed, until the provider refuses the
+    /// request outright — the exact failure compaction exists to prevent.
+    pub compaction_failures: u32,
     /// The environment as last described to the model, so the next turn can
     /// send only what changed. `None` until the first turn establishes a
     /// baseline from the system prompt.
@@ -649,6 +656,23 @@ fn provider_messages_from_record(record: &Value) -> Vec<Value> {
             Some(json!({ "role": role, "content": content }))
         })
         .collect()
+}
+
+/// Consecutive auto-compaction failures before the session stops trying.
+///
+/// Three, not one: a summary call can fail for reasons that pass on the next
+/// turn — a 5xx, a rate limit, a transcript that moved mid-summary. What this
+/// catches is the shape that never recovers, where every turn pays for a
+/// summary that cannot succeed while the context keeps growing.
+const MAX_COMPACTION_FAILURES: u32 = 3;
+
+/// Whether this session has stopped attempting auto-compaction.
+///
+/// A named predicate rather than an inline comparison so the boundary is
+/// testable: the difference between `>` and `>=` here is one extra doomed
+/// summary call on every turn for the rest of the session.
+fn compaction_breaker_tripped(failures: u32) -> bool {
+    failures >= MAX_COMPACTION_FAILURES
 }
 
 /// Context length assumed when neither the config's `compaction.context_length`
@@ -882,6 +906,7 @@ impl AgentManager {
                 pending: HashMap::new(),
                 cancel: CancellationToken::default(),
                 world_state: None,
+                compaction_failures: 0,
                 always_allow: Vec::new(),
                 context_length: None,
                 usage: model::Usage::default(),
@@ -1207,8 +1232,19 @@ impl AgentManager {
                     let budget = context_budget_tokens(&config, guard.context_length);
                     guard.should_compact(budget)
                 };
-                if wants {
-                    if let Err(error) = self
+                // Stop trying once it has failed repeatedly. Retrying every
+                // turn forever is the worst of both: the transcript still
+                // grows, and each turn buys another failed summary call.
+                let tripped = compaction_breaker_tripped(session.lock().await.compaction_failures);
+                if wants && tripped {
+                    tracing::warn!(
+                        session = %current_session_id,
+                        "auto-compaction disabled for this session after \
+                         {MAX_COMPACTION_FAILURES} consecutive failures"
+                    );
+                }
+                if wants && !tripped {
+                    match self
                         .compact_session(
                             state,
                             &current_session_id,
@@ -1217,8 +1253,21 @@ impl AgentManager {
                         )
                         .await
                     {
-                        tracing::warn!(%error, session = %current_session_id,
-                            "auto-compaction failed; continuing uncompacted");
+                        Ok(_) => {
+                            // Any success clears the count: the breaker is for
+                            // a persistently broken transcript, not for one
+                            // unlucky provider hiccup.
+                            session.lock().await.compaction_failures = 0;
+                        }
+                        Err(error) => {
+                            let failures = {
+                                let mut guard = session.lock().await;
+                                guard.compaction_failures += 1;
+                                guard.compaction_failures
+                            };
+                            tracing::warn!(%error, session = %current_session_id, failures,
+                                "auto-compaction failed; continuing uncompacted");
+                        }
                     }
                 }
             }
@@ -1972,6 +2021,7 @@ impl AgentManager {
             cancel: CancellationToken::default(),
             always_allow: Vec::new(),
             world_state: None,
+            compaction_failures: 0,
             context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
@@ -4148,6 +4198,39 @@ mod tests {
     }
 
     #[test]
+    fn the_compaction_breaker_trips_only_after_repeated_failure() {
+        // One unlucky summary call — a 5xx, a rate limit, a transcript that
+        // moved mid-summary — must not disable compaction for the session.
+        assert!(!compaction_breaker_tripped(0));
+        assert!(!compaction_breaker_tripped(1));
+        assert!(!compaction_breaker_tripped(MAX_COMPACTION_FAILURES - 1));
+        // And it must trip eventually: retrying forever means the transcript
+        // keeps growing while every turn buys another failed summary. The
+        // boundary is inclusive — an off-by-one here is one extra doomed call
+        // per turn for the rest of the session.
+        assert!(compaction_breaker_tripped(MAX_COMPACTION_FAILURES));
+        assert!(compaction_breaker_tripped(MAX_COMPACTION_FAILURES + 10));
+    }
+
+    #[tokio::test]
+    async fn a_successful_compaction_clears_the_failure_count() {
+        // The breaker is for a persistently broken transcript, not a bad
+        // minute; without the reset a session that recovered would stop
+        // compacting for the rest of its life.
+        let (bus, _rx) = tokio::sync::broadcast::channel(8);
+        let agents = AgentManager::new(bus);
+        agents.ensure_session("breaker").await.unwrap();
+        let session = agents.session("breaker").await.unwrap();
+
+        session.lock().await.compaction_failures = MAX_COMPACTION_FAILURES;
+        assert!(session.lock().await.compaction_failures >= MAX_COMPACTION_FAILURES);
+
+        // What the success arm in `chat` does.
+        session.lock().await.compaction_failures = 0;
+        assert_eq!(session.lock().await.compaction_failures, 0);
+    }
+
+    #[test]
     fn compaction_still_fires_when_the_provider_reports_no_usage() {
         // Several OpenAI-compatible gateways return no `usage` block on a
         // streamed response. Keyed on the reported count alone, occupancy sat
@@ -4163,6 +4246,7 @@ mod tests {
             cancel: CancellationToken::default(),
             always_allow: Vec::new(),
             world_state: None,
+            compaction_failures: 0,
             context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
@@ -4196,6 +4280,7 @@ mod tests {
             cancel: CancellationToken::default(),
             always_allow: Vec::new(),
             world_state: None,
+            compaction_failures: 0,
             context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
@@ -5336,6 +5421,7 @@ mod tests {
             cancel: CancellationToken::default(),
             always_allow: Vec::new(),
             world_state: None,
+            compaction_failures: 0,
             context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
@@ -5439,6 +5525,7 @@ mod tests {
             cancel: CancellationToken::default(),
             always_allow: Vec::new(),
             world_state: None,
+            compaction_failures: 0,
             context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
@@ -5572,6 +5659,7 @@ mod tests {
             cancel: CancellationToken::default(),
             always_allow: Vec::new(),
             world_state: None,
+            compaction_failures: 0,
             context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,
@@ -5796,6 +5884,7 @@ mod tests {
             cancel: CancellationToken::default(),
             always_allow: Vec::new(),
             world_state: None,
+            compaction_failures: 0,
             context_length: None,
             usage: model::Usage::default(),
             last_prompt_tokens: 0,

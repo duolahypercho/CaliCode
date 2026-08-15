@@ -92,11 +92,97 @@ pub enum StreamChunk {
 struct AttemptError {
     retryable: bool,
     error: anyhow::Error,
+    /// What the provider asked us to wait, from `Retry-After` /
+    /// `retry-after-ms`. `None` means it did not say and the fixed backoff
+    /// decides.
+    retry_after: Option<std::time::Duration>,
+}
+
+/// Force every tool call in one response to carry a distinct id.
+///
+/// The agent loop answers each call with a `tool` message keyed by
+/// `tool_call_id`. Two calls sharing an id therefore produce two answers to
+/// one question, which providers reject for the *whole* request — so the
+/// session is stuck until somebody edits the transcript by hand.
+///
+/// Both halves of that are real here. A provider can repeat an id, and the
+/// empty-id fallback used to be `call-<argument length>`, which manufactures
+/// collisions on its own: two `file_read` calls whose arguments happen to be
+/// the same length got the same id. Position is used instead, which is unique
+/// by construction.
+///
+/// Renaming is safe because these ids are opaque routing labels — nothing
+/// resolves them against the provider, they only pair a call with its result
+/// inside our transcript.
+fn uniquify_tool_call_ids(calls: &mut [ToolCall]) {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (index, call) in calls.iter_mut().enumerate() {
+        if call.id.trim().is_empty() {
+            call.id = format!("call-{index}");
+        }
+        if seen.insert(call.id.clone()) {
+            continue;
+        }
+        // Suffix until free. Bounded by the number of calls in one response.
+        let base = call.id.clone();
+        let mut attempt = 2usize;
+        loop {
+            let candidate = format!("{base}-{attempt}");
+            if seen.insert(candidate.clone()) {
+                tracing::warn!(
+                    duplicate = %base,
+                    replacement = %candidate,
+                    "provider repeated a tool call id; renaming so the turn survives"
+                );
+                call.id = candidate;
+                break;
+            }
+            attempt += 1;
+        }
+    }
+}
+
+/// Longest a provider may park a turn by asking.
+///
+/// A `Retry-After` is a request, not an instruction we owe unbounded
+/// obedience to: a gateway answering "wait an hour" would otherwise hold a
+/// turn open for an hour with the user watching a spinner. Past this the
+/// fixed backoff runs instead and the attempt is allowed to fail normally.
+const MAX_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Parse `Retry-After` (delay-seconds) and the `retry-after-ms` some gateways
+/// send instead.
+///
+/// HTTP-date form is deliberately unsupported: it needs a clock the machine
+/// may have wrong, and every provider seen in the wild sends the numeric form.
+/// Unparseable means "did not say", which falls back to the fixed backoff
+/// rather than guessing.
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<std::time::Duration> {
+    // Finiteness is checked before clamping, not after: `"NaN"` and `"inf"`
+    // both parse as `f64`, and `f64::max` *sanitises* NaN to the other operand
+    // — so a guard placed after the clamp can never fire, and a malformed
+    // header would quietly become "retry immediately".
+    let numeric = |text: &str| -> Option<f64> {
+        let parsed = text.trim().parse::<f64>().ok()?;
+        parsed.is_finite().then_some(parsed.max(0.0))
+    };
+    let millis = headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(numeric);
+    let seconds = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(numeric)
+        .map(|secs| secs * 1000.0);
+    let ms = millis.or(seconds)?;
+    Some(std::time::Duration::from_millis(ms as u64).min(MAX_RETRY_AFTER))
 }
 
 impl AttemptError {
     fn transient(error: anyhow::Error) -> Self {
         Self {
+            retry_after: None,
             retryable: true,
             error,
         }
@@ -106,6 +192,8 @@ impl AttemptError {
         Self {
             retryable: false,
             error,
+            // Never retried, so a wait would never be honoured anyway.
+            retry_after: None,
         }
     }
 }
@@ -336,12 +424,20 @@ async fn chat_with_retries(
             }
             Ok(result) => return Ok(result),
             Err(err) if err.retryable && attempt < backoff_ms.len() => {
+                // The provider's own answer wins over our guess. A 429 saying
+                // "wait 30s" retried after 250ms spends all three attempts
+                // inside five seconds and fails a turn that would have
+                // succeeded by waiting once.
+                let fixed = std::time::Duration::from_millis(backoff_ms[attempt]);
+                let delay = err.retry_after.unwrap_or(fixed);
                 tracing::warn!(
                     attempt = attempt + 1,
+                    delay_ms = delay.as_millis() as u64,
+                    honoured_retry_after = err.retry_after.is_some(),
                     error = %err.error,
                     "transient model error; retrying"
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(backoff_ms[attempt])).await;
+                tokio::time::sleep(delay).await;
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -480,11 +576,18 @@ async fn chat_once(
             let retryable = err.is_connect() || err.is_timeout();
             let error = anyhow::Error::from(err)
                 .context(format!("model request failed for {}", config.model.default));
-            return Err(AttemptError { retryable, error });
+            return Err(AttemptError {
+                retryable,
+                error,
+                // A transport failure never produced a response to ask.
+                retry_after: None,
+            });
         }
     };
     if !response.status().is_success() {
         let status = response.status();
+        // Read before consuming the body: `text()` takes the response.
+        let retry_after = parse_retry_after(response.headers());
         let text = response.text().await.unwrap_or_default();
         // 429 and 5xx are transient; other 4xx (auth, validation) are the
         // caller's problem and must never be retried.
@@ -492,6 +595,7 @@ async fn chat_once(
         return Err(AttemptError {
             retryable,
             error: anyhow::anyhow!("model returned {status}: {}", truncate(&text, 500)),
+            retry_after,
         });
     }
 
@@ -574,19 +678,16 @@ async fn chat_once(
         &mut received_delta,
     );
 
-    let tool_calls: Vec<ToolCall> = tool_calls
+    let mut tool_calls: Vec<ToolCall> = tool_calls
         .into_iter()
         .filter(|t| !t.name.is_empty())
         .map(|t| ToolCall {
-            id: if t.id.is_empty() {
-                format!("call-{}", t.arguments.len())
-            } else {
-                t.id
-            },
+            id: t.id,
             name: t.name,
             arguments: serde_json::from_str(&t.arguments).unwrap_or(Value::Null),
         })
         .collect();
+    uniquify_tool_call_ids(&mut tool_calls);
 
     Ok(ChatResult {
         content: content.trim().to_string(),
@@ -680,16 +781,24 @@ async fn chat_once_responses(request: ResponsesRequest<'_>) -> Result<ChatResult
                 "Responses model request failed for {}",
                 config.model.default
             ));
-            return Err(AttemptError { retryable, error });
+            return Err(AttemptError {
+                retryable,
+                error,
+                // A transport failure never produced a response to ask.
+                retry_after: None,
+            });
         }
     };
     if !response.status().is_success() {
         let status = response.status();
+        // Read before `text()` consumes the response, as above.
+        let retry_after = parse_retry_after(response.headers());
         let text = response.text().await.unwrap_or_default();
         let retryable = status.as_u16() == 429 || status.is_server_error();
         return Err(AttemptError {
             retryable,
             error: anyhow::anyhow!("model returned {status}: {}", truncate(&text, 500)),
+            retry_after,
         });
     }
 
@@ -767,13 +876,13 @@ async fn chat_once_responses(request: ResponsesRequest<'_>) -> Result<ChatResult
         &mut received_delta,
     );
 
-    let tool_calls: Vec<ToolCall> = tool_calls
+    let mut tool_calls: Vec<ToolCall> = tool_calls
         .into_iter()
         .filter(|tool| !tool.name.is_empty())
         .map(|tool| ToolCall {
-            id: if tool.id.is_empty() {
-                format!("call-{}", tool.arguments.len())
-            } else if tool.item_id.is_empty() {
+            // The Responses API pairs a call id with an item id; both are
+            // needed downstream, so they travel joined.
+            id: if tool.id.is_empty() || tool.item_id.is_empty() {
                 tool.id
             } else {
                 format!("{}|{}", tool.id, tool.item_id)
@@ -782,6 +891,7 @@ async fn chat_once_responses(request: ResponsesRequest<'_>) -> Result<ChatResult
             arguments: serde_json::from_str(&tool.arguments).unwrap_or(Value::Null),
         })
         .collect();
+    uniquify_tool_call_ids(&mut tool_calls);
     Ok(ChatResult {
         content: content.trim().to_string(),
         tool_calls,
@@ -1613,6 +1723,174 @@ fn truncate(text: &str, max: usize) -> String {
         text.to_string()
     } else {
         format!("{}...", &text[..max])
+    }
+}
+
+#[cfg(test)]
+mod tool_call_id_tests {
+    use super::{uniquify_tool_call_ids, ToolCall};
+    use serde_json::json;
+
+    fn call(id: &str, name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args,
+        }
+    }
+
+    fn ids(calls: &[ToolCall]) -> Vec<String> {
+        calls.iter().map(|c| c.id.clone()).collect()
+    }
+
+    #[test]
+    fn distinct_ids_are_left_exactly_alone() {
+        // Renaming what was already fine would break nothing, but it would
+        // make the logs lie about what the provider sent.
+        let mut calls = vec![
+            call("a", "file_read", json!({})),
+            call("b", "file_read", json!({})),
+        ];
+        uniquify_tool_call_ids(&mut calls);
+        assert_eq!(ids(&calls), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn a_repeated_id_is_renamed_so_the_turn_survives() {
+        // Two answers to one question makes the provider reject the whole
+        // request, and the session stays stuck that way.
+        let mut calls = vec![
+            call("dup", "file_read", json!({ "path": "a" })),
+            call("dup", "file_read", json!({ "path": "b" })),
+            call("dup", "file_read", json!({ "path": "c" })),
+        ];
+        uniquify_tool_call_ids(&mut calls);
+        let out = ids(&calls);
+        assert_eq!(out[0], "dup", "the first occurrence keeps its id");
+        assert_eq!(out.len(), 3);
+        assert_eq!(
+            out.iter().collect::<std::collections::HashSet<_>>().len(),
+            3,
+            "every id must be distinct: {out:?}"
+        );
+    }
+
+    #[test]
+    fn empty_ids_are_numbered_by_position_not_by_argument_length() {
+        // The old fallback was `call-<argument length>`, which manufactured
+        // collisions: two calls whose arguments happened to be the same length
+        // got the same id. Position cannot collide.
+        let mut calls = vec![
+            call("", "file_read", json!({ "path": "aa" })),
+            call("", "file_read", json!({ "path": "bb" })),
+        ];
+        uniquify_tool_call_ids(&mut calls);
+        let out = ids(&calls);
+        assert_eq!(out, vec!["call-0", "call-1"]);
+    }
+
+    #[test]
+    fn a_synthetic_id_that_collides_with_a_real_one_still_resolves() {
+        // A provider is free to send a literal "call-1"; the synthetic scheme
+        // must not assume its namespace is private.
+        let mut calls = vec![
+            call("call-1", "file_read", json!({})),
+            call("", "file_glob", json!({})),
+        ];
+        uniquify_tool_call_ids(&mut calls);
+        let out = ids(&calls);
+        assert_eq!(out[0], "call-1");
+        assert_ne!(
+            out[1], "call-1",
+            "the synthetic id must step aside: {out:?}"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_ids_count_as_absent() {
+        let mut calls = vec![call("   ", "file_read", json!({}))];
+        uniquify_tool_call_ids(&mut calls);
+        assert_eq!(ids(&calls), vec!["call-0"]);
+    }
+}
+
+#[cfg(test)]
+mod retry_after_tests {
+    use super::parse_retry_after;
+    use super::MAX_RETRY_AFTER;
+    use reqwest::header::HeaderMap;
+    use std::time::Duration;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut map = HeaderMap::new();
+        for (name, value) in pairs {
+            map.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                value.parse().unwrap(),
+            );
+        }
+        map
+    }
+
+    #[test]
+    fn a_provider_that_says_nothing_leaves_the_backoff_alone() {
+        // `None` is what makes the fixed schedule the default; a zero here
+        // would turn silence into "retry immediately".
+        assert_eq!(parse_retry_after(&headers(&[])), None);
+    }
+
+    #[test]
+    fn delay_seconds_are_honoured() {
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "3")])),
+            Some(Duration::from_secs(3))
+        );
+        // Fractional seconds appear in the wild despite the RFC.
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "1.5")])),
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    #[test]
+    fn the_millisecond_header_some_gateways_send_wins() {
+        // `retry-after-ms` is more precise, so it is preferred where both are
+        // present rather than being silently ignored.
+        let both = headers(&[("retry-after", "5"), ("retry-after-ms", "250")]);
+        assert_eq!(parse_retry_after(&both), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn an_absurd_wait_is_capped_rather_than_obeyed() {
+        // A gateway answering "wait an hour" would otherwise hold the turn
+        // open for an hour with the user watching a spinner.
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "3600")])),
+            Some(MAX_RETRY_AFTER)
+        );
+    }
+
+    #[test]
+    fn unparseable_and_hostile_values_fall_back_rather_than_guess() {
+        // HTTP-date form is deliberately unsupported — it needs a clock the
+        // machine may have wrong.
+        assert_eq!(
+            parse_retry_after(&headers(&[(
+                "retry-after",
+                "Wed, 21 Oct 2026 07:28:00 GMT"
+            )])),
+            None
+        );
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "soon")])),
+            None
+        );
+        assert_eq!(parse_retry_after(&headers(&[("retry-after", "NaN")])), None);
+        // Negative means "now", not "travel backwards".
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "-10")])),
+            Some(Duration::ZERO)
+        );
     }
 }
 

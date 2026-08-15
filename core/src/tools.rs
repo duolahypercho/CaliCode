@@ -2689,11 +2689,57 @@ pub fn model_switch(
     model_list(config)
 }
 
+/// A required string argument, or an error the model can act on.
+///
+/// The message is written for its actual reader. A validator dump like
+/// "missing required string slug" tells a model that something is wrong but
+/// not what to send, so the retry is a guess — and a guess costs another turn.
+/// Naming what arrived is the part that distinguishes the three ways this
+/// fails: absent, null, or the right key holding the wrong type (a number or
+/// an object), which look identical from inside the model.
 pub fn required_str<'a>(value: &'a Value, key: &'a str) -> Result<&'a str> {
-    value
-        .get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required string {}", key))
+    match value.get(key) {
+        Some(Value::String(text)) => Ok(text),
+        found => {
+            let saw = match found {
+                None => "it was not provided".to_string(),
+                Some(Value::Null) => "it was null".to_string(),
+                Some(other) => format!(
+                    "it was {}: {}",
+                    json_type_name(other),
+                    clamp_for_error(&other.to_string())
+                ),
+            };
+            anyhow::bail!(
+                "the `{key}` argument must be a string, but {saw}. Call the tool again with \
+                 `{key}` set to a string."
+            )
+        }
+    }
+}
+
+/// Echo back enough of a bad value to identify it, and no more. The whole
+/// point is a short, actionable message; quoting a 2MB argument back at the
+/// model would cost more than the mistake did.
+fn clamp_for_error(text: &str) -> String {
+    const MAX: usize = 120;
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(MAX).collect();
+    format!("{kept}…")
+}
+
+/// The JSON type name a model would recognise from its own schema.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 fn current_time_ms() -> u64 {
@@ -3730,6 +3776,61 @@ mod tests {
         )
         .await
         .expect("creating a file must not be refused");
+    }
+
+    #[test]
+    fn a_bad_argument_tells_the_model_what_to_send() {
+        // The reader is a model deciding what to do next, not a developer
+        // reading a log. "missing required string slug" says something is
+        // wrong without saying what to send, so the retry is a guess.
+        let err = required_str(&json!({}), "slug").unwrap_err().to_string();
+        assert!(err.contains("`slug`"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(err.contains("not provided"), "{err}");
+        assert!(err.contains("Call the tool again"), "{err}");
+    }
+
+    #[test]
+    fn the_three_ways_it_fails_are_distinguishable() {
+        // Absent, null, and wrong-type look identical from inside the model
+        // unless the error separates them.
+        let absent = required_str(&json!({}), "path").unwrap_err().to_string();
+        let null = required_str(&json!({ "path": null }), "path")
+            .unwrap_err()
+            .to_string();
+        let wrong = required_str(&json!({ "path": 7 }), "path")
+            .unwrap_err()
+            .to_string();
+        assert!(absent.contains("not provided"), "{absent}");
+        assert!(null.contains("null"), "{null}");
+        assert!(wrong.contains("a number"), "{wrong}");
+        assert!(wrong.contains('7'), "the value itself helps: {wrong}");
+        assert_ne!(absent, null);
+        assert_ne!(null, wrong);
+    }
+
+    #[test]
+    fn a_huge_wrong_argument_is_not_quoted_back_whole() {
+        // Echoing a 2MB argument back would cost more than the mistake did.
+        let big = json!({ "content": "x".repeat(50_000) });
+        let err = required_str(&big, "missing").unwrap_err().to_string();
+        assert!(err.len() < 400, "error was {} chars", err.len());
+
+        let wrong_type = json!({ "path": vec!["y".repeat(50_000)] });
+        let err = required_str(&wrong_type, "path").unwrap_err().to_string();
+        assert!(err.len() < 400, "error was {} chars", err.len());
+        assert!(err.contains('…'), "truncation must be visible: {err}");
+    }
+
+    #[test]
+    fn a_valid_string_argument_still_just_works() {
+        assert_eq!(
+            required_str(&json!({ "slug": "demo" }), "slug").unwrap(),
+            "demo"
+        );
+        // Empty is a valid string; rejecting it is a per-tool decision, not
+        // this function's.
+        assert_eq!(required_str(&json!({ "slug": "" }), "slug").unwrap(), "");
     }
 
     #[tokio::test]
