@@ -58,6 +58,9 @@ struct PendingApproval {
 pub enum Resolution {
     /// A human clicked. The only path that can carry `approved: false`.
     Answered { approved: bool },
+    /// An "always allow" the human just gave already covers this request.
+    /// Approval only — it cannot deny, so the governing invariant holds.
+    AlwaysAllowed,
     /// Core's own bounded timer expired.
     TimedOut,
     /// The run that raised this is over; there is nothing left to approve.
@@ -74,6 +77,7 @@ impl Resolution {
         match self {
             Self::Answered { approved: true } => "answered-approved",
             Self::Answered { approved: false } => "answered-denied",
+            Self::AlwaysAllowed => "always-allowed",
             Self::TimedOut => "timed-out",
             Self::RunCancelled => "run-cancelled",
             Self::SessionGone => "session-gone",
@@ -84,9 +88,16 @@ impl Resolution {
     /// The value handed to the waiting tool call. Only `Answered` can approve;
     /// every other exit is an absence of an answer, not a denial, and the
     /// caller reports it as such (see [`Approvals::request`]).
-    fn payload(&self) -> Value {
+    fn payload(&self, reason: Option<&str>) -> Value {
         match self {
-            Self::Answered { approved } => json!({ "approved": approved }),
+            Self::Answered { approved } => {
+                let mut answer = json!({ "approved": approved });
+                if let Some(reason) = reason {
+                    answer["reason"] = json!(reason);
+                }
+                answer
+            }
+            Self::AlwaysAllowed => json!({ "approved": true }),
             Self::TimedOut => json!({ "abandoned": "timed-out" }),
             Self::RunCancelled => json!({ "abandoned": "run-cancelled" }),
             Self::SessionGone => json!({ "abandoned": "session-gone" }),
@@ -100,8 +111,10 @@ impl Resolution {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ApprovalOutcome {
     Approved,
-    /// A human clicked Deny.
-    Denied,
+    /// A human clicked Deny. Carries what they typed, if anything: a denial
+    /// with no reason teaches the model only that the door is shut, and it
+    /// reaches for the same door again.
+    Denied(Option<String>),
     /// Nobody answered and the request left the map for a non-human reason.
     /// Carries the wire spelling so the tool error names the real cause
     /// instead of claiming a denial nobody issued.
@@ -199,7 +212,14 @@ impl Approvals {
         // else arrived through `resolve` and names its own cause.
         match answer.get("approved").and_then(Value::as_bool) {
             Some(true) => ApprovalOutcome::Approved,
-            Some(false) => ApprovalOutcome::Denied,
+            Some(false) => ApprovalOutcome::Denied(
+                answer
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|reason| !reason.is_empty())
+                    .map(str::to_string),
+            ),
             None => {
                 ApprovalOutcome::Abandoned(match answer.get("abandoned").and_then(Value::as_str) {
                     Some("run-cancelled") => Resolution::RunCancelled.outcome(),
@@ -223,6 +243,7 @@ impl Approvals {
         request_id: &str,
         client_id: Option<&str>,
         approved: bool,
+        reason: Option<&str>,
     ) -> Result<Value> {
         let answered;
         {
@@ -245,8 +266,14 @@ impl Approvals {
             answered = Some((entry.answer_session.clone(), entry.tool.clone()));
         }
         let (session, tool) = answered.expect("the guard above returns on a missing entry");
+        // A reason belongs to a denial. On an approval it is noise the model
+        // would have to read as an instruction, so it is dropped here rather
+        // than left for each caller to remember.
+        let reason = reason
+            .map(str::trim)
+            .filter(|reason| !approved && !reason.is_empty());
         if self
-            .resolve(request_id, Resolution::Answered { approved })
+            .resolve_with(request_id, Resolution::Answered { approved }, reason)
             .await
         {
             Ok(json!({ "accepted": true, "sessionId": session, "tool": tool }))
@@ -302,6 +329,41 @@ impl Approvals {
         cancelled
     }
 
+    /// Approve the other pending requests an "always allow" already covers.
+    ///
+    /// A grant is folded into the turn's permission rules when the turn
+    /// *starts*, so the sibling calls a parallel tool batch already raised keep
+    /// their cards up: the user grants "always allow file_write" and is then
+    /// asked about file_write four more times, which reads as the grant having
+    /// failed. Same session, same tool, same window — the answer is already in
+    /// hand, so give it.
+    ///
+    /// Scoped to the window that clicked. A grant recorded from one CaliCode
+    /// window must not reach across and answer a card sitting in another; that
+    /// is the same address enforcement [`Self::respond`] makes, and skipping it
+    /// here would route around it.
+    pub async fn grant_pending(&self, session_id: &str, tool: &str, client_id: &str) -> usize {
+        let ids: Vec<String> = {
+            let pending = self.pending.lock().await;
+            pending
+                .iter()
+                .filter(|(_, entry)| {
+                    entry.answer_session == session_id
+                        && entry.tool == tool
+                        && entry.target_client_id.as_deref() == Some(client_id)
+                })
+                .map(|(request_id, _)| request_id.clone())
+                .collect()
+        };
+        let mut granted = 0;
+        for request_id in ids {
+            if self.resolve(&request_id, Resolution::AlwaysAllowed).await {
+                granted += 1;
+            }
+        }
+        granted
+    }
+
     /// Is anybody parked on an approval bound to this session?
     ///
     /// Session eviction used to filter victims on `session.pending.is_empty()`.
@@ -322,15 +384,26 @@ impl Approvals {
     /// map — every other method funnels here so no path can leave without a
     /// broadcast.
     async fn resolve(&self, request_id: &str, resolution: Resolution) -> bool {
+        self.resolve_with(request_id, resolution, None).await
+    }
+
+    /// [`Self::resolve`] with the words a human attached to their answer.
+    async fn resolve_with(
+        &self,
+        request_id: &str,
+        resolution: Resolution,
+        reason: Option<&str>,
+    ) -> bool {
         let entry = self.pending.lock().await.remove(request_id);
         let Some(entry) = entry else {
             return false;
         };
-        let _ = entry.sender.send(resolution.payload());
+        let _ = entry.sender.send(resolution.payload(reason));
         let _ = self.events.send(json!({
             "type": "agent.approval_resolved",
             "requestId": request_id,
             "outcome": resolution.outcome(),
+            "reason": reason,
             "sessionId": entry.answer_session,
             "ownerSession": entry.owner_session,
             "ownerGraph": entry.owner_graph,
@@ -395,7 +468,7 @@ mod tests {
         let request_id = next_request_id(&mut rx).await;
 
         let stolen = approvals
-            .respond(&request_id, Some("window-b"), true)
+            .respond(&request_id, Some("window-b"), true, None)
             .await
             .expect_err("a foreign window must be refused");
         assert!(
@@ -404,7 +477,7 @@ mod tests {
         );
         // And the refusal must not have consumed the request.
         approvals
-            .respond(&request_id, Some("window-a"), true)
+            .respond(&request_id, Some("window-a"), true, None)
             .await
             .expect("the addressed window still answers");
         assert_eq!(waiter.await.unwrap(), ApprovalOutcome::Approved);
@@ -421,7 +494,7 @@ mod tests {
 
         for client in [None, Some("window-a"), Some("window-b")] {
             let refused = approvals
-                .respond(&request_id, client, true)
+                .respond(&request_id, client, true, None)
                 .await
                 .expect_err("an unaddressed approval is answerable by nobody");
             assert!(
@@ -504,10 +577,138 @@ mod tests {
         };
         let request_id = next_request_id(&mut rx).await;
         approvals
-            .respond(&request_id, Some("window-a"), false)
+            .respond(&request_id, Some("window-a"), false, None)
             .await
             .expect("the addressed window may deny");
-        assert_eq!(waiter.await.unwrap(), ApprovalOutcome::Denied);
+        assert_eq!(waiter.await.unwrap(), ApprovalOutcome::Denied(None));
+    }
+
+    #[tokio::test]
+    async fn a_denial_carries_the_words_the_user_typed() {
+        let (approvals, mut rx) = approvals();
+        let waiter = {
+            let approvals = approvals.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(request("session-a", Some("window-a")))
+                    .await
+            })
+        };
+        let request_id = next_request_id(&mut rx).await;
+        approvals
+            .respond(
+                &request_id,
+                Some("window-a"),
+                false,
+                Some("  not that file — edit the config instead  "),
+            )
+            .await
+            .expect("the addressed window may deny");
+        assert_eq!(
+            waiter.await.unwrap(),
+            ApprovalOutcome::Denied(Some("not that file — edit the config instead".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_drops_a_reason_rather_than_feeding_it_to_the_model() {
+        // A reason on an approval would reach the model as an instruction it
+        // never asked for; only a denial needs words.
+        let (approvals, mut rx) = approvals();
+        let waiter = {
+            let approvals = approvals.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(request("session-a", Some("window-a")))
+                    .await
+            })
+        };
+        let request_id = next_request_id(&mut rx).await;
+        approvals
+            .respond(&request_id, Some("window-a"), true, Some("sure, go ahead"))
+            .await
+            .expect("the addressed window may approve");
+        assert_eq!(waiter.await.unwrap(), ApprovalOutcome::Approved);
+    }
+
+    #[tokio::test]
+    async fn an_always_allow_answers_the_cards_it_already_covers() {
+        let (approvals, mut rx) = approvals();
+        let mut waiters = Vec::new();
+        for _ in 0..3 {
+            let approvals = approvals.clone();
+            waiters.push(tokio::spawn(async move {
+                approvals
+                    .request(request("session-a", Some("window-a")))
+                    .await
+            }));
+        }
+        // A different tool, and the same tool in a different window: neither is
+        // covered by what the user was shown.
+        let other_tool = {
+            let approvals = approvals.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(ApprovalRequest {
+                        tool: "file_delete",
+                        ..request("session-a", Some("window-a"))
+                    })
+                    .await
+            })
+        };
+        let other_window = {
+            let approvals = approvals.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(request("session-a", Some("window-b")))
+                    .await
+            })
+        };
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            ids.push(next_request_id(&mut rx).await);
+        }
+        assert_eq!(approvals.pending_count().await, 5);
+
+        let granted = approvals
+            .grant_pending("session-a", "file_write", "window-a")
+            .await;
+        assert_eq!(granted, 3, "every file_write card in that window");
+        for waiter in waiters {
+            assert_eq!(waiter.await.unwrap(), ApprovalOutcome::Approved);
+        }
+        assert_eq!(approvals.pending_count().await, 2);
+        assert!(!other_tool.is_finished(), "a different tool still waits");
+        assert!(!other_window.is_finished(), "another window still waits");
+    }
+
+    #[tokio::test]
+    async fn a_cascaded_grant_is_reported_as_its_own_outcome() {
+        // Not "answered-approved": nobody clicked this card, and a transcript
+        // that says they did is a lie about consent.
+        let (approvals, mut rx) = approvals();
+        {
+            let approvals = approvals.clone();
+            tokio::spawn(async move {
+                approvals
+                    .request(request("session-a", Some("window-a")))
+                    .await
+            });
+        }
+        let _ = next_request_id(&mut rx).await;
+        assert_eq!(
+            approvals
+                .grant_pending("session-a", "file_write", "window-a")
+                .await,
+            1
+        );
+        let resolved = loop {
+            let event = rx.recv().await.expect("event");
+            if event["type"] == "agent.approval_resolved" {
+                break event;
+            }
+        };
+        assert_eq!(resolved["outcome"], "always-allowed");
     }
 
     #[tokio::test]
@@ -535,6 +736,7 @@ mod tests {
         let all = [
             Resolution::Answered { approved: true },
             Resolution::Answered { approved: false },
+            Resolution::AlwaysAllowed,
             Resolution::TimedOut,
             Resolution::RunCancelled,
             Resolution::SessionGone,
@@ -547,6 +749,6 @@ mod tests {
                 "duplicate outcome spelling for {resolution:?}"
             );
         }
-        assert_eq!(seen.len(), 6);
+        assert_eq!(seen.len(), 7);
     }
 }

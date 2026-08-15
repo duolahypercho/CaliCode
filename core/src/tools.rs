@@ -477,6 +477,21 @@ async fn apply_file_edit_request(
     // text that is not in the file — see `crate::edit_match` — so the refusals
     // below still mean what they always did.
     let Some(found) = crate::edit_match::find(&text, old) else {
+        // `file_read` renders `cat -n` style, so the likeliest reason a quote
+        // does not match is that its line numbers came along. Diagnosed by
+        // *testing the fix* rather than by pattern-matching the input: the
+        // message only appears when stripping the numbers actually finds the
+        // text, so a legitimate edit whose content happens to start with
+        // digits can never be refused for this.
+        if let Some(stripped) = strip_line_numbers(old) {
+            if crate::edit_match::find(&text, &stripped).is_some() {
+                anyhow::bail!(
+                    "old_string was not found in {rel}, but it matches once the line numbers are \
+                     removed. Those numbers come from file_read's display and are not in the \
+                     file — pass just the text after the tab."
+                );
+            }
+        }
         anyhow::bail!(
             "old_string not found in {rel}; read the file and pass the exact current text"
         );
@@ -741,7 +756,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "file_read".into(),
-            description: "Read a text file from the active game's folder (its attached workspace when it has one, otherwise the project). Returns a window: at most 2000 lines and 128KB per call, with very long lines clamped. When more of the file remains the result says exactly which offset to continue from — read that rather than guessing. Non-text files report what they are instead of returning bytes.".into(),
+            description: "Read a text file from the active game's folder (its attached workspace when it has one, otherwise the project). Returns a window: at most 2000 lines and 128KB per call, with very long lines clamped. Lines are prefixed with their number and a tab for reference — that prefix is NOT part of the file, so never include it in file_edit's old_string. When more of the file remains the result says exactly which offset to continue from — read that rather than guessing. Non-text files report what they are instead of returning bytes.".into(),
             parameters: json!({
                 "type":"object",
                 "properties":{
@@ -1491,6 +1506,9 @@ pub(crate) async fn execute_core_tool_with_activity(
                     None => repair,
                 };
                 result["notice"] = json!(notice);
+            }
+            if let Some(rules) = nearest_directory_rules(&base.base, rel) {
+                result["directoryRules"] = json!(rules);
             }
             if capture_activity {
                 let path = result
@@ -2689,11 +2707,126 @@ pub fn model_switch(
     model_list(config)
 }
 
+/// A required string argument, or an error the model can act on.
+///
+/// The message is written for its actual reader. A validator dump like
+/// "missing required string slug" tells a model that something is wrong but
+/// not what to send, so the retry is a guess — and a guess costs another turn.
+/// Naming what arrived is the part that distinguishes the three ways this
+/// fails: absent, null, or the right key holding the wrong type (a number or
+/// an object), which look identical from inside the model.
 pub fn required_str<'a>(value: &'a Value, key: &'a str) -> Result<&'a str> {
-    value
-        .get(key)
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("missing required string {}", key))
+    match value.get(key) {
+        Some(Value::String(text)) => Ok(text),
+        found => {
+            let saw = match found {
+                None => "it was not provided".to_string(),
+                Some(Value::Null) => "it was null".to_string(),
+                Some(other) => format!(
+                    "it was {}: {}",
+                    json_type_name(other),
+                    clamp_for_error(&other.to_string())
+                ),
+            };
+            anyhow::bail!(
+                "the `{key}` argument must be a string, but {saw}. Call the tool again with \
+                 `{key}` set to a string."
+            )
+        }
+    }
+}
+
+/// Longest directory-level rules block carried on a read.
+const MAX_DIRECTORY_RULES_BYTES: usize = 1024;
+
+/// The nearest `CALICODE.md` above `rel`, if one exists below the root.
+///
+/// Project conventions were a single root `CALICODE.md` inlined into the system
+/// prompt, so an area with its own rules — "scripts here must not allocate per
+/// frame", "assets in this folder are generated, edit the source" — had nowhere
+/// to put them. opencode solves this by attaching the nearest `AGENTS.md` to
+/// the read that touches its subtree, which puts the rule in front of the model
+/// exactly when it is about to matter.
+///
+/// The root file is skipped because it is already in the prompt; repeating it
+/// on every read would be pure cost. Nearest-only, for the same reason.
+///
+/// Not deduplicated across reads: the tool layer has no session identity (the
+/// same gap that made `staleness` key on the file), and a global cache would
+/// mean a second session in the same process silently never sees the rules.
+/// Repetition inside one subtree is the accepted price, bounded to 1KB.
+fn nearest_directory_rules(base: &Path, rel: &str) -> Option<String> {
+    let mut dir = Path::new(rel).parent()?;
+    loop {
+        // An empty parent means we walked back to the root, whose rules the
+        // prompt already carries.
+        if dir.as_os_str().is_empty() {
+            return None;
+        }
+        let candidate = base.join(dir).join("CALICODE.md");
+        if candidate.is_file() {
+            let body = std::fs::read_to_string(&candidate).ok()?;
+            let body = body.trim();
+            if body.is_empty() {
+                return None;
+            }
+            let clamped: String = body.chars().take(MAX_DIRECTORY_RULES_BYTES).collect();
+            let elided = if body.chars().count() > MAX_DIRECTORY_RULES_BYTES {
+                "\n… (truncated; read it in full if you need the rest)"
+            } else {
+                ""
+            };
+            return Some(format!(
+                "Conventions for {}/ from its CALICODE.md — these govern this file and win over \
+                 your defaults:\n{clamped}{elided}",
+                dir.display()
+            ));
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Strip a `cat -n` prefix from every line, or `None` if they do not all have
+/// one.
+///
+/// All-or-nothing on purpose: a partial strip would silently rewrite the
+/// caller's text, and this only ever feeds a diagnostic that is checked
+/// against the file before it is shown.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let (number, rest) = line.split_once('\t')?;
+        let number = number.trim();
+        if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        out.push(rest);
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
+/// Echo back enough of a bad value to identify it, and no more. The whole
+/// point is a short, actionable message; quoting a 2MB argument back at the
+/// model would cost more than the mistake did.
+fn clamp_for_error(text: &str) -> String {
+    const MAX: usize = 120;
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(MAX).collect();
+    format!("{kept}…")
+}
+
+/// The JSON type name a model would recognise from its own schema.
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "a boolean",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
 }
 
 fn current_time_ms() -> u64 {
@@ -3465,7 +3598,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result["content"], "session-b");
+        assert_eq!(result["content"], "     1\tsession-b");
     }
 
     #[test]
@@ -3730,6 +3863,218 @@ mod tests {
         )
         .await
         .expect("creating a file must not be refused");
+    }
+
+    #[test]
+    fn a_bad_argument_tells_the_model_what_to_send() {
+        // The reader is a model deciding what to do next, not a developer
+        // reading a log. "missing required string slug" says something is
+        // wrong without saying what to send, so the retry is a guess.
+        let err = required_str(&json!({}), "slug").unwrap_err().to_string();
+        assert!(err.contains("`slug`"), "{err}");
+        assert!(err.contains("must be a string"), "{err}");
+        assert!(err.contains("not provided"), "{err}");
+        assert!(err.contains("Call the tool again"), "{err}");
+    }
+
+    #[test]
+    fn the_three_ways_it_fails_are_distinguishable() {
+        // Absent, null, and wrong-type look identical from inside the model
+        // unless the error separates them.
+        let absent = required_str(&json!({}), "path").unwrap_err().to_string();
+        let null = required_str(&json!({ "path": null }), "path")
+            .unwrap_err()
+            .to_string();
+        let wrong = required_str(&json!({ "path": 7 }), "path")
+            .unwrap_err()
+            .to_string();
+        assert!(absent.contains("not provided"), "{absent}");
+        assert!(null.contains("null"), "{null}");
+        assert!(wrong.contains("a number"), "{wrong}");
+        assert!(wrong.contains('7'), "the value itself helps: {wrong}");
+        assert_ne!(absent, null);
+        assert_ne!(null, wrong);
+    }
+
+    #[test]
+    fn a_huge_wrong_argument_is_not_quoted_back_whole() {
+        // Echoing a 2MB argument back would cost more than the mistake did.
+        let big = json!({ "content": "x".repeat(50_000) });
+        let err = required_str(&big, "missing").unwrap_err().to_string();
+        assert!(err.len() < 400, "error was {} chars", err.len());
+
+        let wrong_type = json!({ "path": vec!["y".repeat(50_000)] });
+        let err = required_str(&wrong_type, "path").unwrap_err().to_string();
+        assert!(err.len() < 400, "error was {} chars", err.len());
+        assert!(err.contains('…'), "truncation must be visible: {err}");
+    }
+
+    #[test]
+    fn a_valid_string_argument_still_just_works() {
+        assert_eq!(
+            required_str(&json!({ "slug": "demo" }), "slug").unwrap(),
+            "demo"
+        );
+        // Empty is a valid string; rejecting it is a per-tool decision, not
+        // this function's.
+        assert_eq!(required_str(&json!({ "slug": "" }), "slug").unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn reading_a_file_surfaces_the_conventions_for_its_folder() {
+        // A root CALICODE.md is in the prompt; an area with its own rules had
+        // nowhere to put them, so the model learned conventions only for the
+        // project as a whole.
+        let (root, folder) = game_with_workspace();
+        std::fs::create_dir_all(folder.path().join("scripts/enemy")).unwrap();
+        std::fs::write(
+            folder.path().join("scripts/enemy/CALICODE.md"),
+            "Enemies must not allocate per frame.",
+        )
+        .unwrap();
+        std::fs::write(
+            folder.path().join("scripts/enemy/boss.js"),
+            "export const hp = 3;\n",
+        )
+        .unwrap();
+
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "file_read")
+            .unwrap();
+        let state = mock_state("127.0.0.1:9".parse().unwrap());
+        let result = execute_core_tool(
+            &def,
+            &json!({ "slug": "demo", "path": "scripts/enemy/boss.js" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        let rules = result["directoryRules"].as_str().expect("rules attached");
+        assert!(rules.contains("must not allocate per frame"), "{rules}");
+        assert!(
+            rules.contains("scripts/enemy"),
+            "it names the scope: {rules}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_with_no_folder_rules_carries_none() {
+        let (root, folder) = game_with_workspace();
+        std::fs::write(folder.path().join("plain.js"), "const a = 1;\n").unwrap();
+        // The root's own CALICODE.md is deliberately not attached: it is
+        // already in the system prompt, so repeating it on every read is cost
+        // with no information.
+        std::fs::write(folder.path().join("CALICODE.md"), "Project-wide rules.").unwrap();
+
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "file_read")
+            .unwrap();
+        let state = mock_state("127.0.0.1:9".parse().unwrap());
+        let result = execute_core_tool(
+            &def,
+            &json!({ "slug": "demo", "path": "plain.js" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.get("directoryRules").is_none(), "{result}");
+    }
+
+    #[test]
+    fn folder_rules_take_the_nearest_and_stay_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/CALICODE.md"), "outer").unwrap();
+        std::fs::write(base.join("a/b/CALICODE.md"), "inner").unwrap();
+
+        // Nearest wins: the specific rule is the one that applies.
+        let found = nearest_directory_rules(base, "a/b/file.js").unwrap();
+        assert!(found.contains("inner"), "{found}");
+        assert!(!found.contains("outer"), "{found}");
+
+        // A folder with no rules of its own inherits the one above it.
+        let inherited = nearest_directory_rules(base, "a/other.js").unwrap();
+        assert!(inherited.contains("outer"), "{inherited}");
+
+        // A runaway rules file cannot flood every read in its subtree.
+        std::fs::write(base.join("a/b/CALICODE.md"), "x".repeat(50_000)).unwrap();
+        let clamped = nearest_directory_rules(base, "a/b/file.js").unwrap();
+        assert!(clamped.len() < MAX_DIRECTORY_RULES_BYTES + 300);
+        assert!(clamped.contains("truncated"), "{}", &clamped[..80]);
+    }
+
+    #[tokio::test]
+    async fn an_old_string_pasted_with_line_numbers_says_so() {
+        // The mistake `file_read`'s numbering invites. Without this the edit
+        // just reports "not found" and the model cannot see why, because from
+        // its side it copied the text exactly as shown.
+        let (root, folder) = game_with_workspace();
+        std::fs::write(
+            folder.path().join("hero.js"),
+            "const speed = 1;\nconst jump = 2;\n",
+        )
+        .unwrap();
+
+        let error = apply_file_edit(
+            root.path(),
+            "demo",
+            "hero.js",
+            "     1\tconst speed = 1;",
+            "const speed = 3;",
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("line numbers"), "{error}");
+        assert!(error.contains("after the tab"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn text_that_merely_starts_with_digits_is_not_blamed_on_numbering() {
+        // The guard is only allowed to fire when stripping actually fixes the
+        // match — otherwise a legitimate edit to tab-separated data would be
+        // told to remove numbers that are its own content.
+        let (root, folder) = game_with_workspace();
+        std::fs::write(folder.path().join("data.tsv"), "1\talpha\n2\tbeta\n").unwrap();
+
+        // This IS the file's content, numbers and tabs included.
+        let ok = apply_file_edit(
+            root.path(),
+            "demo",
+            "data.tsv",
+            "2\tbeta",
+            "2\tgamma",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["written"], json!(true));
+        assert!(std::fs::read_to_string(folder.path().join("data.tsv"))
+            .unwrap()
+            .contains("2\tgamma"));
+
+        // And a genuine miss still reports a plain not-found.
+        let error = apply_file_edit(
+            root.path(),
+            "demo",
+            "data.tsv",
+            "9\tzeta",
+            "9\tomega",
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not found"), "{error}");
+        assert!(!error.contains("line numbers"), "misdiagnosed: {error}");
     }
 
     #[tokio::test]
@@ -4650,10 +4995,12 @@ mod tests {
         )
         .await
         .unwrap();
+        // Numbering continues from the resume offset rather than restarting,
+        // so a line the model cites still names the right line.
         assert!(second["content"]
             .as_str()
             .unwrap()
-            .starts_with("dep-2001: 1.0.0\n"));
+            .starts_with("  2001\tdep-2001: 1.0.0\n"));
     }
 
     #[tokio::test]
@@ -4670,7 +5017,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result["content"], "hello");
+        assert_eq!(result["content"], "     1\thello");
         // The repair is announced: a silent one would leave the model typing
         // the spelling that does not exist.
         assert!(result["notice"]
@@ -4761,7 +5108,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result["content"], "two");
+        assert_eq!(result["content"], "     2\ttwo");
 
         // But a value that only looks numeric is refused, never read as 2 —
         // a silently wrong window is worse than an error.
@@ -4966,7 +5313,9 @@ mod tests {
         let mut sanitized = result;
         let activity = take_internal_activity(&mut sanitized).expect("read activity metadata");
         assert_eq!(activity, json!({ "operation": "read", "path": "main.js" }));
-        assert_eq!(sanitized["content"], "const ready = true;");
+        // Numbered, as every model-facing read is; the activity metadata above
+        // is what carries the openable path.
+        assert_eq!(sanitized["content"], "     1\tconst ready = true;");
     }
 
     #[tokio::test]
@@ -5145,7 +5494,10 @@ mod tests {
                             // including this probe with no client id — is
                             // refused by `respond`, which is the point.
                             Some(client) => {
-                                let _ = agents.approvals().respond(&rid, Some(client), true).await;
+                                let _ = agents
+                                    .approvals()
+                                    .respond(&rid, Some(client), true, None)
+                                    .await;
                             }
                             // Unaddressed: answerable by nobody, so it would
                             // park for core's full 300s timer. The probe plays

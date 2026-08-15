@@ -407,8 +407,26 @@ fn utf8_prefix(bytes: &[u8], max: usize) -> &[u8] {
 ///
 /// A clean, complete read carries no notice at all — the commonest case must
 /// not pay for the rare ones.
+/// Render the window the way `cat -n` does: right-aligned number, tab, line.
+///
+/// The format is deliberately the conventional one rather than something
+/// tidier. Models have seen `cat -n` and Claude Code's identical rendering far
+/// more than any alternative, and the cost of a novel format is the model
+/// misreading which column is the file's own content.
+///
+/// Numbers are display only. The pairing guard in `file_edit` exists because
+/// the obvious next mistake is pasting them back into `old_string`.
+pub(crate) fn number_lines(lines: &[String], start_line: usize) -> String {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(index, line)| format!("{:>6}\t{line}", start_line + index))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn describe(rel: &str, size: u64, offset: usize, limit: usize, window: Window) -> Value {
-    let content = window.lines.join("\n");
+    let content = number_lines(&window.lines, window.start_line);
     let mut result = json!({
         "path": rel,
         "content": content,
@@ -424,6 +442,11 @@ fn describe(rel: &str, size: u64, offset: usize, limit: usize, window: Window) -
     result["truncated"] = json!(!complete_from_start || window.clamped);
 
     let mut notices: Vec<String> = Vec::new();
+
+    // The "numbers are not part of the file" warning lives in the tool's
+    // description, not here. It is the same sentence either way, but the
+    // description is paid for once per session while a per-read notice is paid
+    // for on every read — and `file_edit` catches the mistake anyway.
 
     // Offset past the end. This is the one case worth the full scan's line
     // count, because the count is exactly what the model needs to retry.
@@ -708,6 +731,53 @@ pub fn arg_count(args: &Value, key: &str, default: usize) -> Result<usize> {
 mod tests {
     use super::*;
 
+    /// The file's own text, with `file_read`'s display numbering removed.
+    ///
+    /// These tests are about *what was read* — windowing, clamping, encoding —
+    /// not about how it is presented. The presentation is pinned separately by
+    /// `read_output_is_numbered_like_cat_n`, so it is asserted once instead of
+    /// being baked into every expectation.
+    fn content_of(result: &Value) -> String {
+        result["content"]
+            .as_str()
+            .unwrap_or_default()
+            .lines()
+            .map(|line| line.split_once('\t').map(|(_, rest)| rest).unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn read_output_is_numbered_like_cat_n() {
+        // The conventional rendering, not a tidier invention: models have seen
+        // `cat -n` far more than any alternative, and an unfamiliar format
+        // invites misreading which column is the file's own text.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write(dir.path(), "n.txt", "alpha\nbeta\n");
+        let result = read_window(&path, "n.txt", 1, 10).unwrap();
+        assert_eq!(
+            result["content"].as_str().unwrap(),
+            "     1\talpha\n     2\tbeta"
+        );
+        // startLine/endLine still describe the file, not the rendering.
+        assert_eq!(result["startLine"], json!(1));
+        assert_eq!(result["endLine"], json!(2));
+    }
+
+    #[test]
+    fn numbering_starts_at_the_window_not_at_one() {
+        // A window renumbered from 1 would make every line the model cites
+        // wrong by exactly the offset.
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=20).map(|i| format!("line {i}\n")).collect();
+        let path = write(dir.path(), "w.txt", &body);
+        let result = read_window(&path, "w.txt", 7, 3).unwrap();
+        assert_eq!(
+            result["content"].as_str().unwrap(),
+            "     7\tline 7\n     8\tline 8\n     9\tline 9"
+        );
+    }
+
     fn write(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, body).unwrap();
@@ -723,7 +793,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "f.txt", "one\ntwo\nthree\n");
         let result = read(&path, 1, DEFAULT_LINE_LIMIT);
-        assert_eq!(result["content"], "one\ntwo\nthree");
+        assert_eq!(content_of(&result), "one\ntwo\nthree");
         assert_eq!(result["startLine"], 1);
         assert_eq!(result["endLine"], 3);
         assert_eq!(result["totalLines"], 3);
@@ -737,7 +807,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "f.txt", "one\ntwo");
         let result = read(&path, 1, DEFAULT_LINE_LIMIT);
-        assert_eq!(result["content"], "one\ntwo");
+        assert_eq!(content_of(&result), "one\ntwo");
         assert_eq!(result["totalLines"], 2);
     }
 
@@ -757,9 +827,19 @@ mod tests {
         assert!(notice.contains("offset=2001"), "notice was: {notice}");
         assert!(!notice.starts_with("Error"), "a fact, not a failure");
 
-        // The offset the notice handed back resumes exactly where it stopped.
+        // The offset the notice handed back resumes exactly where it stopped,
+        // and the numbering continues from there rather than restarting at 1 —
+        // a window that renumbered from 1 would make every citation wrong.
         let next = read(&path, 2_001, 2_000);
-        assert!(next["content"].as_str().unwrap().starts_with("line 2001\n"));
+        assert!(content_of(&next).starts_with("line 2001\n"));
+        assert!(
+            next["content"]
+                .as_str()
+                .unwrap()
+                .starts_with("  2001\tline 2001"),
+            "numbering must continue: {}",
+            &next["content"].as_str().unwrap()[..40.min(next["content"].as_str().unwrap().len())]
+        );
     }
 
     #[test]
@@ -793,7 +873,7 @@ mod tests {
         let path = write(dir.path(), "f.txt", &format!("{}\n", "m".repeat(900_000)));
 
         let result = read(&path, 1, DEFAULT_LINE_LIMIT);
-        let content = result["content"].as_str().unwrap();
+        let content = content_of(&result);
         assert!(
             content.len() < 16_000,
             "one minified line returned {} bytes",
@@ -817,7 +897,7 @@ mod tests {
         let path = write(dir.path(), "f.txt", &body);
 
         let result = read(&path, 2, 10);
-        assert_eq!(result["content"], "wanted");
+        assert_eq!(content_of(&result), "wanted");
         assert_eq!(result["startLine"], 2);
     }
 
@@ -826,7 +906,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "f.txt", "one\ntwo\n");
         let result = read(&path, 99, 10);
-        assert_eq!(result["content"], "");
+        assert_eq!(content_of(&result), "");
         let notice = result["notice"].as_str().unwrap();
         assert!(notice.contains("has 2 lines"), "notice was: {notice}");
         assert!(notice.contains("smaller offset"));
@@ -837,7 +917,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "f.txt", "");
         let result = read(&path, 1, 10);
-        assert_eq!(result["content"], "");
+        assert_eq!(content_of(&result), "");
         assert!(result["notice"].as_str().unwrap().contains("is empty"));
     }
 
@@ -888,7 +968,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "f.txt", "\u{feff}one\r\ntwo\r\n");
         let result = read(&path, 1, 10);
-        assert_eq!(result["content"], "one\ntwo");
+        assert_eq!(content_of(&result), "one\ntwo");
     }
 
     #[test]
@@ -898,7 +978,7 @@ mod tests {
         // prefix is trimmed to a boundary.
         let path = write(dir.path(), "f.txt", &format!("{}\n", "漢".repeat(60_000)));
         let result = read(&path, 1, 10);
-        let content = result["content"].as_str().unwrap();
+        let content = content_of(&result);
         assert!(!content.contains('\u{fffd}'), "codepoint was split");
         assert!(content.contains("line clamped"));
     }
@@ -910,6 +990,8 @@ mod tests {
         std::fs::write(&path, [0u8, 1, 2, 3, 0, 9]).unwrap();
         let result = read_window(&path, "blob.bin", 1, 10).unwrap();
         assert_eq!(result["encoding"], "binary");
+        // Not merely empty text: the field is absent, so nothing downstream
+        // mistakes a binary for a zero-line file.
         assert!(result["content"].is_null());
         assert!(result["notice"].as_str().unwrap().contains("binary file"));
     }
@@ -927,7 +1009,7 @@ mod tests {
         let text = dir.path().join("lie.png");
         std::fs::write(&text, b"just words\n").unwrap();
         let result = read_window(&text, "lie.png", 1, 10).unwrap();
-        assert_eq!(result["content"], "just words");
+        assert_eq!(content_of(&result), "just words");
     }
 
     #[test]
@@ -935,7 +1017,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = write(dir.path(), "icon.svg", "<svg viewBox=\"0 0 1 1\"/>\n");
         let result = read_window(&path, "icon.svg", 1, 10).unwrap();
-        assert_eq!(result["content"], "<svg viewBox=\"0 0 1 1\"/>");
+        assert_eq!(content_of(&result), "<svg viewBox=\"0 0 1 1\"/>");
     }
 
     #[test]
@@ -1049,7 +1131,7 @@ mod tests {
                 break; // past the end
             }
             assert_eq!(start, offset, "window did not start where asked");
-            let content = result["content"].as_str().unwrap();
+            let content = content_of(&result);
             let lines: Vec<&str> = content.split('\n').collect();
             assert_eq!(
                 lines.len(),

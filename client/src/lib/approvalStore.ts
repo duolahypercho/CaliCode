@@ -55,6 +55,13 @@ export type ApprovalEntry = {
 export type ResolvedOutcome =
   | "answered-approved"
   | "answered-denied"
+  /**
+   * An "always allow" the user gave on a sibling card already covered this
+   * one, so core answered it rather than asking the same permission twice.
+   * Deliberately not spelled `answered-approved`: nobody clicked this card,
+   * and a transcript that says they did is a lie about consent.
+   */
+  | "always-allowed"
   | "timed-out"
   | "run-cancelled"
   | "session-gone"
@@ -214,6 +221,18 @@ export function reduce(store: ApprovalStore, event: ApprovalEvent): ApprovalStor
       if (!existing) return store;
       if (existing.state.kind === "settled" || existing.state.kind === "lapsed") return store;
       const entries = new Map(store.entries);
+      // A grant the user just gave covers this card. It is settled and
+      // approved whichever state it was in — including a send of our own that
+      // is still in flight, which core will resolve the same way.
+      if (event.outcome === "always-allowed") {
+        entries.set(event.requestId, {
+          ...existing,
+          state: { kind: "settled", approved: true },
+          finishedAtMs:
+            existing.state.kind === "answering" ? existing.state.startedAtMs : null,
+        });
+        return withEntries(store, entries);
+      }
       if (existing.state.kind === "answering") {
         // Our own send is what core is announcing: settle it truthfully.
         const ours =
