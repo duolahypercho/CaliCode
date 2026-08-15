@@ -136,10 +136,11 @@ function HelpPanel({ commands }: Extract<CommandPanel, { kind: "help" }>) {
               ) : null}
               {/* Wraps rather than truncates: this panel exists to say what a
                   command does, so an elided summary is the one thing it must
-                  not do. */}
-              <span className="min-w-0 flex-1 text-right text-[11.5px] text-ink-subtle">
-                {command.summary}
-              </span>
+                  not do. Left-aligned for the same reason — right-aligning tidies
+                  the one-line built-ins but gives a skill's paragraph a ragged
+                  left edge, and the long descriptions are exactly the ones a
+                  reader needs to get through. */}
+              <span className="min-w-0 flex-1 text-[11.5px] text-ink-subtle">{command.summary}</span>
             </div>
           ))}
         </div>
