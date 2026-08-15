@@ -7,6 +7,8 @@ import {
   APPROVAL_TTL_MS,
   MAX_QUEUED_APPROVALS,
   SETTLED_LINGER_MS,
+  approvalTarget,
+  argumentsWorthShowing,
   emptyStore,
   headApproval,
   reduce,
@@ -291,7 +293,7 @@ describe("the queue", () => {
     store = reduce(store, { kind: "SendAccepted", requestId: "r-2" });
     expect(stateOf(store, "r-1")).toEqual({ kind: "pending" });
     expect(stateOf(store, "r-3")).toEqual({ kind: "pending" });
-    expect(stateOf(store, "r-2")).toEqual({ kind: "settled", approved: true });
+    expect(stateOf(store, "r-2")).toEqual({ kind: "settled", approved: true, via: "this-window" });
   });
 
   // Defect 5, second half: the queue that replaced the single slot wedged
@@ -341,5 +343,78 @@ describe("the queue", () => {
     expect(entry.arrivedAtMs).toBe(1_000);
     expect(entry.order).toBe(0);
     expect(entry.graphLabel).toBe("graph-7");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 7: one act rendered twice. An answered card kept its "Approve X?"
+// prompt up beside the transcript row the same click had just written, so a
+// finished turn read as a wall of unanswered prompts.
+// ---------------------------------------------------------------------------
+
+describe("what a finished request still shows", () => {
+  it("stops rendering a card this window answered, because the transcript has it", () => {
+    let store = reduce(emptyStore(), arrived("r-1"));
+    store = reduce(store, { kind: "UserAnswered", requestId: "r-1", approved: true, nowMs: 2_000 });
+    store = reduce(store, { kind: "SendAccepted", requestId: "r-1" });
+
+    expect(visibleApprovals(store).map((entry) => entry.requestId)).toEqual([]);
+    // Gone from the view, not from the map: a redelivered `Arrived` must still
+    // find it finished rather than resurrecting an answered prompt.
+    expect(stateOf(reduce(store, arrived("r-1")), "r-1")).toEqual({
+      kind: "settled",
+      approved: true,
+      via: "this-window",
+    });
+  });
+
+  it("keeps up a card core cleared under an always-allow, which has no row of its own", () => {
+    let store = reduce(emptyStore(), arrived("r-1"));
+    store = reduce(store, { kind: "Resolved", requestId: "r-1", outcome: "always-allowed" });
+    expect(visibleApprovals(store).map((entry) => entry.requestId)).toEqual(["r-1"]);
+  });
+
+  it("starts the eviction clock on a card that finished with no send in flight", () => {
+    // `finishedAtMs` is null here — nothing was in flight to inherit a start
+    // from. `null ?? nowMs` made the age permanently zero, so the card aged
+    // out never and sat in the transcript for the rest of the session.
+    let store = reduce(emptyStore(), arrived("r-1"));
+    store = reduce(store, { kind: "Resolved", requestId: "r-1", outcome: "always-allowed" });
+    expect(store.entries.get("r-1")!.finishedAtMs).toBeNull();
+
+    store = reduce(store, { kind: "Tick", nowMs: 5_000 });
+    expect(store.entries.get("r-1")!.finishedAtMs).toBe(5_000);
+    store = reduce(store, { kind: "Tick", nowMs: 5_000 + SETTLED_LINGER_MS });
+    expect(stateOf(store, "r-1")).toBe("absent");
+  });
+});
+
+describe("what a card says it is about", () => {
+  it("names the file, command or address the request would touch", () => {
+    expect(approvalTarget({ path: "src/game.ts" })).toBe("src/game.ts");
+    expect(approvalTarget({ file_path: "  a.txt  " })).toBe("a.txt");
+    expect(approvalTarget({ command: "rm -rf build" })).toBe("rm -rf build");
+    expect(approvalTarget({ url: "https://example.com" })).toBe("https://example.com");
+  });
+
+  it("has no target rather than a wrong one", () => {
+    expect(approvalTarget(null)).toBeNull();
+    expect(approvalTarget({ depth: 3 })).toBeNull();
+    expect(approvalTarget(["a.txt"])).toBeNull();
+    expect(approvalTarget({ path: "   " })).toBeNull();
+  });
+
+  it("prints nothing a request did not carry, and nothing it already said", () => {
+    // `JSON.stringify` renders the first three as text the user then has to
+    // decide is not an error. "null" was on screen under a live prompt.
+    expect(argumentsWorthShowing(null, null)).toBe(false);
+    expect(argumentsWorthShowing(undefined, null)).toBe(false);
+    expect(argumentsWorthShowing({}, null)).toBe(false);
+    expect(argumentsWorthShowing([], null)).toBe(false);
+    // The lone key IS the target line directly above it.
+    expect(argumentsWorthShowing({ path: "a.txt" }, "a.txt")).toBe(false);
+    expect(argumentsWorthShowing({ path: "a.txt", encoding: "utf8" }, "a.txt")).toBe(true);
+    // No target line, so the JSON is the only thing describing the request.
+    expect(argumentsWorthShowing({ depth: 3 }, null)).toBe(true);
   });
 });
