@@ -1355,6 +1355,50 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             access: Access::ReadOnly,
         },
         ToolDef {
+            name: "browser_play".into(),
+            description: "Play the game for a moment: hold keys and look around at the same \
+                          time. This is the one to reach for when driving a character — \
+                          browser_key can only do one key then stop, so strafing (w+a) or \
+                          aiming while advancing is impossible with it. Keys are held for \
+                          holdMs while the mouse look is spread across that same time, then \
+                          every key is released. Example: keys ['w','a'], holdMs 900, dx 150 \
+                          runs forward-left while turning right."
+                .into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "keys":{"type":"array","items":{"type":"string"},"description":"keys to hold together, e.g. ['w','a'] or ['w','Shift'] to sprint"},
+                    "holdMs":{"type":"integer","description":"how long to hold them, up to 10000 (default 500)"},
+                    "dx":{"type":"number","description":"horizontal look during the hold; positive turns right"},
+                    "dy":{"type":"number","description":"vertical look during the hold; positive looks down"},
+                    "steps":{"type":"integer","description":"mousemove events to spread the look across (default 10)"}
+                }
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "browser_mouse_move".into(),
+            description: "Move the mouse by a delta — this is how you aim and look around in a \
+                          3D game. `dx` is left/right, `dy` is up/down, in pixels of motion. A \
+                          game reads the movement, not the destination, so this is what turns \
+                          a camera; browser_click is for pressing things. Movement is split \
+                          into `steps` so the view turns instead of snapping. Click the canvas \
+                          once first if the game wants a pointer lock."
+                .into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "dx":{"type":"number","description":"horizontal motion in pixels; positive looks right"},
+                    "dy":{"type":"number","description":"vertical motion in pixels; positive looks down"},
+                    "steps":{"type":"integer","description":"how many mousemove events to split the motion across (default 10, max 120)"}
+                },
+                "required":["dx","dy"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
             name: "browser_scroll".into(),
             description: "Scroll the page. Positive dy scrolls down. Elements below the fold are absent from a snapshot, so scroll and re-snapshot when what you want is not listed.".into(),
             parameters: json!({
@@ -1391,6 +1435,17 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             }),
             kind: ToolKind::Core,
             access: Access::Guarded,
+        },
+        ToolDef {
+            name: "browser_downloads".into(),
+            description: "List files downloaded in the browser, newest first. Clicking a download link in a page saves the file to a staging folder; this is how you find it afterwards. Use file tools to move one into the game's folder — the path returned is absolute.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{"limit":{"type":"integer","description":"how many, 1-50 (default 10)"}}
+            }),
+            kind: ToolKind::Core,
+            // Reads a directory listing and nothing else.
+            access: Access::ReadOnly,
         },
         ToolDef {
             name: "browser_console".into(),
@@ -1988,6 +2043,29 @@ pub(crate) async fn execute_core_tool_with_activity(
                 )
                 .await
         }
+        "browser_play" => {
+            let keys: Vec<String> = args["keys"]
+                .as_array()
+                .map(|list| {
+                    list.iter()
+                        .filter_map(|value| value.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let hold_ms = args["holdMs"].as_u64().unwrap_or(500);
+            let dx = args["dx"].as_f64().unwrap_or(0.0);
+            let dy = args["dy"].as_f64().unwrap_or(0.0);
+            let steps = args["steps"].as_u64().unwrap_or(10) as u32;
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser.play(&keys, hold_ms, dx, dy, steps).await
+        }
+        "browser_mouse_move" => {
+            let dx = args["dx"].as_f64().unwrap_or(0.0);
+            let dy = args["dy"].as_f64().unwrap_or(0.0);
+            let steps = args["steps"].as_u64().unwrap_or(10) as u32;
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            browser.mouse_move(dx, dy, steps).await
+        }
         "browser_scroll" => {
             let browser = state.browsers.ensure(state.bus.clone()).await?;
             browser
@@ -2054,6 +2132,13 @@ pub(crate) async fn execute_core_tool_with_activity(
                 workspace_override,
             )?;
             Ok(crate::capture_persist::as_json(&persisted))
+        }
+        // Deliberately does not start a browser: asking what was downloaded is
+        // a question about the filesystem, not about a running page.
+        "browser_downloads" => {
+            let limit = args["limit"].as_u64().unwrap_or(10).clamp(1, 50) as usize;
+            let files = crate::browser::downloads(limit);
+            Ok(json!({ "count": files.len(), "files": files }))
         }
         "browser_console" => {
             let browser = state.browsers.ensure(state.bus.clone()).await?;
@@ -2918,7 +3003,7 @@ mod tests {
             .collect();
         assert_eq!(
             browser.len(),
-            12,
+            15,
             "browser surface changed; update the docs in AGENTS.md too"
         );
         for def in &browser {

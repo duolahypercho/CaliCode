@@ -424,13 +424,33 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         // so a URL the user types and a URL the model navigates to are
         // normalized, refused, and settled by exactly one code path.
         "browser_navigate" | "browser_search" | "browser_snapshot" | "browser_click"
-        | "browser_type" | "browser_key" | "browser_scroll" | "browser_screenshot"
-        | "browser_look" | "browser_console" | "browser_eval" | "browser_close" => {
+        | "browser_type" | "browser_key" | "browser_scroll" | "browser_mouse_move"
+        | "browser_play" | "browser_screenshot" | "browser_look" | "browser_console"
+        | "browser_downloads" | "browser_eval" | "browser_close" => {
             let def = crate::tools::core_tool_defs()
                 .into_iter()
                 .find(|tool| tool.name == method)
                 .with_context(|| format!("{method} tool is unavailable"))?;
             crate::tools::execute_core_tool(&def, &params, state, &state.projects_root, None).await
+        }
+        // The desktop shell hands core the panel it just created, so core drives
+        // the view the user is looking at instead of a headless Chrome of its
+        // own. Not discovered by url or title: guessing would eventually pick
+        // the editor's own window and core would start driving the app.
+        "browser_attach" => {
+            let browser = state
+                .browsers
+                .attach(
+                    str_param(&params, "endpoint")?,
+                    str_param(&params, "targetId")?,
+                    state.bus.clone(),
+                )
+                .await?;
+            let (width, height) = browser.shape();
+            Ok(json!({
+                "attached": true,
+                "viewport": { "width": width, "height": height },
+            }))
         }
         // Deliberately never launches one: the tab polls this, and a poll that
         // starts a browser would have every open editor spawn a Chrome.

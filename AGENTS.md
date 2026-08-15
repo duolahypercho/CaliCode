@@ -174,6 +174,27 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
   for `<canvas>`, which is the only way to reach a running game.
 - `browser_search` deliberately skips Google, which serves this browser an
   interstitial instead of results.
+- **The Electron shell hands core its own panel** (`browser_attach`), so core
+  drives the `WebContentsView` the user is looking at instead of launching a
+  Chrome of its own. The target id is passed, never discovered: guessing by url
+  or title would eventually pick the editor's own window, and core would start
+  driving the app instead of the page inside it. Under Tauri, and whenever the
+  handshake fails, core falls back to launching its own Chrome — degraded but
+  working, and the panel is then a screencast of it.
+- **Playing a game is a different verb from using a page.** `browser_key` takes
+  `holdMs` because movement is a held W, not a tapped one; `browser_mouse_move`
+  takes a *delta* because a camera turns by motion, not by destination. It
+  splits that motion into steps and primes the origin first — Blink measures
+  `movementX` against the previous pointer position, so the first event of a
+  sequence reports 0 and an unprimed turn arrives one step short. `browser_play`
+  exists because the other two are strictly sequential: strafing (w+a) or aiming
+  while advancing needs keys held *and* the mouse moving at once. Click the
+  canvas once before looking if the game wants a pointer lock.
+- Files downloaded in the panel land in `~/.cali/downloads`, and
+  `browser_downloads` lists them — a download is working material the agent is
+  about to pull into a project, not a personal download. A navigation that turns
+  into one reports `aborted: true` rather than failing: chrome cancels the page
+  load by design, and the file is already on disk.
 - The BROWSER tab renders the same page over a CDP screencast, so the user and
   the agent share one browser rather than each having their own. The tab strip
   shows that page's own favicon and title; its accessible name stays `browser`.
@@ -183,8 +204,10 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
 - A chrome that outlives core keeps the profile's `SingletonLock`. Core clears
   a lock whose pid is gone and diverts to a unique scratch profile when one is
   genuinely held, so a leaked browser cannot wedge the next launch.
-- Live coverage is one `#[ignore]`d test: `cargo test browser::tests::live --
-  --ignored`. Run it after touching that module; CI cannot.
+- Live coverage is four `#[ignore]`d tests: `cargo test browser::tests::live --
+  --ignored`. Run them after touching that module; CI cannot. `live_attach` is
+  the one to keep honest — it asserts core drives a browser it did not launch
+  *and* leaves it running, which is the shell's entire contract.
 
 ## Extending without touching source
 
