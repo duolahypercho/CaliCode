@@ -26,6 +26,7 @@ import {
   X,
 } from "lucide-react";
 import { AgentText } from "./AgentText";
+import { CommandPanelView } from "./CommandPanels";
 import { GraphPanel } from "./GraphPanel";
 import { ReasoningRow } from "./ReasoningRow";
 import { ModelPicker, buildModelChoices } from "./ModelPicker";
@@ -139,7 +140,13 @@ import {
   type ActivityFileChange,
 } from "../../lib/activity";
 import { openLoopReport, type LoopReport } from "../../lib/loopReports";
-import type { AgentMessage, BrowserTool, ModelList, SubagentResult } from "../../lib/types";
+import type {
+  AgentMessage,
+  BrowserTool,
+  CommandPanel,
+  ModelList,
+  SubagentResult,
+} from "../../lib/types";
 
 type BrowserToolOwnershipEvent = Pick<
   AgentEvent,
@@ -1137,6 +1144,10 @@ export function AgentPanel({
   // state is a render mirror and is never read to make a decision.
   const approvalsRef = useRef<ApprovalStore>(emptyStore());
   const [approvals, setApprovals] = useState<ApprovalStore>(approvalsRef.current);
+  // What the user typed into a card's Deny box, keyed by request id. Kept
+  // beside the store rather than in it: the store is the approval state
+  // machine, and a half-typed sentence is not a state transition.
+  const [denyReasons, setDenyReasons] = useState<Record<string, string>>({});
   // Sandbox by default: safe tools run freely, irreversible writes ask. A
   // full-access default would silently bypass the permission rules and plan
   // mode on a newcomer's very first prompt.
@@ -1834,6 +1845,10 @@ export function AgentPanel({
     appendMessage({ role, content });
   };
 
+  const showPanel = (panel: CommandPanel, text: string) => {
+    appendMessage({ role: "assistant", content: text, panel });
+  };
+
   // A stopped turn drops the response core would have replied with, so any tool
   // row still spinning will never receive its finish event. Settle those rows
   // and say plainly what the stop could not undo: `agent_cancel` refuses the
@@ -2337,7 +2352,18 @@ export function AgentPanel({
     const latestPrompt = usage.lastPromptTokens;
     const latestCached = Math.min(latestPrompt, usage.lastCacheReadTokens ?? 0);
     const cachePercent = latestPrompt > 0 ? Math.round((latestCached / latestPrompt) * 100) : 0;
-    say(
+    showPanel(
+      {
+        kind: "usage",
+        promptTokens: usage.promptTokens,
+        completionTokens: usage.completionTokens,
+        cacheReadTokens: usage.cacheReadTokens ?? 0,
+        totalTokens: usage.totalTokens,
+        lastPromptTokens: latestPrompt,
+        lastCacheReadTokens: latestCached,
+        contextWindow: window,
+        autoCompactAt: compaction && !compaction.auto ? null : (compaction?.threshold ?? 0.75),
+      },
       [
         "Token usage this session:",
         `• prompt tokens: ${usage.promptTokens.toLocaleString()}`,
@@ -3041,6 +3067,7 @@ export function AgentPanel({
 
   const slashContext: SlashContext = {
     say,
+    showPanel,
     runSkill,
     commands: allCommands,
     clear: () => setMessages([]),
@@ -3134,8 +3161,12 @@ export function AgentPanel({
       nowMs: Date.now(),
     });
     if (after === before) return;
+    // A bare denial tells the model the door is shut, so it tries the same
+    // door. The sentence the user typed is what redirects it, and core only
+    // forwards one on a denial.
+    const reason = approved ? "" : (denyReasons[entry.requestId] ?? "").trim();
     try {
-      await rpc("agent_approval_response", {
+      const answer = (await rpc("agent_approval_response", {
         requestId: entry.requestId,
         clientId: editorClientIdRef.current,
         approved,
@@ -3143,7 +3174,12 @@ export function AgentPanel({
         // on a denial. Core grants the exact tool name, never the server or a
         // prefix, and refuses outright if config denies it.
         ...(always ? { always: true } : {}),
-      });
+        ...(reason ? { reason } : {}),
+      })) as { alsoApproved?: number } | null;
+      // Core answers the sibling cards the grant already covers. Saying how
+      // many is what tells the user those cards went away because of their
+      // click and not because something dropped them.
+      const cascaded = typeof answer?.alsoApproved === "number" ? answer.alsoApproved : 0;
       dispatchApproval({ kind: "SendAccepted", requestId: entry.requestId });
       setMessages((current) => [
         ...current,
@@ -3151,12 +3187,17 @@ export function AgentPanel({
           role: "tool",
           content: approved
             ? always
-              ? `Approved ${entry.tool}, and won't ask again for it this session`
+              ? `Approved ${entry.tool}, and won't ask again for it this session${
+                  cascaded > 0 ? ` — cleared ${cascaded} waiting request${cascaded === 1 ? "" : "s"}` : ""
+                }`
               : `Approved ${entry.tool}`
-            : `Denied ${entry.tool}`,
+            : reason
+              ? `Denied ${entry.tool} — ${reason}`
+              : `Denied ${entry.tool}`,
           tool: entry.tool,
         },
       ]);
+      setDenyReasons(({ [entry.requestId]: _answered, ...rest }) => rest);
     } catch (error) {
       // The only classifier in this file, with exactly one call site, and its
       // default is "retry" — the card stays up and the click is repeatable.
@@ -3347,7 +3388,11 @@ export function AgentPanel({
               <div key={index} data-role="assistant" className="max-w-[94%] self-start">
                 <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-ink-subtle">CALICODE</div>
                 <div className="text-[13px] leading-[1.6] text-ink">
-                  <AgentText content={message.content} />
+                  {message.panel ? (
+                    <CommandPanelView panel={message.panel} />
+                  ) : (
+                    <AgentText content={message.content} />
+                  )}
                 </div>
               </div>
             );
@@ -3426,6 +3471,25 @@ export function AgentPanel({
                     >
                       <ShieldOff className="mr-1 h-3.5 w-3.5" /> Deny
                     </Button>
+                    {/* Optional, and deliberately not a modal step: a denial
+                        must stay one click. Enter denies with what is typed,
+                        so a reason never needs a second reach for the mouse. */}
+                    <input
+                      type="text"
+                      aria-label={`Reason for denying ${entry.tool}`}
+                      placeholder="Deny with a reason (optional)"
+                      disabled={answering}
+                      value={denyReasons[entry.requestId] ?? ""}
+                      onChange={(event) =>
+                        setDenyReasons((current) => ({ ...current, [entry.requestId]: event.target.value }))
+                      }
+                      onKeyDown={(event) => {
+                        if (event.key !== "Enter") return;
+                        event.preventDefault();
+                        void respondToApproval(entry, false);
+                      }}
+                      className="min-w-[10rem] flex-1 rounded-md border border-line bg-surface-0 px-2 text-[11.5px] text-ink placeholder:text-ink-faint"
+                    />
                   </div>
                 )}
               </div>

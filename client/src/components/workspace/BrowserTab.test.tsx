@@ -231,6 +231,46 @@ describe("BrowserTab", () => {
     expect(callsTo("browser_input")).toHaveLength(1);
   });
 
+  it("maps clicks through the painted frame, not the element box", async () => {
+    // `object-contain` letterboxes whenever the panel and the viewport differ
+    // in aspect, so the image element is bigger than the picture inside it.
+    // Mapping against the element box offset every click by the letterbox.
+    mocks.rpc.mockImplementation((method: string) =>
+      method === "browser_status"
+        ? Promise.resolve({ running: true, viewport: { width: 1000, height: 500 } })
+        : Promise.resolve({}),
+    );
+    render(<BrowserTab />);
+    await waitFor(() => expect(emit).not.toBeNull());
+    act(() => {
+      emit?.({ type: "browser.frame", data: "AAAA" } as AgentEvent);
+    });
+    const image = await screen.findByRole("img");
+    // A 2:1 frame in a square box: painted area is 400x200, pinned to the top.
+    Object.defineProperty(image, "naturalWidth", { value: 2000, configurable: true });
+    Object.defineProperty(image, "naturalHeight", { value: 1000, configurable: true });
+    vi.spyOn(image, "getBoundingClientRect").mockReturnValue({
+      left: 0, top: 0, width: 400, height: 400, right: 400, bottom: 400, x: 0, y: 0,
+      toJSON: () => ({}),
+    });
+
+    const surface = screen.getByRole("application");
+    // Centre of the painted strip -> centre of the viewport.
+    fireEvent.click(surface, { clientX: 200, clientY: 100 });
+    await waitFor(() => expect(callsTo("browser_input").length).toBeGreaterThanOrEqual(2));
+    expect(callsTo("browser_input")[0][1]).toMatchObject({ kind: "down", x: 500, y: 250 });
+
+    // Below the painted strip is letterbox, not page: no input, but the panel
+    // still takes focus, or one stray click would cost the user the keyboard.
+    mocks.rpc.mockClear();
+    fireEvent.click(surface, { clientX: 200, clientY: 350 });
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(callsTo("browser_input")).toHaveLength(0);
+    expect(document.activeElement).toBe(surface);
+  });
+
   it("takes the page's cursor shape so the pointer changes over links", async () => {
     // The panel is an image, so its cursor never changed on its own — an arrow
     // over every link, which reads as "picture of a page" on every mouse move.

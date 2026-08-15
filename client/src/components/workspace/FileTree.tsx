@@ -1,4 +1,6 @@
+import { ChevronRight, LoaderCircle } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import { fileGlyph, folderGlyph, toneClass } from "../../lib/fileIcons";
 import { readTree, type FileNode } from "../../lib/workspace";
 
 interface FileTreeProps {
@@ -106,6 +108,7 @@ export function FileTree({
       const open = expanded.has(node.path);
       const active = node.path === activePath;
       const dirty = node.kind === "dir" ? dirtyInside(node.path) : dirtyPaths.has(node.path);
+      const { Icon, tone } = node.kind === "dir" ? folderGlyph(open) : fileGlyph(node.name);
       return (
         <div key={node.path}>
           <button
@@ -114,16 +117,35 @@ export function FileTree({
             aria-expanded={node.kind === "dir" ? open : undefined}
             style={{ paddingLeft: `${depth * 12 + 8}px` }}
             aria-busy={pending.has(node.path) || undefined}
-            className={`flex min-h-[28px] w-full items-center gap-1.5 rounded py-[5px] pr-2 text-left text-[12px] transition-colors ${
+            className={`flex min-h-[28px] w-full items-center gap-1 rounded py-[5px] pr-2 text-left text-[12px] transition-colors ${
               active
                 ? "bg-surface-3 text-ink-strong active:bg-surface-3"
                 : "text-ink-subtle hover:bg-surface-2 hover:text-ink active:bg-surface-3"
             }`}
           >
-            <span aria-hidden className="w-2.5 shrink-0 text-[9px] text-ink-subtle">
-              {node.kind === "dir" ? (pending.has(node.path) ? "◌" : open ? "▾" : "▸") : ""}
+            <span aria-hidden className="flex h-4 w-4 shrink-0 items-center justify-center">
+              {node.kind === "dir" ? (
+                pending.has(node.path) ? (
+                  <LoaderCircle
+                    className="h-3.5 w-3.5 animate-spin text-ink-faint"
+                    strokeWidth={1.7}
+                  />
+                ) : (
+                  <ChevronRight
+                    className={`h-4 w-4 text-ink-subtle transition-transform duration-150 ${
+                      open ? "rotate-90" : ""
+                    }`}
+                    strokeWidth={1.7}
+                  />
+                )
+              ) : null}
             </span>
-            <span className="min-w-0 flex-1 truncate">{node.name}</span>
+            <Icon
+              aria-hidden
+              className={`h-[15px] w-[15px] shrink-0 ${toneClass(tone)}`}
+              strokeWidth={1.7}
+            />
+            <span className="ml-0.5 min-w-0 flex-1 truncate">{node.name}</span>
             {dirty ? (
               node.kind === "dir" ? (
                 <span

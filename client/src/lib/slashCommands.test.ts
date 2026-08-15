@@ -159,12 +159,36 @@ describe("skillCommands", () => {
 });
 
 describe("/help", () => {
-  test("lists the skills the menu offers, not just the built-ins", () => {
-    const say = vi.fn();
+  const runHelp = () => {
+    const showPanel = vi.fn();
     const commands = [...SLASH_COMMANDS, ...skillCommands([skill()])];
     const parsed = parseSlashIn("/help", commands);
-    parsed?.command?.run("", { say, commands } as unknown as SlashContext);
-    expect(say.mock.calls[0][0]).toContain("/playtest [task] — Drive the game and report what broke");
+    parsed?.command?.run("", { showPanel, commands } as unknown as SlashContext);
+    const [panel, text] = showPanel.mock.calls[0];
+    return { panel, text };
+  };
+
+  test("lists the skills the menu offers, not just the built-ins", () => {
+    const { panel } = runHelp();
+    expect(panel.kind).toBe("help");
+    const playtest = panel.commands.find((command: { name: string }) => command.name === "playtest");
+    expect(playtest).toEqual({
+      name: "playtest",
+      usage: "[task]",
+      summary: "Drive the game and report what broke",
+      skill: true,
+    });
+  });
+
+  test("tags skills apart from built-ins, so the panel can group them", () => {
+    const { panel } = runHelp();
+    expect(panel.commands.find((c: { name: string }) => c.name === "loop").skill).toBe(false);
+  });
+
+  test("keeps the plain-text listing as the fallback body", () => {
+    // A transcript read back without the panel renderer still has to be useful.
+    const { text } = runHelp();
+    expect(text).toContain("/playtest [task] — Drive the game and report what broke");
   });
 });
 
