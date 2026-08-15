@@ -131,12 +131,19 @@ function approvalSends(): Array<{
   approved: boolean;
   clientId?: string;
   always?: boolean;
+  reason?: string;
 }> {
   return mocks.rpc.mock.calls
     .filter(([method]) => method === "agent_approval_response")
     .map(
       ([, params]) =>
-        params as { requestId: string; approved: boolean; clientId?: string; always?: boolean },
+        params as {
+          requestId: string;
+          approved: boolean;
+          clientId?: string;
+          always?: boolean;
+          reason?: string;
+        },
     );
 }
 
@@ -237,6 +244,120 @@ describe("always allow", () => {
       fireEvent.click(screen.getByRole("button", { name: /Approve/ }));
     });
     expect(approvalSends()[0]?.always).toBeUndefined();
+  });
+});
+
+describe("an always-allow that covers cards already up", () => {
+  it("reports how many core cleared, and settles them as approved", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    const clientId = attachedClientId();
+
+    await emit(approvalRequest({ requestId: "approval-1", targetClientId: clientId }));
+    await emit(approvalRequest({ requestId: "approval-2", targetClientId: clientId }));
+    expect(screen.getAllByText(/Approve file_write\?/)).toHaveLength(2);
+
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === "agent_approval_response") {
+        return { accepted: true, sessionId: "session-1", tool: "file_write", alsoApproved: 1 };
+      }
+      if (method === "editor_attach") return {};
+      return {};
+    });
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /Always/ })[0]);
+    });
+    expect(await screen.findByText(/cleared 1 waiting request/)).toBeTruthy();
+
+    // Core then announces the sibling. It was answered — by the grant the user
+    // just gave — so it must not read as "no longer answerable".
+    await emit({ type: "agent.approval_resolved", requestId: "approval-2", outcome: "always-allowed" });
+    const sibling = document.querySelector('[data-approval="approval-2"]');
+    expect(sibling?.getAttribute("data-approval-state")).toBe("settled");
+    expect(sibling?.textContent).toContain("Approved.");
+    expect(sibling?.textContent).not.toContain("No longer answerable");
+  });
+});
+
+describe("denying with a reason", () => {
+  it("forwards what the user typed and shows it in the transcript", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    const clientId = attachedClientId();
+
+    await emit(approvalRequest({ targetClientId: clientId }));
+    expect(await screen.findByText(/Approve file_write\?/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Reason for denying file_write"), {
+      target: { value: "  not that file, edit the config  " },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Deny/ }));
+    });
+
+    const sends = approvalSends();
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).toMatchObject({ approved: false, reason: "not that file, edit the config" });
+    expect(await screen.findByText(/Denied file_write — not that file, edit the config/)).toBeTruthy();
+  });
+
+  it("denies on Enter so a reason costs no extra reach for the mouse", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    const clientId = attachedClientId();
+
+    await emit(approvalRequest({ targetClientId: clientId }));
+    const box = await screen.findByLabelText("Reason for denying file_write");
+    fireEvent.change(box, { target: { value: "wrong path" } });
+    await act(async () => {
+      fireEvent.keyDown(box, { key: "Enter" });
+    });
+    expect(approvalSends()[0]).toMatchObject({ approved: false, reason: "wrong path" });
+  });
+
+  it("omits `reason` when the box is empty, and never sends one with an approval", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    const clientId = attachedClientId();
+
+    await emit(approvalRequest({ targetClientId: clientId }));
+    expect(await screen.findByText(/Approve file_write\?/)).toBeTruthy();
+    // Typed, then approved: the words were an argument against the call, so
+    // handing them to the model as an instruction would invert their meaning.
+    fireEvent.change(screen.getByLabelText("Reason for denying file_write"), {
+      target: { value: "   " },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /^Approve/ }));
+    });
+    expect(approvalSends()[0]?.reason).toBeUndefined();
+  });
+
+  it("keeps a typed reason on its own card when several are pending", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    const clientId = attachedClientId();
+
+    await emit(approvalRequest({ requestId: "approval-1", targetClientId: clientId }));
+    await emit(
+      approvalRequest({ requestId: "approval-2", tool: "file_delete", targetClientId: clientId }),
+    );
+    const first = screen.getByLabelText("Reason for denying file_write");
+    fireEvent.change(first, { target: { value: "only this one" } });
+    await act(async () => {
+      fireEvent.keyDown(first, { key: "Enter" });
+    });
+    // Only the first card was answered; the second card's box is untouched,
+    // which is only true if the text is keyed per request.
+    expect(approvalSends()[0]).toMatchObject({
+      requestId: "approval-1",
+      reason: "only this one",
+    });
+    expect((screen.getByLabelText("Reason for denying file_delete") as HTMLInputElement).value).toBe("");
   });
 });
 

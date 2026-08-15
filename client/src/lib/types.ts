@@ -85,9 +85,36 @@ export interface TestResult {
   baselineDistance?: number;
 }
 
+/**
+ * Structured payload for the commands whose answer is a small readout rather
+ * than prose. `content` stays populated beside it as the plain-text fallback —
+ * saved transcripts, `/help` in a narrow panel, and anything that reads a
+ * session back without this renderer still show something useful.
+ */
+export type CommandPanel =
+  | {
+      kind: "help";
+      commands: { name: string; usage?: string; summary: string; skill?: boolean }[];
+    }
+  | {
+      kind: "usage";
+      promptTokens: number;
+      completionTokens: number;
+      cacheReadTokens: number;
+      totalTokens: number;
+      /** Context occupancy is the latest prompt, not the session total. */
+      lastPromptTokens: number;
+      lastCacheReadTokens: number;
+      contextWindow: number;
+      /** Fraction of the window that triggers auto-compaction; null = off. */
+      autoCompactAt: number | null;
+    };
+
 export interface AgentMessage {
   role: "user" | "assistant" | "tool";
   content: string;
+  /** Renders in place of `content` when the client understands the kind. */
+  panel?: CommandPanel;
   tool?: string;
   /** Tool rows only: lifecycle of the execution. Absent = informational line. */
   status?: "running" | "done" | "error";

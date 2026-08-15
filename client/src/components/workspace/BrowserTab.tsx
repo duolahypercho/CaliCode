@@ -206,9 +206,24 @@ export function BrowserTab() {
         // the page reflows to exactly this panel. The screencast is sized
         // separately, in device pixels, so the frame arrives at the resolution
         // the panel paints.
-        rpc("browser_viewport", { width: Math.round(box.width), height: Math.round(box.height) }).catch(
-          () => undefined,
-        );
+        rpc<{ width?: number; height?: number }>("browser_viewport", {
+          width: Math.round(box.width),
+          height: Math.round(box.height),
+        })
+          .then((shape) => {
+            // Adopt the shape core actually applied, immediately.
+            //
+            // Clicks are mapped through this number. Waiting for the next
+            // status poll left it up to two seconds stale after every resize,
+            // and core clamps the values besides — so during that window every
+            // click was mapped through the *previous* viewport and landed
+            // somewhere the user did not point at. That reads as "clicking
+            // does nothing", which is precisely what it did.
+            if (typeof shape?.width === "number" && typeof shape?.height === "number") {
+              setStatus((prev) => ({ ...prev, viewport: { width: shape.width!, height: shape.height! } }));
+            }
+          })
+          .catch(() => undefined);
       }, 250);
     });
     observer.observe(surface);
@@ -250,13 +265,39 @@ export function BrowserTab() {
     if (!image) return null;
     const box = image.getBoundingClientRect();
     if (box.width < 1 || box.height < 1) return null;
-    return {
-      x: ((event.clientX - box.left) / box.width) * viewport.width,
-      y: ((event.clientY - box.top) / box.height) * viewport.height,
-    };
+    // Map against the *painted* image, not the element box.
+    //
+    // `object-contain` fits the frame inside the element and letterboxes the
+    // remainder, so the two are the same rectangle only while the panel and
+    // the viewport share an aspect. Any moment they do not — the beat after a
+    // resize, before a reshaped frame lands — every click was offset by the
+    // letterbox and landed somewhere the user did not point at. It reads as
+    // "clicking does nothing", because it lands on empty page.
+    const natural = { w: image.naturalWidth || box.width, h: image.naturalHeight || box.height };
+    const scale = Math.min(box.width / natural.w, box.height / natural.h);
+    const painted = { w: natural.w * scale, h: natural.h * scale };
+    // `object-top` pins the frame to the top and centres it horizontally.
+    const left = box.left + (box.width - painted.w) / 2;
+    const top = box.top;
+    // Guard on the *fraction*, never on viewport pixels. Whether a point is
+    // inside the painted frame is a fact about this element and needs no
+    // knowledge of core's viewport — and the cached viewport can be stale for
+    // a moment after a resize. Testing pixels against a stale number rejected
+    // perfectly good clicks, which is how a bounds check meant to ignore the
+    // letterbox ended up swallowing every click in a widened panel.
+    const fx = (event.clientX - left) / painted.w;
+    const fy = (event.clientY - top) / painted.h;
+    if (fx < 0 || fy < 0 || fx > 1 || fy > 1) return null;
+    return { x: fx * viewport.width, y: fy * viewport.height };
   };
 
   const forwardClick = (event: React.MouseEvent) => {
+    // Focus first, unconditionally. Keystrokes are forwarded from this
+    // element's own key handler, so it has to hold focus — and a click that
+    // maps to nowhere still means "I am working in this panel now". Taking
+    // focus only on a successful hit meant one bad click also cost the user
+    // their keyboard.
+    surfaceRef.current?.focus({ preventScroll: true });
     const point = pointAt(event);
     if (!point) return;
     // Down and up as two calls rather than one synthetic click: a page that

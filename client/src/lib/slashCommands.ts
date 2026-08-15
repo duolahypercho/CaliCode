@@ -2,6 +2,7 @@ import { parseRestoreArgs } from "./checkpoints";
 import { parseInterval, parseLoopArgs } from "./interval";
 import type { SkillInfo } from "./extensions";
 import { parseGoalCommand, type GoalCommand } from "./goal";
+import type { CommandPanel } from "./types";
 
 // Slash-command registry for the agent panel — the harness surface that codex,
 // opencode, and t3-code all expose. Commands are data; execution is delegated to
@@ -10,6 +11,11 @@ import { parseGoalCommand, type GoalCommand } from "./goal";
 export interface SlashContext {
   /** Push a transcript line. `role` defaults to assistant. */
   say: (content: string, role?: "assistant" | "tool") => void;
+  /**
+   * Push a structured readout. `text` rides along as the fallback body, so a
+   * transcript read back without the renderer is still readable.
+   */
+  showPanel: (panel: CommandPanel, text: string) => void;
   /** Clear the visible transcript. */
   clear: () => void;
   /** Start a fresh session (new sessionId, empty transcript). */
@@ -92,10 +98,22 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
     name: "help",
     summary: "List available commands",
     run: (_args, ctx) => {
-      const lines = (ctx.commands ?? SLASH_COMMANDS).map(
+      const commands = ctx.commands ?? SLASH_COMMANDS;
+      const lines = commands.map(
         (command) => `/${command.name}${command.usage ? ` ${command.usage}` : ""} — ${command.summary}`,
       );
-      ctx.say(["Commands:", ...lines].join("\n"));
+      ctx.showPanel(
+        {
+          kind: "help",
+          commands: commands.map((command) => ({
+            name: command.name,
+            usage: command.usage,
+            summary: command.summary,
+            skill: command.kind === "skill",
+          })),
+        },
+        ["Commands:", ...lines].join("\n"),
+      );
     },
   },
   {

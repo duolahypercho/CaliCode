@@ -37,6 +37,19 @@
   --danger-soft: #b04a4a;
   --success-soft: #168447;
   --raised: #ffffff; /* elevated cards: the composer, floating panels */
+  /*
+   * File-type tints. The one place chrome carries hue: a file tree reads far
+   * faster when a `.ts` and a `.png` do not look alike. Muted on purpose —
+   * these sit beside --ink-subtle labels and must not out-shout them.
+   */
+  --file-blue: #3b7dd8;
+  --file-cyan: #1f8f9e;
+  --file-green: #2f8f57;
+  --file-yellow: #a8791a;
+  --file-orange: #c2662b;
+  --file-red: #c0504a;
+  --file-purple: #7c5cc4;
+  --file-pink: #b4568f;
   /* keyboard focus ring — 5.2:1 on --surface-0, clears WCAG 1.4.11 */
   /*
    * PIE viewport stage — deliberately NOT redefined under .dark.
@@ -96,6 +109,14 @@
   --danger-soft: #c98b8b;
   --success-soft: #63bd82;
   --raised: #242423;
+  --file-blue: #6fa8e8;
+  --file-cyan: #58bfce;
+  --file-green: #6bbd84;
+  --file-yellow: #d3b262;
+  --file-orange: #de8b56;
+  --file-red: #db8a85;
+  --file-purple: #a98ce6;
+  --file-pink: #d78cb6;
   /* 9.4:1 on --surface-0 */
   --color-text-subtle: #949494;
   --color-text-default: #bdbdbd;
@@ -138,6 +159,14 @@
   --color-danger-soft: var(--danger-soft);
   --color-success-soft: var(--success-soft);
   --color-raised: var(--raised);
+  --color-file-blue: var(--file-blue);
+  --color-file-cyan: var(--file-cyan);
+  --color-file-green: var(--file-green);
+  --color-file-yellow: var(--file-yellow);
+  --color-file-orange: var(--file-orange);
+  --color-file-red: var(--file-red);
+  --color-file-purple: var(--file-purple);
+  --color-file-pink: var(--file-pink);
   --radius-DEFAULT: var(--radius);
 }
 
@@ -177,7 +206,8 @@ select {
 }
 
 .font-display {
-  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", system-ui, sans-serif;
   letter-spacing: -0.01em;
 }
 
@@ -232,31 +262,31 @@ select {
    a normal unlayered declaration outranks every normal layered one, so no
    utility can reintroduce an outline past this. */
 :where(
-    a[href],
-    button,
-    input,
-    textarea,
-    select,
-    summary,
-    [role="button"],
-    [role="tab"],
-    [role="option"],
-    [role="menuitem"],
-    [tabindex]
-  ):focus,
+  a[href],
+  button,
+  input,
+  textarea,
+  select,
+  summary,
+  [role="button"],
+  [role="tab"],
+  [role="option"],
+  [role="menuitem"],
+  [tabindex]
+):focus,
 :where(
-    a[href],
-    button,
-    input,
-    textarea,
-    select,
-    summary,
-    [role="button"],
-    [role="tab"],
-    [role="option"],
-    [role="menuitem"],
-    [tabindex]
-  ):focus-visible,
+  a[href],
+  button,
+  input,
+  textarea,
+  select,
+  summary,
+  [role="button"],
+  [role="tab"],
+  [role="option"],
+  [role="menuitem"],
+  [tabindex]
+):focus-visible,
 .focus-ring:focus-visible,
 .focus-ring-inset:focus-visible,
 [data-no-focus-ring]:focus-visible {
@@ -277,8 +307,13 @@ select {
 /* Shimmering "Thinking…" label: a bright window sweeps across gray text. */
 .cb-shimmer {
   color: transparent;
-  background: linear-gradient(90deg, var(--ink-subtle) 40%, var(--ink-strong) 50%, var(--ink-subtle) 60%) 100% / 250%
-    100% no-repeat;
+  background: linear-gradient(
+      90deg,
+      var(--ink-subtle) 40%,
+      var(--ink-strong) 50%,
+      var(--ink-subtle) 60%
+    )
+    100% / 250% 100% no-repeat;
   -webkit-background-clip: text;
   background-clip: text;
   animation: cb-shimmer 2s linear infinite;
