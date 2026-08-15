@@ -1507,6 +1507,9 @@ pub(crate) async fn execute_core_tool_with_activity(
                 };
                 result["notice"] = json!(notice);
             }
+            if let Some(rules) = nearest_directory_rules(&base.base, rel) {
+                result["directoryRules"] = json!(rules);
+            }
             if capture_activity {
                 let path = result
                     .get("path")
@@ -2733,6 +2736,56 @@ pub fn required_str<'a>(value: &'a Value, key: &'a str) -> Result<&'a str> {
     }
 }
 
+/// Longest directory-level rules block carried on a read.
+const MAX_DIRECTORY_RULES_BYTES: usize = 1024;
+
+/// The nearest `CALICODE.md` above `rel`, if one exists below the root.
+///
+/// Project conventions were a single root `CALICODE.md` inlined into the system
+/// prompt, so an area with its own rules — "scripts here must not allocate per
+/// frame", "assets in this folder are generated, edit the source" — had nowhere
+/// to put them. opencode solves this by attaching the nearest `AGENTS.md` to
+/// the read that touches its subtree, which puts the rule in front of the model
+/// exactly when it is about to matter.
+///
+/// The root file is skipped because it is already in the prompt; repeating it
+/// on every read would be pure cost. Nearest-only, for the same reason.
+///
+/// Not deduplicated across reads: the tool layer has no session identity (the
+/// same gap that made `staleness` key on the file), and a global cache would
+/// mean a second session in the same process silently never sees the rules.
+/// Repetition inside one subtree is the accepted price, bounded to 1KB.
+fn nearest_directory_rules(base: &Path, rel: &str) -> Option<String> {
+    let mut dir = Path::new(rel).parent()?;
+    loop {
+        // An empty parent means we walked back to the root, whose rules the
+        // prompt already carries.
+        if dir.as_os_str().is_empty() {
+            return None;
+        }
+        let candidate = base.join(dir).join("CALICODE.md");
+        if candidate.is_file() {
+            let body = std::fs::read_to_string(&candidate).ok()?;
+            let body = body.trim();
+            if body.is_empty() {
+                return None;
+            }
+            let clamped: String = body.chars().take(MAX_DIRECTORY_RULES_BYTES).collect();
+            let elided = if body.chars().count() > MAX_DIRECTORY_RULES_BYTES {
+                "\n… (truncated; read it in full if you need the rest)"
+            } else {
+                ""
+            };
+            return Some(format!(
+                "Conventions for {}/ from its CALICODE.md — these govern this file and win over \
+                 your defaults:\n{clamped}{elided}",
+                dir.display()
+            ));
+        }
+        dir = dir.parent()?;
+    }
+}
+
 /// Strip a `cat -n` prefix from every line, or `None` if they do not all have
 /// one.
 ///
@@ -3865,6 +3918,96 @@ mod tests {
         // Empty is a valid string; rejecting it is a per-tool decision, not
         // this function's.
         assert_eq!(required_str(&json!({ "slug": "" }), "slug").unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn reading_a_file_surfaces_the_conventions_for_its_folder() {
+        // A root CALICODE.md is in the prompt; an area with its own rules had
+        // nowhere to put them, so the model learned conventions only for the
+        // project as a whole.
+        let (root, folder) = game_with_workspace();
+        std::fs::create_dir_all(folder.path().join("scripts/enemy")).unwrap();
+        std::fs::write(
+            folder.path().join("scripts/enemy/CALICODE.md"),
+            "Enemies must not allocate per frame.",
+        )
+        .unwrap();
+        std::fs::write(
+            folder.path().join("scripts/enemy/boss.js"),
+            "export const hp = 3;\n",
+        )
+        .unwrap();
+
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "file_read")
+            .unwrap();
+        let state = mock_state("127.0.0.1:9".parse().unwrap());
+        let result = execute_core_tool(
+            &def,
+            &json!({ "slug": "demo", "path": "scripts/enemy/boss.js" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        let rules = result["directoryRules"].as_str().expect("rules attached");
+        assert!(rules.contains("must not allocate per frame"), "{rules}");
+        assert!(
+            rules.contains("scripts/enemy"),
+            "it names the scope: {rules}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_with_no_folder_rules_carries_none() {
+        let (root, folder) = game_with_workspace();
+        std::fs::write(folder.path().join("plain.js"), "const a = 1;\n").unwrap();
+        // The root's own CALICODE.md is deliberately not attached: it is
+        // already in the system prompt, so repeating it on every read is cost
+        // with no information.
+        std::fs::write(folder.path().join("CALICODE.md"), "Project-wide rules.").unwrap();
+
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|tool| tool.name == "file_read")
+            .unwrap();
+        let state = mock_state("127.0.0.1:9".parse().unwrap());
+        let result = execute_core_tool(
+            &def,
+            &json!({ "slug": "demo", "path": "plain.js" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(result.get("directoryRules").is_none(), "{result}");
+    }
+
+    #[test]
+    fn folder_rules_take_the_nearest_and_stay_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/CALICODE.md"), "outer").unwrap();
+        std::fs::write(base.join("a/b/CALICODE.md"), "inner").unwrap();
+
+        // Nearest wins: the specific rule is the one that applies.
+        let found = nearest_directory_rules(base, "a/b/file.js").unwrap();
+        assert!(found.contains("inner"), "{found}");
+        assert!(!found.contains("outer"), "{found}");
+
+        // A folder with no rules of its own inherits the one above it.
+        let inherited = nearest_directory_rules(base, "a/other.js").unwrap();
+        assert!(inherited.contains("outer"), "{inherited}");
+
+        // A runaway rules file cannot flood every read in its subtree.
+        std::fs::write(base.join("a/b/CALICODE.md"), "x".repeat(50_000)).unwrap();
+        let clamped = nearest_directory_rules(base, "a/b/file.js").unwrap();
+        assert!(clamped.len() < MAX_DIRECTORY_RULES_BYTES + 300);
+        assert!(clamped.contains("truncated"), "{}", &clamped[..80]);
     }
 
     #[tokio::test]
