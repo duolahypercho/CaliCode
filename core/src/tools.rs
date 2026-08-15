@@ -477,6 +477,21 @@ async fn apply_file_edit_request(
     // text that is not in the file — see `crate::edit_match` — so the refusals
     // below still mean what they always did.
     let Some(found) = crate::edit_match::find(&text, old) else {
+        // `file_read` renders `cat -n` style, so the likeliest reason a quote
+        // does not match is that its line numbers came along. Diagnosed by
+        // *testing the fix* rather than by pattern-matching the input: the
+        // message only appears when stripping the numbers actually finds the
+        // text, so a legitimate edit whose content happens to start with
+        // digits can never be refused for this.
+        if let Some(stripped) = strip_line_numbers(old) {
+            if crate::edit_match::find(&text, &stripped).is_some() {
+                anyhow::bail!(
+                    "old_string was not found in {rel}, but it matches once the line numbers are \
+                     removed. Those numbers come from file_read's display and are not in the \
+                     file — pass just the text after the tab."
+                );
+            }
+        }
         anyhow::bail!(
             "old_string not found in {rel}; read the file and pass the exact current text"
         );
@@ -741,7 +756,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "file_read".into(),
-            description: "Read a text file from the active game's folder (its attached workspace when it has one, otherwise the project). Returns a window: at most 2000 lines and 128KB per call, with very long lines clamped. When more of the file remains the result says exactly which offset to continue from — read that rather than guessing. Non-text files report what they are instead of returning bytes.".into(),
+            description: "Read a text file from the active game's folder (its attached workspace when it has one, otherwise the project). Returns a window: at most 2000 lines and 128KB per call, with very long lines clamped. Lines are prefixed with their number and a tab for reference — that prefix is NOT part of the file, so never include it in file_edit's old_string. When more of the file remains the result says exactly which offset to continue from — read that rather than guessing. Non-text files report what they are instead of returning bytes.".into(),
             parameters: json!({
                 "type":"object",
                 "properties":{
@@ -2718,6 +2733,25 @@ pub fn required_str<'a>(value: &'a Value, key: &'a str) -> Result<&'a str> {
     }
 }
 
+/// Strip a `cat -n` prefix from every line, or `None` if they do not all have
+/// one.
+///
+/// All-or-nothing on purpose: a partial strip would silently rewrite the
+/// caller's text, and this only ever feeds a diagnostic that is checked
+/// against the file before it is shown.
+fn strip_line_numbers(text: &str) -> Option<String> {
+    let mut out: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let (number, rest) = line.split_once('\t')?;
+        let number = number.trim();
+        if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        out.push(rest);
+    }
+    (!out.is_empty()).then(|| out.join("\n"))
+}
+
 /// Echo back enough of a bad value to identify it, and no more. The whole
 /// point is a short, actionable message; quoting a 2MB argument back at the
 /// model would cost more than the mistake did.
@@ -3511,7 +3545,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result["content"], "session-b");
+        assert_eq!(result["content"], "     1\tsession-b");
     }
 
     #[test]
@@ -3831,6 +3865,73 @@ mod tests {
         // Empty is a valid string; rejecting it is a per-tool decision, not
         // this function's.
         assert_eq!(required_str(&json!({ "slug": "" }), "slug").unwrap(), "");
+    }
+
+    #[tokio::test]
+    async fn an_old_string_pasted_with_line_numbers_says_so() {
+        // The mistake `file_read`'s numbering invites. Without this the edit
+        // just reports "not found" and the model cannot see why, because from
+        // its side it copied the text exactly as shown.
+        let (root, folder) = game_with_workspace();
+        std::fs::write(
+            folder.path().join("hero.js"),
+            "const speed = 1;\nconst jump = 2;\n",
+        )
+        .unwrap();
+
+        let error = apply_file_edit(
+            root.path(),
+            "demo",
+            "hero.js",
+            "     1\tconst speed = 1;",
+            "const speed = 3;",
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("line numbers"), "{error}");
+        assert!(error.contains("after the tab"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn text_that_merely_starts_with_digits_is_not_blamed_on_numbering() {
+        // The guard is only allowed to fire when stripping actually fixes the
+        // match — otherwise a legitimate edit to tab-separated data would be
+        // told to remove numbers that are its own content.
+        let (root, folder) = game_with_workspace();
+        std::fs::write(folder.path().join("data.tsv"), "1\talpha\n2\tbeta\n").unwrap();
+
+        // This IS the file's content, numbers and tabs included.
+        let ok = apply_file_edit(
+            root.path(),
+            "demo",
+            "data.tsv",
+            "2\tbeta",
+            "2\tgamma",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(ok["written"], json!(true));
+        assert!(std::fs::read_to_string(folder.path().join("data.tsv"))
+            .unwrap()
+            .contains("2\tgamma"));
+
+        // And a genuine miss still reports a plain not-found.
+        let error = apply_file_edit(
+            root.path(),
+            "demo",
+            "data.tsv",
+            "9\tzeta",
+            "9\tomega",
+            false,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("not found"), "{error}");
+        assert!(!error.contains("line numbers"), "misdiagnosed: {error}");
     }
 
     #[tokio::test]
@@ -4751,10 +4852,12 @@ mod tests {
         )
         .await
         .unwrap();
+        // Numbering continues from the resume offset rather than restarting,
+        // so a line the model cites still names the right line.
         assert!(second["content"]
             .as_str()
             .unwrap()
-            .starts_with("dep-2001: 1.0.0\n"));
+            .starts_with("  2001\tdep-2001: 1.0.0\n"));
     }
 
     #[tokio::test]
@@ -4771,7 +4874,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result["content"], "hello");
+        assert_eq!(result["content"], "     1\thello");
         // The repair is announced: a silent one would leave the model typing
         // the spelling that does not exist.
         assert!(result["notice"]
@@ -4862,7 +4965,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(result["content"], "two");
+        assert_eq!(result["content"], "     2\ttwo");
 
         // But a value that only looks numeric is refused, never read as 2 —
         // a silently wrong window is worse than an error.
@@ -5067,7 +5170,9 @@ mod tests {
         let mut sanitized = result;
         let activity = take_internal_activity(&mut sanitized).expect("read activity metadata");
         assert_eq!(activity, json!({ "operation": "read", "path": "main.js" }));
-        assert_eq!(sanitized["content"], "const ready = true;");
+        // Numbered, as every model-facing read is; the activity metadata above
+        // is what carries the openable path.
+        assert_eq!(sanitized["content"], "     1\tconst ready = true;");
     }
 
     #[tokio::test]
