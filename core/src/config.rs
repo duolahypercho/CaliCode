@@ -613,7 +613,14 @@ impl Default for ModelConfig {
             base_url: env_or("CALI_OPENAI_BASE_URL", "https://api.openai.com/v1"),
             api_key_env: "CALI_OPENAI_API_KEY".to_string(),
             temperature: 0.4,
-            max_tokens: Some(4096),
+            // One `file_write` of a real source file is bigger than 4096
+            // tokens, and on a reasoning model the thinking comes out of this
+            // same budget — the old default cut tool calls in half mid-argument
+            // and the truncated JSON reached the agent as a call with no
+            // arguments at all. A model whose own ceiling is lower says so and
+            // gets it (`rejected_output_cap`), so raising this cannot lock a
+            // smaller model out.
+            max_tokens: Some(32_768),
             roles: std::collections::BTreeMap::new(),
         }
     }

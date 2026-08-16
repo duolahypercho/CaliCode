@@ -9,6 +9,28 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
+    /// The argument text exactly as the provider spelled it, kept only when it
+    /// is not valid JSON. A response that ends at its output-token cap stops
+    /// mid-call, and what arrives parses as nothing; letting that become an
+    /// empty argument set runs the tool with no arguments, which then reports
+    /// a field the model *did* supply as missing — `file_write` losing a long
+    /// `content` to the cap surfaced as "missing required string path".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unparsed_arguments: Option<String>,
+}
+
+/// Provider argument text as a value, plus the raw text when it is not JSON.
+///
+/// Empty text is a legitimate no-argument call, not a failure — several
+/// gateways send `""` rather than `"{}"` for a tool that takes nothing.
+pub fn parse_tool_arguments(text: &str) -> (Value, Option<String>) {
+    if text.trim().is_empty() {
+        return (json!({}), None);
+    }
+    match serde_json::from_str::<Value>(text) {
+        Ok(value) => (value, None),
+        Err(_) => (Value::Null, Some(text.to_string())),
+    }
 }
 
 /// Token usage reported by the provider for one completed request.
@@ -96,6 +118,10 @@ struct AttemptError {
     /// `retry-after-ms`. `None` means it did not say and the fixed backoff
     /// decides.
     retry_after: Option<std::time::Duration>,
+    /// Nothing answered at the configured address. Waiting cannot fix a port
+    /// that moved, so this is the one failure worth looking for the endpoint
+    /// somewhere else before spending the backoff.
+    unreachable: bool,
 }
 
 /// Force every tool call in one response to carry a distinct id.
@@ -185,6 +211,7 @@ impl AttemptError {
             retry_after: None,
             retryable: true,
             error,
+            unreachable: false,
         }
     }
 
@@ -194,6 +221,7 @@ impl AttemptError {
             error,
             // Never retried, so a wait would never be honoured anyway.
             retry_after: None,
+            unreachable: false,
         }
     }
 }
@@ -386,7 +414,30 @@ async fn chat_with_retries(
     backoff_ms: &[u64],
 ) -> Result<ChatResult, AttemptError> {
     let mut attempt = 0usize;
+    // Set once a provider has refused the configured output cap as too large
+    // for the model it routed to. Not a retry in the backoff sense — nothing
+    // is waited on, and the ceiling is the provider's own number.
+    let mut cap_override: Option<u32> = None;
+    let mut cap_climbdowns = 0usize;
+    // Set once the configured address has gone quiet and the provider was
+    // found answering elsewhere on this machine.
+    let mut endpoint_override: Option<String> = None;
+    let mut endpoint_searched = false;
     loop {
+        let tuned_config;
+        let config = if cap_override.is_some() || endpoint_override.is_some() {
+            let mut tuned = config.clone();
+            if let Some(cap) = cap_override {
+                tuned.model.max_tokens = Some(cap);
+            }
+            if let Some(base_url) = endpoint_override.clone() {
+                tuned.model.base_url = base_url;
+            }
+            tuned_config = tuned;
+            &tuned_config
+        } else {
+            config
+        };
         match chat_once(
             config,
             messages,
@@ -423,6 +474,26 @@ async fn chat_with_retries(
                 }
             }
             Ok(result) => return Ok(result),
+            // Nothing is listening where config says. Backing off cannot
+            // fix a port that moved, so look for the provider on this machine
+            // before spending the attempts — for an OAuth user this is the
+            // difference between a working app and one that only says
+            // "connection refused" after a router upgrade.
+            Err(err) if err.unreachable && !endpoint_searched => {
+                endpoint_searched = true;
+                match rediscover_codex_router(config).await {
+                    Some(base_url) => {
+                        tracing::warn!(
+                            configured = %config.model.base_url,
+                            found = %base_url,
+                            "model endpoint moved; using the address that answered and \
+                             continuing — update model.base_url to make it permanent"
+                        );
+                        endpoint_override = Some(base_url);
+                    }
+                    None => return Err(err),
+                }
+            }
             Err(err) if err.retryable && attempt < backoff_ms.len() => {
                 // The provider's own answer wins over our guess. A 429 saying
                 // "wait 30s" retried after 250ms spends all three attempts
@@ -440,9 +511,159 @@ async fn chat_with_retries(
                 tokio::time::sleep(delay).await;
                 attempt += 1;
             }
+            // A model whose own output ceiling is below the configured cap
+            // rejects every request outright, which would make one entry in a
+            // multi-model provider unusable rather than merely smaller. Take
+            // the provider's number and go again.
+            Err(err)
+                if cap_climbdowns < MAX_CAP_CLIMBDOWNS
+                    && rejected_output_cap(&err.error.to_string(), config.model.max_tokens)
+                        .is_some() =>
+            {
+                let cap = rejected_output_cap(&err.error.to_string(), config.model.max_tokens)
+                    .expect("guard matched");
+                tracing::warn!(
+                    model = %config.model.default,
+                    from = config.model.max_tokens,
+                    to = cap,
+                    "provider refused the configured output cap; lowering it for this turn"
+                );
+                cap_override = Some(cap);
+                cap_climbdowns += 1;
+            }
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Gateway ports codex-router has shipped with. The router moved from 4100 to
+/// 4200 in 0.4.0-beta, and an OAuth user has no API key to fall back on: a
+/// stale port in config means every turn dies on a connection refused with
+/// nothing in the app naming the cause.
+const CODEX_ROUTER_GATEWAY_PORTS: &[u16] = &[4200, 4100];
+
+/// Where codex-router is really listening, when the configured address has
+/// gone quiet.
+///
+/// Loopback only, and only for that provider. This may correct a port on the
+/// machine the user is already talking to; it must never move a turn to
+/// another host, which is why a non-loopback base URL returns `None` rather
+/// than being probed.
+async fn rediscover_codex_router(config: &AppConfig) -> Option<String> {
+    if !config
+        .model
+        .provider
+        .eq_ignore_ascii_case(crate::config::CODEX_ROUTER_PROVIDER_ID)
+    {
+        return None;
+    }
+    let base = config.model.base_url.trim_end_matches('/');
+    let (scheme, rest) = base.split_once("://")?;
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let (host, configured_port) = authority
+        .split_once(':')
+        .map(|(host, port)| (host, port.parse::<u16>().ok()))
+        .unwrap_or((authority, None));
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return None;
+    }
+    let client = http_client().ok()?;
+    let from_env = std::env::var("CODEX_ROUTER_GATEWAY_PORT")
+        .ok()
+        .and_then(|value| value.trim().parse::<u16>().ok());
+    let candidates = from_env
+        .into_iter()
+        .chain(CODEX_ROUTER_GATEWAY_PORTS.iter().copied())
+        .filter(|port| Some(*port) != configured_port);
+    let mut seen = Vec::new();
+    for port in candidates {
+        if seen.contains(&port) {
+            continue;
+        }
+        seen.push(port);
+        let candidate = if path.is_empty() {
+            format!("{scheme}://{host}:{port}")
+        } else {
+            format!("{scheme}://{host}:{port}/{path}")
+        };
+        // The gateway answers this unauthenticated; a squatter on the port
+        // will not, so a wrong process cannot capture the turn.
+        let health = format!("{scheme}://{host}:{port}/health/liveliness");
+        let answered = client
+            .get(&health)
+            .timeout(std::time::Duration::from_millis(1_500))
+            .send()
+            .await
+            .is_ok_and(|response| response.status().is_success());
+        if answered {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// The sentence a codex-router user needs when the router turns them away.
+///
+/// Their key is a file the router rotates, not something they typed, so
+/// "401 Unauthorized" alone sends them looking for a setting that does not
+/// exist.
+fn stale_key_hint(config: &AppConfig, status: reqwest::StatusCode) -> &'static str {
+    let unauthorized = matches!(status.as_u16(), 401 | 403);
+    let router = config
+        .model
+        .provider
+        .eq_ignore_ascii_case(crate::config::CODEX_ROUTER_PROVIDER_ID);
+    if unauthorized && router {
+        " — codex-router rejected the stored key (~/.codex/codex-router/internal-secret). \
+         It rotates on router restart or upgrade: restart the router, then try again."
+    } else {
+        ""
+    }
+}
+
+/// How many times one turn may take a provider's word for a smaller cap.
+/// Each step uses the ceiling the provider named, so three is already more
+/// than any real ladder needs; the bound only stops a provider that keeps
+/// refusing without ever naming a number it would accept.
+const MAX_CAP_CLIMBDOWNS: usize = 3;
+
+/// The output cap this provider would accept, when its refusal is about the
+/// cap being too large for the model.
+///
+/// Providers spell the ceiling differently — "at most 16384 completion
+/// tokens", "> 8192, which is the maximum allowed", "the valid range of
+/// max_tokens is [1, 8192]" — but every one of them prints it. Taking the
+/// largest number below what we asked for reads all three, and the requested
+/// value in the same sentence is excluded by that same comparison. With no
+/// number to read, halving is the fallback.
+fn rejected_output_cap(error: &str, requested: Option<u32>) -> Option<u32> {
+    const FLOOR: u32 = 1_024;
+    let requested = requested?;
+    if requested <= FLOOR {
+        return None;
+    }
+    let lowered = error.to_ascii_lowercase();
+    if !(lowered.contains("max_tokens") || lowered.contains("max_output_tokens")) {
+        return None;
+    }
+    let about_the_ceiling = [
+        "too large",
+        "maximum",
+        "at most",
+        "valid range",
+        "less than",
+    ]
+    .iter()
+    .any(|phrase| lowered.contains(phrase));
+    if !about_the_ceiling {
+        return None;
+    }
+    let named = lowered
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|run| run.parse::<u32>().ok())
+        .filter(|&value| (FLOOR..requested).contains(&value))
+        .max();
+    Some(named.unwrap_or(requested / 2).max(FLOOR))
 }
 
 async fn chat_once(
@@ -574,13 +795,20 @@ async fn chat_once(
             // Connect refusals/resets and timeouts are transient; anything
             // else (builder, redirect policy) will not fix itself.
             let retryable = err.is_connect() || err.is_timeout();
-            let error = anyhow::Error::from(err)
-                .context(format!("model request failed for {}", config.model.default));
+            let unreachable = err.is_connect();
+            // The cause is the whole message here. "model request failed" told
+            // a user nothing they could act on; "connection refused at
+            // 127.0.0.1:4100" tells them their router is down or has moved.
+            let error = anyhow::Error::from(err).context(format!(
+                "cannot reach the model endpoint at {} for {}",
+                config.model.base_url, config.model.default
+            ));
             return Err(AttemptError {
                 retryable,
                 error,
                 // A transport failure never produced a response to ask.
                 retry_after: None,
+                unreachable,
             });
         }
     };
@@ -594,8 +822,13 @@ async fn chat_once(
         let retryable = status.as_u16() == 429 || status.is_server_error();
         return Err(AttemptError {
             retryable,
-            error: anyhow::anyhow!("model returned {status}: {}", truncate(&text, 500)),
+            error: anyhow::anyhow!(
+                "model returned {status}: {}{}",
+                truncate(&text, 500),
+                stale_key_hint(config, status)
+            ),
             retry_after,
+            unreachable: false,
         });
     }
 
@@ -681,10 +914,14 @@ async fn chat_once(
     let mut tool_calls: Vec<ToolCall> = tool_calls
         .into_iter()
         .filter(|t| !t.name.is_empty())
-        .map(|t| ToolCall {
-            id: t.id,
-            name: t.name,
-            arguments: serde_json::from_str(&t.arguments).unwrap_or(Value::Null),
+        .map(|t| {
+            let (arguments, unparsed_arguments) = parse_tool_arguments(&t.arguments);
+            ToolCall {
+                id: t.id,
+                name: t.name,
+                arguments,
+                unparsed_arguments,
+            }
         })
         .collect();
     uniquify_tool_call_ids(&mut tool_calls);
@@ -777,15 +1014,17 @@ async fn chat_once_responses(request: ResponsesRequest<'_>) -> Result<ChatResult
         Ok(response) => response,
         Err(err) => {
             let retryable = err.is_connect() || err.is_timeout();
+            let unreachable = err.is_connect();
             let error = anyhow::Error::from(err).context(format!(
-                "Responses model request failed for {}",
-                config.model.default
+                "cannot reach the model endpoint at {} for {}",
+                config.model.base_url, config.model.default
             ));
             return Err(AttemptError {
                 retryable,
                 error,
                 // A transport failure never produced a response to ask.
                 retry_after: None,
+                unreachable,
             });
         }
     };
@@ -797,8 +1036,13 @@ async fn chat_once_responses(request: ResponsesRequest<'_>) -> Result<ChatResult
         let retryable = status.as_u16() == 429 || status.is_server_error();
         return Err(AttemptError {
             retryable,
-            error: anyhow::anyhow!("model returned {status}: {}", truncate(&text, 500)),
+            error: anyhow::anyhow!(
+                "model returned {status}: {}{}",
+                truncate(&text, 500),
+                stale_key_hint(config, status)
+            ),
             retry_after,
+            unreachable: false,
         });
     }
 
@@ -879,16 +1123,20 @@ async fn chat_once_responses(request: ResponsesRequest<'_>) -> Result<ChatResult
     let mut tool_calls: Vec<ToolCall> = tool_calls
         .into_iter()
         .filter(|tool| !tool.name.is_empty())
-        .map(|tool| ToolCall {
-            // The Responses API pairs a call id with an item id; both are
-            // needed downstream, so they travel joined.
-            id: if tool.id.is_empty() || tool.item_id.is_empty() {
-                tool.id
-            } else {
-                format!("{}|{}", tool.id, tool.item_id)
-            },
-            name: tool.name,
-            arguments: serde_json::from_str(&tool.arguments).unwrap_or(Value::Null),
+        .map(|tool| {
+            let (arguments, unparsed_arguments) = parse_tool_arguments(&tool.arguments);
+            ToolCall {
+                // The Responses API pairs a call id with an item id; both are
+                // needed downstream, so they travel joined.
+                id: if tool.id.is_empty() || tool.item_id.is_empty() {
+                    tool.id
+                } else {
+                    format!("{}|{}", tool.id, tool.item_id)
+                },
+                name: tool.name,
+                arguments,
+                unparsed_arguments,
+            }
         })
         .collect();
     uniquify_tool_call_ids(&mut tool_calls);
@@ -1736,6 +1984,7 @@ mod tool_call_id_tests {
             id: id.into(),
             name: name.into(),
             arguments: args,
+            unparsed_arguments: None,
         }
     }
 
@@ -1902,7 +2151,7 @@ mod tests {
     use axum::http::StatusCode;
     use axum::response::sse::{Event, Sse};
     use axum::response::{IntoResponse, Response};
-    use axum::routing::post;
+    use axum::routing::{get, post};
     use axum::Router;
     use std::convert::Infallible;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2075,6 +2324,178 @@ mod tests {
         assert_eq!(content, "shipped");
         assert_eq!(visible, "shipped");
         assert_eq!(reasoning, "planning");
+    }
+
+    /// The failure an OAuth user hits when codex-router moves its gateway
+    /// port on upgrade: the configured address is dead, the router is alive
+    /// one port over, and there is no API key to fall back on.
+    #[tokio::test]
+    async fn a_codex_router_that_moved_ports_is_found_and_the_turn_completes() {
+        let app = Router::new()
+            .route("/health/liveliness", get(|| async { "ok" }))
+            .route(
+                "/v1/chat/completions",
+                post(|| async {
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            json!({"choices":[{"message":{"role":"assistant","content":"found the router"}}]})
+                                .to_string(),
+                        ))
+                        .unwrap()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let moved_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        // Nothing listens here — the address config still points at.
+        let dead = {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = probe.local_addr().unwrap().port();
+            drop(probe);
+            port
+        };
+        std::env::set_var("CODEX_ROUTER_GATEWAY_PORT", moved_port.to_string());
+        let mut config = test_config(format!("http://127.0.0.1:{dead}/v1"));
+        config.model.provider = crate::config::CODEX_ROUTER_PROVIDER_ID.into();
+        let result = chat_with_backoff(
+            &config,
+            &[json!({ "role": "user", "content": "hello" })],
+            None,
+            None,
+            &[],
+        )
+        .await;
+        std::env::remove_var("CODEX_ROUTER_GATEWAY_PORT");
+        assert_eq!(
+            result.expect("the moved router must be found").content,
+            "found the router"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_moved_endpoint_search_never_leaves_this_machine() {
+        // A remote provider that is down stays down: correcting a local port
+        // is one thing, sending a turn to a different host is another.
+        let mut config = test_config("https://api.example.com/v1".into());
+        config.model.provider = crate::config::CODEX_ROUTER_PROVIDER_ID.into();
+        assert!(rediscover_codex_router(&config).await.is_none());
+
+        // And the search is that provider's, not everyone's.
+        let mut other = test_config("http://127.0.0.1:4100/v1".into());
+        other.model.provider = "openai".into();
+        assert!(rediscover_codex_router(&other).await.is_none());
+    }
+
+    #[test]
+    fn an_unauthorized_router_names_the_key_that_went_stale() {
+        let mut router = test_config("http://127.0.0.1:4200/v1".into());
+        router.model.provider = crate::config::CODEX_ROUTER_PROVIDER_ID.into();
+        let hint = stale_key_hint(&router, reqwest::StatusCode::UNAUTHORIZED);
+        assert!(hint.contains("internal-secret"), "unexpected hint: {hint}");
+        assert!(hint.contains("restart the router"));
+        // Not every 401 is that story, and not every provider keeps its key
+        // in that file.
+        assert_eq!(stale_key_hint(&router, reqwest::StatusCode::NOT_FOUND), "");
+        let mut openai = test_config("https://api.openai.com/v1".into());
+        openai.model.provider = "openai".into();
+        assert_eq!(
+            stale_key_hint(&openai, reqwest::StatusCode::UNAUTHORIZED),
+            ""
+        );
+    }
+
+    #[test]
+    fn a_provider_that_names_its_own_output_ceiling_is_believed() {
+        // The three shapes seen in the wild. Each sentence contains the
+        // requested value as well, which must never be read as the ceiling.
+        assert_eq!(
+            rejected_output_cap(
+                "model returned 400: max_tokens is too large: 32768. This model supports at most \
+                 16384 completion tokens",
+                Some(32_768)
+            ),
+            Some(16_384)
+        );
+        assert_eq!(
+            rejected_output_cap(
+                "model returned 400: max_tokens: 32768 > 8192, which is the maximum allowed",
+                Some(32_768)
+            ),
+            Some(8_192)
+        );
+        assert_eq!(
+            rejected_output_cap(
+                "model returned 400: Invalid max_tokens value, the valid range of max_tokens is \
+                 [1, 8192]",
+                Some(32_768)
+            ),
+            Some(8_192)
+        );
+        // Refused for the cap but with no number to read: halve rather than
+        // give up, since the next attempt still costs one request.
+        assert_eq!(
+            rejected_output_cap(
+                "model returned 400: max_tokens exceeds the maximum for this model",
+                Some(32_768)
+            ),
+            Some(16_384)
+        );
+    }
+
+    #[test]
+    fn other_provider_failures_never_lower_the_output_cap() {
+        // Every one of these would otherwise cost extra requests, and two of
+        // them would silently shrink a healthy turn's budget.
+        assert_eq!(
+            rejected_output_cap("model returned 401: invalid api key", Some(32_768)),
+            None
+        );
+        assert_eq!(
+            rejected_output_cap(
+                "model returned 400: max_tokens must be an integer",
+                Some(32_768)
+            ),
+            None,
+            "a malformed max_tokens is not a ceiling to climb down to"
+        );
+        assert_eq!(
+            rejected_output_cap(
+                "model returned 429: maximum request rate exceeded",
+                Some(32_768)
+            ),
+            None
+        );
+        // Already at the floor: lowering further would trade one failure for
+        // a turn too small to answer in.
+        assert_eq!(
+            rejected_output_cap(
+                "model returned 400: max_tokens is too large, at most 512 allowed",
+                Some(1_024)
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn argument_text_that_is_not_json_survives_as_itself() {
+        // Empty text is a no-argument call, not a failure.
+        let (value, raw) = parse_tool_arguments("");
+        assert_eq!(value, json!({}));
+        assert!(raw.is_none());
+
+        let (value, raw) = parse_tool_arguments("{\"path\":\"a.txt\"}");
+        assert_eq!(value, json!({ "path": "a.txt" }));
+        assert!(raw.is_none());
+
+        // Cut off mid-string. Discarding this text is what made a truncated
+        // call look like a call with no arguments at all.
+        let cut_off = "{\"path\":\"a.txt\",\"content\":\"half a fi";
+        let (value, raw) = parse_tool_arguments(cut_off);
+        assert!(value.is_null());
+        assert_eq!(raw.as_deref(), Some(cut_off));
     }
 
     #[test]
@@ -2439,6 +2860,66 @@ mod tests {
         .await
         .expect("a normal JSON completion is valid");
         assert_eq!(result.content, "JSON fallback");
+    }
+
+    /// A model whose own output ceiling is below the configured cap refuses
+    /// every request with a 400 — not a retryable status — so without this the
+    /// smaller entry in a multi-model provider would be unusable rather than
+    /// merely smaller.
+    #[tokio::test]
+    async fn a_refused_output_cap_is_lowered_and_the_turn_goes_through() {
+        let asked = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+        let asked_for_route = asked.clone();
+        let app = Router::new().route(
+            "/v1/chat/completions",
+            post(move |axum::Json(body): axum::Json<Value>| {
+                let asked = asked_for_route.clone();
+                async move {
+                    let requested = body["max_tokens"].as_u64().unwrap_or_default();
+                    asked.lock().unwrap().push(requested);
+                    if requested > 8_192 {
+                        return Response::builder()
+                            .status(400)
+                            .body(axum::body::Body::from(
+                                json!({"error": {"message": format!(
+                                    "max_tokens: {requested} > 8192, which is the maximum allowed"
+                                )}})
+                                .to_string(),
+                            ))
+                            .unwrap();
+                    }
+                    Response::builder()
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            json!({"choices":[{"message":{"role":"assistant","content":"within the cap"}}]})
+                                .to_string(),
+                        ))
+                        .unwrap()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let mut config = test_config(format!("http://{addr}/v1"));
+        config.model.max_tokens = Some(32_768);
+        let result = chat_with_backoff(
+            &config,
+            &[json!({ "role": "user", "content": "hello" })],
+            None,
+            None,
+            &[],
+        )
+        .await
+        .expect("the second attempt asks for a cap the model accepts");
+        assert_eq!(result.content, "within the cap");
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![32_768, 8_192],
+            "the climb-down must use the ceiling the provider named, not a guess"
+        );
     }
 
     #[tokio::test]
