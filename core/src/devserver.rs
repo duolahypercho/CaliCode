@@ -170,6 +170,13 @@ pub async fn start(
     let port = free_port()?;
     let mut command = resolve_command(&workspace.root, script, port)?;
     let mut child = command.spawn().context("failed to start the dev server")?;
+    if let Some(pid) = child.id() {
+        crate::spawn_ledger::global().register(
+            pid,
+            crate::spawn_ledger::SpawnKind::DevServer,
+            format!("dev server ({})", workspace.id),
+        );
+    }
 
     let logs = Arc::new(Mutex::new(VecDeque::with_capacity(LOG_CAPACITY)));
     let status = Arc::new(Mutex::new(Status::Starting));

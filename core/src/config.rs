@@ -52,6 +52,29 @@ pub struct AppConfig {
     /// Spend ceiling for a single chat session. Off unless configured.
     #[serde(default)]
     pub budget: BudgetConfig,
+    /// Tuning for `auto` mode's guardian (see `crate::guardian`).
+    #[serde(default)]
+    pub approvals: ApprovalsConfig,
+}
+
+/// `approvals:` — how `auto` mode's second opinion is obtained.
+///
+/// Only the model is configurable, and only as an override. Everything the
+/// guardian decides is decided by prompt and by the fail-closed parser, not by
+/// a knob here: a threshold that lets an operator turn "ask" into "allow"
+/// would be the setting that quietly undoes the mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct ApprovalsConfig {
+    /// `provider:model` (or a bare model on the session's provider) the
+    /// guardian judges with. `None` — the default — means the client picks
+    /// the cheapest model the active provider offers, and failing that the
+    /// session's own model runs the review.
+    ///
+    /// No model name is hardcoded in core on purpose: the catalogue comes
+    /// from models.dev through the client (AGENTS.md, "Model catalog"), so a
+    /// literal here would be the stale list that rule exists to prevent.
+    pub guardian_model: Option<String>,
 }
 
 /// `budget:` — a ceiling on what one session may spend before it stops.

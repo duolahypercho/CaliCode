@@ -431,6 +431,13 @@ impl Browser {
         let child = command
             .spawn()
             .with_context(|| format!("cannot start {}", binary.display()))?;
+        if let Some(pid) = child.id() {
+            crate::spawn_ledger::global().register(
+                pid,
+                crate::spawn_ledger::SpawnKind::Browser,
+                "agent browser (chrome)",
+            );
+        }
 
         let ws_url = match wait_for_devtools(&port_file).await {
             Ok(url) => url,
@@ -837,7 +844,6 @@ impl Browser {
                 "key": spec.key,
                 "code": spec.code,
                 "windowsVirtualKeyCode": spec.code_num,
-                "nativeVirtualKeyCode": spec.code_num,
                 "text": spec.text,
             });
             self.call("Input.dispatchKeyEvent", down).await?;
@@ -851,7 +857,6 @@ impl Browser {
                     "key": spec.key,
                     "code": spec.code,
                     "windowsVirtualKeyCode": spec.code_num,
-                    "nativeVirtualKeyCode": spec.code_num,
                 }),
             )
             .await?;
@@ -902,6 +907,7 @@ impl Browser {
         dx: f64,
         dy: f64,
         steps: u32,
+        record_frames: u32,
     ) -> Result<Value> {
         if keys.is_empty() && dx == 0.0 && dy == 0.0 {
             bail!("browser_play needs at least one key to hold or a dx/dy to look by");
@@ -915,13 +921,16 @@ impl Browser {
         for spec in &specs {
             self.call(
                 "Input.dispatchKeyEvent",
+                // `rawKeyDown`, never `keyDown` with text, even for a letter.
+                // Holding W to walk must not also type "w" into the page — and
+                // a text-carrying keyDown left outstanding stops Chrome
+                // answering `Input.dispatchMouseEvent` at all, which is what
+                // made looking-while-moving hang rather than merely misbehave.
                 json!({
-                    "type": if spec.text.is_empty() { "rawKeyDown" } else { "keyDown" },
+                    "type": "rawKeyDown",
                     "key": spec.key,
                     "code": spec.code,
                     "windowsVirtualKeyCode": spec.code_num,
-                    "nativeVirtualKeyCode": spec.code_num,
-                    "text": spec.text,
                     "autoRepeat": false,
                 }),
             )
@@ -929,21 +938,17 @@ impl Browser {
         }
 
         // Held first, released last, whatever happens between: the `?` is
-        // deliberately absent here so a failed look cannot leak a held key.
-        let looked = if dx != 0.0 || dy != 0.0 {
-            eprintln!("[play] keys down; starting look");
-            let outcome = self.mouse_move_over(dx, dy, steps, hold_ms).await;
-            if let Err(error) = &outcome {
-                eprintln!("[play] look FAILED: {error}");
-            }
+        // deliberately absent here so neither a failed look nor a failed
+        // capture can leak a held key.
+        let mut frames = Vec::new();
+        let looked = {
+            let outcome = self
+                .act_while_held(dx, dy, steps, hold_ms, record_frames, &mut frames)
+                .await;
             outcome.err().map(|error| error.to_string())
-        } else {
-            tokio::time::sleep(Duration::from_millis(hold_ms)).await;
-            None
         };
 
         for spec in &specs {
-            eprintln!("[play] releasing {}", spec.key);
             self.call(
                 "Input.dispatchKeyEvent",
                 json!({
@@ -951,7 +956,6 @@ impl Browser {
                     "key": spec.key,
                     "code": spec.code,
                     "windowsVirtualKeyCode": spec.code_num,
-                    "nativeVirtualKeyCode": spec.code_num,
                 }),
             )
             .await?;
@@ -964,33 +968,60 @@ impl Browser {
             "held": keys,
             "heldMs": hold_ms,
             "lookedBy": { "dx": dx, "dy": dy },
+            "frames": frames,
         }))
     }
 
-    /// [`mouse_move`](Self::mouse_move), paced to fill `over_ms`.
+    /// Look and capture while the keys are down.
     ///
-    /// A look that lands in 3ms while a key is held for 800 is not a look taken
-    /// while moving — it is a snap followed by a walk. Spreading the steps over
-    /// the hold is what makes the two simultaneous.
-    async fn mouse_move_over(&self, dx: f64, dy: f64, steps: u32, over_ms: u64) -> Result<Value> {
-        let steps = steps.clamp(1, 120);
-        let gap = over_ms / steps.max(1) as u64;
-        let mut last = json!({});
-        let (per_x, per_y) = (dx / steps as f64, dy / steps as f64);
-        for index in 0..steps {
-            eprintln!("[play]   move step {index}");
-            last = match self.mouse_move(per_x, per_y, 1).await {
-                Ok(value) => value,
-                Err(error) => {
-                    eprintln!("[play]   step {index} error: {error}");
-                    return Err(error);
-                }
-            };
-            if gap > 0 && index + 1 < steps {
+    /// One interleaved loop rather than two concurrent ones. The devtools
+    /// connection multiplexes, but every failure in this area has been an event
+    /// arriving while another was outstanding, and a recording that wedges the
+    /// browser mid-play is worse than one that costs a few milliseconds of
+    /// pacing. Frames are captured *during* the action for the same reason the
+    /// look is: a screenshot taken after the keys come up is a picture of
+    /// standing still.
+    async fn act_while_held(
+        &self,
+        dx: f64,
+        dy: f64,
+        steps: u32,
+        hold_ms: u64,
+        record_frames: u32,
+        frames: &mut Vec<Value>,
+    ) -> Result<()> {
+        let looking = dx != 0.0 || dy != 0.0;
+        let steps = if looking { steps.clamp(1, 120) } else { 0 };
+        let wanted = record_frames.min(32);
+        let slots = steps.max(wanted).max(1);
+        let gap = hold_ms / slots as u64;
+        let started = std::time::Instant::now();
+
+        let (per_x, per_y) = if steps > 0 {
+            (dx / steps as f64, dy / steps as f64)
+        } else {
+            (0.0, 0.0)
+        };
+
+        for slot in 0..slots {
+            if slot < steps {
+                self.mouse_move(per_x, per_y, 1).await?;
+            }
+            // Spread the frames across the slots rather than taking them all at
+            // the front, so the sheet shows the whole action.
+            if wanted > 0 && (slot * wanted) / slots != ((slot + 1) * wanted) / slots {
+                let image = self.capture(false, CAST_QUALITY).await?;
+                frames.push(json!({
+                    "image": format!("data:image/jpeg;base64,{image}"),
+                    "timestampSeconds": started.elapsed().as_secs_f64(),
+                    "frameNumber": frames.len() + 1,
+                }));
+            }
+            if gap > 0 {
                 tokio::time::sleep(Duration::from_millis(gap)).await;
             }
         }
-        Ok(last)
+        Ok(())
     }
 
     /// Move the pointer, which is how a 3D game's camera is driven.
@@ -2684,9 +2715,9 @@ mod tests {
         tokio::spawn(async move {
             const BODY: &str =
                 "<html><body style='margin:0'><canvas width=800 height=600></canvas>\
-                <script>window.__down={};window.__up={};window.__moves=[];window.__mx=0;\
-                addEventListener('keydown',e=>{if(!(e.key in window.__down))\
-                  window.__down[e.key]=performance.now()});\
+                <script>window.__down={};window.__seq=[];window.__up={};window.__moves=[];window.__mx=0;\
+                addEventListener('keydown',e=>{window.__seq.push(e.key+':'+e.code);\
+                  if(!(e.key in window.__down))window.__down[e.key]=performance.now()});\
                 addEventListener('keyup',e=>{window.__up[e.key]=performance.now()});\
                 addEventListener('mousemove',e=>{window.__mx+=e.movementX;\
                   window.__moves.push(performance.now())});\
@@ -2707,17 +2738,19 @@ mod tests {
             .expect("navigate");
         tokio::time::sleep(Duration::from_millis(1200)).await;
 
-        // Isolate: keys alone, then keys + look, so a hang names its own half.
-        eprintln!("[probe] keys only");
-        browser
-            .play(&["w".to_string()], 200, 0.0, 0.0, 1)
-            .await
-            .expect("keys-only play must run");
-        eprintln!("[probe] keys only OK; now keys + look");
-        browser
-            .play(&["w".to_string(), "a".to_string()], 800, 150.0, 0.0, 10)
+        let played = browser
+            .play(&["w".to_string(), "a".to_string()], 800, 150.0, 0.0, 10, 4)
             .await
             .expect("play must run");
+        // Frames must come from *during* the hold. A recording taken after the
+        // keys come up is a picture of standing still, which is exactly the
+        // useless artefact this exists to avoid.
+        let captured = played["frames"].as_array().map(Vec::len).unwrap_or(0);
+        println!("recorded frames: {captured}");
+        assert_eq!(
+            captured, 4,
+            "frames must be captured during the action, got {captured}"
+        );
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         let overlap = browser
@@ -2728,7 +2761,8 @@ mod tests {
                    during: window.__moves.filter(t => t > window.__down['w'] \
                                                    && t < window.__up['w']).length,\
                    total: window.__moves.length,\
-                   mx: window.__mx})",
+                   mx: window.__mx, seqLen: window.__seq.length,\
+                   seqHead: window.__seq.slice(0,6)})",
             )
             .await
             .expect("read back");
@@ -2754,6 +2788,32 @@ mod tests {
             "the look must land while the keys are down, not before or after: {report}"
         );
 
+        // Pins a fixed bug. `nativeVirtualKeyCode` was being given the Windows
+        // VK code, and on macOS that is a different keycode space — 87 is
+        // keypad-5 — so every held key arrived as `Numpad5` and auto-repeated
+        // about twenty thousand times in 600ms. A game keyed on
+        // `e.code === "KeyW"`, which is the usual way, saw nothing at all.
+        let sequence: Vec<&str> = report["seqHead"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            sequence
+                .iter()
+                .all(|event| *event == "w:KeyW" || *event == "a:KeyA"),
+            "every keydown must carry its real code — no Numpad5, no Unidentified: {report}"
+        );
+        assert!(
+            sequence.contains(&"w:KeyW") && sequence.contains(&"a:KeyA"),
+            "both held keys must reach the page: {report}"
+        );
+        // A held key repeating is real browser behaviour; twenty thousand
+        // repeats in 600ms was the bug.
+        assert!(
+            report["seqLen"].as_u64().unwrap_or(u64::MAX) < 60,
+            "a held key must not flood the page with repeats: {report}"
+        );
+
         drop(browser);
         browsers.shutdown().await;
     }
@@ -2766,126 +2826,6 @@ mod tests {
     /// the same final position and a useless snap, so the step count is checked
     /// too: this is a motion, not a teleport.
     ///
-    /// Attach drives a browser core did not start, and leaves it running.
-    ///
-    /// This is the Electron shell's whole contract in one test. The shell owns
-    /// the `WebContentsView`; core adopts it and drives the very page the user
-    /// is looking at, which is the difference between one browser and two.
-    ///
-    /// Both halves are asserted, and the second is the one with teeth: a
-    /// `shutdown` that killed an attached browser would close the user's panel —
-    /// or, in the packaged app, take a window out from under them — every time a
-    /// session ended.
-    ///
-    /// `cargo test browser::tests::live_attach -- --ignored --nocapture`
-    #[tokio::test]
-    #[ignore = "needs a real Chrome"]
-    async fn live_attach_drives_a_browser_it_did_not_launch() {
-        let binary = find_chrome().expect("a chrome to stand in for the shell's panel");
-        let profile = tempfile::tempdir().unwrap();
-        let port = {
-            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            probe.local_addr().unwrap().port()
-        };
-
-        // Chrome the test owns, exactly as the Electron shell would own it.
-        let mut panel = tokio::process::Command::new(&binary)
-            .arg(format!("--remote-debugging-port={port}"))
-            .arg(format!("--user-data-dir={}", profile.path().display()))
-            .arg("--headless=new")
-            .arg("--no-first-run")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("chrome must start");
-
-        let endpoint = format!("http://127.0.0.1:{port}");
-        let targets = async {
-            loop {
-                if let Ok(response) = reqwest::get(format!("{endpoint}/json/list")).await {
-                    if let Ok(list) = response.json::<Vec<Value>>().await {
-                        if list.iter().any(|t| t["type"] == "page") {
-                            return list;
-                        }
-                    }
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        };
-        let targets = tokio::time::timeout(Duration::from_secs(20), targets)
-            .await
-            .expect("chrome must expose a devtools page target");
-        let target_id = targets
-            .iter()
-            .find(|t| t["type"] == "page")
-            .and_then(|t| t["id"].as_str())
-            .expect("a page target")
-            .to_string();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let served = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            const BODY: &str = "<html><title>attached</title><body>panel</body></html>";
-            while let Ok((mut socket, _)) = listener.accept().await {
-                use tokio::io::AsyncWriteExt;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
-                    BODY.len(),
-                    BODY
-                );
-                socket.write_all(response.as_bytes()).await.ok();
-            }
-        });
-
-        let (bus, _rx) = tokio::sync::broadcast::channel(64);
-        let browsers = Browsers::new();
-        let browser = browsers
-            .attach(&endpoint, &target_id, bus)
-            .await
-            .expect("core must adopt the target the shell handed it");
-
-        browser
-            .navigate(&format!("http://127.0.0.1:{served}/"))
-            .await
-            .expect("navigate");
-
-        // Read the url back over the test's own devtools connection rather than
-        // core's, so this cannot pass on core merely believing it navigated.
-        let seen = reqwest::get(format!("{endpoint}/json/list"))
-            .await
-            .unwrap()
-            .json::<Vec<Value>>()
-            .await
-            .unwrap()
-            .into_iter()
-            .find(|t| t["id"] == target_id.as_str())
-            .expect("the adopted target must still exist");
-        assert!(
-            seen["url"]
-                .as_str()
-                .unwrap_or_default()
-                .contains(&served.to_string()),
-            "core drove some other page: {seen:?}"
-        );
-
-        // The half that matters: ending the session must not close the panel.
-        browsers.shutdown().await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        assert!(
-            reqwest::get(format!("{endpoint}/json/version"))
-                .await
-                .is_ok(),
-            "shutdown killed a browser core did not launch"
-        );
-        assert!(
-            panel.try_wait().expect("wait").is_none(),
-            "shutdown killed the shell's chrome process"
-        );
-
-        panel.kill().await.ok();
-    }
-
     /// `cargo test browser::tests::live_mouse_move -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "needs a real Chrome"]

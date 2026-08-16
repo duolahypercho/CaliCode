@@ -212,6 +212,13 @@ const SEARCH_SECRET_PATTERNS: &[&str] =
 /// there) so an edit can never grow a file past what `file_write` allows.
 const EDIT_MAX_WRITE_BYTES: usize = 8 * 1024 * 1024;
 
+/// Where `plan_write` writes, relative to the active game's folder.
+///
+/// A constant rather than a parameter: this name is the whole reason plan mode
+/// can admit a writer at all, and a caller-supplied path would make it
+/// `file_write` wearing a different label.
+pub const PLAN_DOCUMENT: &str = "plan.md";
+
 /// Reserved only for the in-process agent activity bridge. Public RPC callers
 /// receive the normal tool result without this field; the agent removes it
 /// before appending the result to provider history and emits it separately on
@@ -541,7 +548,7 @@ async fn apply_file_edit_request(
         // same memory will differ too.
         result["matchedBy"] = json!(matched_by.label());
         result["note"] = json!(format!(
-            "old_string did not match the file exactly — it was located {}. The file's own              formatting is unchanged; re-read {rel} before your next edit to it.",
+            "old_string did not match the file exactly — it was located {}. The file's own formatting is unchanged; re-read {rel} before your next edit to it.",
             matched_by.label()
         ));
     }
@@ -778,6 +785,54 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             access: Access::Guarded,
         },
         ToolDef {
+            name: "plan_write".into(),
+            description: "Write the plan for this work to plan.md in the active game's folder. This is the one thing plan mode may write: everything else it can do is a read. Write the whole document each time — it replaces the file.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "slug":{"type":"string"},
+                    "content":{"type":"string","description":"the whole plan as markdown, starting with a # heading"}
+                },
+                "required":["slug","content"]
+            }),
+            kind: ToolKind::Core,
+            // Ungated for the same reason `project_checkpoint` and
+            // `test_baseline_save` are: it writes one known path, and what it
+            // writes is the agent's own account of what it intends to do —
+            // the document the user is about to read before allowing any of
+            // it. Prompting to approve the writing of a plan would be asking
+            // permission to ask permission. The staleness guard in the
+            // executor is what keeps it from overwriting a plan.md the user
+            // edited while it was thinking.
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "exit_plan_mode".into(),
+            description: "Present the finished plan and ask the user to approve leaving plan mode. Call this only when the plan is complete. If they approve, the session leaves plan mode and you may start work; if they do not, the call fails carrying what they want changed — revise and present again.".into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "plan":{"type":"string","description":"the plan as markdown, starting with a # heading"}
+                },
+                "required":["plan"]
+            }),
+            kind: ToolKind::Core,
+            // Never reaches `execute_core_tool`: `execute_tool_call`
+            // intercepts it, because leaving plan mode is a question for the
+            // user and an event for their client, and neither the approvals
+            // registry nor the session id is reachable from here.
+            //
+            // `ReadOnly` is the truthful answer to what `Access` actually
+            // asks — "must the user say yes before this runs in the ordinary
+            // modes". This one does not run in the ordinary modes at all: it
+            // errors outside plan mode, and inside it the interception asks
+            // the user unconditionally, without consulting this field.
+            // Marking it `Guarded` would have claimed a gate that no code
+            // reads, and put a tool that writes nothing into the destructive
+            // set.
+            access: Access::ReadOnly,
+        },
+        ToolDef {
             name: "tool_output_read".into(),
             description: "Read the rest of a tool result that was too large to return inline. Use the outputId from that result's notice. Pages by byte offset: pass each nextOffset back as offset until it is null.".into(),
             parameters: json!({
@@ -910,6 +965,96 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             access: Access::ReadOnly,
         },
         ToolDef {
+            name: "computer_targets".into(),
+            description: "List the processes computer use is allowed to drive. CaliCode may \
+                          only drive what it started itself — the dev server, the agent \
+                          browser, Blender — so this is the whole population of things you \
+                          can ask to control. Pass `pid` to ask whether one specific process \
+                          is drivable; a refusal names what is."
+                .into(),
+            parameters: json!({"type":"object","properties":{"pid":{"type":"integer","description":"Ask about this pid specifically."}}}),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "computer_doctor".into(),
+            description: "Check whether computer use can actually work: the two macOS grants \
+                          it needs, which process they attach to, whether a capture really \
+                          succeeds, and what is currently drivable. Call this first when a \
+                          computer_* tool behaves as though nothing happened — every failure \
+                          in this area is silent. The report carries a `fixes` list with the \
+                          exact Settings pane to open for anything missing; pass request=true \
+                          to raise the system prompts instead, after asking the user."
+                .into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "request":{"type":"boolean","description":"raise the macOS permission prompts for anything missing, instead of only reporting it. Ask the user before using this — it opens a modal dialog on their screen."}
+                }
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "computer_look".into(),
+            description: "Look at a window of a process CaliCode started, and get back a \
+                          description in words. Pass the `pid` from computer_targets, and \
+                          optionally `windowId` when that process owns more than one window. \
+                          This is how you see a native app the browser tools cannot reach — \
+                          an engine editor, Blender, a packaged build. It works on a window \
+                          that is behind another one, and it does not move the user's cursor \
+                          or change what is focused."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer", "description": "From computer_targets."},
+                    "windowId": {"type": "integer", "description": "Which window, when the process owns several."},
+                    "question": {"type": "string", "description": "What you want to know about what is on screen."}
+                },
+                "required": ["pid"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
+            name: "computer_type".into(),
+            description: "Type text into a process CaliCode started. Goes onto that app's own \
+                          event queue, so the user's cursor does not move and their focus does \
+                          not change. Note: an app reading raw HID input — a running game \
+                          built on Unity's Input System or Unreal's raw input — may not \
+                          receive this; editors do."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer", "description": "From computer_targets."},
+                    "text": {"type": "string", "description": "Literal text to type."}
+                },
+                "required": ["pid", "text"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
+            name: "computer_key".into(),
+            description: "Press a named key in a process CaliCode started: return, tab, space, \
+                          delete, escape, or an arrow. Optional `modifiers` of cmd, shift, alt, \
+                          ctrl. For literal text use computer_type instead."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pid": {"type": "integer", "description": "From computer_targets."},
+                    "key": {"type": "string", "description": "return, tab, space, delete, escape, up, down, left, right."},
+                    "modifiers": {"type": "array", "items": {"type": "string"}, "description": "cmd, shift, alt, ctrl."}
+                },
+                "required": ["pid", "key"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
             name: "model_list".into(),
             description: "List configured model providers and the active model.".into(),
             parameters: json!({"type":"object","properties":{}}),
@@ -964,9 +1109,9 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                     "sources": {"type": "array", "items": {"type": "string",
                                 "enum": ["local", "library", "polyhaven"]},
                                 "description": "default: all three"},
-                    "types":   {"type": "array", "items": {"type": "string"},
+                    "types": {"type": "array", "items": {"type": "string"},
                                 "description": "filter by kind: cali, image, gltf, model, texture, hdri"},
-                    "limit":   {"type": "integer", "minimum": 1, "maximum": 50}
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50}
                 },
                 "required": ["query"]
             }),
@@ -979,10 +1124,10 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "slug":    {"type": "string"},
+                    "slug": {"type": "string"},
                     "source":  {"type": "string", "enum": ["local", "library", "polyhaven"]},
-                    "id":      {"type": "string"},
-                    "name":    {"type": "string", "description": "override display name"},
+                    "id": {"type": "string"},
+                    "name": {"type": "string", "description": "override display name"},
                     "options": {"type": "object", "description": "polyhaven: {resolution: '1k'|'2k'|'4k'}"}
                 },
                 "required": ["slug", "source", "id"]
@@ -996,16 +1141,38 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "slug":       {"type": "string"},
-                    "name":       {"type": "string"},
-                    "image":      {"type": "string", "description": "base64 or data URI; omit when assetId is given"},
-                    "assetId":    {"type": "string", "description": "existing image/cali asset to use as source"},
-                    "mode":       {"type": "string", "enum": ["extrude", "heightfield", "lathe"], "default": "extrude"},
-                    "depth":      {"type": "number", "description": "extrusion depth / relief height in world units; omit for auto"},
+                    "slug": {"type": "string"},
+                    "name": {"type": "string"},
+                    "image": {"type": "string", "description": "base64 or data URI; omit when assetId is given"},
+                    "assetId": {"type": "string", "description": "existing image/cali asset to use as source"},
+                    "mode": {"type": "string", "enum": ["extrude", "heightfield", "lathe"], "default": "extrude"},
+                    "depth": {"type": "number", "description": "extrusion depth / relief height in world units; omit for auto"},
                     "resolution": {"type": "integer", "minimum": 8, "maximum": 192},
                     "targetSize": {"type": "number", "default": 1.6}
                 },
                 "required": ["slug", "name"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
+            name: "image_look".into(),
+            description: "Look at an image the project already has on disk and get back a \
+                          description in words. This is how you read a recording: \
+                          browser_play with recordFrames writes a contact sheet, and this is \
+                          what lets you actually see it. Also works on saved screenshots and \
+                          baselines. The sheet's sibling manifest holds the numbers — read \
+                          that with file_read when you want measured motion rather than an \
+                          impression."
+                .into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "slug": {"type": "string"},
+                    "path": {"type": "string", "description": "project-relative path, e.g. the pngPath browser_play returned"},
+                    "question": {"type": "string", "description": "what you want to know about it"}
+                },
+                "required": ["slug", "path"]
             }),
             kind: ToolKind::Core,
             access: Access::Guarded,
@@ -1016,7 +1183,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "slug":   {"type": "string"},
+                    "slug": {"type": "string"},
                     "assetId":{"type": "string", "description": "generated image-to-3D asset to review"},
                     "image":  {"type": "string", "description": "base64 or data URI screenshot of the reconstruction"},
                     "passId": {"type": "string", "description": "build pass being reviewed, e.g. blockout"}
@@ -1362,7 +1529,9 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                           aiming while advancing is impossible with it. Keys are held for \
                           holdMs while the mouse look is spread across that same time, then \
                           every key is released. Example: keys ['w','a'], holdMs 900, dx 150 \
-                          runs forward-left while turning right."
+                          runs forward-left while turning right. Add recordFrames with a slug \
+                          and label to capture the action as a contact sheet you can then \
+                          review — a screenshot afterwards only shows standing still."
                 .into(),
             parameters: json!({
                 "type":"object",
@@ -1371,7 +1540,10 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
                     "holdMs":{"type":"integer","description":"how long to hold them, up to 10000 (default 500)"},
                     "dx":{"type":"number","description":"horizontal look during the hold; positive turns right"},
                     "dy":{"type":"number","description":"vertical look during the hold; positive looks down"},
-                    "steps":{"type":"integer","description":"mousemove events to spread the look across (default 10)"}
+                    "steps":{"type":"integer","description":"mousemove events to spread the look across (default 10)"},
+                    "recordFrames":{"type":"integer","description":"capture this many frames during the action (2-32) to see what happened; needs slug and label"},
+                    "slug":{"type":"string","description":"project to persist the recording under"},
+                    "label":{"type":"string","description":"evidence name, e.g. jump-over-gap-take-3"}
                 }
             }),
             kind: ToolKind::Core,
@@ -1505,6 +1677,82 @@ pub async fn execute_core_tool(
 /// The activity bridge is deliberately opt-in: public RPC calls must keep
 /// returning the stable tool contract, while agent calls may carry a bounded
 /// before/after preview out-of-band for the activity timeline.
+/// Turn a run of frames into a persisted contact sheet with motion metrics.
+///
+/// Shared by `video_contact_sheet`, where the caller supplies the frames, and
+/// `browser_play`, which records its own while the game is being driven. The
+/// frames never travel back through the conversation in either case — a dozen
+/// base64 JPEGs would swamp it — so what both return is a path and a
+/// measurement.
+async fn build_contact_sheet(
+    root: &Path,
+    slug: &str,
+    label: String,
+    frames: &[Value],
+    args: &Value,
+) -> Result<Value> {
+    if !(2..=video_analysis::MAX_FRAMES).contains(&frames.len()) {
+        anyhow::bail!(
+            "frames must contain between 2 and {} images",
+            video_analysis::MAX_FRAMES
+        );
+    }
+    let frames = frames
+        .iter()
+        .map(|frame| {
+            let bytes = baselines::decode_image_base64(required_str(frame, "image")?)?;
+            let timestamp_seconds = frame["timestampSeconds"]
+                .as_f64()
+                .ok_or_else(|| anyhow::anyhow!("timestampSeconds must be a number"))?;
+            let frame_number = frame["frameNumber"]
+                .as_u64()
+                .and_then(|value| u32::try_from(value).ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| anyhow::anyhow!("frameNumber must be a positive integer"))?;
+            Ok(video_analysis::VideoFrame {
+                bytes,
+                timestamp_seconds,
+                frame_number,
+                caption: frame
+                    .get("caption")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let config = video_analysis::ContactSheetConfig {
+        tile_width: args["tileWidth"]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(video_analysis::DEFAULT_TILE_WIDTH),
+        columns: args["columns"]
+            .as_u64()
+            .and_then(|value| u32::try_from(value).ok()),
+        ..video_analysis::ContactSheetConfig::default()
+    };
+    let reports = store::project_dir(root, slug)?
+        .join("reports")
+        .join("video");
+    let frame_count = frames.len();
+    let persisted = tokio::task::spawn_blocking(move || {
+        video_analysis::persist_report(&reports, &label, &frames, &config)
+    })
+    .await??;
+    let project_dir = store::project_dir(root, slug)?;
+    let relative = |path: &Path| {
+        path.strip_prefix(&project_dir)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    };
+    Ok(json!({
+        "pngPath": relative(&persisted.png_path),
+        "manifestPath": relative(&persisted.manifest_path),
+        "pngBytes": persisted.png_bytes,
+        "frames": frame_count,
+    }))
+}
+
 pub(crate) async fn execute_core_tool_with_activity(
     tool: &ToolDef,
     args: &Value,
@@ -1634,6 +1882,47 @@ pub(crate) async fn execute_core_tool_with_activity(
             } else {
                 Ok(result)
             }
+        }
+        // Reachable only if something dispatched it directly, which is a bug:
+        // the agent loop intercepts this name before the dispatch table. It
+        // fails loudly rather than being absent, so a future caller that skips
+        // the interception gets an error instead of a silent no-op that the
+        // model would read as "the plan was approved".
+        "exit_plan_mode" => anyhow::bail!(
+            "exit_plan_mode is answered by the agent loop, not the tool table — it cannot be \
+             dispatched directly"
+        ),
+        // The one write plan mode allows. The path is a constant rather than
+        // an argument: a `path` parameter would make this `file_write` under
+        // another name, and plan mode's whitelist would then be admitting an
+        // arbitrary writer.
+        "plan_write" => {
+            let base = game_file_base(root, required_str(args, "slug")?, workspace_override)?;
+            let content = required_str(args, "content")?;
+            let path = resolve_in_base(&base, PLAN_DOCUMENT)?;
+            let _write_lock = crate::pathlock::write_lock(&path).await;
+            // Same reasoning as `file_write`: this replaces the whole file,
+            // and a plan.md that moved since the agent last read it is
+            // somebody's work about to vanish. The usual case — a file the
+            // agent has never read because it does not exist yet — is not
+            // stale, so a first plan writes without ceremony.
+            if crate::staleness::changed_since_seen(&path) {
+                anyhow::bail!(
+                    "{PLAN_DOCUMENT} changed since you last read it. Read it again and write the \
+                     plan from what is there now, so an edit made while you were thinking is not \
+                     thrown away."
+                );
+            }
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, content)?;
+            crate::staleness::remember(&path);
+            Ok(json!({
+                "path": PLAN_DOCUMENT,
+                "written": true,
+                "bytes": content.len(),
+            }))
         }
         // Reads nothing but core's own spill directory, addressed by id rather
         // than by path — the model never names a filesystem location here, so
@@ -1851,6 +2140,66 @@ pub(crate) async fn execute_core_tool_with_activity(
             .await??;
             crate::image3d::generate_mesh_asset(root, &slug, &name, &hash, &mesh)
         }
+        "image_look" => {
+            let slug = required_str(args, "slug")?;
+            let rel = required_str(args, "path")?;
+            let path = store::safe_join(&store::project_dir(root, slug)?, rel)?;
+            let bytes = std::fs::read(&path)
+                .with_context(|| format!("cannot read {rel} in project {slug}"))?;
+            let mime = match path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(str::to_ascii_lowercase)
+                .as_deref()
+            {
+                Some("png") => "image/png",
+                Some("jpg" | "jpeg") => "image/jpeg",
+                Some("webp") => "image/webp",
+                other => anyhow::bail!(
+                    "{rel} is a {} file; image_look reads png, jpeg or webp",
+                    other.unwrap_or("typeless")
+                ),
+            };
+            let encoded = {
+                use base64::Engine;
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            };
+            let question = args["question"]
+                .as_str()
+                .map(str::trim)
+                .filter(|question| !question.is_empty())
+                .unwrap_or(
+                    "Describe what this shows. If it is a sequence of frames, say what changes \
+                     across them and in what order.",
+                );
+            // Same shape as `browser_look`: tool results are text, so the image
+            // goes to a vision model here and its words are what the agent
+            // reads. A provider without vision degrades to a clear refusal
+            // rather than a confident guess about a picture it never saw.
+            let message = json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": format!(
+                        "You are looking at an image from a game project ({rel}). If it is a \
+                         contact sheet, the tiles are consecutive frames in time order and are \
+                         labelled.\n\nQuestion: {question}"
+                    ) },
+                    { "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{encoded}") } }
+                ]
+            });
+            match crate::model::chat(&config, &[message], None, None).await {
+                Ok(result) => Ok(json!({
+                    "answer": result.content,
+                    "path": rel,
+                    "model": config.model.default,
+                })),
+                Err(error) => Ok(json!({
+                    "error": format!("vision review unavailable: {error}"),
+                    "hint": "the active model may not accept images; the sibling manifest has \
+                             measured motion that reads as text",
+                })),
+            }
+        }
         "image3d_review" => {
             crate::image3d::review(
                 root,
@@ -1904,66 +2253,7 @@ pub(crate) async fn execute_core_tool_with_activity(
             let frames = args["frames"]
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("frames must be an array"))?;
-            if !(2..=video_analysis::MAX_FRAMES).contains(&frames.len()) {
-                anyhow::bail!(
-                    "frames must contain between 2 and {} images",
-                    video_analysis::MAX_FRAMES
-                );
-            }
-            let frames = frames
-                .iter()
-                .map(|frame| {
-                    let bytes = baselines::decode_image_base64(required_str(frame, "image")?)?;
-                    let timestamp_seconds = frame["timestampSeconds"]
-                        .as_f64()
-                        .ok_or_else(|| anyhow::anyhow!("timestampSeconds must be a number"))?;
-                    let frame_number = frame["frameNumber"]
-                        .as_u64()
-                        .and_then(|value| u32::try_from(value).ok())
-                        .filter(|value| *value > 0)
-                        .ok_or_else(|| anyhow::anyhow!("frameNumber must be a positive integer"))?;
-                    Ok(video_analysis::VideoFrame {
-                        bytes,
-                        timestamp_seconds,
-                        frame_number,
-                        caption: frame
-                            .get("caption")
-                            .and_then(Value::as_str)
-                            .map(str::to_string),
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let config = video_analysis::ContactSheetConfig {
-                tile_width: args["tileWidth"]
-                    .as_u64()
-                    .and_then(|value| u32::try_from(value).ok())
-                    .unwrap_or(video_analysis::DEFAULT_TILE_WIDTH),
-                columns: args["columns"]
-                    .as_u64()
-                    .and_then(|value| u32::try_from(value).ok()),
-                ..video_analysis::ContactSheetConfig::default()
-            };
-            let reports = store::project_dir(root, slug)?
-                .join("reports")
-                .join("video");
-            let frame_count = frames.len();
-            let persisted = tokio::task::spawn_blocking(move || {
-                video_analysis::persist_report(&reports, &label, &frames, &config)
-            })
-            .await??;
-            let project_dir = store::project_dir(root, slug)?;
-            let relative = |path: &Path| {
-                path.strip_prefix(&project_dir)
-                    .unwrap_or(path)
-                    .to_string_lossy()
-                    .to_string()
-            };
-            Ok(json!({
-                "pngPath": relative(&persisted.png_path),
-                "manifestPath": relative(&persisted.manifest_path),
-                "pngBytes": persisted.png_bytes,
-                "frames": frame_count,
-            }))
+            build_contact_sheet(root, slug, label, frames, args).await
         }
         "capture_persist" => {
             let slug = required_str(args, "slug")?;
@@ -2056,8 +2346,30 @@ pub(crate) async fn execute_core_tool_with_activity(
             let dx = args["dx"].as_f64().unwrap_or(0.0);
             let dy = args["dy"].as_f64().unwrap_or(0.0);
             let steps = args["steps"].as_u64().unwrap_or(10) as u32;
+            let record = args["recordFrames"].as_u64().unwrap_or(0) as u32;
             let browser = state.browsers.ensure(state.bus.clone()).await?;
-            browser.play(&keys, hold_ms, dx, dy, steps).await
+            let mut played = browser.play(&keys, hold_ms, dx, dy, steps, record).await?;
+
+            // Frames are turned into a sheet here and dropped: handing a dozen
+            // base64 JPEGs back to the model would cost more context than the
+            // whole rest of the turn, and it could not look at them anyway.
+            let recorded = played["frames"].take();
+            let recorded = recorded.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            played["frames"] = json!(recorded.len());
+            if recorded.len() >= 2 {
+                match (args["slug"].as_str(), args["label"].as_str()) {
+                    (Some(slug), Some(label)) => {
+                        played["contactSheet"] =
+                            build_contact_sheet(root, slug, label.to_string(), recorded, args)
+                                .await?;
+                    }
+                    _ => {
+                        played["recordingSkipped"] =
+                            json!("pass slug and label to persist the frames as a contact sheet");
+                    }
+                }
+            }
+            Ok(played)
         }
         "browser_mouse_move" => {
             let dx = args["dx"].as_f64().unwrap_or(0.0);
@@ -2247,6 +2559,42 @@ pub(crate) async fn execute_core_tool_with_activity(
             required_str(args, "image")?,
         )?),
         "image3d_validate" => Ok(image3d::validate_spec(&args["spec"])?),
+        "computer_targets" => crate::computer::targets_tool(args),
+        "computer_doctor" => crate::computer::doctor_tool(args),
+        "computer_type" => crate::computer::type_tool(args),
+        "computer_key" => crate::computer::key_tool(args),
+        "computer_look" => {
+            let (data_url, label) = crate::computer::look(args)?;
+            let question = args["question"]
+                .as_str()
+                .map(str::trim)
+                .filter(|question| !question.is_empty())
+                .unwrap_or("Describe what is on screen and what can be done with it.");
+            // Same shape as `browser_look`: tool results are text, so the frame
+            // goes to a vision model here and its words are what the agent reads.
+            let message = json!({
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": format!(
+                        "You are looking at a screenshot of a native application window an \
+                         agent is driving ({label}). Answer concretely and briefly.\n\n\
+                         Question: {question}"
+                    ) },
+                    { "type": "image_url", "image_url": { "url": data_url } }
+                ]
+            });
+            match crate::model::chat(&config, &[message], None, None).await {
+                Ok(result) => Ok(json!({
+                    "answer": result.content,
+                    "window": label,
+                    "model": config.model.default,
+                })),
+                Err(error) => Ok(json!({
+                    "error": format!("vision review unavailable: {error}"),
+                    "hint": "the active model may not accept images",
+                })),
+            }
+        }
         "model_list" => Ok(model_list(&config)?),
         "model_switch" => {
             drop(config);
@@ -2304,6 +2652,10 @@ pub struct SpawnParent {
     pub permission_mode: String,
     /// The parent's per-turn reasoning effort; children inherit it verbatim.
     pub reasoning_effort: Option<String>,
+    /// The parent's guardian model. Inherited for the same reason the
+    /// permission mode is: a child that reviewed its calls on a different
+    /// model — or on none — would be a way to spawn past the parent's review.
+    pub guardian_model: Option<String>,
     /// Root ancestor session id — `agent.approval_request` events for the
     /// child (and its descendants) are emitted under this id.
     pub approval_session: String,
@@ -2620,6 +2972,9 @@ async fn spawn_subagent_with(
             .as_ref()
             .and_then(|parent| parent.reasoning_effort.clone())
             .or(explicit_reasoning_effort),
+        guardian_model: parent
+            .as_ref()
+            .and_then(|parent| parent.guardian_model.clone()),
         loop_id: None,
         system: Some(system),
         model_roles: model_role_candidates(internal_binding.is_some(), args, role),
@@ -2993,6 +3348,308 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn plan_write_writes_the_plan_document_and_only_that() {
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|def| def.name == "plan_write")
+            .expect("plan_write must be registered");
+        // Ungated on purpose: it writes the document the user is about to
+        // read before allowing anything else. Prompting to approve the
+        // writing of a plan is asking permission to ask permission.
+        assert_eq!(def.access, Access::ReadOnly);
+        // The path is not a parameter. A `path` here would make this
+        // `file_write` under another name, and plan mode's whitelist would be
+        // admitting an arbitrary writer.
+        let properties = def.parameters["properties"].as_object().unwrap();
+        assert!(!properties.contains_key("path"));
+
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        crate::store::create_project(root.path(), "demo", "Demo").unwrap();
+        let out = execute_core_tool(
+            &def,
+            &json!({ "slug": "demo", "content": "# Plan\n\n1. read main.js\n" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .expect("plan_write must dispatch");
+        assert_eq!(out["path"], json!(PLAN_DOCUMENT));
+        let written =
+            std::fs::read_to_string(root.path().join("demo").join(PLAN_DOCUMENT)).unwrap();
+        assert!(written.starts_with("# Plan"));
+    }
+
+    #[tokio::test]
+    async fn plan_write_refuses_to_overwrite_a_plan_that_moved_underneath_it() {
+        // Same guard as `file_write`, for the same reason: this replaces the
+        // whole file, so a plan.md edited while the agent was thinking would
+        // vanish without either of them noticing.
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|def| def.name == "plan_write")
+            .unwrap();
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        crate::store::create_project(root.path(), "demo", "Demo").unwrap();
+        let path = root.path().join("demo").join(PLAN_DOCUMENT);
+
+        execute_core_tool(
+            &def,
+            &json!({ "slug": "demo", "content": "# One" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .unwrap();
+        // Somebody else edits it.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&path, "# Theirs").unwrap();
+
+        let error = execute_core_tool(
+            &def,
+            &json!({ "slug": "demo", "content": "# Two" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .expect_err("a plan that moved must not be silently replaced");
+        assert!(error.to_string().contains(PLAN_DOCUMENT), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "# Theirs");
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_cannot_be_dispatched_through_the_tool_table() {
+        // It is answered by the agent loop, which is where the approvals
+        // registry and the session id are. A silent no-op here would be read
+        // by the model as "the plan was approved".
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|def| def.name == "exit_plan_mode")
+            .expect("exit_plan_mode must be registered");
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let error = execute_core_tool(
+            &def,
+            &json!({ "plan": "# Plan" }),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .expect_err("direct dispatch must fail loudly");
+        assert!(error.to_string().contains("agent loop"), "{error}");
+    }
+
+    /// The whole loop, once, through the tools a model actually calls.
+    ///
+    /// Every other test here proves one primitive. This proves they compose:
+    /// open a page with a canvas that moves when a key is held, drive it with
+    /// `browser_play` while recording, and end with a real contact sheet and a
+    /// real motion manifest on disk. If any link is wrong — the keycode, the
+    /// frame timing, the sheet path, the project boundary — this is where it
+    /// shows, and nowhere earlier.
+    ///
+    /// `cargo test tools::tests::live_play_a_game -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a real Chrome"]
+    async fn live_play_a_game_end_to_end() {
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        crate::store::create_project(root.path(), "demo", "Demo").unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            // A canvas that only moves while a key is held — so a frame that
+            // shows movement is evidence the key actually arrived.
+            const BODY: &str = "<html><body style='margin:0'>\
+              <canvas id=c width=640 height=400></canvas><script>\
+              const x0=20;let x=x0,held=false;const g=document.getElementById('c').getContext('2d');\
+              addEventListener('keydown',e=>{if(e.code==='KeyW')held=true});\
+              addEventListener('keyup',e=>{if(e.code==='KeyW')held=false});\
+              (function f(){if(held)x+=4;g.fillStyle='#111';g.fillRect(0,0,640,400);\
+              g.fillStyle='#0f0';g.fillRect(x,180,40,40);window.__x=x;\
+              requestAnimationFrame(f)})();</script></body></html>";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                    BODY.len(),
+                    BODY
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        let call = |name: &str, args: Value| {
+            let def = core_tool_defs()
+                .into_iter()
+                .find(|def| def.name == name)
+                .unwrap_or_else(|| panic!("{name} must be registered"));
+            let state = state.clone();
+            let root = root.path().to_path_buf();
+            async move { execute_core_tool(&def, &args, &state, &root, None).await }
+        };
+
+        call(
+            "browser_navigate",
+            json!({ "url": format!("http://127.0.0.1:{port}/") }),
+        )
+        .await
+        .expect("navigate");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        let played = call(
+            "browser_play",
+            json!({
+                "keys": ["w"], "holdMs": 900, "dx": 120, "steps": 8,
+                "recordFrames": 4, "slug": "demo", "label": "walk-right"
+            }),
+        )
+        .await
+        .expect("browser_play must run");
+        println!("played: {played}");
+
+        // The game moved, which means the held key reached it.
+        let moved = call("browser_eval", json!({ "expression": "window.__x" }))
+            .await
+            .expect("read game state");
+        println!("character x: {moved}");
+
+        let sheet = &played["contactSheet"];
+        let png = sheet["pngPath"].as_str().expect("a sheet must be written");
+        let manifest = sheet["manifestPath"].as_str().expect("a manifest too");
+        let project = crate::store::project_dir(root.path(), "demo").unwrap();
+        assert!(
+            project.join(png).exists(),
+            "the contact sheet must exist on disk at {png}"
+        );
+
+        let report: Value =
+            serde_json::from_str(&std::fs::read_to_string(project.join(manifest)).unwrap())
+                .expect("manifest must be json");
+        let motion = report["motion"].as_array().expect("motion metrics");
+        println!("motion edges: {}", motion.len());
+        assert!(
+            !motion.is_empty(),
+            "the manifest must carry measured motion, not just tiles"
+        );
+        assert!(
+            motion
+                .iter()
+                .any(|edge| edge["mean_abs_luma_delta"].as_f64().unwrap_or(0.0) > 0.0),
+            "something must have changed between frames: {report}"
+        );
+
+        state.browsers.shutdown().await;
+    }
+
+    /// A recording is only useful if something can read it back, and the sheet
+    /// is written into the project rather than handed to the model — so the
+    /// path is attacker-shaped input and gets the same treatment as any other.
+    #[tokio::test]
+    async fn image_look_refuses_a_path_outside_the_project() {
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|def| def.name == "image_look")
+            .expect("image_look must be registered");
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        crate::store::create_project(root.path(), "demo", "Demo").unwrap();
+
+        let error = execute_core_tool(
+            &def,
+            &json!({"slug": "demo", "path": "../../../etc/passwd"}),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .expect_err("a traversal must be refused");
+        assert!(
+            !error.to_string().contains("vision"),
+            "it must fail on the path, not by reaching a model: {error}"
+        );
+    }
+
+    /// The failure a model will actually hit: pointing this at the manifest
+    /// instead of the sheet. Saying which extensions work turns a dead end into
+    /// a correction.
+    #[tokio::test]
+    async fn image_look_names_the_formats_it_reads() {
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|def| def.name == "image_look")
+            .expect("image_look must be registered");
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let project = crate::store::create_project(root.path(), "demo", "Demo").unwrap();
+        let _ = project;
+        let dir = crate::store::project_dir(root.path(), "demo").unwrap();
+        std::fs::write(dir.join("motion.json"), b"{}").unwrap();
+
+        let error = execute_core_tool(
+            &def,
+            &json!({"slug": "demo", "path": "motion.json"}),
+            &state,
+            root.path(),
+            None,
+        )
+        .await
+        .expect_err("a json manifest is not an image");
+        assert!(
+            error.to_string().contains("png"),
+            "the refusal must say what it can read: {error}"
+        );
+    }
+
+    /// `computer_targets` is the whole computer-use surface today, and the one
+    /// answer that must already be trustworthy: it is how the model learns what
+    /// attach scoping will let it drive. Read-only on purpose — a listing that
+    /// asked for approval would be asked every turn and waved through.
+    #[tokio::test]
+    async fn computer_targets_is_registered_and_dispatches() {
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|def| def.name == "computer_targets")
+            .expect("computer_targets must be registered");
+        assert_eq!(def.access, Access::ReadOnly);
+
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let out = execute_core_tool(&def, &json!({}), &state, root.path(), None)
+            .await
+            .expect("listing must dispatch and succeed");
+        assert!(out["targets"].is_array(), "got {out}");
+    }
+
+    /// The invariant, exercised through the tool path a model actually takes.
+    /// Pid 1 is launchd: alive, real, and emphatically not ours.
+    #[tokio::test]
+    async fn computer_targets_refuses_a_pid_core_did_not_spawn() {
+        let def = core_tool_defs()
+            .into_iter()
+            .find(|def| def.name == "computer_targets")
+            .expect("computer_targets must be registered");
+
+        let state = mock_state("127.0.0.1:1".parse().unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let error = execute_core_tool(&def, &json!({"pid": 1}), &state, root.path(), None)
+            .await
+            .expect_err("a pid core did not spawn must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("only drive processes CaliCode started"),
+            "the refusal must state the rule, got: {error}"
+        );
+    }
+
     /// The browser's surface, as the model sees it.
     #[test]
     fn browser_tools_are_registered_with_usable_schemas() {
@@ -3360,6 +4017,7 @@ mod tests {
             SpawnParent {
                 permission_mode: "supervised".into(),
                 reasoning_effort: None,
+                guardian_model: None,
                 approval_session: "session-parent".into(),
                 owner_session: None,
                 owner_graph: None,
@@ -3382,6 +4040,7 @@ mod tests {
             SpawnParent {
                 permission_mode: "auto".into(),
                 reasoning_effort: None,
+                guardian_model: None,
                 approval_session: "session-parent".into(),
                 owner_session: None,
                 owner_graph: None,
@@ -3414,6 +4073,7 @@ mod tests {
             SpawnParent {
                 permission_mode: "auto".into(),
                 reasoning_effort: Some("max".into()),
+                guardian_model: None,
                 approval_session: "session-parent".into(),
                 owner_session: None,
                 owner_graph: None,
@@ -3525,6 +4185,7 @@ mod tests {
             SpawnParent {
                 permission_mode: "full-access".into(),
                 reasoning_effort: None,
+                guardian_model: None,
                 approval_session: "session-root".into(),
                 owner_session: None,
                 owner_graph: None,
@@ -3799,7 +4460,7 @@ mod tests {
         // refusal, a re-read, and another turn.
         std::fs::write(
             folder.path().join("enemy.js"),
-            "class Enemy {\n        step() {   \n            this.x += 1;\n        }\n}\n",
+            "class Enemy {\n step() { \n this.x += 1;\n }\n}\n",
         )
         .unwrap();
 
@@ -3807,8 +4468,8 @@ mod tests {
             root.path(),
             "demo",
             "enemy.js",
-            "step() {\n    this.x += 1;\n}",
-            "step() {\n    this.x += 2;\n}",
+            "step() {\n this.x += 1;\n}",
+            "step() {\n this.x += 2;\n}",
             false,
         )
         .await

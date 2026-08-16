@@ -1174,14 +1174,25 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                     agent_permission_rules(&config.permissions),
                 )
             };
+            let permission_mode = params
+                .get("permissionMode")
+                .and_then(|v| v.as_str())
+                .unwrap_or(crate::agent::DEFAULT_PERMISSION_MODE)
+                .to_string();
             let system = params
                 .get("system")
                 .and_then(|v| v.as_str())
                 .map(String::from)
                 .or_else(|| {
-                    project_slug
-                        .as_deref()
-                        .map(|slug| default_system_prompt(state, slug, &skills_cfg, &registered))
+                    project_slug.as_deref().map(|slug| {
+                        let mut prompt =
+                            default_system_prompt(state, slug, &skills_cfg, &registered);
+                        // Appended last so the static body stays a shared
+                        // prompt-cache prefix: switching modes mid-session
+                        // invalidates this tail and nothing above it.
+                        prompt.push_str(permission_mode_prompt(&permission_mode));
+                        prompt
+                    })
                 });
             let options = AgentOptions {
                 // Fail closed on an omitted mode. `requires_approval` already
@@ -1191,11 +1202,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 // always sends one, so the only callers reaching this line are
                 // scripts and outside MCP clients, which is exactly the set
                 // that should not silently get full access.
-                permission_mode: params
-                    .get("permissionMode")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(crate::agent::DEFAULT_PERMISSION_MODE)
-                    .to_string(),
+                permission_mode: permission_mode.clone(),
                 max_turns: params
                     .get("maxTurns")
                     .and_then(|v| v.as_u64())
@@ -1210,6 +1217,17 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                     .and_then(|v| v.as_u64())
                     .filter(|value| *value > 0)
                     .map(|value| value.min(u64::from(u32::MAX)) as u32),
+                // Which model reviews calls in `auto`. Arrives with the turn
+                // for the same reason `contextLength` does: the catalogue is
+                // the client's, and a model name literal in core is the stale
+                // list AGENTS.md exists to keep out. Absent falls back to
+                // `approvals.guardian_model`, then to the session's model.
+                guardian_model: params
+                    .get("guardianModel")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+                    .map(str::to_string),
                 final_response_drain: params
                     .get("finalResponseDrain")
                     .and_then(Value::as_bool)
@@ -1791,6 +1809,40 @@ fn mcp_tools_block(registered: &std::collections::HashMap<String, ToolDef>) -> S
 /// The production default system prompt: reference bar, tiered escalation,
 /// decompose -> fan out -> judge blind -> iterate, grounded in this project's
 /// digest, live tool set, templates, and skills.
+/// What the session's permission mode means, in the model's own terms.
+///
+/// Only the two modes where the model has something to *do* about the setting
+/// say anything. Manual and Full access are facts about the user's console,
+/// not instructions — telling a model "everything you call will be approved"
+/// is an invitation, and telling it "everything will be asked" invites it to
+/// batch or apologise. Both get nothing, which also keeps them on the same
+/// prompt-cache prefix as each other.
+fn permission_mode_prompt(mode: &str) -> &'static str {
+    match mode {
+        "auto" => AUTO_MODE_PROMPT,
+        "plan" => PLAN_MODE_PROMPT,
+        _ => "",
+    }
+}
+
+const AUTO_MODE_PROMPT: &str = "\n\n## Permissions: Auto\n\
+The user is not approving each call. Ordinary work runs; an automatic reviewer reads the rest against what they asked for, and only what it stops reaches them.\n\
+\n\
+Guarded tools take an optional `ask_user` argument. Set it when *you* judge that a specific call is one they would want to see first — it goes beyond what they asked for, it is hard to undo, it spends their money, it acts outside this machine, or they said they wanted to be asked. The value is the question they see, short and in their terms.\n\
+\n\
+Do not set it on ordinary work. Every unnecessary prompt makes the next one less likely to be read. Do not narrate the permission system either: act, and let the card do the asking.\n\
+\n\
+If a call is refused by the reviewer, do not retry a variant of it. Say what you were trying to do and let the user decide.";
+
+const PLAN_MODE_PROMPT: &str = "\n\n## Permissions: Plan\n\
+You are planning, not building. Every tool that changes anything is unavailable, and will stay unavailable until the user approves a plan.\n\
+\n\
+Read whatever you need — files, the scene, the web. Then write the plan with `plan_write`, which is the one thing you may write, and present it with `exit_plan_mode`.\n\
+\n\
+Write the plan you would want to be handed: what you understand the goal to be, what you found while reading, what you will change and in what order, and what you are unsure about. Name real files and real functions. A plan the user cannot check against the code is not a plan they can approve.\n\
+\n\
+If they ask for changes, revise and present again. Do not describe the change as though you made it.";
+
 fn default_system_prompt(
     state: &AppState,
     slug: &str,
@@ -2297,6 +2349,8 @@ mod tests {
                         asking_session: "session-1",
                         tool: "file_write",
                         arguments: json!({ "path": "a.txt" }),
+                        reason: None,
+                        reason_source: None,
                     })
                     .await
             }));
@@ -2350,6 +2404,8 @@ mod tests {
                         asking_session: "session-1",
                         tool: "file_write",
                         arguments: json!({ "path": "a.txt" }),
+                        reason: None,
+                        reason_source: None,
                     })
                     .await
             })
@@ -3033,6 +3089,31 @@ mod tests {
                 access: crate::tools::Access::Guarded,
             },
         )])
+    }
+
+    #[test]
+    fn only_the_two_actionable_modes_add_prompt_text() {
+        // Manual and Full access are facts about the user's console, not
+        // instructions. Sharing the empty tail also keeps them on one
+        // prompt-cache prefix.
+        assert_eq!(permission_mode_prompt("supervised"), "");
+        assert_eq!(permission_mode_prompt("full-access"), "");
+        assert_eq!(permission_mode_prompt("auto-accept-edits"), "");
+        assert_eq!(permission_mode_prompt("not-a-mode"), "");
+        assert!(permission_mode_prompt("auto").contains("ask_user"));
+        assert!(permission_mode_prompt("plan").contains("plan_write"));
+        assert!(permission_mode_prompt("plan").contains("exit_plan_mode"));
+    }
+
+    #[test]
+    fn the_mode_section_never_promises_a_gate_the_mode_does_not_have() {
+        // Auto's text must not tell the model its calls are approved, and
+        // plan's must not suggest a way out other than the exit tool.
+        let auto = permission_mode_prompt("auto");
+        assert!(!auto.to_lowercase().contains("without review"));
+        assert!(auto.contains("automatic reviewer"));
+        let plan = permission_mode_prompt("plan");
+        assert!(plan.contains("until the user approves"));
     }
 
     #[test]

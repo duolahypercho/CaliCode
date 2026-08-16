@@ -3272,6 +3272,9 @@ async fn spawn_critic_with_frames(
         context_length: None,
         final_response_drain: true,
         reasoning_effort: graph.reasoning_effort.clone(),
+        // The judge runs `full-access`, so no call is ever routed to the
+        // guardian and the model it would have used is moot.
+        guardian_model: None,
         system: Some(system),
         // `judge` and `monitor` are the engine's own reserved role keys: they
         // are not plan-authored node roles, so a user routing the judge to a
@@ -7586,6 +7589,8 @@ mod tests {
                         asking_session: "session-node",
                         tool: "file_write",
                         arguments: json!({}),
+                        reason: None,
+                        reason_source: None,
                     })
                     .await
             })

@@ -29,6 +29,16 @@ tracing-subscriber = "0.3"
 unicode-normalization = "0.1.25"
 uuid = { version = "1", features = ["v4"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Window enumeration for computer use. CGWindowListCopyWindowInfo is pure C and
+# synchronous; the ScreenCaptureKit wrapper crates build and link Swift, which
+# would drag a third language into a Rust + TypeScript repo for one call.
+core-graphics = { version = "0.24", features = ["highsierra"] }  # highsierra: CGEvent::new_scroll_event
+core-foundation = "0.10"
+# For ForeignType::as_ptr on CGEvent, to hand a raw CGEventRef to the
+# CGEventPostToPid extern that `core-graphics` does not expose.
+foreign-types = "0.5"
+
 [dev-dependencies]
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }

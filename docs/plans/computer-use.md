@@ -1,10 +1,19 @@
 # Computer use
 
-Status: **plan only, nothing built.** TCC spike run 2026-08-14; results in §1.
-Recommendation: **§4 — built-in `computer_*` tools in `tools.rs`, over an embedded
-`cua-driver-rs`.** Codex-style from the user's side: zero install, zero config, tools always
-present. But we do not write the input/capture stack, and we do not ship it as a
-user-configured MCP server either.
+Status: **shipped, deliberately partial.** `computer_targets`, `computer_doctor`,
+`computer_look`, `computer_type`, `computer_key` are live and verified. `computer_click` and
+`computer_scroll` are built, measured, and **withheld** — see §4.1b.
+
+**Scope decision (2026-08-15): the current target is three.js and WebGPU only.** Unity, Godot
+and Unreal are future work. That is what makes the withheld click a non-issue rather than a
+gap: web games run in the agent browser, and `browser_click` already takes raw viewport
+coordinates to reach a `<canvas>` — over CDP, which works. Computer use is staged for the day a
+native engine target exists, and the click question should be reopened then, not before.
+Recommendation: **§4 — built-in `computer_*` tools in `tools.rs`, over our own capture and
+input built on public macOS API.** Codex-style from the user's side: zero install, zero
+config, tools always present — and no third-party driver, because every part we need turned
+out to be public API. Targets are game engines (§4.1a), which makes capture the feature and
+input the smaller half.
 
 ---
 
@@ -12,21 +21,26 @@ user-configured MCP server either.
 
 CaliCode already has more computer use than it looks: `browser.rs` drives a real Chrome over
 CDP, and `browser_click` takes raw viewport coordinates specifically so the agent can reach a
-`<canvas>`, which is how it plays a running three.js game. The gap is **native windows** — a
-packaged build, Blender's GUI, an engine editor, `CaliCode.app` itself. Closing that gap does
-not require inventing anything: the industry converged during 2026 on one architecture, and
-there is a mature MIT-licensed implementation of it (`trycua/cua`, 21.4k stars) that already
-speaks MCP over stdio — the exact transport `mcp.rs` already implements. The work worth doing
-here is **not the driver**. It is the policy layer the driver deliberately leaves to its host:
-what the agent may attach to, how a click gets approved, and where the user watches. That is
-where CaliCode's existing invariants — the spawn ledger, `approvals.rs`, the BROWSER tab —
-already give us something the competitors do not have.
+`<canvas>`, which is how it plays a running three.js game. **That already covers the web
+half — three.js and WebGPU need nothing new.** The gap is native windows, and the decided
+roadmap says which ones: Unity, Godot and Unreal, later.
 
-Ship it **built-in**, the way Codex does: `computer_*` tools sitting in `tools.rs` beside
-`browser_*`, present with no install and no config. That is a statement about the product
-surface, not about who writes the private-SPI code underneath — and §4 keeps those two
-questions apart, because collapsing them is the mistake that leads to spending months
-reimplementing `cua-driver-rs` badly.
+That target set determines the whole design. Engine editors are custom-drawn and running
+builds are a single GPU surface, so there is no useful accessibility tree to read — **pixels
+and coordinates are the primary interface, not the fallback** (§4.1a). And since the editors
+are all scriptable anyway, what computer use uniquely adds is not a hand but an eye: the
+answer to *does it look right*, which is the question `baselines.rs`, `capture_persist` and
+`video_analysis` already exist to ask.
+
+Build it ourselves. ScreenCaptureKit, `AXUIElement` and `CGEventPostToPid` are all public API
+with Rust crates on crates.io (§4.1); adopting `cua-driver` would mean re-signing a
+third-party macOS app bundle inside ours and adding Swift, for ten actions where it ships 49.
+Ship it **built-in**, the way Codex does: `computer_*` tools in `tools.rs` beside `browser_*`,
+present with no install and no config.
+
+The policy layer is the part that is already built and green: the spawn ledger, attach
+scoping, `approvals.rs`, and a COMPUTER tab to watch it. That is what makes an unattended
+`/loop` defensible, and it is deliberately what exists first.
 
 ---
 
@@ -120,22 +134,32 @@ matters most.
 
 ---
 
-## 3. What I got wrong in the first sketch
+## 3. Corrections, in order
 
-Recorded because the correction is load-bearing.
+Recorded because each one moved the design.
 
-I proposed `CGEventPostToPid` for background input. Hermes/cua use
-**`SLPSPostEventRecordTo`**, a private SkyLight SPI, for pid-scoped posting without a cursor
-warp. Both avoid moving the cursor; the SkyLight path is what actually works across the app
-surface in practice, and it is also why this is a **maintained dependency, not a weekend
-module** — private SPIs move between macOS releases, and absorbing that maintenance is a
-standing cost we should decline. That single fact is the strongest argument for §4.
+**(a) "Background input needs a private SPI."** Wrong, and it was the load-bearing argument for
+adopting a driver. `CGEventPostToPid` is public and posts to a target process without
+activating it or moving the real cursor. `SLPSPostEventRecordTo` (private SkyLight, what
+Hermes/cua use) is *more robust* — background dialogs in particular — but it is not the price
+of entry. Superseded by §4.1.
 
-I also proposed the AX tree as the snapshot analogue of `browser_snapshot`. That was right,
-and it is what cua already does (`capture` with `mode: "ax"` for text, `mode: "som"` for a
-numbered-element overlay). The known failure — sparse or empty AX trees on custom-drawn apps
-and modern UWP/Electron — is exactly the case CaliCode already has an answer for: fall back to
-coordinates, the way `browser_click` already does for `<canvas>`.
+**(b) "cua-driver is a Rust workspace we can link."** Only on Windows and Linux. The
+production macOS driver is Swift, and upstream says the Rust port is not at macOS parity.
+
+**(c) "There is an embedded-host mode for apps holding TCC grants."** Misread. The design
+requires a signed `CuaDriver.app` bundle, because grants persist only against a bundle
+identity.
+
+**(d) "Core already has a spawn ledger."** It did not — spawns were scattered across five
+modules with no central record. Built as `spawn_ledger.rs`; see §4.2.1.
+
+**(e) "AX tree first, screenshots second," mirroring `browser_snapshot`.** Right for web,
+backwards for game engines, which are custom-drawn. Inverted in §4.1a.
+
+The one thing that survived every revision: the AX tree *is* the right shape wherever an app
+exposes one, and coordinates are the honest fallback where it does not — which is exactly what
+`browser_click` already does for `<canvas>`.
 
 ---
 
@@ -161,64 +185,225 @@ edit, name the tools `mcp__cua__click` instead of `computer_click`, and route th
 untrusted-server permission path rather than the normal one. Config-gating the feature is the
 opposite of built-in.
 
-### 4.1 Why not native `computer.rs`, and why not Python
+### 4.1 Build our own — decided 2026-08-15
 
-`cua-driver-rs` is a **Rust workspace** — a daemon, platform crates, and a UniFFI SDK sitting
-above a versioned C ABI — MIT-licensed, covering macOS, Windows and Linux. The Python and
-TypeScript SDKs are *generated bindings over that same native runtime*, not the runtime itself.
-An earlier draft called this "a new runtime dependency class (Python/Swift/TS)"; that was
-wrong, and it removes the main objection to adopting it.
+**Reversing the earlier recommendation to adopt `cua-driver`.** Two things changed it.
 
-It exposes 49 tools, including `get_window_state`, which returns a structured accessibility
-tree grounded on `element_index` rather than raw pixels — the direct analogue of
-`browser_snapshot`, and confirmation that the snapshot-first discipline in §4.2.4 is native to
-the driver rather than something we would be bolting on.
+**The private-SPI argument was overstated.** An earlier draft called
+`SLPSPostEventRecordTo` the price of entry for background input and said owning that was a
+permanent tax. It is not. **`CGEventPostToPid` is public API** and delivers events straight to
+a target process without activating it and without moving the real cursor — the whole
+no-cursor-steal property, on a supported call. The private SkyLight path buys *more
+robustness*, notably background app dialogs where the public call does not land. That is a real
+difference, and for a narrow target set it is an acceptable one.
 
-Caveats to settle during the spike, not to assume:
+Every part we need is public API with a Rust crate already on crates.io:
 
-- The crates are **not published to crates.io**; SDKs are assembled from `cua-driver-rs-v*`
-  release artifacts. Embedding means a pinned git or artifact dependency. Pin it, vendor the
-  C ABI header, and treat driver upgrades as deliberate.
-- Sources conflict on whether the Rust port has reached **macOS parity** with the original
-  Swift driver (the README presents macOS as supported; release notes elsewhere describe
-  parity as in progress). CaliCode is macOS-first, so this is the single fact most likely to
-  change the shape below. Verify against the pinned version before committing.
+| Part | API | Crate |
+| --- | --- | --- |
+| Window capture, incl. occluded | ScreenCaptureKit (macOS 12.3+) | `screencapturekit`, `objc2-screen-capture-kit` |
+| Element tree | `AXUIElement` | `accessibility-sys` / objc2 |
+| Background input | `CGEventPostToPid` | `core-graphics` |
 
-### 4.1a Embed in-process (B), or bundle as a sidecar (C)
+Against that, adopting means redistributing and **re-signing a third-party macOS `.app`** inside
+ours, tracking a 4,000-commit upstream, and adding **Swift** to a Rust + TypeScript repo —
+because the Rust port is not at macOS parity (§4.1 caveats, still true). For roughly ten
+actions, where cua ships 49. Not worth it.
 
-Both deliver built-in UX. Both keep `computer_*` native in `tools.rs`. The fork is only where
-the driver runs.
+Consequence: §1.3 stops being the blocking measurement. Our own capture and input live inside
+`cali-core`, which is spawned by the app and inherits its grants (§1.2) — there is no second
+bundle to keep signed, so C′ and C″ both dissolve.
 
-**B — link `cua-driver-rs` into `cali-core` over its C ABI.** No second process, no IPC, no
-`externalBin` entry. Viable *because* of the spike: cua's macOS daemon-proxy exists to preserve
-TCC grants by routing through a signed `CuaDriver.app`, and a host that already holds the
-grants does not need it — "embedded host integration for apps holding TCC permissions" is a
-documented mode, and §1.2 says `CaliCode.app` is such a host. Cleanest, and needs no Seatbelt
-carve-out at all, since core is the host and is already unconfined.
+### 4.1a The targets are game engines, and that inverts the design
 
-**C — ship the driver as a second Tauri sidecar.** `externalBin` already carries
-`binaries/cali-core`; adding one more is the pattern the repo has, not a new one. Core talks to
-it over its Unix socket. Still zero-install for the user. More robust operationally: a driver
-crash does not take core down, and upgrading the driver does not mean recompiling core. Costs a
-Seatbelt carve-out (§4.4) and a process to supervise.
+Decided use: three.js / WebGPU on the web now; **Unity, Godot and Unreal later**. That is the
+roadmap, not a bet, and it settles two things the earlier draft got wrong.
 
-**Recommendation: start at C, migrate to B if it proves worth it.** C is the lower-risk first
-landing — it is the existing sidecar pattern, it isolates a dependency we have not run before,
-and it keeps the driver swappable while §4.1's two caveats are still open. B is strictly nicer
-once the macOS-parity question is settled and the dependency has earned trust.
+**AX is not the primary interface here.** Unity's editor is IMGUI, Unreal's is Slate, Godot
+draws its own UI — all three are custom-drawn, which is precisely the sparse-or-empty
+accessibility-tree case. A *running* engine build is worse still: one GPU surface, no tree at
+all. So the `browser_snapshot`-style "text first, image second" ordering inverts. **Pixels and
+coordinates are primary; AX is an opportunistic bonus where an app happens to expose one.**
+This is structurally the same problem `browser_click` already solves for `<canvas>`, and it
+removes the most tedious component — AX tree walking — from the critical path.
 
-**These two are also the risk hedge for each other.** If §1.3's bundled-attribution assumption
-fails and grants do *not* land on `com.calicode.desktop`, B is dead — an in-process driver has
-no way to hold a grant the host lacks. C survives, by falling back to cua's own signed
-`CuaDriver.app` daemon, which exists precisely for that case. Do not close off C before the
-spike closes §1.3.
+**Computer use here is primarily an eye, secondarily a hand.** Engine editors are all
+scriptable (Unity C# batch mode, Godot headless CLI, Unreal Python and commandlets), and
+scripting beats pixels for *driving* them. What scripting cannot do is answer "does it look
+right", which is the question this repo is already built around — `baselines.rs`,
+`capture_persist`, `video_analysis`, `image3d`. Capture is the feature; input is the smaller
+half.
+
+**Open risk, and it is the sharpest one: raw input.** Unity's Input System and Unreal's raw
+input read HID directly, and neither `CGEventPostToPid` nor the private SkyLight path is
+guaranteed to reach them. Editors are AppKit-hosted and should be fine; *running builds* may
+not be. This needs a per-engine spike before anyone promises the agent can play a native build,
+and it does not affect capture at all — which is another reason to land the eye first.
+
+**Web games need none of this.** three.js and WebGPU run in the agent browser and are already
+reachable by coordinate clicks on `<canvas>`. No computer use required, today or later.
+
+### 4.1b Measured: keyboard reaches a background window, mouse does not
+
+The one result that changes the plan, and it was measured rather than reasoned about.
+Real Chrome, macOS 26.4, core-spawned so it is in the ledger, verified through CDP so the
+evidence comes back on a different channel than the input went in on:
+
+| Input | `CGEventPostToPid` to a background window | Evidence |
+| --- | --- | --- |
+| **Keyboard** (`computer_type`, `computer_key`) | **arrives, even to a window that is never key** | CDP reads the typed value back; the AppKit control logs `keyDown` |
+| **Mouse — click** | **does not arrive** | page click handler never fires; CDP reads `0` |
+| **Mouse — scroll** | **does not arrive** | 5000px page, scroll posted, `window.scrollY` stays `0` |
+
+The split is not arbitrary and it is worth stating as a rule rather than two results: **keyboard
+events route to the focused responder and need no hit-test; mouse events carry a location and
+need one, and an application that is not under the pointer cannot perform it.** Anything
+location-bearing is therefore expected to fail by the same mechanism, and testing each new one
+before exposing it is cheaper than discovering it in use.
+
+**Four delivery routes were then tried, against two different kinds of target.** An earlier
+version of this section generalised from Chrome alone, which was a mistake — Chromium runs a
+renderer-side trust filter that rejects synthetic clicks outright, so it is the documented
+*hardest* case and the worst thing to conclude from. The control is a plain AppKit window that
+never becomes key, writing to a file on `mouseDown`:
+
+| Route | Chrome | plain AppKit window |
+| --- | --- | --- |
+| `CGEventPostToPid` | no | no |
+| `CGEventPostToPSN` (Carbon addressing) | no | no |
+| `SLEventPostToPid` (SkyLight private SPI, `dlsym`) | no | no |
+| keyboard, any route | **yes** | — |
+
+The decisive run puts all four routes and the keyboard control **in one process, one non-key
+window, one measurement**:
+
+```
+target pid=20427 window=15803 bounds=(60,507,420,352)
+after PID:      posted=true events=[]
+after PSN:      posted=true events=[]
+after SKYLIGHT: posted=true events=[]
+after KEYBOARD: events=["keyDown:k"]
+```
+
+That single line of keyboard output is what makes the empty ones mean something. It rules out
+four confounds at once: the target is alive and its logging works; it is not Chromium's trust
+filter, because this is plain AppKit; it is not `acceptsFirstMouse` defaulting to false, because
+the control overrides it to true; and it is not "the window simply was not key", because the
+window is never key and the keystroke still arrived.
+
+Two earlier claims in this document were repaired by that control. The first diagnostic built
+its three posts inside an array literal, so all three fired before any sleep ran and the
+per-route attribution was meaningless. The second counted log *lines* including the target's
+own `ready` marker, so zero clicks read as one. Both are why the run above prints the events
+rather than a count.
+
+So it is genuinely background mouse delivery, not one hostile application. And **the private SPI
+alone is not the answer either** — the symbol resolves and the call returns, and nothing
+arrives. Per cua's own write-up the working recipe is three stages, not one call: two
+`SLPSPostEventRecordTo` records to flip AppKit-active state without raising, a primer
+`LeftMouseDown`/`Up` at `(-1, -1)` to tick the user-activation gate, and only then the real
+click — with a `mouseEventSubtype` byte and window-local coordinate stamp whose values that
+write-up does not publish.
+
+**All three implementable stages were then built and measured, and they still do not deliver.**
+
+| Stage attempted | Mouse arrives? |
+| --- | --- |
+| `CGEventPostToPid` — bare, then `+CLICK_STATE`, then `+WINDOW_UNDER_MOUSE_POINTER` ×2 | no |
+| `CGEventPostToPSN` (Carbon addressing) | no |
+| `SLEventPostToPid` (SkyLight private SPI, `dlsym`) | no |
+| `+ SLPSPostEventRecordTo` activation record (yabai's `make_key_window` layout) | no |
+| `+ primer click at (-1,-1)` | no |
+| keyboard, throughout | **yes** |
+
+The activation record and the primer click are stages 1 and 2 of the published recipe, and both
+were implemented from the open-source layout. What remains is the part cua describes but does
+not publish: the `mouseEventSubtype` byte and the window-local coordinate stamp that mark an
+event as a trusted user gesture. Without those values the record is incomplete, and no amount of
+addressing fixes it.
+
+That is the end of what can be reached by inference. It is a reverse-engineering project against
+undocumented byte layouts, not an afternoon. It
+is the honest reason to reconsider **adopting cua for the input path only** while keeping our
+own capture: they have already paid that cost, under MIT, and the split is clean because
+capture and input share nothing but the ledger.
+
+`post_to_psn`, `post_via_skylight` and `click_via` are kept compiled under `#[cfg(test)]` — the
+measurements are reproducible, and production carries only the route that works.
+
+`computer_scroll` was built, measured, and **withheld on that evidence** — shipping input that
+silently does nothing is worse than shipping none. Its implementation stays compiled under
+`#[cfg(test)]` as the executable record and the regression check.
+
+The click was tried three ways: bare down/up; with `MOUSE_EVENT_CLICK_STATE` set; and with both
+`MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER` and
+`..._THAT_CAN_HANDLE_THIS_EVENT` naming the target window. None arrived. In every case the
+frontmost application was correctly left alone — the events are being posted, they are simply
+not being routed to a window the pointer is not over.
+
+This is the boundary of the public API, and it is exactly what the private SkyLight SPI exists
+to cross — cua's own write-up on this is titled *how SkyLight enables multi-cursor background
+agents*. §4.1 said "the private SPI buys more robustness"; it is more specific than that.
+**It buys background mouse input, and nothing public substitutes.**
+
+So §4.1's "build our own" holds for capture, enumeration and keyboard, and does **not** hold
+for clicking. Three ways out, and this is a decision to take deliberately rather than drift
+into:
+
+1. **Private SkyLight SPI for the click path only.** Smallest surface — one call — but it
+   reintroduces exactly the maintenance tax §4.1 rejected, on an API Apple can change per
+   release.
+2. **Activate the window, then click.** Public, reliable, and it steals the user's focus —
+   which forfeits the property that makes unattended `/loop` acceptable. Defensible only as an
+   explicit opt-in mode the user turns on while watching.
+3. **Prefer per-target channels over OS-level clicking.** Chrome already has CDP, which is
+   strictly better. Unity, Godot and Unreal editors all have scripting bridges. Under this
+   reading, OS-level clicking is the fallback for apps with no channel at all, and the eye
+   (capture) stays the feature — which is where §4.1a already landed.
+
+`computer_click` ships reporting `delivered: "unconfirmed"` rather than claiming a success it
+cannot observe, and its live test is kept failing-and-ignored as the regression check for
+whichever option lands.
+
+**Still untested: whether the click lands when the window is frontmost.** Two attempts to force
+Chrome to the front failed (the `osascript … to activate` never took), so the frontmost case has
+been observed only incidentally, never controlled. It matters because it separates "the
+mechanism is sound and only background routing is missing" from "synthetic mouse input does not
+reach this app at all", and those point at different options above. Settle it before choosing.
+
+**Two defects found while measuring this, both now fixed:**
+
+- **Captures were squashed to a square.** `MAX_CAPTURE_EDGE` was applied to each axis
+  independently, so a 1280x800 window came back 1568x1568 — a distorted picture handed to a
+  vision model, and invisible in the bytes because it still decodes cleanly. Both axes now scale
+  by one factor, and `a_capture_keeps_the_window_aspect_ratio` asserts the ratio against the real
+  window rather than trusting the arithmetic.
+- **The "focus was not stolen" assertion was vacuous.** It compared frontmost-app names obtained
+  by asking System Events over AppleScript, which needs an Automation grant this context does not
+  have and so returned `""` both times — `"" == ""` passes forever. Now read from
+  `lsappinfo front`, which needs no grant and returns a real ASN.
 
 ### 4.2 The four things CaliCode must own
 
 **1. Attach scoping — the invariant that makes this safe.** The agent may attach only to
-windows of processes core itself spawned. Core already has that ledger: dev server, Blender,
-Chrome. A window whose pid is not in it is not attachable, and `computer_attach` refuses with a
-reason. This makes "the agent read your email" *unrepresentable* rather than merely
+windows of processes core itself spawned. A window whose pid is not in the ledger is not
+attachable, and `computer_attach` refuses with a reason.
+
+*Correction (2026-08-15): an earlier draft claimed "core already has that ledger". It did not.*
+Spawns were scattered across `blender.rs`, `browser.rs`, `devserver.rs`, `mcp.rs` and
+`diagnostics.rs`, each holding its own `Child` with no central record. `spawn_ledger.rs` now
+supplies it, and it is built rather than assumed because a naive version is worse than none:
+**pids are recycled**, so a ledger storing bare pids keeps answering "yes, that is our browser"
+after the browser exits and the kernel reissues the number — handing the agent whatever now
+owns it. Entries therefore carry the kernel start time and every lookup re-reads and compares,
+so a recycled pid misses. Registration that never happens costs a refused attach; a stale entry
+that matched would cost the invariant, so everything fails in the first direction — including
+platforms where the start time cannot be read, where every lookup misses rather than degrading
+to pid-only.
+
+Still outstanding: the spawn sites do not call `register` yet, so the ledger is correct but
+empty. Wiring them is the next step, and until it happens attach scoping refuses everything —
+which is the right way round to be incomplete. This makes "the agent read your email" *unrepresentable* rather than merely
 discouraged — the same construction as the approvals invariant ("only two things may produce a
 denial"). No competitor in §2 has this, and it is the difference between a feature that can run
 unattended in a `/loop` and one that cannot.
@@ -290,23 +475,23 @@ carve-out must be cut with it.
 - **Unpinned upstream.** The crates are not on crates.io (§4.1), so the dependency is a pinned
   git/artifact reference on a fast-moving 4,000-commit project. Pin hard, review diffs on
   bump, and never float the version.
-- **macOS parity of the Rust port** may lag the original Swift driver (§4.1). This is the
-  fact most likely to reshape the plan, and CaliCode is macOS-first.
+- **The macOS driver is Swift, not Rust** (§4.1, confirmed) — so the dependency is a signed
+  macOS app bundle we redistribute and re-sign, not a crate we compile. Rust parity is
+  upstream's stated direction but is not here yet.
 - **macOS-first.** `cfg`-gate; the driver covers Windows/Linux later if the app ever does.
 
 ---
 
 ## 6. Phasing
 
-1. **Finish the spike (~half day).** Three questions, all cheap, all shape-determining:
-   (a) five-line patch so the bundled app spawns the probe — confirm attribution lands on
-   `com.calicode.desktop`, then revert (§1.3); (b) pin a `cua-driver-rs` version and establish
-   whether its macOS backend is at parity (§4.1); (c) confirm the embedded-host mode works for
-   a host holding its own TCC grants, which is what decides B vs C (§4.1a).
-2. **Driver + policy.** Sidecar (shape C) under `externalBin`, Seatbelt carve-out, native
-   `computer_*` tools in `tools.rs` with plan-mode classification, attach scoping against the
-   spawn ledger, and a `computer_doctor` preflight reporting which TCC subject actually holds
-   the grant. Rust tests for scoping refusal, plan-mode classification, and the carve-out.
+1. **Run §1.3 — the one blocking measurement (~1h).** Five-line patch so the bundled app
+   spawns the probe; confirm whether attribution lands on `com.calicode.desktop`; revert.
+   Selects C″ (one bundle) or C′ (nested driver bundle) per §4.1a. Questions (b) and (c) from
+   the earlier draft are now answered in §4.1 and need no further work.
+2. **Driver + policy.** The shape §1.3 selected, Seatbelt carve-out, native `computer_*` tools
+   in `tools.rs` with plan-mode classification, attach scoping against the spawn ledger, and a
+   `computer_doctor` preflight reporting which TCC subject actually holds the grant. Rust tests
+   for scoping refusal, plan-mode classification, and the carve-out.
 3. **COMPUTER tab** on BrowserTab's cast plumbing.
 4. **Token discipline**: screenshot eviction, image-aware counting.
 5. *Optional:* migrate C → B (link in-process, drop the sidecar and its carve-out) once the
@@ -323,7 +508,53 @@ distinction mechanical rather than a matter of care.
 
 ---
 
-## 7. Honest scoping note
+## 7. The Electron pivot (decided 2026-08-15) — read before Phase 1
+
+The desktop shell is moving from Tauri to Electron. Three consequences for this plan, one of
+them blocking.
+
+**Blocking: §1.3 must be re-measured, not carried over.** TCC attribution is a property of the
+bundle layout, and Electron's differs completely — `Contents/Frameworks/` carrying nested
+`Helper (Renderer).app`, `(GPU).app`, `(Plugin).app`. The Tauri measurement in §1.2 tells us
+the *mechanism* (responsibility inheritance) but not the *answer* for the new bundle. **Do the
+migration first, then run Phase 1.** Measuring a shell that is about to be deleted is waste.
+
+**C′ gets cheaper.** §4.1a treated nesting a signed `CuaDriver.app` as a wart because it is
+unusual under Tauri. Under Electron, per-helper nested bundle signing is exactly what
+electron-builder / `@electron/osx-sign` already do four times over. The exotic option becomes
+the routine one, which narrows the gap between C′ and C″ considerably.
+
+**`computer_doctor` comes mostly for free.** `systemPreferences.getMediaAccessStatus('screen')`
+and `askForMediaAccess` are first-class Electron APIs covering precisely the preflight
+§4.2/§6 specifies. Prefer them to hand-rolled `CGPreflight*` calls in core.
+
+**And §1.4 gets worse.** One bundle becomes five nested ones, every one of which needs stable
+signing identity or TCC grants die silently. Settle signing during the migration.
+
+Unaffected: everything in `core/`. `sandbox.rs`, `approvals.rs`, the spawn ledger and the
+agent loop are shell-agnostic, so §4.2's policy layer is untouched by the pivot.
+
+---
+
+## 8. What this is actually for, today
+
+Nothing. And that is the correct answer, not a failure.
+
+The shipped tools reach native windows, and today there are none worth reaching: three.js and
+WebGPU games render in the agent browser, where `browser_snapshot`, `browser_click` on the
+canvas and `browser_look` already do the whole job over CDP. `computer_doctor` will say so
+plainly — "everything CaliCode started is headless or windowless" — which is the honest report
+rather than a confusing empty one.
+
+What has been bought is the boundary and the eye, both proven, waiting for the target that needs
+them. The spawn ledger, attach scoping, capture and the permission preflight are the parts that
+take real time to get right and that are hard to retrofit safely; the click is the part that can
+be revisited in an afternoon once there is a Unity or Unreal window to point at. Building them
+in that order was the right way round.
+
+---
+
+## 9. Honest scoping note
 
 For three.js games specifically, `browser_click` on canvas already covers the play-test loop.
 What this buys is native surfaces: packaged builds, Blender's GUI, engine editors, and

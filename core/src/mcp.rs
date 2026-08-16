@@ -410,6 +410,13 @@ impl StdioTransport {
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn mcp server '{}': {}", cfg.id, cfg.command))?;
+        if let Some(pid) = child.id() {
+            crate::spawn_ledger::global().register(
+                pid,
+                crate::spawn_ledger::SpawnKind::Mcp,
+                format!("mcp server ({})", cfg.id),
+            );
+        }
         let stdin_pipe = child.stdin.take().context("mcp child has no stdin")?;
         let stdout = child.stdout.take().context("mcp child has no stdout")?;
         let stderr = child.stderr.take().context("mcp child has no stderr")?;
