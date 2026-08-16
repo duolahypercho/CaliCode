@@ -1,6 +1,6 @@
 import { rpc } from "./rpc";
 import type { Project } from "./types";
-import { isDesktopShell } from "./desktop";
+import { electronBridge, isDesktopShell } from "./desktop";
 
 export interface WorkspaceInfo {
   id: string;
@@ -92,17 +92,7 @@ export async function openWorkspace(path: string, name?: string): Promise<Worksp
  */
 export async function chooseNativeWorkspace(defaultPath?: string): Promise<string | null> {
   if (!isDesktopShell()) return null;
-  const { open } = await import("@tauri-apps/plugin-dialog");
-  const selected = await open({
-    directory: true,
-    multiple: false,
-    recursive: true,
-    fileAccessMode: "scoped",
-    canCreateDirectories: false,
-    defaultPath,
-    title: "Choose a game folder",
-  });
-  return typeof selected === "string" ? selected : null;
+  return (await electronBridge()?.chooseFolder(defaultPath)) ?? null;
 }
 
 export const listWorkspaces = () => rpc<WorkspaceInfo[]>("workspace_list", {});

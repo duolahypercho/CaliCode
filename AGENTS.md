@@ -13,7 +13,7 @@ repo works.
 | ---------------- | ------------------------------------------------------------------------ |
 | `core/`          | Rust control plane. JSON-RPC over HTTP + SSE. Owns projects, sessions, agent loop, assets, MCP, skills. |
 | `client/`        | Vite + React + TypeScript editor. Three.js viewport, agent panel, workspace tabs. |
-| `client/src-tauri/` | macOS desktop shell. Bundles the core release binary as a sidecar.     |
+| `client/electron/`  | Desktop shell (Electron). Spawns core, hosts the browser panel as a real view. |
 | `shared/schemas/` | `project.schema.json`, `cali-asset.schema.json` — the contracts both sides honour. |
 | `scripts/`       | `dev.sh` (run both halves), `desktop.sh` (package the app), live agent clients. |
 | `docs/`          | `runbook.md` (operations), `verification.md` (what proves each feature works), plans, templates. |
@@ -35,6 +35,22 @@ browser. Both ports are overridable (`CALI_PORT`, `CALI_CLIENT_PORT`).
 pnpm desktop:build        # from client/ — packages CaliCode.app (+ .dmg)
 pnpm desktop:dev          # native shell against a live core
 ```
+
+**One shell, and it is Electron.** A Tauri shell shipped first and was removed
+(`docs/plans/electron-shell.md`): its webview is a different engine per platform
+— WKWebView, WebView2, WebKitGTK — and none of them can host a second browser, so
+the BROWSER tab could only ever be a video stream of a Chrome running elsewhere.
+Electron bundles Chromium, so the panel is a `WebContentsView` the window
+composites directly and core drives over CDP.
+
+The macOS menu bar reads `CFBundleName`, so an unpackaged `pnpm desktop:electron`
+says "Electron" no matter what `app.setName` is; only a packaged build says
+CaliCode. Not a bug to chase.
+
+`CALI_PORT` moves the shell off `:8765` so a second instance can run beside a
+live app — attaching two clients to one core is worse than a port collision,
+because `editor_attachment` is one owner per session and the newcomer silently
+steals tool routing.
 
 ## Verify before you claim done
 
@@ -146,18 +162,37 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
   Linux (chrome, then chromium, then edge, then a playwright cache);
   `CALI_CHROME` overrides the path, `CALI_BROWSER_HEADED=1` shows the window
   for debugging, `CALI_BROWSER_PROFILE` moves the profile off `~/.cali/browser`.
-- **Why a separate Chrome rather than an embedded webview.** Tauri's webview is
-  a different engine per platform — WKWebView, WebView2, WebKitGTK — and only
-  the Windows one speaks CDP. Embedding would mean three rendering behaviours
-  and an agent that can only drive the browser on one of the three. One found
-  Chrome behaves identically everywhere. The cost is that the tab is a
-  screencast, so it cannot select text or open devtools; the toolbar's
-  open-in-browser button is the way out.
+- **A found Chrome is the fallback, not the panel.** When the shell hands core
+  its `WebContentsView` there is one browser and the user watches the agent work
+  in it. Core still knows how to launch its own Chrome, because the handshake can
+  fail and a headless agent has no panel at all; that path is degraded — the tab
+  shows a screencast of it — but it keeps working rather than failing.
 - The model reads pages as ref-tagged element lists (`browser_snapshot`), not
   HTML or pixels, and clicks refs rather than coordinates. Coordinates exist
   for `<canvas>`, which is the only way to reach a running game.
 - `browser_search` deliberately skips Google, which serves this browser an
   interstitial instead of results.
+- **The Electron shell hands core its own panel** (`browser_attach`), so core
+  drives the `WebContentsView` the user is looking at instead of launching a
+  Chrome of its own. The target id is passed, never discovered: guessing by url
+  or title would eventually pick the editor's own window, and core would start
+  driving the app instead of the page inside it. `browser::tests::live_attach`
+  is the regression check: it asserts core drives a browser it did not launch and
+  leaves it running.
+- **Playing a game is a different verb from using a page.** `browser_key` takes
+  `holdMs` because movement is a held W, not a tapped one; `browser_mouse_move`
+  takes a *delta* because a camera turns by motion, not by destination. It
+  splits that motion into steps and primes the origin first — Blink measures
+  `movementX` against the previous pointer position, so the first event of a
+  sequence reports 0 and an unprimed turn arrives one step short. `browser_play`
+  exists because the other two are strictly sequential: strafing (w+a) or aiming
+  while advancing needs keys held *and* the mouse moving at once. Click the
+  canvas once before looking if the game wants a pointer lock.
+- Files downloaded in the panel land in `~/.cali/downloads`, and
+  `browser_downloads` lists them — a download is working material the agent is
+  about to pull into a project, not a personal download. A navigation that turns
+  into one reports `aborted: true` rather than failing: chrome cancels the page
+  load by design, and the file is already on disk.
 - The BROWSER tab renders the same page over a CDP screencast, so the user and
   the agent share one browser rather than each having their own. The tab strip
   shows that page's own favicon and title; its accessible name stays `browser`.
@@ -167,8 +202,10 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
 - A chrome that outlives core keeps the profile's `SingletonLock`. Core clears
   a lock whose pid is gone and diverts to a unique scratch profile when one is
   genuinely held, so a leaked browser cannot wedge the next launch.
-- Live coverage is one `#[ignore]`d test: `cargo test browser::tests::live --
-  --ignored`. Run it after touching that module; CI cannot.
+- Live coverage is four `#[ignore]`d tests: `cargo test browser::tests::live --
+  --ignored`. Run them after touching that module; CI cannot. `live_attach` is
+  the one to keep honest — it asserts core drives a browser it did not launch
+  *and* leaves it running, which is the shell's entire contract.
 
 ## Extending without touching source
 

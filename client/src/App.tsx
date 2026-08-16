@@ -1792,7 +1792,7 @@ export default function App() {
               the layout (the rail carries its own set otherwise); the title
               and the tools-dock toggle live here in both states. */}
           <div
-            data-tauri-drag-region="deep"
+            data-drag-region="deep"
             className={`${sidebarDrawerOpen ? "hidden" : "flex"} h-10 shrink-0 select-none items-center gap-0.5 border-b border-line ${
               overlayControls && !sidebarVisible ? "pl-[80px]" : "pl-1.5"
             } pr-1.5`}

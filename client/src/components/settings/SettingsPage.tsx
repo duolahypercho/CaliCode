@@ -114,7 +114,7 @@ function PageHeader({
   const active = SETTINGS_SECTIONS.find((entry) => entry.id === section) ?? SETTINGS_SECTIONS[0];
   return (
     <header
-      data-tauri-drag-region="deep"
+      data-drag-region="deep"
       className="flex shrink-0 items-start justify-between gap-4 border-b border-line px-5 py-5 md:px-8 md:py-7"
     >
       <div className="min-w-0">
@@ -596,7 +596,7 @@ export function SettingsPage({
     <div className="fixed inset-0 z-[60] flex min-h-0 overflow-hidden bg-surface-0 text-ink" data-settings-page>
       <aside className="flex w-[220px] shrink-0 flex-col border-r border-line bg-surface-1 pb-3 max-md:w-[168px]">
         <div
-          data-tauri-drag-region="deep"
+          data-drag-region="deep"
           className={`flex h-10 shrink-0 select-none items-center ${overlayControls ? "pl-[80px] pr-2" : "px-3"}`}
         >
           <button

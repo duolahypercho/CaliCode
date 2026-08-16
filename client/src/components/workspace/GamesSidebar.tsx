@@ -225,10 +225,11 @@ export function GamesSidebar({
       {/* Window-controls row: traffic lights (native in the desktop shell,
           decorative in the browser), panel toggle, history back/forward.
           The whole header doubles as the window drag region. */}
-      <header data-tauri-drag-region="deep" className="select-none">
-        {/* In the desktop shell the native traffic lights are lowered to
-            center at ~20pt (tauri.conf trafficLightPosition) — an h-10 row
-            with no top padding centers our icons on that same line. */}
+      <header data-drag-region="deep" className="select-none">
+        {/* In the desktop shell the native traffic lights are placed to center
+            at 20pt (electron/main.ts trafficLightPosition) — an h-10 row with
+            no top padding centers our icons on that same line. Changing this
+            row's height without moving them puts the lights on their own. */}
         {/* The controls swap instantly (no fade) when the rail collapses, so
             exactly one "Toggle games sidebar" button exists at any moment —
             the chrome strip's copy takes over the same spot. */}

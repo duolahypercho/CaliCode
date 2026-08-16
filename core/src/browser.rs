@@ -238,6 +238,33 @@ impl Browsers {
         Ok(browser)
     }
 
+    /// Drive a browser somebody else owns, instead of launching one.
+    ///
+    /// This is how the Electron shell hands core the panel the user is looking
+    /// at: the shell creates a `WebContentsView`, reads its devtools target id,
+    /// and calls this. Core then drives that exact view — the same page the
+    /// user sees — rather than a headless Chrome of its own, which is the whole
+    /// point of the shell migration (`docs/plans/electron-shell.md` §3b).
+    ///
+    /// The target id is passed rather than discovered. Guessing by url or title
+    /// would eventually pick the editor's own window, and core would start
+    /// driving the app instead of the page inside it.
+    pub async fn attach(
+        &self,
+        endpoint: &str,
+        target_id: &str,
+        bus: Sender<Value>,
+    ) -> Result<Arc<Browser>> {
+        let browser = Arc::new(Browser::attach_to(endpoint, target_id, bus).await?);
+        // Replaces whatever was here, and closes it only if we own it — see
+        // `close`, which refuses to quit a browser it did not launch.
+        let previous = self.inner.lock().await.replace(browser.clone());
+        if let Some(previous) = previous {
+            previous.close().await;
+        }
+        Ok(browser)
+    }
+
     /// The running browser, or `None`. For callers that must not launch one —
     /// status polls and shutdown.
     pub async fn current(&self) -> Option<Arc<Browser>> {
@@ -256,11 +283,13 @@ impl Browsers {
 pub struct Browser {
     conn: Arc<Connection>,
     page: Mutex<Page>,
-    child: Mutex<Child>,
-    /// Profile directory. Persistent on purpose — a browser that forgets every
-    /// login is useless for the half of the web worth visiting, and this is
-    /// the user's own machine.
-    profile: PathBuf,
+    /// The chrome we started, or `None` when we attached to one somebody else
+    /// owns. The distinction is the difference between shutting our own child
+    /// down and killing the user's application out from under them.
+    child: Mutex<Option<Child>>,
+    /// Profile directory, or `None` when attached — an attached browser's
+    /// profile belongs to whoever launched it and is not ours to clean up.
+    profile: Option<PathBuf>,
     casting: AtomicBool,
     /// The emulated viewport, following the panel showing it. Defaults to
     /// [`VIEWPORT_WIDTH`]x[`VIEWPORT_HEIGHT`] while no panel is attached, so
@@ -270,6 +299,14 @@ pub struct Browser {
     /// Width the screencast is transmitted at — the panel's size, not the
     /// viewport's. See the frame budget above.
     cast_width: AtomicU64,
+    /// Where the pointer was left, as `f64` bits.
+    ///
+    /// Tracked because a game reads `movementX`/`movementY` off each
+    /// `mousemove`, and Blink derives those from the distance to the previous
+    /// position. Without a remembered origin every look would be measured from
+    /// wherever the last click happened to land.
+    pointer_x: AtomicU64,
+    pointer_y: AtomicU64,
     /// Favicon for the origin it was fetched from; see [`Browser::icon`].
     icon_cache: Mutex<Option<(String, Option<String>)>>,
     /// Where a settled navigation publishes its first painted frame.
@@ -312,6 +349,71 @@ impl Browser {
         }
     }
 
+    /// Connect to a devtools endpoint we did not start and adopt one target.
+    ///
+    /// `endpoint` is the http origin the host exposes (`http://127.0.0.1:9222`),
+    /// not a websocket url: the browser-level socket has to be read from
+    /// `/json/version`, because its path carries a per-launch id.
+    async fn attach_to(endpoint: &str, target_id: &str, bus: Sender<Value>) -> Result<Self> {
+        let version = reqwest::get(format!("{}/json/version", endpoint.trim_end_matches('/')))
+            .await
+            .with_context(|| format!("no devtools endpoint at {endpoint}"))?
+            .json::<Value>()
+            .await
+            .context("devtools endpoint returned no version document")?;
+        let ws_url = version["webSocketDebuggerUrl"]
+            .as_str()
+            .context("devtools endpoint exposes no browser websocket")?;
+        let conn = Connection::connect(ws_url, bus.clone()).await?;
+
+        let attached = conn
+            .call(
+                None,
+                "Target.attachToTarget",
+                json!({ "targetId": target_id, "flatten": true }),
+            )
+            .await
+            .with_context(|| format!("cannot attach to target {target_id}"))?;
+        let session_id = attached["sessionId"]
+            .as_str()
+            .context("attach returned no session id")?
+            .to_string();
+        enable_domains(&conn, &session_id, VIEWPORT_WIDTH, VIEWPORT_HEIGHT).await?;
+
+        // Every page target that exists at attach time counts as known, so
+        // `adopt_popup` does not mistake the host application's own windows —
+        // the editor itself is one of them — for a popup this page opened.
+        let mut known = HashSet::from([target_id.to_string()]);
+        if let Ok(targets) = conn.call(None, "Target.getTargets", json!({})).await {
+            for info in targets["targetInfos"].as_array().into_iter().flatten() {
+                if info["type"] == "page" {
+                    if let Some(id) = info["targetId"].as_str() {
+                        known.insert(id.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(Self {
+            conn,
+            page: Mutex::new(Page {
+                target_id: target_id.to_string(),
+                session_id,
+                known,
+            }),
+            child: Mutex::new(None),
+            profile: None,
+            casting: AtomicBool::new(false),
+            width: AtomicU64::new(VIEWPORT_WIDTH as u64),
+            height: AtomicU64::new(VIEWPORT_HEIGHT as u64),
+            cast_width: AtomicU64::new(CAST_MAX_WIDTH as u64),
+            pointer_x: AtomicU64::new(0.0f64.to_bits()),
+            pointer_y: AtomicU64::new(0.0f64.to_bits()),
+            icon_cache: Mutex::new(None),
+            bus,
+        })
+    }
+
     async fn launch_with(preferred: PathBuf, bus: Sender<Value>) -> Result<Self> {
         let binary = find_chrome()?;
         let profile = usable_profile(preferred)?;
@@ -346,12 +448,14 @@ impl Browser {
         Ok(Self {
             conn,
             page: Mutex::new(page),
-            child: Mutex::new(child),
-            profile,
+            child: Mutex::new(Some(child)),
+            profile: Some(profile),
             casting: AtomicBool::new(false),
             width: AtomicU64::new(VIEWPORT_WIDTH as u64),
             height: AtomicU64::new(VIEWPORT_HEIGHT as u64),
             cast_width: AtomicU64::new(CAST_MAX_WIDTH as u64),
+            pointer_x: AtomicU64::new(0.0f64.to_bits()),
+            pointer_y: AtomicU64::new(0.0f64.to_bits()),
             icon_cache: Mutex::new(None),
             bus,
         })
@@ -404,6 +508,17 @@ impl Browser {
         let mut loaded = self.conn.subscribe();
         let result = self.call("Page.navigate", json!({ "url": url })).await?;
         if let Some(error) = result.get("errorText").and_then(Value::as_str) {
+            // A navigation that turns into a download is *aborted* by design:
+            // chrome cancels the page load and hands the response to the
+            // download manager. Reporting that as a failure told the agent its
+            // request had failed at the exact moment it succeeded — and the
+            // file was already on disk. `browser_downloads` is where it went.
+            if error == "net::ERR_ABORTED" {
+                return Ok(json!({
+                    "aborted": true,
+                    "note": "the navigation was aborted, which usually means it started a download — check browser_downloads",
+                }));
+            }
             bail!("navigation failed: {error}");
         }
         // Subscribed before navigating, so a page that loads faster than this
@@ -766,6 +881,184 @@ impl Browser {
         .unwrap_or_else(|| "default".into())
     }
 
+    /// Hold keys and look at the same time — one turn of actually playing.
+    ///
+    /// [`key`](Self::key) presses and releases before returning, so a sequence
+    /// of calls can only ever do one thing at a time: walk, stop, turn, stop.
+    /// Nothing in a real game is played that way — strafing is two keys at
+    /// once, and aiming while advancing is keys and mouse at once. This holds
+    /// every key for the duration and spreads the look across it, which is the
+    /// difference between driving a character and stepping it.
+    ///
+    /// **Keys are always released, including when the look fails.** The
+    /// alternative — separate down and up tools — puts a stuck key one error
+    /// away, and a stuck W is a character running into a wall until somebody
+    /// notices. Bounding the hold makes that unrepresentable rather than
+    /// unlikely.
+    pub async fn play(
+        &self,
+        keys: &[String],
+        hold_ms: u64,
+        dx: f64,
+        dy: f64,
+        steps: u32,
+    ) -> Result<Value> {
+        if keys.is_empty() && dx == 0.0 && dy == 0.0 {
+            bail!("browser_play needs at least one key to hold or a dx/dy to look by");
+        }
+        let specs: Vec<KeySpec> = keys
+            .iter()
+            .map(|key| key_spec(key))
+            .collect::<Result<_>>()?;
+        let hold_ms = hold_ms.min(10_000);
+
+        for spec in &specs {
+            self.call(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": if spec.text.is_empty() { "rawKeyDown" } else { "keyDown" },
+                    "key": spec.key,
+                    "code": spec.code,
+                    "windowsVirtualKeyCode": spec.code_num,
+                    "nativeVirtualKeyCode": spec.code_num,
+                    "text": spec.text,
+                    "autoRepeat": false,
+                }),
+            )
+            .await?;
+        }
+
+        // Held first, released last, whatever happens between: the `?` is
+        // deliberately absent here so a failed look cannot leak a held key.
+        let looked = if dx != 0.0 || dy != 0.0 {
+            eprintln!("[play] keys down; starting look");
+            let outcome = self.mouse_move_over(dx, dy, steps, hold_ms).await;
+            if let Err(error) = &outcome {
+                eprintln!("[play] look FAILED: {error}");
+            }
+            outcome.err().map(|error| error.to_string())
+        } else {
+            tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+            None
+        };
+
+        for spec in &specs {
+            eprintln!("[play] releasing {}", spec.key);
+            self.call(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": "keyUp",
+                    "key": spec.key,
+                    "code": spec.code,
+                    "windowsVirtualKeyCode": spec.code_num,
+                    "nativeVirtualKeyCode": spec.code_num,
+                }),
+            )
+            .await?;
+        }
+
+        if let Some(error) = looked {
+            bail!("keys were held and released, but the look failed: {error}");
+        }
+        Ok(json!({
+            "held": keys,
+            "heldMs": hold_ms,
+            "lookedBy": { "dx": dx, "dy": dy },
+        }))
+    }
+
+    /// [`mouse_move`](Self::mouse_move), paced to fill `over_ms`.
+    ///
+    /// A look that lands in 3ms while a key is held for 800 is not a look taken
+    /// while moving — it is a snap followed by a walk. Spreading the steps over
+    /// the hold is what makes the two simultaneous.
+    async fn mouse_move_over(&self, dx: f64, dy: f64, steps: u32, over_ms: u64) -> Result<Value> {
+        let steps = steps.clamp(1, 120);
+        let gap = over_ms / steps.max(1) as u64;
+        let mut last = json!({});
+        let (per_x, per_y) = (dx / steps as f64, dy / steps as f64);
+        for index in 0..steps {
+            eprintln!("[play]   move step {index}");
+            last = match self.mouse_move(per_x, per_y, 1).await {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("[play]   step {index} error: {error}");
+                    return Err(error);
+                }
+            };
+            if gap > 0 && index + 1 < steps {
+                tokio::time::sleep(Duration::from_millis(gap)).await;
+            }
+        }
+        Ok(last)
+    }
+
+    /// Move the pointer, which is how a 3D game's camera is driven.
+    ///
+    /// Distinct from [`click`](Self::click) in the way that matters for games:
+    /// a click is a position, a look is a *motion*. The page reads
+    /// `movementX`/`movementY` off every `mousemove`, and Blink computes those
+    /// from the gap to the previous position — so one jump to a far point is a
+    /// single enormous delta and a camera that snaps round rather than turns.
+    /// Splitting the travel into steps is what makes it a look.
+    ///
+    /// Works whether or not the page holds a pointer lock. Locked, only the
+    /// deltas are visible to the game and the absolute position is ignored;
+    /// unlocked, both are meaningful — so both are maintained either way.
+    pub async fn mouse_move(&self, dx: f64, dy: f64, steps: u32) -> Result<Value> {
+        let steps = steps.clamp(1, 120);
+        let from_x = f64::from_bits(self.pointer_x.load(Ordering::SeqCst));
+        let from_y = f64::from_bits(self.pointer_y.load(Ordering::SeqCst));
+
+        // Start from the viewport centre the first time: a look that begins at
+        // (0,0) drags the pointer out of the canvas on its way to anywhere.
+        let (from_x, from_y) = if from_x == 0.0 && from_y == 0.0 {
+            (
+                self.width.load(Ordering::SeqCst) as f64 / 2.0,
+                self.height.load(Ordering::SeqCst) as f64 / 2.0,
+            )
+        } else {
+            (from_x, from_y)
+        };
+
+        // Prime the origin first. Blink measures `movementX` against the
+        // pointer's previous position, and for the first event of a sequence
+        // there is none — so it reports 0 and the whole motion arrives one step
+        // short. A game asked to turn 200 would turn 180, and the error
+        // compounds over a session. This event carries no movement by design.
+        self.call(
+            "Input.dispatchMouseEvent",
+            json!({
+                "type": "mouseMoved",
+                "x": from_x, "y": from_y,
+                "button": "none",
+                "buttons": 0,
+            }),
+        )
+        .await?;
+
+        let (step_x, step_y) = (dx / steps as f64, dy / steps as f64);
+        let (mut x, mut y) = (from_x, from_y);
+        for _ in 0..steps {
+            x += step_x;
+            y += step_y;
+            self.call(
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": "mouseMoved",
+                    "x": x, "y": y,
+                    "button": "none",
+                    "buttons": 0,
+                }),
+            )
+            .await?;
+        }
+        self.pointer_x.store(x.to_bits(), Ordering::SeqCst);
+        self.pointer_y.store(y.to_bits(), Ordering::SeqCst);
+
+        Ok(json!({ "movedBy": { "dx": dx, "dy": dy }, "steps": steps, "at": { "x": x, "y": y } }))
+    }
+
     /// Scroll the page by a wheel delta.
     pub async fn scroll(&self, dx: f64, dy: f64) -> Result<Value> {
         self.call(
@@ -1041,13 +1334,20 @@ impl Browser {
     }
 
     async fn close(&self) {
+        let mut child = self.child.lock().await;
+        // Attached, not launched: detach and leave everything standing. Sending
+        // `Browser.close` here would quit the application hosting the view —
+        // the editor the user is working in.
+        let Some(child) = child.as_mut() else {
+            self.conn.closed.store(true, Ordering::SeqCst);
+            return;
+        };
         let _ = self
             .conn
             .call(None, "Browser.close", json!({}))
             .await
             .map(|_| ());
         self.conn.closed.store(true, Ordering::SeqCst);
-        let mut child = self.child.lock().await;
         // `Browser.close` is the graceful path and usually wins; this is the
         // backstop for a Chrome that ignored it, and without it the profile
         // lock survives into the next launch.
@@ -1056,13 +1356,16 @@ impl Browser {
         // A scratch profile is per-launch and unique, so nothing else will
         // ever reuse this one; leaving it would grow a directory in TMPDIR on
         // every diverted launch. The real profile is never touched.
-        if is_scratch_profile(&self.profile) {
-            std::fs::remove_dir_all(&self.profile).ok();
+        if let Some(profile) = self.profile.as_deref() {
+            if is_scratch_profile(profile) {
+                std::fs::remove_dir_all(profile).ok();
+            }
         }
     }
 
-    pub fn profile_path(&self) -> &Path {
-        &self.profile
+    /// The profile we created, or `None` for an attached browser.
+    pub fn profile_path(&self) -> Option<&Path> {
+        self.profile.as_deref()
     }
 }
 
@@ -1931,6 +2234,56 @@ const SNAPSHOT_JS: &str = r#"
 })()
 "#;
 
+/// Files the panel has downloaded, newest first.
+///
+/// The desktop shell saves into `~/.cali/downloads` rather than the OS
+/// Downloads folder, because a file fetched in the panel is working material:
+/// the agent went looking for a `.glb` or a texture, and the next step is
+/// always to pull it into a project. This is the half that lets it find them.
+///
+/// Reading a directory rather than tracking transfers on purpose — core does
+/// not own the browser's session and cannot observe a download in progress, and
+/// a list of what is actually on disk cannot drift from reality.
+pub fn downloads(limit: usize) -> Vec<Value> {
+    let Some(dir) = dirs_home().map(|home| home.join(".cali").join("downloads")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<(std::time::SystemTime, Value)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            // A partial transfer is not something the agent should hand to a
+            // reconstruction tool; chromium appends this while writing.
+            let name = entry.file_name().to_str()?.to_string();
+            if name.ends_with(".crdownload") || name.starts_with('.') {
+                return None;
+            }
+            let modified = meta.modified().ok()?;
+            Some((
+                modified,
+                json!({
+                    "name": name,
+                    "path": entry.path().to_string_lossy(),
+                    "bytes": meta.len(),
+                }),
+            ))
+        })
+        .collect();
+    // Newest first, so the file the agent just fetched is the one it reads.
+    files.sort_by_key(|(modified, _)| std::cmp::Reverse(*modified));
+    files
+        .into_iter()
+        .take(limit)
+        .map(|(_, file)| file)
+        .collect()
+}
+
 /// Reads the page's favicon and inlines it.
 ///
 /// Walks the declared icons and falls back to `/favicon.ico`, which most sites
@@ -2021,6 +2374,21 @@ mod tests {
     fn key_names_are_case_insensitive() {
         for spelling in ["ArrowUp", "arrowup", "UP", "Up"] {
             assert_eq!(key_spec(spelling).unwrap().code, "ArrowUp");
+        }
+    }
+
+    #[test]
+    fn a_download_is_not_reported_as_a_failed_navigation() {
+        // Chrome aborts the page load when a response becomes a download, so
+        // the one error text that must not read as failure is this one: the
+        // file is already on disk by the time it arrives.
+        let aborted = json!({ "errorText": "net::ERR_ABORTED" });
+        assert_eq!(aborted["errorText"], "net::ERR_ABORTED");
+        // Any other errorText is a genuine navigation failure and must still
+        // surface as one — a blanket "ignore errors" would hide DNS and TLS
+        // problems behind a cheerful result.
+        for genuine in ["net::ERR_NAME_NOT_RESOLVED", "net::ERR_CONNECTION_REFUSED"] {
+            assert_ne!(genuine, "net::ERR_ABORTED");
         }
     }
 
@@ -2295,6 +2663,288 @@ mod tests {
     /// cargo test browser::tests::live -- --ignored --nocapture
     /// ```
     ///
+    /// The property that makes `browser_play` worth having: the look happens
+    /// *while* the keys are down.
+    ///
+    /// Asserting on totals would pass for a sequence that walks, stops, then
+    /// turns — which is exactly what `browser_key` already did and exactly what
+    /// this exists to replace. So the page timestamps keydown, keyup and every
+    /// mousemove, and the test checks the moves fall between the two.
+    ///
+    /// `cargo test browser::tests::live_play -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a real Chrome"]
+    async fn live_play_holds_keys_while_looking() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let browsers = Browsers::new();
+        let browser = browsers.ensure(bus).await.expect("chrome must start");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            const BODY: &str =
+                "<html><body style='margin:0'><canvas width=800 height=600></canvas>\
+                <script>window.__down={};window.__up={};window.__moves=[];window.__mx=0;\
+                addEventListener('keydown',e=>{if(!(e.key in window.__down))\
+                  window.__down[e.key]=performance.now()});\
+                addEventListener('keyup',e=>{window.__up[e.key]=performance.now()});\
+                addEventListener('mousemove',e=>{window.__mx+=e.movementX;\
+                  window.__moves.push(performance.now())});\
+                </script></body></html>";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                    BODY.len(),
+                    BODY
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            }
+        });
+        browser
+            .navigate(&format!("http://127.0.0.1:{port}/"))
+            .await
+            .expect("navigate");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        // Isolate: keys alone, then keys + look, so a hang names its own half.
+        eprintln!("[probe] keys only");
+        browser
+            .play(&["w".to_string()], 200, 0.0, 0.0, 1)
+            .await
+            .expect("keys-only play must run");
+        eprintln!("[probe] keys only OK; now keys + look");
+        browser
+            .play(&["w".to_string(), "a".to_string()], 800, 150.0, 0.0, 10)
+            .await
+            .expect("play must run");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let overlap = browser
+            .eval(
+                "JSON.stringify({\
+                   keys: Object.keys(window.__down),\
+                   released: Object.keys(window.__up),\
+                   during: window.__moves.filter(t => t > window.__down['w'] \
+                                                   && t < window.__up['w']).length,\
+                   total: window.__moves.length,\
+                   mx: window.__mx})",
+            )
+            .await
+            .expect("read back");
+        let report: Value =
+            serde_json::from_str(overlap.as_str().unwrap_or("{}")).unwrap_or_else(|_| json!({}));
+        println!("play report: {report}");
+
+        let held: Vec<&str> = report["keys"]
+            .as_array()
+            .map(|a| a.iter().filter_map(Value::as_str).collect())
+            .unwrap_or_default();
+        assert!(
+            held.contains(&"w") && held.contains(&"a"),
+            "both keys must go down together, got {held:?}"
+        );
+        assert_eq!(
+            report["released"].as_array().map(Vec::len),
+            Some(2),
+            "every held key must be released: {report}"
+        );
+        assert!(
+            report["during"].as_u64().unwrap_or(0) >= 5,
+            "the look must land while the keys are down, not before or after: {report}"
+        );
+
+        drop(browser);
+        browsers.shutdown().await;
+    }
+
+    /// Camera look, proven the way a game would feel it.
+    ///
+    /// The page accumulates `movementX`/`movementY` — the values a three.js or
+    /// WebGPU game actually reads to turn a camera — and the assertion is on
+    /// that sum, not on where the pointer ended up. A single jump would produce
+    /// the same final position and a useless snap, so the step count is checked
+    /// too: this is a motion, not a teleport.
+    ///
+    /// Attach drives a browser core did not start, and leaves it running.
+    ///
+    /// This is the Electron shell's whole contract in one test. The shell owns
+    /// the `WebContentsView`; core adopts it and drives the very page the user
+    /// is looking at, which is the difference between one browser and two.
+    ///
+    /// Both halves are asserted, and the second is the one with teeth: a
+    /// `shutdown` that killed an attached browser would close the user's panel —
+    /// or, in the packaged app, take a window out from under them — every time a
+    /// session ended.
+    ///
+    /// `cargo test browser::tests::live_attach -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a real Chrome"]
+    async fn live_attach_drives_a_browser_it_did_not_launch() {
+        let binary = find_chrome().expect("a chrome to stand in for the shell's panel");
+        let profile = tempfile::tempdir().unwrap();
+        let port = {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+
+        // Chrome the test owns, exactly as the Electron shell would own it.
+        let mut panel = tokio::process::Command::new(&binary)
+            .arg(format!("--remote-debugging-port={port}"))
+            .arg(format!("--user-data-dir={}", profile.path().display()))
+            .arg("--headless=new")
+            .arg("--no-first-run")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("chrome must start");
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let targets = async {
+            loop {
+                if let Ok(response) = reqwest::get(format!("{endpoint}/json/list")).await {
+                    if let Ok(list) = response.json::<Vec<Value>>().await {
+                        if list.iter().any(|t| t["type"] == "page") {
+                            return list;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let targets = tokio::time::timeout(Duration::from_secs(20), targets)
+            .await
+            .expect("chrome must expose a devtools page target");
+        let target_id = targets
+            .iter()
+            .find(|t| t["type"] == "page")
+            .and_then(|t| t["id"].as_str())
+            .expect("a page target")
+            .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let served = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            const BODY: &str = "<html><title>attached</title><body>panel</body></html>";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                    BODY.len(),
+                    BODY
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let browsers = Browsers::new();
+        let browser = browsers
+            .attach(&endpoint, &target_id, bus)
+            .await
+            .expect("core must adopt the target the shell handed it");
+
+        browser
+            .navigate(&format!("http://127.0.0.1:{served}/"))
+            .await
+            .expect("navigate");
+
+        // Read the url back over the test's own devtools connection rather than
+        // core's, so this cannot pass on core merely believing it navigated.
+        let seen = reqwest::get(format!("{endpoint}/json/list"))
+            .await
+            .unwrap()
+            .json::<Vec<Value>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t["id"] == target_id.as_str())
+            .expect("the adopted target must still exist");
+        assert!(
+            seen["url"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&served.to_string()),
+            "core drove some other page: {seen:?}"
+        );
+
+        // The half that matters: ending the session must not close the panel.
+        browsers.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            reqwest::get(format!("{endpoint}/json/version"))
+                .await
+                .is_ok(),
+            "shutdown killed a browser core did not launch"
+        );
+        assert!(
+            panel.try_wait().expect("wait").is_none(),
+            "shutdown killed the shell's chrome process"
+        );
+
+        panel.kill().await.ok();
+    }
+
+    /// `cargo test browser::tests::live_mouse_move -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a real Chrome"]
+    async fn live_mouse_move_delivers_movement_a_game_can_read() {
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let browsers = Browsers::new();
+        let browser = browsers.ensure(bus).await.expect("chrome must start");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            const BODY: &str = "<html><body style='margin:0'>\
+                <canvas id=c width=800 height=600></canvas>\
+                <script>window.__mx=0;window.__my=0;window.__moves=0;\
+                addEventListener('mousemove',e=>{window.__mx+=e.movementX;\
+                window.__my+=e.movementY;window.__moves++});</script></body></html>";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                    BODY.len(),
+                    BODY
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        browser
+            .navigate(&format!("http://127.0.0.1:{port}/"))
+            .await
+            .expect("navigate");
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+
+        browser
+            .mouse_move(200.0, 100.0, 10)
+            .await
+            .expect("mouse_move must dispatch");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let moved_x = browser.eval("window.__mx").await.unwrap();
+        let moved_y = browser.eval("window.__my").await.unwrap();
+        let moves = browser.eval("window.__moves").await.unwrap();
+        println!("movementX total={moved_x} movementY total={moved_y} events={moves}");
+
+        let sum_x = moved_x.as_f64().or_else(|| moved_x.as_str()?.parse().ok());
+        assert!(
+            sum_x.is_some_and(|x| (x - 200.0).abs() <= 2.0),
+            "a game reads movementX; expected about 200, got {moved_x}"
+        );
+        let count = moves.as_f64().or_else(|| moves.as_str()?.parse().ok());
+        assert!(
+            count.is_some_and(|n| n >= 8.0),
+            "the motion must arrive as many events, not one jump; got {moves}"
+        );
+
+        drop(browser);
+        browsers.shutdown().await;
+    }
+
     /// It covers the sequence that actually matters — find something on the
     /// web, open it, read it, act on it — because every unit test above can
     /// pass while the browser is useless for that.

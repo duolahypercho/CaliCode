@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ArrowLeft, ArrowRight, ExternalLink, Loader2, RotateCw, Search } from "lucide-react";
 import { connectEvents, rpc, type AgentEvent } from "../../lib/rpc";
+import { electronBridge } from "../../lib/desktop";
 
 interface Status {
   running: boolean;
@@ -100,6 +101,63 @@ export function BrowserTab() {
     setPainted(true);
   }, []);
 
+  /**
+   * In the Electron shell the panel is a real `WebContentsView` the shell
+   * positions over this element, so there is nothing to stream and nothing to
+   * paint — this component becomes a placeholder that reports where the view
+   * should sit. Everything else here (address bar, status, history) still
+   * applies, because the view is driven through the same core RPCs.
+   */
+  const native = electronBridge();
+
+  useEffect(() => {
+    if (!native) return;
+    const surface = surfaceRef.current;
+    if (!surface || typeof ResizeObserver === "undefined") return;
+    const report = (visible: boolean) => {
+      const box = surface.getBoundingClientRect();
+      // Client coordinates are the window's content area for a full-bleed
+      // renderer, which is what the shell's `setBounds` expects. A native
+      // titlebar inset or a second native view would break that assumption.
+      native.setPanelBounds({
+        x: box.left,
+        y: box.top,
+        width: box.width,
+        height: box.height,
+        visible,
+      });
+    };
+    // A native view floats above the DOM and has its own z-order, so every
+    // portalled overlay in the app — the tab strip's dropdown, the settings
+    // dialog, the session search, the model picker — would render *behind* it.
+    // Radix portals all of them to `document.body`, so watching for one
+    // appearing is what keeps a menu from opening underneath the browser.
+    const overlayOpen = () =>
+      document.querySelector(
+        '[data-radix-popper-content-wrapper], [role="dialog"], [role="menu"], [role="listbox"]',
+      ) !== null;
+    const sync = () => report(!overlayOpen());
+
+    sync();
+    const observer = new ResizeObserver(sync);
+    observer.observe(surface);
+    // The panel also moves when the window resizes or the dock scrolls, and
+    // neither resizes this element.
+    window.addEventListener("resize", sync);
+    // Overlays arrive and leave as body children rather than as anything this
+    // component renders, so a mutation watch is the only signal available.
+    const overlays = new MutationObserver(sync);
+    overlays.observe(document.body, { childList: true, subtree: true });
+    return () => {
+      observer.disconnect();
+      overlays.disconnect();
+      window.removeEventListener("resize", sync);
+      // Hide, never destroy: the agent keeps browsing with the tab closed, and
+      // a native view left visible would float over whatever replaces it.
+      report(false);
+    };
+  }, [native]);
+
   useEffect(() => {
     let cancelled = false;
     const poll = () => {
@@ -143,6 +201,7 @@ export function BrowserTab() {
   // agent tokens, so a screencast left running behind a closed tab is the
   // loudest thing on it for nobody's benefit.
   useEffect(() => {
+    if (native) return;
     let live = true;
     // Device pixels, so the frame arrives at exactly the resolution this panel
     // paints and is neither upscaled (blurry) nor oversized (measured: a fixed

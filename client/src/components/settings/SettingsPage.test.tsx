@@ -8,7 +8,7 @@ vi.mock("../../lib/rpc", () => ({ rpc: vi.fn() }));
 import { rpc } from "../../lib/rpc";
 
 const mockRpc = vi.mocked(rpc);
-const originalTauriInternals = Object.getOwnPropertyDescriptor(window, "__TAURI_INTERNALS__");
+const originalCaliBridge = Object.getOwnPropertyDescriptor(window, "cali");
 const originalNavigatorPlatform = Object.getOwnPropertyDescriptor(navigator, "platform");
 
 const modelList: ModelList = {
@@ -67,7 +67,12 @@ beforeEach(() => {
       messageCount: 4,
     },
   ];
-  Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+  // The titlebar reserves space for the traffic lights only in the desktop
+  // shell, which is detected by the preload's global.
+  Object.defineProperty(window, "cali", {
+    configurable: true,
+    value: { shell: "electron", platform: "darwin" },
+  });
   Object.defineProperty(navigator, "platform", { configurable: true, value: "MacIntel" });
   mockRpc.mockImplementation(async (method: string) => {
     switch (method) {
@@ -98,8 +103,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
-  if (originalTauriInternals) Object.defineProperty(window, "__TAURI_INTERNALS__", originalTauriInternals);
-  else Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
+  if (originalCaliBridge) Object.defineProperty(window, "cali", originalCaliBridge);
+  else Reflect.deleteProperty(window, "cali");
   if (originalNavigatorPlatform) Object.defineProperty(navigator, "platform", originalNavigatorPlatform);
 });
 
@@ -116,7 +121,7 @@ describe("SettingsPage", () => {
     expect(workspaceBack.className).toContain("translate-y-px");
     expect(workspaceBack.className).toContain("text-[13px]");
     expect(workspaceBack.className).toContain("font-semibold");
-    const titlebar = workspaceBack.closest("[data-tauri-drag-region]");
+    const titlebar = workspaceBack.closest("[data-drag-region]");
     expect(titlebar?.className).toContain("h-10");
     expect(titlebar?.className).toContain("pl-[80px]");
     expect(container.querySelector("[data-settings-page]")?.className).toContain("overflow-hidden");

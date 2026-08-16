@@ -295,6 +295,54 @@ describe("BrowserTab", () => {
     await waitFor(() => expect(surface.style.cursor).toBe("pointer"));
   });
 
+  it("reports its rect to the native shell and hides under overlays", async () => {
+    // Under Electron the panel is a real WebContentsView the shell positions
+    // over this element, so this component reports geometry instead of
+    // painting. A native view floats above the DOM with its own z-order, so a
+    // portalled Radix menu would open *behind* it unless the view hides.
+    const setPanelBounds = vi.fn();
+    const bridge = {
+      shell: "electron" as const,
+      platform: "darwin",
+      chooseFolder: vi.fn(),
+      setPanelBounds,
+      panelTarget: vi.fn(),
+    };
+    // contextBridge freezes what it exposes, so the real object cannot be
+    // spied on in the running app — which is why this is asserted here.
+    Object.defineProperty(window, "cali", { value: bridge, configurable: true });
+    // jsdom implements no ResizeObserver, and the geometry effect guards on it
+    // — without a stub it returns before reporting anything.
+    const RealRO = window.ResizeObserver;
+    window.ResizeObserver = class {
+      observe() {}
+      disconnect() {}
+      unobserve() {}
+    } as unknown as typeof ResizeObserver;
+
+    try {
+      render(<BrowserTab />);
+      await waitFor(() => expect(setPanelBounds).toHaveBeenCalled());
+      expect(setPanelBounds.mock.calls.at(-1)?.[0]).toMatchObject({ visible: true });
+
+      // A dialog portalled to <body> is how every overlay in this app arrives.
+      const overlay = document.createElement("div");
+      overlay.setAttribute("role", "dialog");
+      document.body.appendChild(overlay);
+      await waitFor(() =>
+        expect(setPanelBounds.mock.calls.at(-1)?.[0]).toMatchObject({ visible: false }),
+      );
+
+      overlay.remove();
+      await waitFor(() =>
+        expect(setPanelBounds.mock.calls.at(-1)?.[0]).toMatchObject({ visible: true }),
+      );
+    } finally {
+      Reflect.deleteProperty(window, "cali");
+      window.ResizeObserver = RealRO;
+    }
+  });
+
   it("offers a way out to the real browser", async () => {
     mocks.rpc.mockImplementation((method: string) =>
       method === "browser_status"

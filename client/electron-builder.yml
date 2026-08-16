@@ -1,0 +1,45 @@
+# Packaging for the Electron shell.
+#
+# Mirrors what `scripts/desktop.sh` does for Tauri: build the client, build the
+# core release binary, stage both, produce a .app. The identifier and product
+# name match `src-tauri/tauri.conf.json` deliberately — the two shells are the
+# same application, and a user upgrading from one to the other should not end up
+# with two apps and two `~/.cali` states.
+appId: com.calicode.desktop
+productName: CaliCode
+directories:
+  output: release-electron
+  buildResources: build-electron
+
+# `dist-electron` is the compiled shell; `dist` is the built client, which core
+# serves rather than the window loading it from disk.
+files:
+  - dist-electron/**/*
+  - package.json
+
+# Staged beside the app rather than inside the asar: `cali-core` must be a real
+# executable on disk to spawn, and an asar-packed binary is not. `main.ts`
+# probes `process.resourcesPath` for both of these.
+extraResources:
+  - from: ../core/target/release/cali-core
+    to: cali-core
+  - from: dist
+    to: dist
+
+mac:
+  category: public.app-category.developer-tools
+  target:
+    - dmg
+    - dir
+  # Core is spawned as a child and talks to localhost; the hardened runtime
+  # blocks that without these. Kept minimal on purpose — every entitlement is a
+  # capability the notarised app carries forever.
+  hardenedRuntime: true
+  entitlements: build-electron/entitlements.mac.plist
+  entitlementsInherit: build-electron/entitlements.mac.plist
+
+# Signing is deliberately not configured here. The repo has
+# `scripts/dev-signing-identity.sh` for local identities, and a real identity
+# belongs in CI secrets rather than a checked-in file. Unsigned builds are fine
+# for testing the packaging itself; `CSC_IDENTITY_AUTO_DISCOVERY=false` skips
+# the search entirely.
