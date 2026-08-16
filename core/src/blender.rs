@@ -95,9 +95,16 @@ pub fn open(root: &Path, slug: &str, asset_id: &str) -> Result<Value> {
     std::fs::write(&paths.bridge, BRIDGE_SOURCE)?;
     let mut command = launch_command(&paths);
     command.stdout(Stdio::null()).stderr(Stdio::null());
-    command.spawn().context(
+    let child = command.spawn().context(
         "failed to launch Blender; install Blender or set CALI_BLENDER_BIN to its executable",
     )?;
+    // The GUI Blender is the process computer use most wants to drive. Without
+    // this line attach scoping refuses it no matter what the user approves.
+    crate::spawn_ledger::global().register(
+        child.id(),
+        crate::spawn_ledger::SpawnKind::Blender,
+        "blender (gui)",
+    );
     Ok(json!({
         "opened": true,
         "assetId": asset_id,

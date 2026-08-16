@@ -131,6 +131,15 @@ pub struct ApprovalRequest<'a> {
     pub asking_session: &'a str,
     pub tool: &'a str,
     pub arguments: Value,
+    /// Why this call is being shown at all, when something decided that
+    /// rather than the mode. `None` in the modes that ask about everything —
+    /// there is no reason to give beyond the mode itself.
+    pub reason: Option<String>,
+    /// Who supplied `reason`. The client renders the two differently: the
+    /// agent asking about its own call is a different thing from the reviewer
+    /// stopping it, and a card that blurs them teaches the user to read
+    /// neither.
+    pub reason_source: Option<crate::agent::ReasonSource>,
 }
 
 #[derive(Clone)]
@@ -185,6 +194,11 @@ impl Approvals {
             "requestId": request_id,
             "tool": request.tool,
             "arguments": request.arguments,
+            // Both `null` outside the modes that decide per call. A client
+            // that renders the reason unconditionally shows nothing, which is
+            // correct: in Manual the mode is the reason.
+            "reason": request.reason,
+            "reasonSource": request.reason_source.map(|source| source.as_str()),
             // Core's clock, so the client's TTL stops guessing when this began.
             "raisedAtMs": raised_at_ms,
         });
@@ -438,6 +452,8 @@ mod tests {
             asking_session: answer_session,
             tool: "file_write",
             arguments: json!({ "path": "a.txt" }),
+            reason: None,
+            reason_source: None,
         }
     }
 
