@@ -21,7 +21,8 @@ const bridge: CaliBridge = {
   shell: "electron",
   platform: process.platform,
 
-  chooseFolder: () => ipcRenderer.invoke(IPC.chooseFolder) as Promise<string | null>,
+  chooseFolder: (defaultPath?: string) =>
+    ipcRenderer.invoke(IPC.chooseFolder, defaultPath) as Promise<string | null>,
 
   // Fire-and-forget: bounds arrive on every resize and scroll frame, and a
   // reply the renderer would discard only adds latency to that path.

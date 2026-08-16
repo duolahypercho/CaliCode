@@ -138,7 +138,7 @@ export function WorkspaceTabs({
 
   return (
     <div
-      data-tauri-drag-region="deep"
+      data-drag-region="deep"
       className="flex h-10 shrink-0 select-none items-center gap-1 border-b border-line bg-surface-0 px-1.5"
     >
       <div

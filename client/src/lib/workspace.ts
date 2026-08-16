@@ -92,22 +92,7 @@ export async function openWorkspace(path: string, name?: string): Promise<Worksp
  */
 export async function chooseNativeWorkspace(defaultPath?: string): Promise<string | null> {
   if (!isDesktopShell()) return null;
-  // Each shell owns its own native panel. Checked before the Tauri import
-  // below because that import throws outside Tauri, and the failure would look
-  // like "the folder picker is broken" rather than "wrong shell".
-  const electron = electronBridge();
-  if (electron) return electron.chooseFolder();
-  const { open } = await import("@tauri-apps/plugin-dialog");
-  const selected = await open({
-    directory: true,
-    multiple: false,
-    recursive: true,
-    fileAccessMode: "scoped",
-    canCreateDirectories: false,
-    defaultPath,
-    title: "Choose a game folder",
-  });
-  return typeof selected === "string" ? selected : null;
+  return (await electronBridge()?.chooseFolder(defaultPath)) ?? null;
 }
 
 export const listWorkspaces = () => rpc<WorkspaceInfo[]>("workspace_list", {});

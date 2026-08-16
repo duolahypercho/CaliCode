@@ -8,7 +8,6 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "preview": "vite preview",
-    "tauri": "tauri",
     "desktop:dev": "bash ../scripts/desktop.sh dev",
     "desktop:build": "bash ../scripts/desktop.sh build",
     "desktop:install": "bash ../scripts/desktop.sh install",
@@ -18,8 +17,7 @@
     "pretest:e2e": "node -e \"const fs=require('node:fs');for(const path of ['.e2e-state','.e2e-projects','.e2e-config.yaml'])fs.rmSync(path,{recursive:true,force:true})\"",
     "pretest:e2e:live": "pnpm pretest:e2e",
     "build:electron": "tsc -p tsconfig.electron.json && esbuild electron/preload.ts --bundle --platform=node --format=cjs --external:electron --outfile=dist-electron/preload.js && node -e \"require('fs').writeFileSync('dist-electron/package.json','{\\\"type\\\":\\\"commonjs\\\"}')\"",
-    "desktop:electron": "pnpm build:electron && electron dist-electron/main.js",
-    "desktop:electron:build": "pnpm build && pnpm build:electron && cd ../core && cargo build --release && cd ../client && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --config electron-builder.yml --mac dir"
+    "desktop:electron": "pnpm build:electron && electron dist-electron/main.js"
   },
   "dependencies": {
     "@hookform/resolvers": "^3.9.1",
@@ -29,8 +27,6 @@
     "@radix-ui/react-select": "^2.1.2",
     "@radix-ui/react-tabs": "^1.1.1",
     "@radix-ui/react-tooltip": "^1.1.4",
-    "@tauri-apps/api": "^2.11.1",
-    "@tauri-apps/plugin-dialog": "^2.4.2",
     "@xterm/addon-fit": "^0.11.0",
     "@xterm/xterm": "^6.0.0",
     "class-variance-authority": "^0.7.0",
@@ -46,7 +42,6 @@
   "devDependencies": {
     "@playwright/test": "^1.49.0",
     "@tailwindcss/vite": "^4.0.0",
-    "@tauri-apps/cli": "^2.11.4",
     "@testing-library/react": "^16.0.1",
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",

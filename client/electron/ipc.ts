@@ -39,7 +39,7 @@ export interface ShellInfo {
  * to the main process could resolve.
  */
 export interface CaliBridge extends ShellInfo {
-  chooseFolder(): Promise<string | null>;
+  chooseFolder(defaultPath?: string): Promise<string | null>;
   setPanelBounds(bounds: PanelBounds): void;
   panelTarget(): Promise<string | null>;
 }

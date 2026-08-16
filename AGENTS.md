@@ -13,7 +13,7 @@ repo works.
 | ---------------- | ------------------------------------------------------------------------ |
 | `core/`          | Rust control plane. JSON-RPC over HTTP + SSE. Owns projects, sessions, agent loop, assets, MCP, skills. |
 | `client/`        | Vite + React + TypeScript editor. Three.js viewport, agent panel, workspace tabs. |
-| `client/src-tauri/` | macOS desktop shell. Bundles the core release binary as a sidecar.     |
+| `client/electron/`  | Desktop shell (Electron). Spawns core, hosts the browser panel as a real view. |
 | `shared/schemas/` | `project.schema.json`, `cali-asset.schema.json` — the contracts both sides honour. |
 | `scripts/`       | `dev.sh` (run both halves), `desktop.sh` (package the app), live agent clients. |
 | `docs/`          | `runbook.md` (operations), `verification.md` (what proves each feature works), plans, templates. |
@@ -36,18 +36,18 @@ pnpm desktop:build        # from client/ — packages CaliCode.app (+ .dmg)
 pnpm desktop:dev          # native shell against a live core
 ```
 
-**Two shells exist.** Tauri is the shipping one; an Electron shell is being
-brought up alongside it (`docs/plans/electron-shell.md`) because only a Chromium
-window can host the browser panel as a real view rather than a video stream.
-Nothing has been removed — `src-tauri/` and `desktop:build` are untouched.
+**One shell, and it is Electron.** A Tauri shell shipped first and was removed
+(`docs/plans/electron-shell.md`): its webview is a different engine per platform
+— WKWebView, WebView2, WebKitGTK — and none of them can host a second browser, so
+the BROWSER tab could only ever be a video stream of a Chrome running elsewhere.
+Electron bundles Chromium, so the panel is a `WebContentsView` the window
+composites directly and core drives over CDP.
 
-```bash
-pnpm desktop:electron         # run the Electron shell against a live core
-pnpm desktop:electron:build   # package it (unsigned) to release-electron/
-node scripts/compare-shells.mjs   # prove both shells render the same editor
-```
+The macOS menu bar reads `CFBundleName`, so an unpackaged `pnpm desktop:electron`
+says "Electron" no matter what `app.setName` is; only a packaged build says
+CaliCode. Not a bug to chase.
 
-`CALI_PORT` moves either shell off `:8765` so a second instance can run beside a
+`CALI_PORT` moves the shell off `:8765` so a second instance can run beside a
 live app — attaching two clients to one core is worse than a port collision,
 because `editor_attachment` is one owner per session and the newcomer silently
 steals tool routing.
@@ -162,13 +162,11 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
   Linux (chrome, then chromium, then edge, then a playwright cache);
   `CALI_CHROME` overrides the path, `CALI_BROWSER_HEADED=1` shows the window
   for debugging, `CALI_BROWSER_PROFILE` moves the profile off `~/.cali/browser`.
-- **Why a separate Chrome rather than an embedded webview.** Tauri's webview is
-  a different engine per platform — WKWebView, WebView2, WebKitGTK — and only
-  the Windows one speaks CDP. Embedding would mean three rendering behaviours
-  and an agent that can only drive the browser on one of the three. One found
-  Chrome behaves identically everywhere. The cost is that the tab is a
-  screencast, so it cannot select text or open devtools; the toolbar's
-  open-in-browser button is the way out.
+- **A found Chrome is the fallback, not the panel.** When the shell hands core
+  its `WebContentsView` there is one browser and the user watches the agent work
+  in it. Core still knows how to launch its own Chrome, because the handshake can
+  fail and a headless agent has no panel at all; that path is degraded — the tab
+  shows a screencast of it — but it keeps working rather than failing.
 - The model reads pages as ref-tagged element lists (`browser_snapshot`), not
   HTML or pixels, and clicks refs rather than coordinates. Coordinates exist
   for `<canvas>`, which is the only way to reach a running game.
@@ -178,9 +176,9 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
   drives the `WebContentsView` the user is looking at instead of launching a
   Chrome of its own. The target id is passed, never discovered: guessing by url
   or title would eventually pick the editor's own window, and core would start
-  driving the app instead of the page inside it. Under Tauri, and whenever the
-  handshake fails, core falls back to launching its own Chrome — degraded but
-  working, and the panel is then a screencast of it.
+  driving the app instead of the page inside it. `browser::tests::live_attach`
+  is the regression check: it asserts core drives a browser it did not launch and
+  leaves it running.
 - **Playing a game is a different verb from using a page.** `browser_key` takes
   `holdMs` because movement is a held W, not a tapped one; `browser_mouse_move`
   takes a *delta* because a camera turns by motion, not by destination. It

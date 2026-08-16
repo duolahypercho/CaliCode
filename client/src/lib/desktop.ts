@@ -1,15 +1,14 @@
 /**
  * Desktop-shell detection.
  *
- * The same bundle is served three ways: to a plain browser on core's own
- * origin, to the Tauri webview, and to the Electron shell. Only the two
- * desktop shells draw native window controls over the top-left of the page,
- * so chrome that has to make room for them keys off this.
+ * The same bundle is served two ways: to a plain browser on core's own origin,
+ * and to the Electron shell. Only the shell draws native window controls over
+ * the top-left of the page, so chrome that has to make room for them keys off
+ * this.
  *
- * Both shells are detected by a global they set, and neither sets the other's.
- * Missing the Electron case does not fail loudly — the app simply concludes it
- * is a browser tab, stops reserving space, and the macOS traffic lights land
- * on top of our own header.
+ * The shell is detected by the global its preload sets. Missing it does not
+ * fail loudly — the app simply concludes it is a browser tab, stops reserving
+ * space, and the macOS traffic lights land on top of our own header.
  */
 
 /**
@@ -21,7 +20,7 @@
 interface ElectronBridge {
   shell: "electron";
   platform: string;
-  chooseFolder(): Promise<string | null>;
+  chooseFolder(defaultPath?: string): Promise<string | null>;
   setPanelBounds(bounds: {
     x: number;
     y: number;
@@ -32,7 +31,7 @@ interface ElectronBridge {
   panelTarget(): Promise<string | null>;
 }
 
-/** The Electron preload bridge, or null under Tauri or a plain browser. */
+/** The Electron preload bridge, or null in a plain browser. */
 export function electronBridge(): ElectronBridge | null {
   if (typeof window === "undefined") return null;
   const bridge = (window as { cali?: ElectronBridge }).cali;
@@ -41,8 +40,6 @@ export function electronBridge(): ElectronBridge | null {
 
 /** True when running inside a desktop shell rather than a plain browser. */
 export function isDesktopShell(): boolean {
-  if (typeof window === "undefined") return false;
-  if ("__TAURI_INTERNALS__" in window || "__TAURI__" in window) return true;
   return electronBridge() !== null;
 }
 

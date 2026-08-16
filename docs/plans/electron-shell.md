@@ -1,6 +1,6 @@
 # Electron shell
 
-Status: **P0 spike run 2026-08-15 and it passed — see §3. Nothing built in the repo.**
+Status: **Done. Tauri is removed and Electron is the only shell (2026-08-15). P3 — deleting the screencast pipeline — is the one phase left.**
 Browser-pipeline measurements taken 2026-08-14; §1.
 Recommendation: **proceed to P1.** The one assumption that could have killed this is
 now measured, and it also settled the capture question in our favour (§5).
@@ -202,6 +202,32 @@ letterbox mapping, the cursor probe, `browser_input`, and all frame painting in
 `BrowserTab.tsx`. What survives unchanged: every `browser_*` tool, the snapshot
 walker, the ref scheme, `browser_search`, and capture-to-project.
 
+## 3c. Tauri retirement — done 2026-08-15
+
+`client/src-tauri/` is gone, along with `@tauri-apps/*`, the `tauri` script, and
+`compare-shells.mjs` (which needed two shells to compare). `scripts/desktop.sh`
+was rewritten rather than deleted: it still owns `build|dev|install`, and it
+still creates the app with a *stable* local signing identity, because an ad-hoc
+signature is keyed to the binary hash and macOS drops the app's TCC grants on
+every rebuild. Signing moved from a post-hoc `codesign --deep` to
+electron-builder's own, since an Electron bundle's helpers must be signed
+inside-out and `--deep` does it in the wrong order.
+
+Three things the removal had to carry rather than drop:
+
+- **The folder picker.** `chooseNativeWorkspace` called `@tauri-apps/plugin-dialog`.
+  It now goes through the shell's `chooseFolder`, and `defaultPath` is threaded
+  through the bridge so the panel still opens where the caller expects.
+- **The icons.** `src-tauri/icons/icon.{icns,ico,png}` and the source SVG moved to
+  `client/build-electron/`, which is electron-builder's `buildResources`. Same
+  artwork, same `com.calicode.desktop` identifier, so an upgrade replaces the app
+  rather than sitting beside it with a second `~/.cali`.
+- **The traffic lights.** `trafficLightPosition` is not measured the same way by
+  the two shells. Tauri's `y: 23` put the lights ~10pt below the sidebar's
+  window-controls row, on a line of their own. Measured against a real window,
+  Electron places the group ~6.75pt above the buttons' visual centre, so `y: 13`
+  centres them at 20pt — the same line as an `h-10` row with no top padding.
+
 ## 4. Phases
 
 Each phase ends somewhere shippable. `src-tauri/` stays until phase 4 proves out, so
@@ -328,7 +354,7 @@ there is always a way back.
   what a macOS user actually sees — and moving to Electron makes the app match
   the tests rather than diverge from them.
 
-  `client/scripts/compare-shells.mjs` walks all eleven surfaces in both shells
+  `client/scripts/compare-shells.mjs` walked all eleven surfaces in both shells
   and passes against the dev shell *and* the packaged app. Its pixel budget is
   6,000, set from measurement: cross-build antialiasing costs 2,666-3,023
   differing pixels, so this catches gross layout breakage and not subtle

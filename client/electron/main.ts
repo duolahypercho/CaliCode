@@ -8,8 +8,9 @@
  * Everything the renderer does is same-origin — no CORS, no proxy, no change to
  * the client's `fetch("/rpc")` / `EventSource("/events")`.
  *
- * Ports the behaviour of `src-tauri/src/lib.rs`, which stays the shipping shell
- * until this one is packaged (docs/plans/electron-shell.md, P4).
+ * The only shell. It replaced a Tauri one, whose webview could not host the
+ * browser panel as anything better than a video stream
+ * (docs/plans/electron-shell.md).
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -18,10 +19,25 @@ import { request } from "node:http";
 import { createConnection } from "node:net";
 import path from "node:path";
 
-import { app, BrowserWindow, dialog, ipcMain } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, nativeImage } from "electron";
 
 import { createBrowserPanel, type BrowserPanel } from "./browserPanel";
 import { IPC, type PanelBounds, type ShellInfo } from "./ipc";
+
+/**
+ * Names the userData directory (`~/Library/Application Support/CaliCode`) and
+ * `app.getName()`. Electron would otherwise take `package.json`'s `name` —
+ * `client` — and scatter this app's cookies and cache under that.
+ *
+ * It does *not* rename the macOS menu bar in an unpackaged run: that title comes
+ * from the running bundle's `CFBundleName`, which is Electron's own, so
+ * `pnpm desktop:electron` shows "Electron" no matter what this says. Only a
+ * packaged build says CaliCode there, because electron-builder writes the plist.
+ *
+ * Must run before the first `getPath("userData")`, which is why it is at module
+ * scope rather than inside `whenReady`.
+ */
+app.setName("CaliCode");
 
 /**
  * Port core listens on. Overridable so a second instance can run beside a live app instead of
@@ -232,7 +248,21 @@ function stopCore(): void {
   child.kill();
 }
 
+/**
+ * The brand mark, for the places macOS does not take from the bundle: the dock
+ * and taskbar while running unpackaged. A packaged build gets its icon from
+ * `build-electron/icon.icns` via electron-builder, and this returns nothing
+ * because the staged resources do not carry the source png.
+ */
+function brandIcon() {
+  const png = path.join(__dirname, "..", "build-electron", "icon.png");
+  if (!existsSync(png)) return undefined;
+  const image = nativeImage.createFromPath(png);
+  return image.isEmpty() ? undefined : image;
+}
+
 function createWindow(): BrowserWindow {
+  const icon = brandIcon();
   return new BrowserWindow({
     width: 1440,
     height: 900,
@@ -240,11 +270,15 @@ function createWindow(): BrowserWindow {
     minHeight: 600,
     center: true,
     show: false,
+    title: "CaliCode",
+    ...(icon ? { icon } : {}),
     titleBarStyle: "hiddenInset",
-    // Mirrors tauri.conf.json. Electron measures this differently from Tauri, so
-    // it still wants tuning by eye against GamesSidebar's hard-coded row height
-    // (docs/plans/electron-shell.md §3a).
-    trafficLightPosition: { x: 16, y: 23 },
+    // Measured, not inherited: this is the top-left of the traffic-light group,
+    // and Electron places it ~6.75pt above the buttons' visual centre. The
+    // sidebar's window-controls row is `h-10` with no top padding, so its icons
+    // centre at 20pt — putting the lights on that same line means y = 20 - 6.75.
+    // The Tauri shell's 23 sat them a full 10pt low, on their own line.
+    trafficLightPosition: { x: 16, y: 13 },
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
@@ -277,8 +311,14 @@ function registerIpc(panel: BrowserPanel): void {
     IPC.shellInfo,
     (): ShellInfo => ({ shell: "electron", platform: process.platform }),
   );
-  ipcMain.handle(IPC.chooseFolder, async () => {
-    const result = await dialog.showOpenDialog({ properties: ["openDirectory"] });
+  ipcMain.handle(IPC.chooseFolder, async (_event, defaultPath?: string) => {
+    const result = await dialog.showOpenDialog({
+      properties: ["openDirectory"],
+      title: "Choose a game folder",
+      // Reopening on the folder the caller expects; a bad path is ignored by
+      // AppKit rather than refused, so it needs no validation here.
+      ...(defaultPath ? { defaultPath } : {}),
+    });
     return result.canceled ? null : (result.filePaths[0] ?? null);
   });
   ipcMain.handle(IPC.panelBounds, (_event, bounds: PanelBounds) => {
@@ -327,6 +367,11 @@ async function attachPanelToCore(panel: BrowserPanel): Promise<void> {
 }
 
 app.whenReady().then(async () => {
+  // Unpackaged runs show Electron's own icon in the dock; a packaged build takes
+  // it from the bundle and `app.dock` does not need telling.
+  const icon = brandIcon();
+  if (icon && process.platform === "darwin") app.dock?.setIcon(icon);
+
   const startup = await startCore();
   const win = createWindow();
   const panel = createBrowserPanel(win);
