@@ -2181,6 +2181,14 @@ impl AgentManager {
         call: &ToolCall,
         options: &AgentOptions,
     ) -> Result<Value> {
+        // Before anything is looked up: arguments that never parsed must not
+        // reach a tool as an empty object. The tool would then report whatever
+        // field it checks first as missing, which sends the model back to fix
+        // an argument it actually sent.
+        if let Some(raw) = call.unparsed_arguments.as_deref() {
+            let max_tokens = state.config.read().await.model.max_tokens;
+            anyhow::bail!(unparsed_arguments_error(&call.name, raw, max_tokens));
+        }
         // Backstop the schema filter above: a provider can hallucinate a
         // tool name that was never advertised, and that must not become a
         // path to changing global model state.
@@ -2380,6 +2388,38 @@ impl AgentManager {
             }
         }
     }
+}
+
+/// What to tell the model when its own tool call did not arrive as JSON.
+///
+/// The two causes need different advice, and the parser can tell them apart:
+/// text that ends while a value is still open was cut off in flight — almost
+/// always the turn reaching its output-token cap partway through a long
+/// argument — while text that is complete but malformed is the model's own
+/// mistake. Naming the cap matters because retrying the same call unchanged
+/// hits the same ceiling at the same place.
+fn unparsed_arguments_error(tool: &str, raw: &str, max_tokens: Option<u32>) -> String {
+    let cut_off = serde_json::from_str::<Value>(raw)
+        .err()
+        .is_some_and(|error| error.classify() == serde_json::error::Category::Eof);
+    if !cut_off {
+        return format!(
+            "the arguments for {tool} were not valid JSON ({} bytes), so nothing ran. Send the \
+             call again with a well-formed arguments object.",
+            raw.len()
+        );
+    }
+    let cap = match max_tokens {
+        Some(limit) => format!(" This turn's output cap is {limit} tokens (model.max_tokens)."),
+        None => String::new(),
+    };
+    format!(
+        "the arguments for {tool} arrived cut off — {} bytes ending mid-value — so nothing ran.{cap} \
+         Retrying the same call unchanged will stop in the same place: split the work into smaller \
+         calls (write a short first chunk, then extend it with file_edit), or ask the user to raise \
+         the cap.",
+        raw.len()
+    )
 }
 
 fn assistant_tool_call(call: &ToolCall) -> Value {
@@ -2606,6 +2646,7 @@ mod tests {
             id: "call-plan".into(),
             name: "graph_plan".into(),
             arguments: Value::Null,
+            unparsed_arguments: None,
         }];
         repair_missing_graph_goal(
             &mut calls,
@@ -2626,11 +2667,13 @@ mod tests {
                 id: "call-plan".into(),
                 name: "graph_plan".into(),
                 arguments: json!({ "goal": "provider goal", "nodes": [] }),
+                unparsed_arguments: None,
             },
             ToolCall {
                 id: "call-list".into(),
                 name: "project_list".into(),
                 arguments: json!({}),
+                unparsed_arguments: None,
             },
         ];
         repair_missing_graph_goal(
@@ -5058,6 +5101,97 @@ mod tests {
             .is_none());
     }
 
+    /// Streams a `file_write` whose argument JSON stops mid-`content`, the
+    /// shape a response takes when it reaches its output-token cap partway
+    /// through a long argument.
+    async fn truncated_call_provider(
+        axum::Json(body): axum::Json<Value>,
+    ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+        let empty = vec![];
+        let messages = body["messages"].as_array().unwrap_or(&empty);
+        let has_tool = messages.iter().any(|message| message["role"] == "tool");
+        let events = if has_tool {
+            content_stream("smaller pieces next time")
+        } else {
+            let cut_off =
+                "{\"slug\":\"demo\",\"path\":\"notes.txt\",\"content\":\"the first half of a long";
+            vec![
+                Ok(Event::default().data(
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-cut","function":{"name":"file_write","arguments": cut_off}}]}}]}).to_string(),
+                )),
+                Ok(Event::default().data(
+                    json!({"choices":[{"finish_reason":"length","index":0,"delta":{}}]}).to_string(),
+                )),
+                Ok(Event::default().data("[DONE]")),
+            ]
+        };
+        Sse::new(futures::stream::iter(events))
+    }
+
+    /// A call the token cap cut in half is refused by its real name. It used
+    /// to parse as nothing, become an empty argument object, and reach
+    /// `file_write` — which reported "missing required string path" and sent
+    /// the model back to fix a path it had spelled correctly.
+    #[tokio::test]
+    async fn a_tool_call_cut_off_by_the_token_cap_is_named_as_such() {
+        let app = Router::new().route("/v1/chat/completions", post(truncated_call_provider));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let (bus, _) = tokio::sync::broadcast::channel(256);
+        let agents = AgentManager::new(bus.clone());
+        let tools: HashMap<String, ToolDef> = HashMap::new();
+        let state = make_state(addr, bus.clone(), agents.clone(), tools.clone());
+        let mut rx = bus.subscribe();
+
+        let options = AgentOptions {
+            max_turns: 3,
+            project_slug: Some("demo".into()),
+            ..Default::default()
+        };
+        let result = agents
+            .chat(
+                &state,
+                &tools,
+                None,
+                &[json!({ "role": "user", "content": "write the file" })],
+                options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result["toolCalls"][0]["status"], "error");
+
+        let mut refusal = None;
+        while let Ok(event) = rx.try_recv() {
+            if event["type"] == "agent.tool_finished" && event["tool"] == "file_write" {
+                refusal = event["result"]["error"].as_str().map(String::from);
+            }
+        }
+        let refusal = refusal.expect("a truncated call must produce an error tool result");
+        assert!(refusal.contains("cut off"), "unexpected refusal: {refusal}");
+        assert!(
+            refusal.contains("128"),
+            "the refusal must name the cap that caused it: {refusal}"
+        );
+        assert!(
+            !refusal.contains("missing required string"),
+            "a truncated call must not be reported as a missing argument: {refusal}"
+        );
+    }
+
+    #[test]
+    fn malformed_arguments_are_told_apart_from_truncated_ones() {
+        let complete_but_wrong = unparsed_arguments_error("file_write", "{path: notes.txt}", None);
+        assert!(complete_but_wrong.contains("not valid JSON"));
+        assert!(!complete_but_wrong.contains("cut off"));
+        let cut_off = unparsed_arguments_error("file_write", "{\"path\": \"note", Some(4096));
+        assert!(cut_off.contains("cut off"));
+        assert!(cut_off.contains("4096"));
+    }
+
     #[tokio::test]
     async fn file_write_activity_is_separate_from_result_and_history() {
         let app = Router::new().route("/v1/chat/completions", post(activity_write_provider));
@@ -5704,6 +5838,7 @@ mod tests {
             id: format!("{name}-1"),
             name: name.into(),
             arguments,
+            unparsed_arguments: None,
         }
     }
 

@@ -222,6 +222,13 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
   models.dev through `@opencode-ai/models` (see `src/lib/modelMeta.ts`), cached
   for a day with the package's bundled snapshot as the offline fallback. Do not
   hardcode model lists.
+- **Output cap** — `model.max_tokens` (default 32768) bounds one turn's
+  completion, reasoning included. Too small and a long tool call is cut off
+  mid-argument; the truncated JSON is kept as `ToolCall.unparsed_arguments` and
+  refused by name rather than reaching a tool as an empty argument set. A
+  provider that refuses the cap as too large for its model has its own ceiling
+  read out of the refusal and retried (`rejected_output_cap`), so raising the
+  default cannot lock a smaller model out.
 
 ## State on disk
 
