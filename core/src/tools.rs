@@ -779,7 +779,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "file_write".into(),
-            description: "Write UTF-8 text into the active game's folder (scripts, tests, docs).".into(),
+            description: "Write UTF-8 text into the active game's folder (scripts, tests, docs). Creates a file or replaces one whole; to change part of a file that already exists, use file_edit instead — this tool re-sends every line.".into(),
             parameters: json!({"type":"object","properties":{"slug":{"type":"string"},"path":{"type":"string"},"content":{"type":"string"}},"required":["slug","path","content"]}),
             kind: ToolKind::Core,
             access: Access::Guarded,
@@ -1688,7 +1688,89 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             kind: ToolKind::Core,
             access: Access::ReadOnly,
         },
+        ToolDef {
+            name: "game_perf".into(),
+            description: "Measure the running game's frame budget — frame rate, draw calls, \
+                          triangles and heap — by sampling it live in the browser. Reach for \
+                          this before calling a build finished or fast: a screenshot cannot \
+                          show a stutter, and motion metrics say pixels changed, not that the \
+                          frame held. Read `fps.low1` first, not `fps.mean`: a game that \
+                          averages 58 and drops to 20 four times a second looks fine in the \
+                          mean and feels broken to play. `idleFrames` counts frames that drew \
+                          nothing, so a black page reads as idle rather than as a perfect 60. \
+                          Pass `budget` to get a pass/fail verdict instead of raw numbers. \
+                          Needs nothing from the game — it instruments the graphics API, so \
+                          three.js, WebGPU and raw WebGL all work unmodified."
+                .into(),
+            parameters: json!({
+                "type":"object",
+                "properties":{
+                    "durationMs":{"type":"integer","description":"sampling window, 200-10000 (default 2000)"},
+                    "budget":{
+                        "type":"object",
+                        "description":"optional targets to judge against; adds a verdict to the result",
+                        "properties":{
+                            "targetFps":{"type":"number","description":"judged against fps.low1, not the mean"},
+                            "maxDrawCalls":{"type":"number","description":"per frame, mean"},
+                            "maxTriangles":{"type":"number","description":"per frame"},
+                            "maxHeapMB":{"type":"number"}
+                        }
+                    }
+                }
+            }),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
     ]
+}
+
+/// Judge a `game_perf` sample against the caller's targets.
+///
+/// Frame rate is judged on `fps.low1` rather than the mean deliberately: a
+/// budget met on average and missed every fifth frame is a budget missed, and
+/// checking the mean would pass exactly the games that stutter.
+fn budget_verdict(measured: &Value, budget: &Value) -> Value {
+    let mut over: Vec<&str> = Vec::new();
+    let mut check = |key: &'static str, actual: Option<f64>, limit: Option<f64>, ceiling: bool| {
+        if let (Some(actual), Some(limit)) = (actual, limit) {
+            let missed = if ceiling {
+                actual > limit
+            } else {
+                actual < limit
+            };
+            if missed {
+                over.push(key);
+            }
+        }
+    };
+    check(
+        "fps",
+        measured["fps"]["low1"].as_f64(),
+        budget["targetFps"].as_f64(),
+        false,
+    );
+    check(
+        "drawCalls",
+        measured["drawCalls"]["mean"].as_f64(),
+        budget["maxDrawCalls"].as_f64(),
+        true,
+    );
+    check(
+        "triangles",
+        measured["triangles"]["perFrame"].as_f64(),
+        budget["maxTriangles"].as_f64(),
+        true,
+    );
+    check(
+        "heapMB",
+        measured["heapMB"].as_f64(),
+        budget["maxHeapMB"].as_f64(),
+        true,
+    );
+    json!({
+        "verdict": if over.is_empty() { "pass" } else { "fail" },
+        "over": over,
+    })
 }
 
 pub fn to_openai_schema(def: &ToolDef) -> Value {
@@ -2552,6 +2634,21 @@ pub(crate) async fn execute_core_tool_with_activity(
         "browser_close" => {
             state.browsers.shutdown().await;
             Ok(json!({ "closed": true }))
+        }
+        "game_perf" => {
+            let duration = args["durationMs"]
+                .as_u64()
+                .unwrap_or(crate::browser::PERF_DEFAULT_MS);
+            let browser = state.browsers.ensure(state.bus.clone()).await?;
+            let mut measured = browser.perf(duration).await?;
+            // A sample that failed to observe any frames has no numbers to
+            // judge, and answering it with a verdict would read as a pass.
+            if measured.get("fps").is_some() {
+                if let Some(budget) = args.get("budget").filter(|value| value.is_object()) {
+                    measured["budget"] = budget_verdict(&measured, budget);
+                }
+            }
+            Ok(measured)
         }
         "loop_report_start" => {
             let slug = required_str(args, "slug")?;
@@ -6646,5 +6743,113 @@ mod tests {
         assert_eq!(approval["ownerGraph"], Value::Null);
         assert_eq!(approval["ownerSession"], Value::Null);
         assert_eq!(approval["targetClientId"], Value::Null);
+    }
+
+    #[test]
+    fn game_perf_is_a_read_and_plannable() {
+        assert_eq!(core_tool_access("game_perf"), Some(Access::ReadOnly));
+        assert!(crate::agent::plan_mode_allows("game_perf"));
+    }
+
+    /// The whole point of the tool: a budget met on average and missed every
+    /// fifth frame is a budget missed.
+    #[test]
+    fn budget_judges_frame_rate_on_the_one_percent_low_not_the_mean() {
+        let measured = json!({ "fps": { "mean": 58.0, "p50": 60.0, "low1": 21.0 } });
+        let verdict = budget_verdict(&measured, &json!({ "targetFps": 60 }));
+        assert_eq!(verdict["verdict"], "fail");
+        assert_eq!(verdict["over"], json!(["fps"]));
+    }
+
+    #[test]
+    fn budget_reports_every_ceiling_it_crossed() {
+        let measured = json!({
+            "fps": { "low1": 62.0 },
+            "drawCalls": { "mean": 2400.0 },
+            "triangles": { "perFrame": 2_000_000.0 },
+            "heapMB": 900.0,
+        });
+        let verdict = budget_verdict(
+            &measured,
+            &json!({
+                "targetFps": 60, "maxDrawCalls": 1500,
+                "maxTriangles": 1_000_000, "maxHeapMB": 512,
+            }),
+        );
+        assert_eq!(verdict["verdict"], "fail");
+        assert_eq!(verdict["over"], json!(["drawCalls", "triangles", "heapMB"]));
+    }
+
+    #[test]
+    fn a_budget_that_is_met_passes_and_names_nothing() {
+        let measured = json!({
+            "fps": { "low1": 61.0 },
+            "drawCalls": { "mean": 900.0 },
+            "triangles": { "perFrame": 400_000.0 },
+            "heapMB": 210.0,
+        });
+        let verdict = budget_verdict(
+            &measured,
+            &json!({
+                "targetFps": 60, "maxDrawCalls": 1500,
+                "maxTriangles": 1_000_000, "maxHeapMB": 512,
+            }),
+        );
+        assert_eq!(verdict["verdict"], "pass");
+        assert_eq!(verdict["over"], json!([]));
+    }
+
+    /// `heapMB` is null outside Chrome-with-`performance.memory`, and a
+    /// missing measurement must not be read as a zero that clears every limit.
+    #[test]
+    fn a_measurement_the_page_could_not_supply_is_not_judged() {
+        let measured = json!({ "fps": { "low1": 61.0 }, "heapMB": Value::Null });
+        let verdict = budget_verdict(&measured, &json!({ "targetFps": 60, "maxHeapMB": 512 }));
+        assert_eq!(verdict["verdict"], "pass");
+        assert_eq!(verdict["over"], json!([]));
+    }
+
+    /// The sampler patches the page's draw entry points, so every exit from it
+    /// must put them back — a leak would make each later call a measurement of
+    /// this tool's own instrumentation.
+    #[test]
+    fn the_sampler_restores_what_it_patched_on_every_exit() {
+        let script = crate::browser::perf_expression(2_000);
+        assert_eq!(
+            script.matches("resolve(").count(),
+            1,
+            "every exit must go through finish(), which is what runs the undo list"
+        );
+        for guard in ["clearTimeout(guard)", "for (const undo of restore)"] {
+            assert!(script.contains(guard), "missing {guard}");
+        }
+    }
+
+    /// rAF keeps ticking at display rate on a page that draws nothing, so a
+    /// black screen would otherwise report a flawless 60.
+    #[test]
+    fn the_sampler_counts_frames_that_drew_nothing() {
+        assert!(crate::browser::perf_expression(2_000).contains("idleFrames"));
+    }
+
+    #[test]
+    fn the_sampler_counts_webgpu_draws_and_flags_them_as_approximate() {
+        let script = crate::browser::perf_expression(2_000);
+        for needle in ["GPURenderPassEncoder", "drawIndexed", "trianglesApprox"] {
+            assert!(script.contains(needle), "missing {needle}");
+        }
+    }
+
+    /// An unbounded window would outlive the CDP round trip and come back
+    /// with nothing at all, which reads as "the game has no frames".
+    #[test]
+    fn a_sampling_window_is_clamped_into_range() {
+        let absurd = crate::browser::perf_expression(u64::MAX);
+        assert!(absurd.contains(&format!("DURATION = {}", crate::browser::PERF_MAX_MS)));
+        let tiny = crate::browser::perf_expression(0);
+        assert!(tiny.contains(&format!("DURATION = {}", crate::browser::PERF_MIN_MS)));
+        let asked = crate::browser::perf_expression(3_000);
+        assert!(asked.contains("DURATION = 3000"));
+        assert!(!asked.contains("__DURATION__"), "placeholder was left in");
     }
 }
