@@ -1,6 +1,6 @@
 import { parseRestoreArgs } from "./checkpoints";
-import { parseInterval, parseLoopArgs } from "./interval";
-import type { SkillInfo } from "./extensions";
+import { parseInterval, parseLoopArgs, type LoopProfile } from "./interval";
+import type { FileCommandInfo, SkillInfo } from "./extensions";
 import { parseGoalCommand, type GoalCommand } from "./goal";
 import type { CommandPanel } from "./types";
 
@@ -25,9 +25,10 @@ export interface SlashContext {
   /**
    * Run the autonomous loop toward a goal. `intervalMs` turns it into a watch:
    * the loop waits that long between iterations and keeps going after the goal
-   * is met, instead of finishing at the first accepted DONE.
+   * is met, instead of finishing at the first accepted DONE. `profile` picks
+   * how much process is imposed on the goal — see [`LoopProfile`].
    */
-  runLoop: (goal: string, intervalMs: number | null) => Promise<void>;
+  runLoop: (goal: string, intervalMs: number | null, profile: LoopProfile) => Promise<void>;
   /**
    * Compact the core session in place (session_compact RPC). `instructions`
    * steer what the summary keeps and are remembered for this session, so the
@@ -69,6 +70,13 @@ export interface SlashContext {
   /** Run an installed skill by name, with an optional task tail. */
   runSkill: (name: string, task: string) => Promise<void>;
   /**
+   * Run a file-defined command: expand its markdown body through core
+   * (`command_render`, which substitutes `$ARGUMENTS` and `$1..$9`) and send
+   * the result as an ordinary turn. Expansion happens in core so one
+   * definition of the syntax serves every client.
+   */
+  runFileCommand: (name: string, args: string) => Promise<void>;
+  /**
    * Everything the panel's menu offers, built-ins plus skills. `/help` reads
    * it so the listing matches the menu; absent, it falls back to the built-ins.
    */
@@ -109,7 +117,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
             name: command.name,
             usage: command.usage,
             summary: command.summary,
-            skill: command.kind === "skill",
+            kind: command.kind,
           })),
         },
         ["Commands:", ...lines].join("\n"),
@@ -119,19 +127,20 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   {
     name: "loop",
     summary: "Work toward a goal until done, or re-check it on an interval",
-    usage: "[interval] <goal>",
+    usage: "[--aaa] [interval] <goal>",
     run: (args, ctx) => {
-      const { intervalMs, goal } = parseLoopArgs(args);
+      const { intervalMs, profile, goal } = parseLoopArgs(args);
       // `/loop 15m` on its own is an interval with nothing to do: run it and
       // the loop would spend an hour chasing the goal "15m".
       if (!goal || parseInterval(goal) !== null) {
         ctx.say(
           "Usage: /loop <goal> — I'll keep working until the goal is met or I hit the iteration cap.\n" +
-            "/loop <interval> <goal> — same work, paced: `/loop 15m run the tests and fix what fails` keeps re-checking every 15m until you stop it. Units are s, m, h.",
+            "/loop <interval> <goal> — same work, paced: `/loop 15m run the tests and fix what fails` keeps re-checking every 15m until you stop it. Units are s, m, h.\n" +
+            "/loop --aaa <goal> — the quality pipeline: a specialist task graph, PIE evidence, and a judge that has to score the result before DONE is believed.",
         );
         return;
       }
-      return ctx.runLoop(goal, intervalMs);
+      return ctx.runLoop(goal, intervalMs, profile);
     },
   },
   {
@@ -285,8 +294,9 @@ export interface NamedCommand {
   usage?: string;
   /** Menu label; defaults to the name title-cased (see [`commandLabel`]). */
   label?: string;
-  /** Skills are tagged so the menu can say where a row came from. */
-  kind?: "skill";
+  /** Skills and file commands are tagged so the menu can say where a row
+   * came from. */
+  kind?: "skill" | "command";
   /**
    * Enter on the bare name runs the command instead of completing it into the
    * composer. Off for everything but `/side`: see [`runsBare`].
@@ -450,6 +460,33 @@ export function skillCommands(skills: readonly SkillInfo[]): SlashCommand[] {
     });
   }
   return commands;
+}
+
+/**
+ * File-defined commands (`~/.cali/commands/*.md`, plus the project's own) as
+ * slash commands. Broken files are left out — they are listed in core's
+ * `command_list` so the menu could show the parse error, but running one would
+ * send an empty prompt. Like a skill, a file command may not shadow a
+ * built-in; core refuses those names too, so this is the second of two locks
+ * on the same door.
+ */
+export function fileCommands(commands: readonly FileCommandInfo[]): SlashCommand[] {
+  const taken = new Set(SLASH_COMMANDS.map((command) => command.name));
+  const out: SlashCommand[] = [];
+  for (const command of commands) {
+    if (command.error) continue;
+    const name = command.name.trim().toLowerCase();
+    if (!name || taken.has(name)) continue;
+    taken.add(name);
+    out.push({
+      name,
+      summary: command.description || `Run the ${name} command`,
+      usage: command.argumentHint ?? "[arguments]",
+      kind: "command",
+      run: (args, ctx) => ctx.runFileCommand(name, args.trim()),
+    });
+  }
+  return out;
 }
 
 /** Parse `/name rest` from input, or null if it is not a slash command. */

@@ -51,21 +51,25 @@ describe("help panel", () => {
   const help: CommandPanel = {
     kind: "help",
     commands: [
-      { name: "loop", usage: "[interval] <goal>", summary: "Work toward a goal", skill: false },
-      { name: "playtest", usage: "[task]", summary: "Drive the game", skill: true },
+      { name: "loop", usage: "[interval] <goal>", summary: "Work toward a goal" },
+      { name: "playtest", usage: "[task]", summary: "Drive the game", kind: "skill" as const },
+      { name: "review", usage: "<pr>", summary: "Review a PR", kind: "command" as const },
     ],
   };
 
-  it("groups skills apart from built-in commands", () => {
+  it("groups skills and file commands apart from built-in commands", () => {
     render(<CommandPanelView panel={help} />);
     expect(screen.getByText("Commands")).toBeTruthy();
     expect(screen.getByText("Skills")).toBeTruthy();
+    expect(screen.getByText("Your commands")).toBeTruthy();
     expect(screen.getByText("/loop")).toBeTruthy();
     expect(screen.getByText("/playtest")).toBeTruthy();
+    expect(screen.getByText("/review")).toBeTruthy();
   });
 
-  it("drops the skills group entirely when none are installed", () => {
+  it("drops the skills and file-command groups entirely when none exist", () => {
     render(<CommandPanelView panel={{ ...help, commands: [help.commands[0]] }} />);
     expect(screen.queryByText("Skills")).toBeNull();
+    expect(screen.queryByText("Your commands")).toBeNull();
   });
 });

@@ -143,3 +143,60 @@ export function isSafeReportPath(path: string): boolean {
   if (path.startsWith("/") || path.includes("?") || path.includes("#") || /[\u0000-\u001f]/.test(path)) return false;
   return path.split("/").every((segment) => segment.length > 0 && segment !== "." && segment !== "..");
 }
+
+/**
+ * A `/loop` run as core reports it. Mirrors `LoopView` in
+ * `core/src/loop_run.rs`.
+ *
+ * The driver lives in core, so this is a view onto a server-side object rather
+ * than the panel's own state: a run keeps going when the tab closes, and a
+ * reloaded panel can pick it back up from `loop_runs`.
+ */
+export interface LoopRun {
+  loopId: string;
+  slug: string;
+  goal: string;
+  profile: "standard" | "aaa";
+  status: "running" | "completed" | "stopped" | "failed";
+  iteration: number;
+  maxIterations: number;
+  startedAtMs: number;
+  intervalMs?: number;
+  sessionId?: string;
+  detail?: string;
+}
+
+export async function startLoopRun(params: {
+  projectSlug: string;
+  goal: string;
+  profile: "standard" | "aaa";
+  intervalMs?: number | null;
+  sessionId?: string;
+  workspaceRoot?: string;
+  permissionMode: string;
+  contextLength?: number;
+  guardianModel?: string;
+}): Promise<LoopRun> {
+  const result = await rpc<{ loop: LoopRun }>("loop_start", {
+    projectSlug: params.projectSlug,
+    goal: params.goal,
+    profile: params.profile,
+    ...(params.intervalMs ? { intervalMs: params.intervalMs } : {}),
+    ...(params.sessionId ? { sessionId: params.sessionId } : {}),
+    ...(params.workspaceRoot ? { workspaceRoot: params.workspaceRoot } : {}),
+    permissionMode: params.permissionMode,
+    ...(params.contextLength ? { contextLength: params.contextLength } : {}),
+    ...(params.guardianModel ? { guardianModel: params.guardianModel } : {}),
+  });
+  return result.loop;
+}
+
+export async function stopLoopRun(loopId: string): Promise<LoopRun> {
+  const result = await rpc<{ loop: LoopRun }>("loop_stop", { loopId });
+  return result.loop;
+}
+
+export async function listLoopRuns(): Promise<LoopRun[]> {
+  const result = await rpc<{ loops?: LoopRun[] }>("loop_runs", {});
+  return result?.loops ?? [];
+}

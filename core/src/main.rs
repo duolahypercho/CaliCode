@@ -8,6 +8,7 @@ mod blender;
 mod browser;
 mod capture_persist;
 mod checkpoints;
+mod commands;
 mod compaction;
 mod computer;
 mod config;
@@ -19,10 +20,13 @@ mod fileread;
 mod goal;
 mod graph;
 mod guardian;
+mod hooks;
 mod image3d;
 mod image_mesh;
 pub(crate) mod loop_report;
+mod loop_run;
 mod mcp;
+mod memory;
 mod model;
 mod pathlock;
 mod rpc;
@@ -76,6 +80,9 @@ pub struct AppState {
     pub sessions_root: PathBuf,
     pub agents: AgentManager,
     pub graphs: graph::GraphManager,
+    /// Server-owned `/loop` runs. Started by `loop_start`, they outlive the
+    /// client that asked for them — see `loop_run.rs`.
+    pub loops: loop_run::LoopManager,
     pub bus: broadcast::Sender<Value>,
     pub tools: Arc<RwLock<HashMap<String, tools::ToolDef>>>,
     pub editor_bridge: editor_bridge::EditorBridge,
@@ -145,6 +152,7 @@ async fn main() -> anyhow::Result<()> {
         sessions_root,
         agents: AgentManager::new(bus.clone()),
         graphs: graph::GraphManager::new(),
+        loops: loop_run::LoopManager::default(),
         bus: bus.clone(),
         tools: Arc::new(RwLock::new(HashMap::new())),
         editor_bridge: editor_bridge::EditorBridge::new(bus.clone()),

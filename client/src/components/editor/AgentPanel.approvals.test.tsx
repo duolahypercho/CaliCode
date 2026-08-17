@@ -808,3 +808,209 @@ describe("defect 6 — one classifier, one call site", () => {
     expect(panelSource()).not.toMatch(/approved:\s*false/);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Auto mode: the card has to say why it is on screen.
+// ---------------------------------------------------------------------------
+
+describe("auto mode — the reason on the card", () => {
+  it("shows the reviewer's reason and attributes it", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await emit(
+      approvalRequest({
+        reason: "this writes outside the game folder",
+        reasonSource: "guardian",
+      }),
+    );
+    expect(await screen.findByText(/this writes outside the game folder/)).toBeTruthy();
+    expect(screen.getByText("Flagged for review:")).toBeTruthy();
+    expect(deniedSends()).toHaveLength(0);
+  });
+
+  it("attributes the agent's own escalation differently", async () => {
+    // The two are not interchangeable: the agent volunteering a doubt about
+    // its own call is a different thing from a reviewer overriding its
+    // silence, and a card that blurs them teaches the user to read neither.
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await emit(
+      approvalRequest({
+        reason: "Install the 40 dependencies this template needs?",
+        reasonSource: "agent",
+      }),
+    );
+    expect(await screen.findByText(/Install the 40 dependencies/)).toBeTruthy();
+    expect(screen.getByText("The agent asks:")).toBeTruthy();
+    expect(screen.queryByText("Flagged for review:")).toBeNull();
+  });
+
+  it("renders nothing extra when there is no reason", async () => {
+    // Manual mode's shape. The mode is the reason, and an empty attribution
+    // line would be furniture.
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await emit(approvalRequest());
+    expect(await screen.findByText(/Approve file_write\?/)).toBeTruthy();
+    expect(screen.queryByText("Flagged for review:")).toBeNull();
+    expect(screen.queryByText("The agent asks:")).toBeNull();
+  });
+
+  it("ignores a reason source it does not know", async () => {
+    // A core that grows a third source shows the sentence unattributed rather
+    // than an unstyled label nobody designed.
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await emit(approvalRequest({ reason: "something happened", reasonSource: "committee" }));
+    expect(await screen.findByText(/something happened/)).toBeTruthy();
+    expect(screen.queryByText("Flagged for review:")).toBeNull();
+    expect(screen.queryByText("The agent asks:")).toBeNull();
+  });
+
+  it("treats a blank reason as no reason", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await emit(approvalRequest({ reason: "   ", reasonSource: "guardian" }));
+    expect(await screen.findByText(/Approve file_write\?/)).toBeTruthy();
+    expect(screen.queryByText("Flagged for review:")).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Plan mode: core announces an approved plan; the picker is still ours.
+// ---------------------------------------------------------------------------
+
+describe("plan mode — leaving it on core's word", () => {
+  const modeButton = () => screen.getByRole("button", { name: /Permission mode/ });
+
+  // jsdom has no PointerEvent, and Radix opens mouse menus on pointer-down.
+  async function chooseMode(label: RegExp): Promise<void> {
+    window.PointerEvent = MouseEvent as typeof PointerEvent;
+    await act(async () => {
+      fireEvent.pointerDown(modeButton(), { button: 0, ctrlKey: false });
+    });
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("menuitem", { name: label }));
+    });
+  }
+
+  const choosePlan = () => chooseMode(/Plan/);
+
+  it("moves the picker off plan when core says the plan was approved", async () => {
+    renderPanel();
+    await act(async () => {});
+    // A turn first, so the panel holds the session id core will name.
+    await startTurn();
+    await choosePlan();
+    expect(modeButton().textContent).toContain("Plan");
+
+    await emit({ type: "agent.permission_mode", sessionId: "session-1", mode: "auto" });
+    await waitFor(() => expect(modeButton().textContent).toContain("Auto"));
+  });
+
+  it("does not move a picker the user already moved themselves", async () => {
+    // The event is the tail of a decision made in plan mode. Someone who left
+    // plan mode while the agent was still writing has since made a newer
+    // choice, and core must not reach in and overwrite it.
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await chooseMode(/Manual/);
+    expect(modeButton().textContent).toContain("Manual");
+
+    await emit({ type: "agent.permission_mode", sessionId: "session-1", mode: "auto" });
+    expect(modeButton().textContent).toContain("Manual");
+  });
+
+  it("ignores an announcement for another session", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await choosePlan();
+    await emit({ type: "agent.permission_mode", sessionId: "session-other", mode: "auto" });
+    expect(modeButton().textContent).toContain("Plan");
+  });
+
+  it("ignores a mode this panel does not offer", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await choosePlan();
+    await emit({ type: "agent.permission_mode", sessionId: "session-1", mode: "yolo" });
+    expect(modeButton().textContent).toContain("Plan");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The plan card: the one request whose arguments are the thing being decided.
+// ---------------------------------------------------------------------------
+
+describe("plan mode — the plan card", () => {
+  const PLAN = "# Add a double jump\n\n1. Read `main.js`\n2. Add the second impulse\n";
+
+  async function raisePlan(): Promise<void> {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await emit(
+      approvalRequest({
+        requestId: "plan-1",
+        tool: "exit_plan_mode",
+        arguments: { plan: PLAN },
+        reason: "The agent has finished planning and wants to start work.",
+        reasonSource: "agent",
+      }),
+    );
+  }
+
+  it("renders the plan as the document it is, not as escaped JSON", async () => {
+    // A plan shown as JSON in a 96px scroller is a plan nobody reads, and this
+    // card is the only moment it is meant to be read.
+    await raisePlan();
+    expect(await screen.findByText("Start work on this plan?")).toBeTruthy();
+    expect(document.querySelector("[data-approval-plan]")).toBeTruthy();
+    // `AgentText` is the panel's inline renderer — bold and code, no block
+    // elements — so the plan reads as markdown source does. That is legible;
+    // a JSON blob with escaped newlines is not, and it is what this replaced.
+    const block = document.querySelector("[data-approval-plan]");
+    expect(block?.textContent).toContain("Add a double jump");
+    expect(block?.textContent).toContain("Add the second impulse");
+    expect(screen.queryByText(/"plan":/)).toBeNull();
+  });
+
+  it("offers Start work and Keep planning, and no standing grant", async () => {
+    // "Always" on a plan would mean the next plan starts unread.
+    await raisePlan();
+    expect(await screen.findByRole("button", { name: /Start work/ })).toBeTruthy();
+    expect(screen.getByRole("button", { name: /Keep planning/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Always/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Approve$/ })).toBeNull();
+  });
+
+  it("sends what the user typed as the change they want", async () => {
+    await raisePlan();
+    const box = await screen.findByLabelText("What to change about the plan");
+    fireEvent.change(box, { target: { value: "do the tests first" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: /Keep planning/ }));
+    });
+    const sent = approvalSends().find((call) => call.requestId === "plan-1");
+    expect(sent?.approved).toBe(false);
+    expect(sent?.reason).toBe("do the tests first");
+  });
+
+  it("leaves an ordinary request rendering exactly as before", async () => {
+    renderPanel();
+    await act(async () => {});
+    await startTurn();
+    await emit(approvalRequest());
+    expect(await screen.findByText(/Approve file_write\?/)).toBeTruthy();
+    expect(document.querySelector("[data-approval-plan]")).toBeNull();
+    expect(screen.getByRole("button", { name: /Always/ })).toBeTruthy();
+  });
+});

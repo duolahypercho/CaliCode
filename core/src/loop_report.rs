@@ -1487,7 +1487,7 @@ fn validate_iteration(iteration: &IterationReport, loop_started_at_ms: u64) -> R
 /// without this gate it can mark a single-iteration, evidence-less report
 /// as `Completed` and the report looks finished on disk. Each check below
 /// names a single concrete failure so the caller knows what to add.
-fn validate_completion_readiness(report: &LoopReport) -> Result<()> {
+pub(crate) fn validate_completion_readiness(report: &LoopReport) -> Result<()> {
     if report
         .reference
         .as_deref()

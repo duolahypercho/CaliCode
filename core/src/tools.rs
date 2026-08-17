@@ -1099,6 +1099,47 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
             access: Access::ReadOnly,
         },
         ToolDef {
+            name: "memory_list".into(),
+            description: "List durable memories (name, description, type, scope) visible to this project. The system prompt already carries this index; call it only to re-read it after writing, or when the index said it omitted entries.".into(),
+            parameters: json!({"type":"object","properties":{"slug":{"type":"string","description":"project slug"}}}),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "memory_read".into(),
+            description: "Read one memory's full body by name. The prompt index carries only descriptions, so read the memory before acting on its subject.".into(),
+            parameters: json!({"type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string"}},"required":["name"]}),
+            kind: ToolKind::Core,
+            access: Access::ReadOnly,
+        },
+        ToolDef {
+            name: "memory_write".into(),
+            description: "Record one durable fact for future sessions, replacing any memory of the same name. Write what a later session could not derive from the code or git history — a constraint, a measurement, a decision and its reason, a dead end already ruled out. The description is what a later session reads to decide whether to open this memory at all, so make it specific. One fact per memory.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "short kebab-case slug, [A-Za-z0-9_-]"},
+                    "description": {"type": "string", "description": "one line; the recall decision is made on this alone"},
+                    "body": {"type": "string", "description": "the fact itself, in markdown; link related memories as [[their-name]]"},
+                    "type": {"type": "string", "enum": ["user", "feedback", "project", "reference"],
+                             "description": "user = who they are; feedback = how to work; project = this work; reference = an external pointer. Default project."},
+                    "scope": {"type": "string", "enum": ["project", "global"],
+                              "description": "project (default) travels with this game; global applies everywhere"},
+                    "slug": {"type": "string", "description": "project slug; required for project scope"}
+                },
+                "required": ["name", "description", "body"]
+            }),
+            kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
+            name: "memory_forget".into(),
+            description: "Delete a memory that has turned out to be wrong or stale. Prefer this over leaving a false fact in place — a wrong memory costs every future session.".into(),
+            parameters: json!({"type":"object","properties":{"name":{"type":"string"},"slug":{"type":"string"}},"required":["name"]}),
+            kind: ToolKind::Core,
+            access: Access::Guarded,
+        },
+        ToolDef {
             name: "asset_search".into(),
             description: "Search for assets across the project's local store, the asset-repo library catalogue, and PolyHaven's free CC0 catalogue. Returns scored hits with ready-made asset_pick arguments. Library hits are marked `installed`: the whole catalogue is browsable, but a repo carries a usable `detail.url` only once this game has installed it — asset_pick installs it and returns the url.".into(),
             parameters: json!({
@@ -2238,6 +2279,49 @@ pub(crate) async fn execute_core_tool_with_activity(
                 out["filesTruncated"] = json!(support.truncated);
             }
             Ok(out)
+        }
+        "memory_list" => {
+            let slug = args.get("slug").and_then(Value::as_str);
+            Ok(json!({ "memories": crate::memory::list_memories(root, slug) }))
+        }
+        "memory_read" => {
+            let slug = args.get("slug").and_then(Value::as_str);
+            let (info, body) = crate::memory::load_memory(root, slug, required_str(args, "name")?)?;
+            Ok(json!({
+                "name": info.name, "description": info.description,
+                "type": info.kind, "scope": info.scope, "body": body
+            }))
+        }
+        "memory_write" => {
+            let slug = args.get("slug").and_then(Value::as_str);
+            // Project is the default scope: a fact learned while working on a
+            // game is about that game until someone says otherwise, and a
+            // global default would quietly fill every other project's prompt.
+            let scope = match args.get("scope").and_then(Value::as_str) {
+                Some("global") => crate::memory::MemoryScope::Global,
+                Some("project") | None => crate::memory::MemoryScope::Project,
+                Some(other) => anyhow::bail!("unknown memory scope '{other}'"),
+            };
+            let info = crate::memory::write_memory(
+                root,
+                slug,
+                scope,
+                required_str(args, "name")?,
+                required_str(args, "description")?,
+                args.get("type").and_then(Value::as_str),
+                required_str(args, "body")?,
+            )?;
+            Ok(json!({
+                "stored": info.name, "description": info.description,
+                "type": info.kind, "scope": info.scope, "path": info.path
+            }))
+        }
+        "memory_forget" => {
+            let slug = args.get("slug").and_then(Value::as_str);
+            let info = crate::memory::forget_memory(root, slug, required_str(args, "name")?)?;
+            Ok(json!({
+                "forgot": info.name, "description": info.description, "scope": info.scope
+            }))
         }
         "graph_plan" => crate::graph::plan_tool(state, args).await,
         "graph_run" => crate::graph::run(state, required_str(args, "graphId")?, None).await,
@@ -3722,6 +3806,7 @@ mod tests {
             sessions_root: tempfile::tempdir().unwrap().path().to_path_buf(),
             agents,
             graphs: crate::graph::GraphManager::new(),
+            loops: Default::default(),
             bus: bus.clone(),
             workspaces: std::sync::Arc::new(tokio::sync::RwLock::new(
                 crate::workspace::Registry::new(),
@@ -5336,6 +5421,91 @@ mod tests {
             .find(|tool| tool.name == name)
             .unwrap_or_else(|| panic!("{name} is not a core tool"));
         execute_core_tool(&def, &args, &state, root, None).await
+    }
+
+    /// End-to-end dispatch for the memory tools: the same `execute_core_tool`
+    /// path the agent loop uses, so the schema the model is shown and the
+    /// arguments the dispatch actually reads cannot drift apart.
+    #[tokio::test]
+    async fn memory_tools_round_trip_through_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        store::create_project(root.path(), "demo", "Demo").unwrap();
+
+        let written = run_tool(
+            root.path(),
+            "memory_write",
+            json!({
+                "slug": "demo",
+                "name": "e2e-port",
+                "description": "the suite refuses to reuse a running core on 8765",
+                "body": "Quit CaliCode.app first; `pnpm test:e2e` wipes .e2e-projects.",
+                "type": "reference",
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(written["stored"], "e2e-port");
+        assert_eq!(written["scope"], "project");
+        assert_eq!(written["type"], "reference");
+
+        let listed = run_tool(root.path(), "memory_list", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        let memories = listed["memories"].as_array().unwrap();
+        assert_eq!(memories.len(), 1);
+        assert_eq!(memories[0]["name"], "e2e-port");
+        // The listing is the index: descriptions, not bodies.
+        assert!(memories[0].get("body").is_none(), "{listed}");
+
+        let read = run_tool(
+            root.path(),
+            "memory_read",
+            json!({ "slug": "demo", "name": "e2e-port" }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            read["body"]
+                .as_str()
+                .unwrap()
+                .contains("wipes .e2e-projects"),
+            "{read}"
+        );
+
+        let forgotten = run_tool(
+            root.path(),
+            "memory_forget",
+            json!({ "slug": "demo", "name": "e2e-port" }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(forgotten["forgot"], "e2e-port");
+        let listed = run_tool(root.path(), "memory_list", json!({ "slug": "demo" }))
+            .await
+            .unwrap();
+        assert!(
+            listed["memories"].as_array().unwrap().is_empty(),
+            "{listed}"
+        );
+    }
+
+    /// A project-scoped write with no slug must fail rather than silently
+    /// landing in the user's global memory, where it would then be attached to
+    /// every other project's prompt.
+    #[tokio::test]
+    async fn memory_write_without_a_slug_refuses_project_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let error = run_tool(
+            root.path(),
+            "memory_write",
+            json!({ "name": "x", "description": "d", "body": "b" }),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("needs a project slug"),
+            "{error:#}"
+        );
     }
 
     /// End-to-end dispatch: a tool call with snake_case iteration fields

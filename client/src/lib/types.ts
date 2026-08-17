@@ -94,7 +94,13 @@ export interface TestResult {
 export type CommandPanel =
   | {
       kind: "help";
-      commands: { name: string; usage?: string; summary: string; skill?: boolean }[];
+      commands: {
+        name: string;
+        usage?: string;
+        summary: string;
+        /** Where the row came from; absent for a built-in. */
+        kind?: "skill" | "command";
+      }[];
     }
   | {
       kind: "usage";

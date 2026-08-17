@@ -995,6 +995,7 @@ mod tests {
             sessions_root,
             agents: crate::agent::AgentManager::new(bus.clone()),
             graphs: crate::graph::GraphManager::new(),
+            loops: Default::default(),
             bus: bus.clone(),
             tools: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
