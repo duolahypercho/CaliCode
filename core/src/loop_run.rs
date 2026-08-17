@@ -497,7 +497,10 @@ fn aaa_prompt(goal: &str, loop_id: &str, iteration: usize) -> String {
     let verification =
         "Play and verify in PIE. Persist at least three individual screenshots with \
                         editor_persist_capture(path), read editor_console_history for runtime \
-                        errors, and call editor_analyze_motion for movement.";
+                        errors, and call editor_analyze_motion for movement. Measure the frame \
+                        budget with game_perf on the running game and record it as a Performance \
+                        check with its numbers — reading fps.low1, not fps.mean. A run that never \
+                        timed a frame cannot complete.";
     let reporting =
         "Call loop_report_start with a specific named quality reference, then append a \
                      structured loop_report_iteration with checks, changed files, durable evidence \

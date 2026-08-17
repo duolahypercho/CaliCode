@@ -1534,9 +1534,19 @@ pub(crate) fn validate_completion_readiness(report: &LoopReport) -> Result<()> {
             iteration = last.iteration,
         );
     }
-    // Build, play, and test must each have at least one passing check. A
-    // single "build passed" with no play/test trace is not a loop completion.
-    for kind in [CheckKind::Build, CheckKind::Play, CheckKind::Test] {
+    // Build, play, test and performance must each have at least one passing
+    // check. A single "build passed" with no play/test trace is not a loop
+    // completion — and neither is a run that never measured a frame budget.
+    // `aaa` is a claim about how the thing plays, and a game that was never
+    // timed has no evidence for the half of that claim a screenshot cannot
+    // carry. `game_perf` is the tool; a run that genuinely cannot measure one
+    // is a run that should not be calling itself finished.
+    for kind in [
+        CheckKind::Build,
+        CheckKind::Play,
+        CheckKind::Test,
+        CheckKind::Performance,
+    ] {
         let passed = last
             .checks
             .iter()
@@ -2238,6 +2248,14 @@ mod tests {
             duration_ms: 1_500,
             details: "All green".into(),
         });
+        input.checks.push(CheckResult {
+            kind: CheckKind::Performance,
+            name: "Frame budget".into(),
+            command: Some("game_perf".into()),
+            status: CheckStatus::Passed,
+            duration_ms: 2_000,
+            details: "fps.low1 61.4, drawCalls.mean 880, triangles/frame 412000".into(),
+        });
         // Bump the only score to clear the default 90 threshold without
         // relying on an explicit passThreshold override.
         if let Some(score) = input.scores.first_mut() {
@@ -2881,6 +2899,83 @@ mod tests {
         assert!(
             error.to_string().contains("passing Play check"),
             "expected play-check error, got: {}",
+            error,
+        );
+    }
+
+    /// A quality bar with no frame budget is a taste contest: `aaa` claims
+    /// the thing plays well, and nothing in a screenshot carries that.
+    #[test]
+    fn completion_requires_a_performance_check() {
+        let (_temp, root) = project_root();
+        create_sample(&root);
+        append_iteration(
+            &root,
+            "space-game",
+            "aaa-pass-01",
+            passing_input(1_000, "First"),
+        )
+        .unwrap();
+        let mut second = passing_input(90_000, "Never timed a frame");
+        second
+            .checks
+            .retain(|check| check.kind != CheckKind::Performance);
+        append_iteration(&root, "space-game", "aaa-pass-01", second).unwrap();
+        let error = update(
+            &root,
+            "space-game",
+            "aaa-pass-01",
+            LoopUpdate {
+                status: Some(LoopStatus::Completed),
+                completed_at_ms: Some(START + 200_000),
+                recorded_at_ms: Some(START + 200_000),
+                ..LoopUpdate::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("passing Performance check"),
+            "expected performance-check error, got: {}",
+            error,
+        );
+    }
+
+    /// The budget-blown case: `game_perf` came back `fail`, the model recorded
+    /// it honestly, and the loop must not be able to declare victory anyway.
+    #[test]
+    fn completion_rejects_a_measured_frame_budget_that_missed() {
+        let (_temp, root) = project_root();
+        create_sample(&root);
+        append_iteration(
+            &root,
+            "space-game",
+            "aaa-pass-01",
+            passing_input(1_000, "First"),
+        )
+        .unwrap();
+        let mut second = passing_input(90_000, "Budget missed");
+        for check in &mut second.checks {
+            if check.kind == CheckKind::Performance {
+                check.status = CheckStatus::Failed;
+                check.details = "fps.low1 17.1 against a 60 target".into();
+            }
+        }
+        append_iteration(&root, "space-game", "aaa-pass-01", second).unwrap();
+        let error = update(
+            &root,
+            "space-game",
+            "aaa-pass-01",
+            LoopUpdate {
+                status: Some(LoopStatus::Completed),
+                completed_at_ms: Some(START + 200_000),
+                recorded_at_ms: Some(START + 200_000),
+                ..LoopUpdate::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("passing Performance check"),
+            "expected performance-check error, got: {}",
             error,
         );
     }
