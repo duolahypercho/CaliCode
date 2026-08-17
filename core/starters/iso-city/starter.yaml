@@ -1,0 +1,9 @@
+name: Isometric City
+description: A three.js isometric city builder — orthographic camera, raycast tile placement, instanced buildings, fixed-timestep simulation.
+tags:
+  - three.js
+  - isometric
+  - city-builder
+  - simulation
+devScript: dev
+install: npm install

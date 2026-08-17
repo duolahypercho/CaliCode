@@ -75,6 +75,8 @@ import { FileEditor } from "./components/workspace/FileEditor";
 import { LivePreview } from "./components/workspace/LivePreview";
 import { NewProjectDialog } from "./components/workspace/NewProjectDialog";
 import { FolderPicker } from "./components/workspace/FolderPicker";
+import { StarterPicker } from "./components/workspace/StarterPicker";
+import { createWorkspaceFromStarter, defaultStarterPath } from "./lib/starters";
 import {
   chooseNativeWorkspace,
   openWorkspace,
@@ -473,6 +475,10 @@ export default function App() {
   const [folderTarget, setFolderTarget] = useState<Project | null>(null);
   const [attachPath, setAttachPath] = useState<string | null>(null);
   const [folderBusy, setFolderBusy] = useState(false);
+  /** "existing" attaches a folder that is already there; "starter" scaffolds one. */
+  const [attachMode, setAttachMode] = useState<"existing" | "starter">("existing");
+  const [starterId, setStarterId] = useState<string | null>(null);
+  const [starterPath, setStarterPath] = useState("");
   const [folderError, setFolderError] = useState("");
   const [theme, setTheme] = useState<Theme>(readTheme);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -690,6 +696,24 @@ export default function App() {
     setFolderTarget(null);
     setAttachPath(null);
     setFolderError("");
+    setAttachMode("existing");
+    setStarterId(null);
+    setStarterPath("");
+  };
+
+  /**
+   * The folder belongs to this game, not to the app — so a second game can
+   * point at a different repo and switching games switches folders. The
+   * workspaceRoot effect below opens the folder when the game is the active one.
+   */
+  const bindWorkspace = async (target: Project, info: WorkspaceInfo) => {
+    await setProjectWorkspace(target.slug, info.root);
+    setProjects((current) =>
+      current.map((item) => (item.slug === target.slug ? { ...item, workspaceRoot: info.root } : item)),
+    );
+    if (project.slug === target.slug) {
+      setProject((current) => ({ ...current, workspaceRoot: info.root }));
+    }
   };
 
   /** Bind the picked folder to the attach dialog's target game. */
@@ -700,22 +724,40 @@ export default function App() {
     setFolderError("");
     try {
       const info = await openWorkspace(path);
-      // The folder belongs to this game, not to the app — so a second game
-      // can point at a different repo and switching games switches folders.
-      // The workspaceRoot effect below opens the folder when the game is the
-      // active one.
-      await setProjectWorkspace(folderTarget.slug, info.root);
-      setProjects((current) =>
-        current.map((item) => (item.slug === folderTarget.slug ? { ...item, workspaceRoot: info.root } : item)),
-      );
-      if (project.slug === folderTarget.slug) {
-        setProject((current) => ({ ...current, workspaceRoot: info.root }));
-      }
+      await bindWorkspace(folderTarget, info);
       closeAttachDialog();
       pushLog(`attached ${info.name} to ${folderTarget.title} (${info.root})`);
     } catch (error) {
       setFolderError(reason(error));
       pushLog(`attach folder failed: ${reason(error)}`, "error");
+    } finally {
+      setFolderBusy(false);
+    }
+  };
+
+  /**
+   * Scaffold a starter into a new folder and attach it. Core writes the tree
+   * and opens it in one call, so there is no window where the folder exists
+   * but nothing points at it.
+   */
+  const attachFromStarter = async () => {
+    const path = starterPath.trim();
+    if (!path || !starterId || !folderTarget || folderBusy) return;
+    setFolderBusy(true);
+    setFolderError("");
+    try {
+      const created = await createWorkspaceFromStarter(starterId, path, folderTarget.title);
+      await bindWorkspace(folderTarget, created.workspace);
+      closeAttachDialog();
+      pushLog(`created ${created.starter.name} at ${created.workspace.root}`);
+      // Core never runs this: installing needs the network, and only a
+      // user-initiated terminal may run a command on their machine.
+      if (created.install) {
+        pushLog(`run \`${created.install}\` in ${created.workspace.root} before PLAY`);
+      }
+    } catch (error) {
+      setFolderError(reason(error));
+      pushLog(`create from starter failed: ${reason(error)}`, "error");
     } finally {
       setFolderBusy(false);
     }
@@ -2377,24 +2419,65 @@ export default function App() {
         <DialogContent className="max-w-lg">
           <DialogTitle>{folderTarget ? `Attach a folder to ${folderTarget.title}` : ""}</DialogTitle>
           <DialogDescription>
-            CaliCode edits this folder in place and runs its own dev server. It must contain a package.json or a
-            .git directory.
+            CaliCode edits this folder in place and runs its own dev server. Attach one you already have, or
+            scaffold a new one from a starter.
           </DialogDescription>
+
+          <div role="tablist" aria-label="Folder source" className="mt-3 flex gap-1 rounded-lg bg-surface-1 p-1">
+            {(["existing", "starter"] as const).map((mode) => (
+              <button
+                key={mode}
+                type="button"
+                role="tab"
+                aria-selected={attachMode === mode}
+                disabled={folderBusy}
+                onClick={() => {
+                  setFolderError("");
+                  setAttachMode(mode);
+                  // Seed the destination from the game's slug the first time
+                  // the starter tab is opened, so the common case is one click.
+                  if (mode === "starter" && !starterPath && folderTarget) {
+                    setStarterPath(defaultStarterPath(folderTarget.slug));
+                  }
+                }}
+                className={`flex-1 rounded-md px-3 py-1.5 text-xs transition-colors ${
+                  attachMode === mode ? "bg-surface-0 text-ink-strong" : "text-ink-subtle hover:bg-surface-2"
+                }`}
+              >
+                {mode === "existing" ? "Existing folder" : "New from starter"}
+              </button>
+            ))}
+          </div>
+
           <form
             className="mt-3"
             onSubmit={(event) => {
               event.preventDefault();
-              void attachFolder();
+              if (attachMode === "starter") void attachFromStarter();
+              else void attachFolder();
             }}
           >
-            <FolderPicker
-              value={attachPath}
-              onChange={(path) => {
-                setFolderError("");
-                setAttachPath(path);
-              }}
-              disabled={folderBusy}
-            />
+            {attachMode === "existing" ? (
+              <FolderPicker
+                value={attachPath}
+                onChange={(path) => {
+                  setFolderError("");
+                  setAttachPath(path);
+                }}
+                disabled={folderBusy}
+              />
+            ) : (
+              <StarterPicker
+                value={starterId}
+                onChange={(id) => {
+                  setFolderError("");
+                  setStarterId(id);
+                }}
+                path={starterPath}
+                onPathChange={setStarterPath}
+                disabled={folderBusy}
+              />
+            )}
             {folderError ? (
               <p role="alert" className="mt-2 text-xs text-danger-soft">
                 {folderError}
@@ -2406,9 +2489,15 @@ export default function App() {
                   Cancel
                 </Button>
               </DialogClose>
-              <Button type="submit" size="sm" disabled={!attachPath || folderBusy}>
-                {folderBusy ? "Attaching..." : "Attach"}
-              </Button>
+              {attachMode === "starter" ? (
+                <Button type="submit" size="sm" disabled={!starterId || !starterPath.trim() || folderBusy}>
+                  {folderBusy ? "Creating..." : "Create and attach"}
+                </Button>
+              ) : (
+                <Button type="submit" size="sm" disabled={!attachPath || folderBusy}>
+                  {folderBusy ? "Attaching..." : "Attach"}
+                </Button>
+              )}
             </div>
           </form>
         </DialogContent>

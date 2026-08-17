@@ -12,6 +12,7 @@ repo works.
 | Path             | What lives there                                                         |
 | ---------------- | ------------------------------------------------------------------------ |
 | `core/`          | Rust control plane. JSON-RPC over HTTP + SSE. Owns projects, sessions, agent loop, assets, MCP, skills. |
+| `core/starters/` | Compiled-in workspace starters — one directory per starter, `include_str!`d by `starters.rs`. |
 | `client/`        | Vite + React + TypeScript editor. Three.js viewport, agent panel, workspace tabs. |
 | `client/src-tauri/` | macOS desktop shell. Bundles the core release binary as a sidecar.     |
 | `shared/schemas/` | `project.schema.json`, `cali-asset.schema.json` — the contracts both sides honour. |
@@ -492,6 +493,28 @@ Rust against a scripted provider rather than through a mocked panel.
     registered map: `build_tools` starts from `core_tool_defs()` and only
     *extends* with that map, so filtering there looked correct and removed
     nothing. `an_agent_allowlist_removes_core_tools_too` pins it.
+- **Starters** — `~/.cali/starters/<id>/` (`CALI_STARTERS_DIR`), a `starter.yaml`
+  manifest beside a `files/` tree that `workspace_create_from_template` writes to
+  disk and then opens as a workspace. Compiled-in starters (`core/starters/`,
+  `include_str!`d so a packaged app carries them) are shadowed by a user
+  directory of the same id, the arrangement `graph.rs` uses for node templates.
+  - **A starter is not a project template.** `store.rs`'s `blank|starter|showcase`
+    are *scene documents* the three.js editor owns; a starter is a *repository*
+    with its own `package.json` and dev script. Anything with a build belongs in
+    a workspace, because a project document round-trips through one debounced
+    `project_save` and a real game's file tree does not fit that.
+  - **Nothing fetches.** A starter is compiled in or already under `~/.cali`,
+    which is the trust level `~/.cali/commands` and `~/.cali/agents` already
+    have. A registry that cloned a remote repo is arbitrary third-party source
+    arriving because somebody clicked a name, and must not ship without
+    first-use consent keyed on the source — copy `approved_project_mcp`. The
+    manifest has no `url:` field so the half-built version cannot exist.
+  - **Dependencies are not installed.** `npm install` needs the network, and the
+    only sanctioned way to run a command on the user's machine is `terminal.rs`,
+    which is user-initiated by design. `install:` is reported to the client as a
+    string to offer, never spawned.
+  - The destination must be absent or empty, paths inside a starter may not
+    traverse, and symlinks are skipped rather than followed.
 - **MCP servers** — configured in `~/.cali/config.yaml`; their tools join agent
   sessions automatically.
 - **Asset library** — one file in `client/src/lib/assetLibrary/repos/`
@@ -517,12 +540,13 @@ Rust against a scripted provider rather than through a mocked panel.
 | `~/.cali/browser/`            | the agent browser's Chrome profile        |
 | `~/.cali/downloads/`          | files downloaded in the browser panel     |
 | `~/.cali/sessions/`           | saved transcripts                         |
+| `~/.cali/starters/`           | user-authored workspace starters          |
 | `~/.cali/memory/`             | durable memories that apply everywhere    |
 | `<project>/.cali/memory/`     | durable memories about one game           |
 | `client/.e2e-projects/`       | throwaway; wiped by `pretest:e2e`         |
 
-Current baseline: 989 Rust tests (plus 16 `#[ignore]`d live ones), 928 client
-unit tests across 74 files.
+Current baseline: 1070 Rust tests (plus 16 `#[ignore]`d live ones), 937 client
+unit tests across 75 files.
 
 ## Memory
 

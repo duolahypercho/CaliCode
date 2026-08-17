@@ -37,6 +37,7 @@ mod skills;
 mod spawn_ledger;
 mod spill;
 mod staleness;
+mod starters;
 mod store;
 mod terminal;
 mod tools;

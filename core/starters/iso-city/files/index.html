@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Isometric City</title>
+    <style>
+      :root { color-scheme: light; }
+      html, body { margin: 0; height: 100%; overflow: hidden; }
+      #app { display: block; width: 100vw; height: 100vh; }
+      #hud {
+        position: fixed; left: 16px; top: 16px;
+        font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+        color: #22303c; background: rgba(255, 255, 255, 0.78);
+        padding: 10px 12px; border-radius: 8px; pointer-events: none;
+        white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="app"></canvas>
+    <div id="hud"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
