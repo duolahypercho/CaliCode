@@ -1423,7 +1423,7 @@ pub fn core_tool_defs() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "loop_report_update".into(),
-            description: "Update a durable /loop report's terminal status, summary, final punch list, or next-iteration memory. Marking completed fails closed unless the report has a named reference, at least two iterations, a passed latest iteration with durable agents, clean build/play/test checks, changed files, visual evidence, an average score of at least 90 with every explicit threshold met, and carry-forward memory.".into(),
+            description: "Update a durable /loop report's terminal status, summary, final punch list, or next-iteration memory. Marking completed fails closed unless the report has a named reference, at least two iterations, a passed latest iteration with durable agents, clean build/play/test/performance checks, changed files, visual evidence, an average score of at least 90 with every explicit threshold met, and carry-forward memory.".into(),
             parameters: json!({
                 "type":"object",
                 "properties":{
