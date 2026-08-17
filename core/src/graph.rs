@@ -3265,6 +3265,7 @@ async fn spawn_critic_with_frames(
     )
     .await;
     let options = crate::agent::AgentOptions {
+        tool_allowlist: Vec::new(),
         permission_mode: "full-access".into(),
         max_turns: JUDGE_MAX_TURNS,
         // A graph run has no panel reporting a window; the judge falls back to

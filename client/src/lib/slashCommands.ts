@@ -67,6 +67,11 @@ export interface SlashContext {
    * first, unconfirmed call must only describe what would be overwritten.
    */
   restoreCheckpoint: (id: string, confirmed: boolean) => Promise<void>;
+  /**
+   * Subagent names core reports (`agent_list`), beyond the built-in roles.
+   * Absent means "built-ins only", which is what an older client sends.
+   */
+  agentNames?: readonly string[];
   /** Run an installed skill by name, with an optional task tail. */
   runSkill: (name: string, task: string) => Promise<void>;
   /**
@@ -83,8 +88,26 @@ export interface SlashContext {
   commands?: readonly NamedCommand[];
 }
 
-/** Roles core's subagent_spawn understands. */
+/**
+ * Roles that work with no file behind them. Core mirrors this list in
+ * `agents::BUILTIN_ROLES`, and refuses a definition that claims one of these
+ * names, so the same word cannot mean two things.
+ *
+ * This is no longer the whole set: `~/.cali/agents/<name>.md` defines more,
+ * and `SlashContext.agentNames` carries whatever core reports. Validation goes
+ * through [`knownSubagentRoles`] rather than this constant.
+ */
 export const SUBAGENT_ROLES = ["planner", "coder", "tester", "critic"] as const;
+
+/** Built-ins plus whatever files define, lowercased and deduped. */
+export function knownSubagentRoles(defined: readonly string[] = []): string[] {
+  const names = new Set<string>(SUBAGENT_ROLES);
+  for (const name of defined) {
+    const trimmed = name.trim().toLowerCase();
+    if (trimmed) names.add(trimmed);
+  }
+  return [...names];
+}
 
 export interface SlashCommand extends NamedCommand {
   run: (args: string, ctx: SlashContext) => void | Promise<void>;
@@ -157,16 +180,20 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
   },
   {
     name: "spawn",
-    summary: "Run a subagent (planner, coder, tester, critic)",
+    summary: "Run a subagent — a built-in role, or one you defined in agents/",
     usage: "<role> <task>",
     run: (args, ctx) => {
+      const roles = knownSubagentRoles(ctx.agentNames);
       const match = /^(\S+)\s+([\s\S]+)$/.exec(args.trim());
       const role = match?.[1].toLowerCase();
-      if (!match || !SUBAGENT_ROLES.includes(role as (typeof SUBAGENT_ROLES)[number])) {
-        ctx.say(`Usage: /spawn <${SUBAGENT_ROLES.join("|")}> <task>`);
+      if (!match || !role || !roles.includes(role)) {
+        ctx.say(
+          `Usage: /spawn <${roles.join("|")}> <task>\n` +
+            "Define more in ~/.cali/agents/<name>.md — the body becomes that agent's system prompt.",
+        );
         return;
       }
-      return ctx.spawnSubagent(role as string, match[2].trim());
+      return ctx.spawnSubagent(role, match[2].trim());
     },
   },
   {

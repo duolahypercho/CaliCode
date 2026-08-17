@@ -8,6 +8,7 @@ import {
   parseSlashIn,
   parseSlash,
   fileCommands,
+  knownSubagentRoles,
   skillCommands,
   slashTokenAt,
   SLASH_COMMANDS,
@@ -126,6 +127,48 @@ describe("completeSlashToken", () => {
 
   test("completes a leading command the way it always did", () => {
     expect(completeSlashToken("/lo", 3, "loop")).toEqual({ text: "/loop ", caret: 6 });
+  });
+});
+
+describe("/spawn accepts defined agents, not just the four built-ins", () => {
+  test("knownSubagentRoles merges built-ins with what files define", () => {
+    const roles = knownSubagentRoles(["shader-critic", "Perf-Auditor"]);
+    expect(roles).toContain("planner");
+    expect(roles).toContain("shader-critic");
+    // Lowercased, so `/spawn Shader-Critic` matches the file's name.
+    expect(roles).toContain("perf-auditor");
+  });
+
+  test("a duplicate of a built-in does not appear twice", () => {
+    expect(knownSubagentRoles(["critic", "critic"]).filter((r) => r === "critic")).toHaveLength(1);
+  });
+
+  test("spawns a file-defined agent", () => {
+    const spawnSubagent = vi.fn();
+    const say = vi.fn();
+    const command = SLASH_COMMANDS.find((c) => c.name === "spawn")!;
+    command.run("shader-critic look at the water", {
+      spawnSubagent,
+      say,
+      agentNames: ["shader-critic"],
+    } as unknown as SlashContext);
+    expect(spawnSubagent).toHaveBeenCalledWith("shader-critic", "look at the water");
+  });
+
+  test("refuses a name nothing defines, and says where to define one", () => {
+    const spawnSubagent = vi.fn();
+    const say = vi.fn();
+    const command = SLASH_COMMANDS.find((c) => c.name === "spawn")!;
+    command.run("nobody do a thing", { spawnSubagent, say, agentNames: [] } as unknown as SlashContext);
+    expect(spawnSubagent).not.toHaveBeenCalled();
+    expect(say.mock.calls[0][0]).toContain("~/.cali/agents");
+  });
+
+  test("still works with no defined agents at all", () => {
+    const spawnSubagent = vi.fn();
+    const command = SLASH_COMMANDS.find((c) => c.name === "spawn")!;
+    command.run("critic review it", { spawnSubagent, say: vi.fn() } as unknown as SlashContext);
+    expect(spawnSubagent).toHaveBeenCalledWith("critic", "review it");
   });
 });
 

@@ -85,8 +85,19 @@ import {
   sandboxSummary,
   type CoreConfig,
 } from "../../lib/coreConfig";
-import { listSkills, type SkillInfo } from "../../lib/extensions";
-import { formatInterval } from "../../lib/interval";
+import {
+  listAgentDefs,
+  listFileCommands,
+  listSkills,
+  renderFileCommand,
+  type FileCommandInfo,
+  type SkillInfo,
+} from "../../lib/extensions";
+import {
+  DEFAULT_LOOP_PROFILE,
+  formatInterval,
+  type LoopProfile,
+} from "../../lib/interval";
 import {
   MAX_LOOP_ITERATIONS,
   SLASH_COMMANDS,
@@ -142,7 +153,13 @@ import {
   type ActivityAction,
   type ActivityFileChange,
 } from "../../lib/activity";
-import { openLoopReport, type LoopReport } from "../../lib/loopReports";
+import {
+  listLoopRuns,
+  openLoopReport,
+  startLoopRun,
+  stopLoopRun,
+  type LoopReport,
+} from "../../lib/loopReports";
 import type {
   AgentMessage,
   BrowserTool,
@@ -1147,6 +1164,11 @@ export function AgentPanel({
   // Installed skills, offered as `/<skill>` beside the built-in commands.
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const skillsLoadedRef = useRef<string | null>(null);
+  const [fileCommandInfos, setFileCommandInfos] = useState<FileCommandInfo[]>([]);
+  const [agentNames, setAgentNames] = useState<string[]>([]);
+  /// The core-side run this panel is rendering, if any.
+  const activeLoopIdRef = useRef<string | null>(null);
+  const loopActivityTurnRef = useRef<string | null>(null);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [sessionWorkspaceRoot, setSessionWorkspaceRoot] = useState<string | null>(workspaceRoot);
   const [busy, setBusy] = useState(false);
@@ -1332,10 +1354,75 @@ export function AgentPanel({
         setSkills(list);
       })
       .catch(() => {});
+    // Loaded on the same trigger as skills, and deliberately re-read whenever
+    // the menu opens: a command is a file the user edits outside the app, so
+    // caching it for the life of the session would show them a stale menu.
+    void listFileCommands(projectSlug)
+      .then((list) => {
+        if (!cancelled) setFileCommandInfos(list);
+      })
+      .catch(() => {});
+    void listAgentDefs(projectSlug)
+      .then(({ agents }) => {
+        if (cancelled) return;
+        setAgentNames(agents.filter((agent) => !agent.error).map((agent) => agent.name));
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
   }, [projectSlug, slashMenuOpen]);
+
+  // A loop lives in core, so it survives this tab. On mount — and whenever the
+  // session being shown changes — ask whether one is still running and take
+  // the UI back over. Without this the run keeps working with nobody rendering
+  // it, every `loop.*` event is discarded because there is no active id to
+  // match, and the composer would cheerfully start a second loop on top.
+  //
+  // Two cases, and they need different rules. With a session open, only a run
+  // belonging to *that* session may be adopted — anything else would stream a
+  // different chat's turns into this transcript. With no session open, which
+  // is what a browser reload leaves behind (`activeSessionId` is not
+  // persisted), the project's running loop is adopted along with its session,
+  // because that session is precisely the chat the loop is talking in.
+  useEffect(() => {
+    if (looping) return;
+    let cancelled = false;
+    // Deferred through a resolved promise so a throwing or absent
+    // `listLoopRuns` becomes a rejection this `.catch` swallows. Rejoining is
+    // an enhancement on top of a working panel; it must never be able to stop
+    // one from mounting.
+    void Promise.resolve()
+      .then(() => listLoopRuns())
+      .then(async (runs) => {
+        if (cancelled) return;
+        const live = runs.filter((run) => run.status === "running" && run.slug === projectSlug);
+        const mine = sessionId
+          ? live.find((run) => run.sessionId === sessionId)
+          : live.find((run) => Boolean(run.sessionId));
+        if (!mine) return;
+        if (!sessionId && mine.sessionId) {
+          // Adopt the run's chat, so its deltas and tool rows have somewhere
+          // to land. Silent: `resumeSession` says nothing either.
+          await resumeSession(mine.sessionId).catch(() => {});
+          if (cancelled) return;
+        }
+        activeLoopIdRef.current = mine.loopId;
+        loopActivityTurnRef.current = beginActivityTurn();
+        setActiveLoop({
+          objective: mine.goal,
+          startedAtMs: mine.startedAtMs,
+          every: mine.intervalMs ? formatInterval(mine.intervalMs) : null,
+        });
+        setLooping(true);
+        setBusy(true);
+        say(`▶ rejoined loop at iteration ${mine.iteration} — it kept running`, "tool");
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, projectSlug, looping]);
 
   useEffect(() => {
     const target = pendingCaretRef.current;
@@ -3081,6 +3168,8 @@ export function AgentPanel({
     say,
     showPanel,
     runSkill,
+    runFileCommand,
+    agentNames,
     commands: allCommands,
     clear: () => setMessages([]),
     newSession: () => {

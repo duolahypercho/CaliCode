@@ -68,6 +68,27 @@ export async function listSkills(projectSlug?: string): Promise<SkillInfo[]> {
   return result?.skills ?? [];
 }
 
+/** Typed mirror of core/src/agents.rs AgentInfo. */
+export interface AgentDefInfo {
+  name: string;
+  description: string;
+  /** Empty/absent means the child reaches everything the parent can. */
+  tools?: string[];
+  scope: SkillScope;
+  path: string;
+  error?: string | null;
+}
+
+export async function listAgentDefs(
+  projectSlug?: string,
+): Promise<{ agents: AgentDefInfo[]; builtinRoles: string[] }> {
+  const result = await rpc<{ agents?: AgentDefInfo[]; builtinRoles?: string[] }>(
+    "agent_list",
+    projectSlug ? { projectSlug } : {},
+  );
+  return { agents: result?.agents ?? [], builtinRoles: result?.builtinRoles ?? [] };
+}
+
 export async function listFileCommands(projectSlug?: string): Promise<FileCommandInfo[]> {
   const result = await rpc<{ commands?: FileCommandInfo[] }>(
     "command_list",

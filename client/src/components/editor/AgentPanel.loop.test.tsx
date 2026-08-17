@@ -24,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   openLoopReport: vi.fn(),
   startLoopRun: vi.fn(),
   stopLoopRun: vi.fn(),
+  listLoopRuns: vi.fn(),
 }));
 
 vi.mock("../../lib/rpc", () => ({
@@ -68,6 +69,7 @@ vi.mock("../../lib/loopReports", () => ({
   openLoopReport: mocks.openLoopReport,
   startLoopRun: mocks.startLoopRun,
   stopLoopRun: mocks.stopLoopRun,
+  listLoopRuns: mocks.listLoopRuns,
 }));
 
 let emitEvent: ((event: AgentEvent) => void) | null = null;
@@ -149,6 +151,7 @@ beforeEach(() => {
   });
   mocks.createSession.mockResolvedValue({ id: "session-1", workspaceRoot: "/tmp/game" });
   mocks.listSessions.mockResolvedValue([]);
+  mocks.listLoopRuns.mockResolvedValue([]);
   mocks.saveSession.mockResolvedValue({});
   mocks.listGraphs.mockResolvedValue([]);
   mocks.graphStatus.mockResolvedValue({});
@@ -369,6 +372,75 @@ describe("session resume", () => {
   });
 });
 
+
+describe("/loop rejoins a run that outlived the tab", () => {
+  const running = (over: Record<string, unknown> = {}) => ({
+    loopId: "loop-live",
+    slug: "demo",
+    goal: "keep the tests green",
+    profile: "standard",
+    status: "running",
+    iteration: 4,
+    maxIterations: 100,
+    startedAtMs: 1,
+    sessionId: "session-1",
+    ...over,
+  });
+
+  it("takes the UI back over for a run still going on this session", async () => {
+    mocks.listLoopRuns.mockResolvedValue([running()]);
+    renderPanel();
+    expect(await screen.findByText(/rejoined loop at iteration 4/)).toBeTruthy();
+    // Stop has to reach the run it rejoined, not a fresh one.
+    mocks.stopLoopRun.mockResolvedValue({ ...running(), status: "stopped" });
+    fireEvent.click(await screen.findByRole("button", { name: "Stop agent loop" }));
+    expect(mocks.stopLoopRun).toHaveBeenCalledWith("loop-live");
+  });
+
+  it("renders the rejoined run's events instead of discarding them", async () => {
+    mocks.listLoopRuns.mockResolvedValue([running()]);
+    renderPanel();
+    await screen.findByText(/rejoined loop at iteration 4/);
+    await act(async () => {
+      emitEvent?.({
+        type: "loop.iteration",
+        loopId: "loop-live",
+        iteration: 5,
+        maxIterations: 100,
+        prompt: "keep the tests green",
+      } as AgentEvent);
+    });
+    expect(await screen.findByText("loop 5/100")).toBeTruthy();
+  });
+
+  it("leaves another chat's run alone when a session is already open", async () => {
+    // Adopting on project alone would stream a different chat's turns into
+    // the transcript the user is looking at.
+    mocks.listLoopRuns.mockResolvedValue([running({ sessionId: "session-elsewhere" })]);
+    mocks.loadSession.mockResolvedValue({ id: "session-1", workspaceRoot: "/tmp/game", messages: [] });
+    renderPanel("session-1");
+    await screen.findByRole("textbox", { name: "Agent prompt" });
+    expect(screen.queryByText(/rejoined loop/)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stop agent loop" })).toBeNull();
+  });
+
+  it("adopts the run's own chat after a reload leaves no session open", async () => {
+    // `activeSessionId` is not persisted, so this is the ordinary state after
+    // a browser reload — and the case reattach exists for.
+    mocks.listLoopRuns.mockResolvedValue([running({ sessionId: "session-live" })]);
+    mocks.loadSession.mockResolvedValue({ id: "session-live", workspaceRoot: "/tmp/game", messages: [] });
+    renderPanel();
+    expect(await screen.findByText(/rejoined loop at iteration 4/)).toBeTruthy();
+    expect(mocks.loadSession).toHaveBeenCalledWith("session-live");
+  });
+
+  it("ignores a run that already finished", async () => {
+    mocks.listLoopRuns.mockResolvedValue([running({ status: "completed" })]);
+    renderPanel();
+    await screen.findByRole("textbox", { name: "Agent prompt" });
+    expect(screen.queryByText(/rejoined loop/)).toBeNull();
+  });
+});
 
 describe("/loop starts a core-side run", () => {
   const startedRun = (over: Record<string, unknown> = {}) => ({

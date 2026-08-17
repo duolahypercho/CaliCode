@@ -750,6 +750,13 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             Ok(json!({ "loop": state.loops.status(loop_id).await? }))
         }
         "loop_runs" => Ok(json!({ "loops": state.loops.list().await })),
+        "agent_list" => {
+            let slug = params.get("projectSlug").and_then(Value::as_str);
+            Ok(json!({
+                "agents": crate::agents::list_agents(&state.projects_root, slug),
+                "builtinRoles": crate::agents::BUILTIN_ROLES,
+            }))
+        }
         "command_list" => {
             let slug = params.get("projectSlug").and_then(Value::as_str);
             Ok(json!({
@@ -1293,6 +1300,7 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 }
             }
             let options = AgentOptions {
+                tool_allowlist: Vec::new(),
                 // Fail closed on an omitted mode. `requires_approval` already
                 // treats an unknown mode as "prompt for everything", so this
                 // default was the single place the harness chose the loosest
