@@ -544,7 +544,7 @@ mod tests {
         }
 
         const WRITE: &str =
-            "Write UTF-8 text into the active game's folder (scripts, tests, docs).";
+            "Write UTF-8 text into the active game's folder (scripts, tests, docs). Creates a file or replaces one whole; to change part of a file that already exists, use file_edit instead — this tool re-sends every line.";
 
         /// Exploratory: does the middle rung exist at all?
         ///

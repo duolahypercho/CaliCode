@@ -5715,6 +5715,68 @@ mod tests {
         assert!(headless_names.iter().any(|name| name == "capture_persist"));
     }
 
+    /// A `deny` rule is the supported way to stop paying for a tool family.
+    ///
+    /// `build_tools` drops denied tools from the list the model is sent, so
+    /// `permissions: [{pattern: "browser_*", action: deny}]` removes fifteen
+    /// schemas — about 2,000 tokens — from every turn of every session, not
+    /// just the call. That was an undocumented side effect of hiding denied
+    /// tools; this pins it, because a future refactor that kept the gate but
+    /// stopped filtering the list would still pass every permission test while
+    /// silently putting the whole cost back.
+    #[test]
+    fn a_deny_rule_removes_the_family_from_what_the_model_is_sent() {
+        let (bus, _) = tokio::sync::broadcast::channel(8);
+        let manager = AgentManager::new(bus);
+        let deny = |pattern: &str| PermissionRule {
+            pattern: pattern.to_string(),
+            action: "deny".to_string(),
+        };
+
+        let all = manager.build_tools(&HashMap::new(), &[], &[]);
+        let browser = all
+            .iter()
+            .filter(|def| def.name.starts_with("browser_"))
+            .count();
+        assert!(browser > 1, "the family exists to be dropped");
+
+        let rules = vec![deny("browser_*"), deny("computer_*")];
+        let pruned = manager.build_tools(&HashMap::new(), &rules, &[]);
+        assert!(pruned
+            .iter()
+            .all(|def| !def.name.starts_with("browser_") && !def.name.starts_with("computer_")));
+        // Only the named families go; everything else is untouched.
+        assert_eq!(
+            pruned.len(),
+            all.len()
+                - all
+                    .iter()
+                    .filter(
+                        |def| def.name.starts_with("browser_") || def.name.starts_with("computer_")
+                    )
+                    .count()
+        );
+        assert!(pruned.iter().any(|def| def.name == "file_read"));
+
+        // An `ask` rule is a gate, not a hide: the tool must still be offered
+        // or the model could never reach the approval card.
+        let asked = manager.build_tools(
+            &HashMap::new(),
+            &[PermissionRule {
+                pattern: "browser_*".to_string(),
+                action: "ask".to_string(),
+            }],
+            &[],
+        );
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|def| def.name.starts_with("browser_"))
+                .count(),
+            browser
+        );
+    }
+
     #[test]
     fn agents_never_receive_the_global_model_switch_tool() {
         let (bus, _) = tokio::sync::broadcast::channel(8);

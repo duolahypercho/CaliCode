@@ -6,6 +6,7 @@ import {
   captureFrameWhenReady,
   captureMotionSequence,
   describeEditorProject,
+  editEditorScript,
   orchestrateLiveImage3dMesh,
   patchEditorEntity,
   upsertEditorScript,
@@ -75,6 +76,58 @@ describe("describeEditorProject", () => {
       metadata: { generator: "box" },
     });
     expect(snapshot.settings).toEqual({ gravity: 9.8 });
+  });
+
+  it("edits a script in place, by id or by name, leaving the rest of the code alone", () => {
+    const byName = editEditorScript(project(), {
+      name: "move",
+      oldString: "+= 1",
+      newString: "+= 4",
+    });
+    expect(byName.result).toEqual({ edited: "move", id: "move", replacements: 1 });
+    expect(byName.project.scripts[0].code).toBe("function update(entity) { entity.position.x += 4; }");
+    expect(byName.project.scripts[0].name).toBe("move");
+
+    const byId = editEditorScript(project(), {
+      id: "move",
+      oldString: "entity.position.x",
+      newString: "entity.position.z",
+    });
+    expect(byId.project.scripts[0].code).toBe("function update(entity) { entity.position.z += 1; }");
+  });
+
+  it("refuses an ambiguous or absent edit rather than guessing which span was meant", () => {
+    const missing = editEditorScript(project(), {
+      name: "move",
+      oldString: "entity.rotation.y",
+      newString: "entity.rotation.x",
+    });
+    expect(missing.result).toMatchObject({ error: expect.stringContaining("not found") });
+    expect(missing.project.scripts[0].code).toBe("function update(entity) { entity.position.x += 1; }");
+
+    const ambiguous = editEditorScript(project(), {
+      name: "move",
+      oldString: "entity",
+      newString: "actor",
+    });
+    expect(ambiguous.result).toMatchObject({ error: expect.stringContaining("matches 2 times") });
+    expect(ambiguous.project.scripts[0].code).toBe("function update(entity) { entity.position.x += 1; }");
+
+    const all = editEditorScript(project(), {
+      name: "move",
+      oldString: "entity",
+      newString: "actor",
+      replaceAll: true,
+    });
+    expect(all.result).toEqual({ edited: "move", id: "move", replacements: 2 });
+    expect(all.project.scripts[0].code).toBe("function update(actor) { actor.position.x += 1; }");
+
+    const unknown = editEditorScript(project(), {
+      name: "nope",
+      oldString: "a",
+      newString: "b",
+    });
+    expect(unknown.result).toMatchObject({ error: expect.stringContaining("no script nope") });
   });
 
   it("upserts scripts by inspected id or name without creating duplicates", () => {
@@ -577,6 +630,38 @@ describe("editor_persist_capture", () => {
       dataUrl,
     });
     expect(result).toMatchObject({ path: "reports/walk/live.png", frame: 42, timeMs: 700 });
+  });
+});
+
+describe("editor_script_edit", () => {
+  it("is registered and its handler commits the edit to the live project", async () => {
+    const { findTool, setProject } = buildUseBrowserToolsHarness();
+    const tool = findTool("editor_script_edit");
+    expect(tool).toBeDefined();
+    if (!tool) return;
+
+    const result = await act(async () => {
+      return tool.handler({ name: "move", oldString: "+= 1", newString: "+= 9" });
+    });
+
+    expect(result).toEqual({ edited: "move", id: "move", replacements: 1 });
+    expect(setProject).toHaveBeenCalledTimes(1);
+    const committed = setProject.mock.calls[0][0] as Project;
+    expect(committed.scripts[0].code).toBe("function update(entity) { entity.position.x += 9; }");
+  });
+
+  it("leaves the project untouched when the edit is refused", async () => {
+    const { findTool, setProject } = buildUseBrowserToolsHarness();
+    const tool = findTool("editor_script_edit")!;
+
+    const result = await act(async () => {
+      return tool.handler({ name: "move", oldString: "never here", newString: "x" });
+    });
+
+    expect(result).toMatchObject({ error: expect.stringContaining("not found") });
+    // mutateProject only commits when the updater returns a new object, so a
+    // refused edit must not reach setProject at all.
+    expect(setProject).not.toHaveBeenCalled();
   });
 });
 

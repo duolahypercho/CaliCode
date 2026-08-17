@@ -185,7 +185,7 @@ pub fn list_skills(
     skills: &crate::config::SkillsConfig,
 ) -> Vec<SkillInfo> {
     let project_dir = slug.and_then(|slug| project_skills_dir(projects_root, slug));
-    list_from_roots(
+    composed(
         &extra_skill_dirs(skills),
         &global_skills_dir(),
         project_dir.as_deref(),
@@ -451,7 +451,7 @@ fn load_from_roots(
     name: &str,
     disabled: &[String],
 ) -> Result<(SkillInfo, String)> {
-    let all = list_from_roots(extras, global, project, disabled);
+    let all = composed(extras, global, project, disabled);
     let Some(info) = all
         .iter()
         .find(|skill| skill.name == name && skill.error.is_none())
@@ -467,8 +467,12 @@ fn load_from_roots(
     if !info.enabled {
         bail!("skill disabled: {name}");
     }
-    let text = std::fs::read_to_string(&info.path)
-        .with_context(|| format!("cannot read skill file {}", info.path))?;
+    let text = if info.path == BUILTIN_PATH {
+        builtin_body(name).context("built-in skill vanished between list and load")?
+    } else {
+        std::fs::read_to_string(&info.path)
+            .with_context(|| format!("cannot read skill file {}", info.path))?
+    };
     let (_, body) = parse_skill(&text)?;
     Ok((info.clone(), truncate_body(body)))
 }
@@ -501,6 +505,78 @@ fn truncate_body(mut body: String) -> String {
 /// directory are skipped — project skill dirs can live inside user repos, and
 /// a symlinked "skill" pointing at `~/.ssh` must not become readable through
 /// `skill_load`.
+/// Skills that ship with core, in the same markdown-plus-frontmatter format a
+/// user would write.
+///
+/// These exist to keep prose out of `STATIC_SYSTEM_PROMPT`. Instructions that
+/// only a fraction of turns can act on — the goal-tier quality loop is 673
+/// tokens and a one-line fix can do nothing with it — cost every turn of every
+/// session when they live in the prompt, and cost only their description here.
+/// That is exactly the trade `skill_load` exists to make; the authorship being
+/// ours rather than the user's changes nothing about it.
+const BUILTIN_SKILLS: &[&str] = &[include_str!("../skills/goal-loop.md")];
+
+/// Marker in [`SkillInfo::path`] for a compiled-in skill, so `load_from_roots`
+/// serves the body from the binary instead of trying to read it off disk.
+/// Angle brackets keep it from ever colliding with a real path.
+const BUILTIN_PATH: &str = "<built-in>";
+
+/// Directory skills plus the built-ins no directory skill shadows.
+///
+/// Merged here rather than inside [`list_from_roots`] on purpose: that
+/// function answers "how do the configured directories rank against each
+/// other", and its tests are about exactly that. Salting every one of them
+/// with a built-in row would make them assert less about what they exist to
+/// pin. A user file always wins — writing `goal-loop.md` replaces ours.
+fn composed(
+    extras: &[PathBuf],
+    global: &Path,
+    project: Option<&Path>,
+    disabled: &[String],
+) -> Vec<SkillInfo> {
+    let mut out = list_from_roots(extras, global, project, disabled);
+    let taken: HashSet<String> = out.iter().map(|skill| skill.name.clone()).collect();
+    for mut builtin in builtin_skills() {
+        if taken.contains(&builtin.name) {
+            continue;
+        }
+        builtin.enabled = !disabled.contains(&disabled_key(builtin.scope, &builtin.name));
+        out.push(builtin);
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name).then(a.path.cmp(&b.path)));
+    out
+}
+
+fn builtin_skills() -> Vec<SkillInfo> {
+    BUILTIN_SKILLS
+        .iter()
+        .filter_map(|text| {
+            // A malformed built-in is our bug, not the user's, and
+            // `builtins_parse` fails the build before it can ship. Skipping
+            // here rather than panicking keeps one bad entry from taking down
+            // every session's prompt.
+            let (front, _) = parse_skill(text).ok()?;
+            Some(SkillInfo {
+                name: front.name,
+                description: front.description,
+                scope: SkillScope::Global,
+                path: BUILTIN_PATH.to_string(),
+                dir: None,
+                enabled: true,
+                error: None,
+            })
+        })
+        .collect()
+}
+
+/// The compiled-in body for a built-in skill name, if it is one.
+fn builtin_body(name: &str) -> Option<String> {
+    BUILTIN_SKILLS.iter().find_map(|text| {
+        let (front, _) = parse_skill(text).ok()?;
+        (front.name == name).then(|| (*text).to_string())
+    })
+}
+
 fn scan_dir(dir: &Path, scope: SkillScope) -> Vec<SkillInfo> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -608,6 +684,84 @@ mod tests {
             format!("---\nname: {name}\ndescription: {description}\n---\n{body}"),
         )
         .unwrap();
+    }
+
+    /// Every built-in must parse, or it would be silently dropped from every
+    /// session's prompt with no failing test to say so.
+    #[test]
+    fn builtins_parse_and_goal_loop_is_one_of_them() {
+        let names: Vec<String> = builtin_skills().into_iter().map(|s| s.name).collect();
+        assert_eq!(
+            names.len(),
+            BUILTIN_SKILLS.len(),
+            "a built-in failed to parse: {names:?}"
+        );
+        assert!(names.iter().any(|name| name == "goal-loop"));
+    }
+
+    /// The point of the built-in: it reaches the prompt as a description and
+    /// its body only through `skill_load`. A regression that inlined the body
+    /// would put 673 tokens back into every turn.
+    #[test]
+    fn a_builtin_is_listed_and_loadable_without_any_skills_directory() {
+        let global = tempfile::tempdir().unwrap();
+        let listed = composed(&[], global.path(), None, &[]);
+        let goal = listed
+            .iter()
+            .find(|skill| skill.name == "goal-loop")
+            .expect("goal-loop is available with no skills dir at all");
+        assert_eq!(goal.path, BUILTIN_PATH);
+        assert!(goal.enabled && goal.error.is_none());
+
+        let (info, body) = load_from_roots(&[], global.path(), None, "goal-loop", &[]).unwrap();
+        assert_eq!(info.name, "goal-loop");
+        assert!(body.contains("NAME THE BAR"), "body served from the binary");
+        // The description carries the trigger, since that line alone decides
+        // whether a later turn opens the body.
+        assert!(goal.description.contains("GOAL"));
+
+        let index = render_index(&listed);
+        assert!(index.contains("goal-loop"));
+        assert!(
+            !index.contains("NAME THE BAR"),
+            "the index must carry descriptions only, never the body"
+        );
+    }
+
+    #[test]
+    fn a_user_file_shadows_the_builtin_of_the_same_name() {
+        let global = tempfile::tempdir().unwrap();
+        write_skill(
+            global.path(),
+            "goal-loop.md",
+            "goal-loop",
+            "mine",
+            "my body",
+        );
+
+        let listed = composed(&[], global.path(), None, &[]);
+        let matches: Vec<&SkillInfo> = listed
+            .iter()
+            .filter(|skill| skill.name == "goal-loop")
+            .collect();
+        assert_eq!(matches.len(), 1, "shadowed, not duplicated");
+        assert_eq!(matches[0].description, "mine");
+        assert_ne!(matches[0].path, BUILTIN_PATH);
+
+        let (_, body) = load_from_roots(&[], global.path(), None, "goal-loop", &[]).unwrap();
+        assert_eq!(body, "my body");
+    }
+
+    #[test]
+    fn a_builtin_can_be_disabled_like_any_other_skill() {
+        let global = tempfile::tempdir().unwrap();
+        let disabled = vec![disabled_key(SkillScope::Global, "goal-loop")];
+
+        let listed = composed(&[], global.path(), None, &disabled);
+        let goal = listed.iter().find(|s| s.name == "goal-loop").unwrap();
+        assert!(!goal.enabled);
+        assert!(!render_index(&listed).contains("goal-loop"));
+        assert!(load_from_roots(&[], global.path(), None, "goal-loop", &disabled).is_err());
     }
 
     #[test]

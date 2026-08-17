@@ -2091,49 +2091,12 @@ When unsure, ask one question if the answer changes the tier; otherwise start\n\
 at the lower tier and escalate the moment the work reveals hidden scope. A\n\
 one-line fix must never spawn a graph.\n\
 \n\
-## The loop: name the bar -> decompose -> fan out -> judge blind -> iterate\n\
-1. NAME THE BAR. Restate the user's goal against a specific, named reference —\n\
-   the best-in-class published game (or asset/scene) in the same genre. Prefer\n\
-   a matching template's reference (template_list; ids below); else\n\
-   pick the obvious genre flagship and tell the user which you chose; if the\n\
-   genre is genuinely ambiguous, ask. If you cannot name the reference you are\n\
-   matching, you do not yet understand the goal.\n\
-2. DECOMPOSE. Call graph_plan: small tasks, one owner each, explicit\n\
-   acceptance criteria, dependency edges. Criteria must demand primary\n\
-   evidence — files written, entities present, tests green, frames captured —\n\
-   because unevidenced claims count as unmet. For a multi-domain game, use at\n\
-   least three dependency-free Build roots (gameplay/entities, assets/visuals,\n\
-   scripts/tests), then a separate Integration Build depending on every root,\n\
-   and a terminal Judge depending on Integration. Never serialize independent\n\
-   roots. Every plan ends in a judge node\n\
-   carrying the named reference and a threshold (90 = would pass review at a\n\
-   top studio; 100 = utterly perfect).\n\
-   For a /loop run, call loop_report_start before graph_plan and append one\n\
-   loop_report_iteration after every build/play/judge pass. Carry its\n\
-   nextIterationMemory into the next pass; finish with loop_report_update.\n\
-3. FAN OUT. Call graph_run. Each node runs as a fresh subagent (planner,\n\
-   coder, artist, tester, critic) owning only its own item — focused context\n\
-   beats one overloaded transcript, and per-item quality beats averaged\n\
-   quality: nothing weak may hide behind something strong.\n\
-4. JUDGE BLIND. The judge is a fresh critic that never sees how anything was\n\
-   built and has no stake in it passing. It inspects the live artifact itself —\n\
-   frames, scene state, test runs — and judges as a blind side-by-side against\n\
-   the reference: \"if these two screenshots were unlabeled, which would a\n\
-   player pick, and why?\" The 'why not ours' becomes the punch list. Harshness\n\
-   is its job: finding flaws is success, approval without evidence is failure.\n\
-5. ITERATE PER ITEM. Below threshold, only the failed item's builders re-run,\n\
-   armed with the judge's punch list; passed items are left alone. Rejection\n\
-   is the system working. The judge — never a builder — decides when an item\n\
-   is done, and \"done\" means the score crossed the threshold, not \"good\n\
-   progress was made\". If attempts are exhausted, report the graph as BLOCKED\n\
-   with the last punch list — never present it as finished. If a graph ends\n\
-   blocked, read graph_status, repair the stuck node's plan, and re-run.\n\
-\n\
-The acceptance criteria are the floor; the reference is the bar. Pursue every\n\
-quality dimension the reference exhibits — lighting, materials, silhouette,\n\
-motion feel, feedback, readability, audio hooks — whether or not anyone listed\n\
-it. That surplus beyond the criteria is the difference between \"meets spec\"\n\
-and a result the judge is genuinely wowed by, and the loop runs until it is.\n\
+## The loop\n\
+- GOAL work runs a quality loop: name a world-class reference, decompose with\n\
+  graph_plan, fan out, judge blind against that reference, iterate per item.\n\
+  Load the `goal-loop` skill for the full procedure BEFORE calling graph_plan\n\
+  or loop_report_start. Do not run it from memory — the thresholds, the plan\n\
+  shape, and the blocked-graph rule are in the skill.\n\
 \n\
 ## Tools\n\
 Project/state: project_list, project_open, project_checkpoint, project_revert,\n\
@@ -3398,8 +3361,27 @@ mod tests {
         assert!(prompt.contains("200 assets"));
         assert!(prompt.contains("50 tests"));
         assert!(prompt.contains("entity-0-with-a-rather-long-descriptive-name"));
-        assert!(prompt.contains("dependency-free Build roots"));
-        assert!(prompt.contains("Integration Build depending on every root"));
+        // The fan-out procedure moved into the `goal-loop` built-in skill, so
+        // the prompt now carries the pointer and the skill carries the rule.
+        // Asserted on both sides rather than dropped: the guidance still has
+        // to reach a model that needs it, just not on turns that cannot use it.
+        assert!(
+            !prompt.contains("dependency-free Build roots"),
+            "the loop procedure belongs in the goal-loop skill, not every turn"
+        );
+        assert!(
+            prompt.contains("goal-loop"),
+            "prompt must point at the skill"
+        );
+        let (_, loop_body) = crate::skills::load_skill(
+            projects.path(),
+            None,
+            "goal-loop",
+            &crate::config::SkillsConfig::default(),
+        )
+        .expect("goal-loop is a built-in and always loadable");
+        assert!(loop_body.contains("dependency-free Build roots"));
+        assert!(loop_body.contains("Integration Build depending on every root"));
     }
 
     #[test]
