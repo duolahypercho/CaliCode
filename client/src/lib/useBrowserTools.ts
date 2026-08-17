@@ -68,6 +68,7 @@ type ProjectMutation<T> = {
 type ToolError = { error: string };
 type EntityToolResult = { updated: string } | ToolError;
 type ScriptToolResult = { saved: string; id: string; created: boolean } | ToolError;
+type ScriptEditResult = { edited: string; id: string; replacements: number } | ToolError;
 type TestToolResult = { saved: string; id: string; created: boolean } | ToolError;
 
 export interface LiveImage3dMeshDeps {
@@ -287,6 +288,69 @@ export function upsertEditorScript(
   return {
     project: { ...project, scripts: [...project.scripts, script] },
     result: { saved: name, id: script.id, created: true },
+  };
+}
+
+/**
+ * Replace an exact string inside one script, leaving the rest untouched.
+ *
+ * This exists for what it costs, not for what it can do: `editor_script_write`
+ * carries the whole script in its arguments, and tool-call arguments are
+ * *completion* tokens — the most expensive thing a turn emits. Retuning one
+ * constant in a 400-line script re-billed all 400 lines at output rates, every
+ * time. An edit sends the changed region only.
+ *
+ * Matching is exact and must be unique, the same rule `file_edit` starts from.
+ * Core's re-indentation and trailing-whitespace fallbacks (`edit_match.rs`)
+ * are deliberately NOT mirrored here: they are a hundred lines of matching
+ * logic whose second copy could disagree with the first, and a script that
+ * will not match exactly can still be rewritten whole. A refusal here costs a
+ * retry; two implementations drifting apart costs a wrong edit.
+ */
+export function editEditorScript(
+  project: Project,
+  args: { id?: unknown; name?: unknown; oldString: unknown; newString: unknown; replaceAll?: unknown },
+): ProjectMutation<ScriptEditResult> {
+  const requestedId = args.id === undefined || args.id === null ? "" : String(args.id).trim();
+  const name = String(args.name ?? "").trim();
+  if (!requestedId && !name) {
+    return { project, result: { error: "script id or name is required" } };
+  }
+  const script = requestedId
+    ? project.scripts.find((entry) => entry.id === requestedId)
+    : project.scripts.find((entry) => entry.name === name);
+  if (!script) {
+    const known = project.scripts.map((entry) => entry.name).join(", ") || "none";
+    return { project, result: { error: `no script ${requestedId || name}; scripts: ${known}` } };
+  }
+
+  const oldString = String(args.oldString ?? "");
+  if (!oldString) return { project, result: { error: "oldString is required" } };
+  const newString = String(args.newString ?? "");
+  if (oldString === newString) {
+    return { project, result: { error: "oldString and newString are identical" } };
+  }
+
+  const occurrences = script.code.split(oldString).length - 1;
+  if (occurrences === 0) {
+    return { project, result: { error: `oldString not found in script ${script.name}` } };
+  }
+  const replaceAll = args.replaceAll === true;
+  if (occurrences > 1 && !replaceAll) {
+    return {
+      project,
+      result: {
+        error: `oldString matches ${occurrences} times in script ${script.name}; include more surrounding lines to make it unique, or set replaceAll`,
+      },
+    };
+  }
+
+  const code = replaceAll
+    ? script.code.split(oldString).join(newString)
+    : script.code.replace(oldString, newString);
+  return {
+    project: updateScript(project, script.id, { code }),
+    result: { edited: script.name, id: script.id, replacements: replaceAll ? occurrences : 1 },
   };
 }
 
@@ -696,7 +760,7 @@ export function useBrowserTools({
       {
         name: "editor_script_write",
         description:
-          "Create or update a game script. Define update(entity, state, delta); time and delta are seconds. Patch only entity transforms. Read frozen state.scene snapshots or state.find(nameOrId), persist private JSON-safe state in state.self, and coordinate scripts through state.world. There are no global scene/input/DOM/network APIs. Pass id to create or update that stable id; omit id to upsert by name.",
+          "Create a game script, or replace one whole. To change part of an existing script use editor_script_edit instead — this tool re-sends every line. Define update(entity, state, delta); time and delta are seconds. Patch only entity transforms. Read frozen state.scene snapshots or state.find(nameOrId), persist private JSON-safe state in state.self, and coordinate scripts through state.world. There are no global scene/input/DOM/network APIs. Pass id to create or update that stable id; omit id to upsert by name.",
         parameters: {
           type: "object",
           properties: { id: { type: "string" }, name: { type: "string" }, code: { type: "string" } },
@@ -705,6 +769,33 @@ export function useBrowserTools({
         handler: async (args) => {
           return mutateProject((current) =>
             upsertEditorScript(current, { id: args.id, name: args.name, code: args.code }),
+          );
+        },
+      },
+      {
+        name: "editor_script_edit",
+        description:
+          "Change part of an existing game script by exact string replacement, without re-sending the rest. Prefer this over editor_script_write for every edit to a script that already exists. oldString must appear exactly once — include surrounding lines to make it unique, or set replaceAll. Name the script by id or name.",
+        parameters: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            name: { type: "string" },
+            oldString: { type: "string" },
+            newString: { type: "string" },
+            replaceAll: { type: "boolean" },
+          },
+          required: ["oldString", "newString"],
+        },
+        handler: async (args) => {
+          return mutateProject((current) =>
+            editEditorScript(current, {
+              id: args.id,
+              name: args.name,
+              oldString: args.oldString,
+              newString: args.newString,
+              replaceAll: args.replaceAll,
+            }),
           );
         },
       },

@@ -243,6 +243,13 @@ reached by falling through the one above:
 
 1. **`permissions:` rules** in `~/.cali/config.yaml` — `deny`, `allow`, `ask`,
    last match wins. The user's standing decision, never reviewed by anything.
+   **`deny` also removes the tool from what the model is sent**, so it is the
+   supported way to stop *paying* for a family, not only to refuse it:
+   `{pattern: "browser_*", action: deny}` drops 15 schemas — about 2,000
+   tokens — from every turn. `ask` deliberately does not, or the approval card
+   would be unreachable. `agent::tests::a_deny_rule_removes_the_family_from_what_the_model_is_sent`
+   pins both halves. Bring a denied capability back as an MCP server when a
+   given project actually needs it.
 2. **The floor** (`auto_floor`) — `project_revert` and untrusted `mcp__*`
    always ask. Two entries, both decidable from the name alone, both wrong
    things to be wrong about.
@@ -471,6 +478,15 @@ Rust against a scripted provider rather than through a mocked panel.
   command: the composer lists them beside the built-ins (tagged `SKILL`) and
   `/<skill> <task>` sends a turn naming it, which the agent pulls in with
   `skill_load`. A skill may not take a built-in's name — the built-in wins.
+  - **Some skills ship with core.** `core/skills/*.md` are `include_str!`d
+    (`skills::BUILTIN_SKILLS`) and merged in `skills::composed`, ranked below
+    every directory so a user file of the same name shadows them; they can be
+    disabled like any other. They exist to keep prose *out* of
+    `STATIC_SYSTEM_PROMPT`: `goal-loop` is the 673-token quality loop that only
+    GOAL-tier turns can act on, and it now costs 69 tokens of description
+    instead of 673 tokens on every turn of every session. The merge is
+    deliberately not inside `list_from_roots` — that function answers how the
+    configured *directories* rank, and its tests exist to pin exactly that.
 - **Slash commands** — `~/.cali/commands/<name>.md` (`CALI_COMMANDS_DIR`) plus
   `<project>/.cali/commands/`, project shadowing global. Frontmatter is
   `description` and optional `argument-hint`; **the body is the prompt**, and

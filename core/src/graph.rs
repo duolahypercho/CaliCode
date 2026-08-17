@@ -7184,7 +7184,14 @@ mod tests {
         let requests = mock.requests.lock().unwrap();
         let body = requests
             .iter()
-            .find(|body| body["messages"][0]["content"] == "JUDGE")
+            // Prefix, not equality: `spawn_critic_with_frames` appends the
+            // skill index to the system prompt, and built-in skills mean that
+            // index is no longer empty just because no skills directory exists.
+            .find(|body| {
+                body["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|system| system.starts_with("JUDGE"))
+            })
             .expect("judge request");
         let parts = body["messages"][1]["content"]
             .as_array()
