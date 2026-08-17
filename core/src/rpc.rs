@@ -4,6 +4,7 @@ use crate::baselines;
 use crate::checkpoints;
 use crate::devserver;
 use crate::image3d;
+use crate::starters;
 use crate::store;
 use crate::tools::{model_list, model_switch, ToolDef};
 use crate::video_analysis;
@@ -316,6 +317,33 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 apply_mcp_project_scope(state, std::path::Path::new(root)).await;
             }
             Ok(described)
+        }
+        "starter_list" => Ok(json!({
+            "starters": starters::list().iter().map(starters::Starter::describe).collect::<Vec<_>>(),
+        })),
+        "workspace_create_from_template" => {
+            let template = str_param(&params, "templateId")?;
+            let path = str_param(&params, "path")?;
+            let starter = starters::get(template)?;
+            let root = starters::create(template, path)?;
+
+            let mut registry = state.workspaces.write().await;
+            let described = workspace::open(
+                &mut registry,
+                &root.to_string_lossy(),
+                params.get("name").and_then(Value::as_str),
+            )?;
+            persist_workspaces(state, workspace::roots(&registry)).await;
+            drop(registry);
+
+            Ok(json!({
+                "workspace": described,
+                "starter": starter.describe(),
+                // The client offers this; core never spawns it. Installing
+                // needs the network, and the only sanctioned way to run a
+                // command on the user's machine is a user-initiated terminal.
+                "install": starter.manifest.install,
+            }))
         }
         "workspace_list" => Ok(workspace::list(&*state.workspaces.read().await)),
         "workspace_browse" => {
@@ -2596,6 +2624,76 @@ mod tests {
 
         assert_eq!(result["pong"], true);
         assert_eq!(result["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn starter_list_offers_the_builtin_with_its_install_command() {
+        let projects = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
+
+        let result = dispatch(&state, "starter_list", json!({})).await.unwrap();
+        let starters = result["starters"].as_array().unwrap();
+        let iso = starters
+            .iter()
+            .find(|s| s["id"] == json!("iso-city"))
+            .expect("the builtin starter is missing from starter_list");
+
+        assert_eq!(iso["scope"], json!("builtin"));
+        assert_eq!(iso["devScript"], json!("dev"));
+        // The client offers this command; core never runs it.
+        assert_eq!(iso["install"], json!("npm install"));
+    }
+
+    /// A scaffold that does not end up attached is a folder the user has to go
+    /// and find, so the create arm opens what it wrote.
+    #[tokio::test]
+    async fn workspace_create_from_template_scaffolds_and_attaches_it() {
+        let projects = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        let config = tempfile::tempdir().unwrap();
+        // Without this the arm's persist_workspaces would rewrite the
+        // developer's own ~/.cali/config.yaml.
+        std::env::set_var("CALI_CONFIG", config.path().join("config.yaml"));
+        let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
+
+        let target = tempfile::tempdir().unwrap();
+        let dest = target.path().join("my-city");
+        let created = dispatch(
+            &state,
+            "workspace_create_from_template",
+            json!({ "templateId": "iso-city", "path": dest.to_str().unwrap(), "name": "My City" }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(created["workspace"]["name"], json!("My City"));
+        assert_eq!(created["starter"]["id"], json!("iso-city"));
+        assert_eq!(created["install"], json!("npm install"));
+        // `describe` reads the scaffolded package.json, so this proves the dev
+        // script the manifest names actually reached disk.
+        assert!(created["workspace"]["scripts"]["dev"].is_string());
+        assert!(dest.join("src/engine/city.ts").exists());
+
+        let id = created["workspace"]["id"].as_str().unwrap().to_string();
+        let listed = dispatch(&state, "workspace_list", json!({})).await.unwrap();
+        assert!(
+            listed
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|w| w["id"] == json!(id)),
+            "the scaffolded workspace was not attached"
+        );
+
+        // Scaffolding over the top of it would silently overwrite work.
+        let again = dispatch(
+            &state,
+            "workspace_create_from_template",
+            json!({ "templateId": "iso-city", "path": dest.to_str().unwrap() }),
+        )
+        .await;
+        assert!(again.is_err());
     }
 
     /// The terminal runs against the same tree `file_read` sees: a game with a
