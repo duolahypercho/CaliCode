@@ -47,6 +47,185 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// launch creates the whole profile before it listens.
 const LAUNCH_TIMEOUT: Duration = Duration::from_secs(25);
 
+/// Sampling window bounds for [`Browser::perf`]. The ceiling is well under
+/// `CALL_TIMEOUT` because the script adds its own two-second guard on top,
+/// and a window that outran the round trip would report nothing at all.
+pub const PERF_MIN_MS: u64 = 200;
+pub const PERF_MAX_MS: u64 = 10_000;
+/// Long enough to cross a few hundred frames, short enough that a `/loop`
+/// can afford to ask after every change.
+pub const PERF_DEFAULT_MS: u64 = 2_000;
+
+/// Frame-budget sampler, injected as one expression by [`Browser::perf`].
+///
+/// Two properties make it work on any engine with no cooperation from the
+/// game. `getContext` returns the *same* context object once one exists, so
+/// re-acquiring it hands back the live renderer's own context and the draw
+/// entry points can be wrapped in place — no reload, no build-time hook. And
+/// wrapping the *graphics API* rather than the engine means three.js, Babylon,
+/// PlayCanvas, raw WebGL and WebGPU all bottom out in the same few calls.
+///
+/// The sampler runs its own `requestAnimationFrame` loop rather than wrapping
+/// the page's: rAF callbacks all fire on the same frame, so an independent
+/// loop counts presented frames without re-entering the game's own scheduling.
+/// The cost is that rAF keeps ticking at display rate on a page that draws
+/// nothing, which would report a perfect 60 for a black screen — hence
+/// `idleFrames`, which counts frames that issued no draw call at all.
+/// The sampler, with its window substituted in and clamped.
+///
+/// Separate from [`Browser::perf`] so the clamp and the substitution can be
+/// checked without a live Chrome — CI has no browser, and a silent edit that
+/// dropped the restore list or the idle-frame count would otherwise ship
+/// measured-looking nonsense.
+pub fn perf_expression(duration_ms: u64) -> String {
+    let duration = duration_ms.clamp(PERF_MIN_MS, PERF_MAX_MS);
+    PERF_SCRIPT.replace("__DURATION__", &duration.to_string())
+}
+
+const PERF_SCRIPT: &str = r#"
+(() => new Promise((resolve) => {
+  const DURATION = __DURATION__;
+  const restore = [];
+  let guard = null;
+  let settled = false;
+
+  const finish = (payload) => {
+    if (settled) return;
+    settled = true;
+    if (guard !== null) clearTimeout(guard);
+    // A patch that outlived the window would make every later measurement a
+    // reading of this tool's own instrumentation.
+    for (const undo of restore) { try { undo(); } catch (e) {} }
+    resolve(payload);
+  };
+
+  const canvases = Array.from(document.querySelectorAll("canvas"));
+  if (canvases.length === 0) { finish({ error: "no canvas on the page", api: "none" }); return; }
+  let canvas = canvases[0];
+  for (const c of canvases) {
+    if (c.width * c.height > canvas.width * canvas.height) canvas = c;
+  }
+
+  let gl = null;
+  let api = "none";
+  for (const name of ["webgl2", "webgl"]) {
+    try {
+      const ctx = canvas.getContext(name);
+      if (ctx) { gl = ctx; api = name; break; }
+    } catch (e) {}
+  }
+
+  let calls = 0;
+  let tris = 0;
+  let approx = false;
+
+  const wrap = (target, method, trisOf) => {
+    if (!target || typeof target[method] !== "function") return;
+    const original = target[method];
+    const owned = Object.prototype.hasOwnProperty.call(target, method);
+    target[method] = function (...a) {
+      calls++;
+      const n = trisOf(a);
+      if (n > 0) tris += n;
+      return original.apply(this, a);
+    };
+    restore.push(() => {
+      if (owned) target[method] = original; else delete target[method];
+    });
+  };
+
+  // Vertex count means nothing without the primitive mode: 4 is TRIANGLES,
+  // 5 and 6 are STRIP and FAN, and the rest draw no triangles at all.
+  const fromMode = (mode, count) => {
+    if (mode === 4) return count / 3;
+    if (mode === 5 || mode === 6) return Math.max(0, count - 2);
+    return 0;
+  };
+
+  // The instance, not the prototype: this catches the gl.drawX() calls every
+  // engine makes without touching any other context on the page.
+  if (gl) {
+    wrap(gl, "drawArrays", (a) => fromMode(a[0], a[2]));
+    wrap(gl, "drawElements", (a) => fromMode(a[0], a[1]));
+    wrap(gl, "drawArraysInstanced", (a) => fromMode(a[0], a[2]) * (a[3] || 1));
+    wrap(gl, "drawElementsInstanced", (a) => fromMode(a[0], a[1]) * (a[4] || 1));
+    wrap(gl, "drawRangeElements", (a) => fromMode(a[0], a[3]));
+  }
+
+  // WebGPU sets topology on the pipeline, not the draw call, so a triangle
+  // count here can only assume a triangle-list. That is true of the large
+  // majority and the result says so rather than presenting a guess as fact.
+  const pass = window.GPURenderPassEncoder && window.GPURenderPassEncoder.prototype;
+  if (pass) {
+    const wgpu = (a) => {
+      approx = true;
+      if (api === "none") api = "webgpu";
+      return (a[0] || 0) / 3 * (a[1] === undefined ? 1 : a[1]);
+    };
+    wrap(pass, "draw", wgpu);
+    wrap(pass, "drawIndexed", wgpu);
+  }
+
+  const deltas = [];
+  const drawn = [];
+  const raf = window.requestAnimationFrame.bind(window);
+  const start = performance.now();
+  let prev = start;
+  let prevCalls = 0;
+
+  const collect = (error) => {
+    // The first delta spans from before sampling began, so it is not a frame.
+    const d = deltas.slice(1);
+    const perFrame = drawn.slice(1);
+    if (d.length === 0) return { error: error || "no frames observed", api };
+    const sorted = d.slice().sort((x, y) => x - y);
+    const at = (p) => sorted[Math.min(sorted.length - 1, Math.floor(p * sorted.length))];
+    const sum = (xs) => xs.reduce((x, y) => x + y, 0);
+    const round = (n) => Math.round(n * 10) / 10;
+    // The 1% low is the mean of the slowest one percent of frames. It is what
+    // a player feels; a mean frame rate averages away the hitches entirely.
+    const worst = sorted.slice(sorted.length - Math.max(1, Math.round(d.length * 0.01)));
+    return {
+      api,
+      frames: d.length,
+      durationMs: Math.round(prev - start),
+      fps: {
+        mean: round(1000 / (sum(d) / d.length)),
+        p50: round(1000 / at(0.5)),
+        low1: round(1000 / (sum(worst) / worst.length)),
+      },
+      frameMs: { p50: round(at(0.5)), p99: round(at(0.99)), max: round(sorted[sorted.length - 1]) },
+      longFrames: {
+        over16ms: d.filter((x) => x > 16.7).length,
+        over33ms: d.filter((x) => x > 33.4).length,
+      },
+      idleFrames: perFrame.filter((n) => n === 0).length,
+      drawCalls: {
+        mean: Math.round(sum(perFrame) / Math.max(1, perFrame.length)),
+        max: perFrame.length ? Math.max.apply(null, perFrame) : 0,
+      },
+      triangles: { total: Math.round(tris), perFrame: Math.round(tris / d.length) },
+      trianglesApprox: approx,
+      heapMB: performance.memory ? round(performance.memory.usedJSHeapSize / 1048576) : null,
+      error: error || null,
+    };
+  };
+
+  const tick = (t) => {
+    deltas.push(t - prev);
+    drawn.push(calls - prevCalls);
+    prev = t;
+    prevCalls = calls;
+    if (t - start < DURATION) raf(tick); else finish(collect(null));
+  };
+
+  // A page that never presents a frame would otherwise hold the round trip
+  // open until CALL_TIMEOUT and come back with nothing.
+  guard = setTimeout(() => finish(collect("sampling window expired early")), DURATION + 2000);
+  raf(tick);
+}))()
+"#;
+
 /// Ceiling on waiting for a page to become readable.
 ///
 /// What is waited *for* is `DOMContentLoaded`, not `load`. Measured on real
@@ -507,6 +686,15 @@ impl Browser {
             bail!("{}", text.lines().next().unwrap_or(text));
         }
         Ok(result["result"]["value"].clone())
+    }
+
+    /// Sample the running game's frame budget over a live window.
+    ///
+    /// One `Runtime.evaluate`: [`Self::eval`] already sets `awaitPromise`, so
+    /// the script can resolve when its own sampling window closes rather than
+    /// needing an inject/wait/collect round trip per measurement.
+    pub async fn perf(&self, duration_ms: u64) -> Result<Value> {
+        self.eval(&perf_expression(duration_ms)).await
     }
 
     /// Navigate and wait for the page to settle.

@@ -2914,6 +2914,9 @@ const PLAN_MODE_TOOLS: &[&str] = &[
     "browser_snapshot",
     "browser_scroll",
     "browser_console",
+    // Reads a page that is already open, sends nothing anywhere, and answers
+    // the one question a plan about performance needs answered first.
+    "game_perf",
 ];
 
 /// Whether plan mode may dispatch this tool at all.
