@@ -2709,6 +2709,18 @@ fn subagent_system(
     if let Some(system) = system {
         return system.to_string();
     }
+    // A defined agent's body *is* its system prompt. Checked before the
+    // generic sentence below, so `~/.cali/agents/shader-critic.md` turns
+    // `role: "shader-critic"` into a reviewer that knows this project rather
+    // than one merely told it is a reviewer.
+    if let Some((_, body)) = crate::agents::load_agent(projects_root, slug, role) {
+        let mut prompt = body;
+        if let Some(slug) = slug {
+            prompt.push_str("\n\nProject: ");
+            prompt.push_str(&crate::rpc::project_digest(projects_root, slug));
+        }
+        return prompt;
+    }
     let mut prompt = format!(
         "You are a {role} subagent inside CaliCode, an AI game engine harness. \
          You have full access to the scene, asset workbench, PIE runtime, and test tools. \
@@ -2968,6 +2980,14 @@ async fn spawn_subagent_with(
         .get("projectSlug")
         .and_then(|v| v.as_str())
         .map(String::from);
+    // A definition may narrow what the child can reach. Enforced by handing it
+    // a smaller tool set rather than by asking it in the prompt: a reviewer
+    // declared `tools: [file_read, file_grep]` should be unable to write, not
+    // merely discouraged from it. An empty list means "everything the parent
+    // can reach", which is what a role with no file has always got.
+    let tool_allowlist = crate::agents::load_agent(&state.projects_root, slug.as_deref(), role)
+        .map(|(definition, _)| definition.tools)
+        .unwrap_or_default();
     let mut system = subagent_system(
         &state.projects_root,
         role,
@@ -3045,6 +3065,7 @@ async fn spawn_subagent_with(
             .map(str::to_string),
     };
     let options = crate::agent::AgentOptions {
+        tool_allowlist,
         permission_mode: permission_mode.clone(),
         max_turns,
         // Inherited like the rest of the parent's turn shape: a subagent runs

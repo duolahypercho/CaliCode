@@ -1,5 +1,6 @@
 mod advisor;
 mod agent;
+mod agents;
 mod approvals;
 mod asset_search;
 mod assets;

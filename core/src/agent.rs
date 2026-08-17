@@ -799,6 +799,10 @@ pub struct AgentOptions {
     /// provider choice with the user. Empty (a top-level chat) always runs
     /// the model picker's selection.
     pub model_roles: Vec<String>,
+    /// Tool names a file-defined subagent is limited to. Empty means every
+    /// tool the parent can reach, which is what an undefined role has always
+    /// got. See `agents.rs`.
+    pub tool_allowlist: Vec<String>,
     pub project_slug: Option<String>,
     /// Immutable workspace selected by the durable session. Core file tools
     /// resolve here instead of following the project's mutable default.
@@ -1205,6 +1209,9 @@ impl AgentManager {
         // exactly right once the question has changed.
         let mut repeats = RepeatWatch::default();
 
+        // Set once a `Stop` hook has re-entered this turn, so the hook can see
+        // it is inside its own continuation.
+        let mut stop_hook_active = false;
         loop {
             if turns >= max_turns {
                 break;
@@ -1226,7 +1233,11 @@ impl AgentManager {
                 }
             }
             turns += 1;
-            let defs = self.build_tools(registered_tools, &options.permission_rules);
+            let defs = self.build_tools(
+                registered_tools,
+                &options.permission_rules,
+                &options.tool_allowlist,
+            );
             let schemas: Vec<Value> = defs
                 .iter()
                 .map(|def| escalatable_schema(def, &options.permission_mode))
@@ -1384,6 +1395,38 @@ impl AgentManager {
                     guard
                         .messages
                         .push(json!({ "role": "assistant", "content": result.content.clone() }));
+                }
+                // The agent is about to hand control back, which is the one
+                // moment a `Stop` hook can turn a finished turn into a
+                // continuing one. Bounded by the turn budget: every
+                // re-injection spends a turn, so a hook that always blocks
+                // ends the turn rather than the process.
+                // Top-level turns only: `subagent_depth == 0` excludes children,
+                // and `owner_graph` excludes graph nodes, which also run at
+                // depth 0. See `hooks::stop` for what firing on children cost.
+                let top_level =
+                    fires_stop_hook(options.subagent_depth, options.owner_graph.as_deref());
+                if top_level {
+                    let hooks = { state.config.read().await.hooks.clone() };
+                    if !hooks.stop.is_empty() {
+                        if let Some(reason) = crate::hooks::stop(
+                            &hooks,
+                            &current_session_id,
+                            &result.content,
+                            stop_hook_active,
+                            options.workspace_root.as_deref(),
+                        )
+                        .await
+                        {
+                            stop_hook_active = true;
+                            let mut guard = session.lock().await;
+                            guard
+                                .messages
+                                .push(json!({ "role": "user", "content": reason }));
+                            drop(guard);
+                            continue;
+                        }
+                    }
                 }
                 return Ok(json!({
                     "sessionId": current_session_id,
@@ -2091,9 +2134,17 @@ impl AgentManager {
         &self,
         registered: &HashMap<String, ToolDef>,
         rules: &[PermissionRule],
+        allowlist: &[String],
     ) -> Vec<ToolDef> {
         let mut defs = core_tool_defs();
         defs.extend(registered.values().cloned());
+        // A file-defined agent may narrow what its child can reach. Applied
+        // here rather than by filtering `registered`, because the core tools
+        // are added above and were never in that map — a filter there looked
+        // like it worked and removed nothing that mattered.
+        if !allowlist.is_empty() {
+            defs.retain(|def| allowlist.iter().any(|allowed| allowed == &def.name));
+        }
         // Provider selection is global application state. Only the user's
         // model picker may mutate it; exposing model_switch to one agent let
         // that task silently reroute every other session and persist the
@@ -2953,6 +3004,16 @@ fn requires_approval(mode: &str, tool: &str, mcp_trusted: bool) -> bool {
 ///   that moves the tool into the judged remainder like anything else.
 fn auto_floor(tool: &str, mcp_trusted: bool) -> bool {
     tool == "project_revert" || (tool.starts_with(crate::mcp::MCP_PREFIX) && !mcp_trusted)
+}
+
+/// Whether this agent is the one a `Stop` hook is about.
+///
+/// Depth 0 excludes subagents; `owner_graph` excludes graph nodes, which run at
+/// depth 0 as well. A hook written for the main turn does not recognise a
+/// child's reply, so without this one `subagent_spawn` could drive a child
+/// through its whole turn budget — measured at 199 extra model calls.
+fn fires_stop_hook(subagent_depth: usize, owner_graph: Option<&str>) -> bool {
+    subagent_depth == 0 && owner_graph.is_none()
 }
 
 /// The reserved argument a model fills in to put its own call in front of the
@@ -5567,12 +5628,12 @@ mod tests {
         ]);
 
         let first: Vec<String> = manager
-            .build_tools(&registered, &[])
+            .build_tools(&registered, &[], &[])
             .into_iter()
             .map(|tool| tool.name)
             .collect();
         let second: Vec<String> = manager
-            .build_tools(&registered, &[])
+            .build_tools(&registered, &[], &[])
             .into_iter()
             .map(|tool| tool.name)
             .collect();
@@ -5595,7 +5656,7 @@ mod tests {
         let registered = HashMap::from([(wrapper.name.clone(), wrapper)]);
 
         let live_names: Vec<String> = manager
-            .build_tools(&registered, &[])
+            .build_tools(&registered, &[], &[])
             .into_iter()
             .map(|tool| tool.name)
             .collect();
@@ -5606,7 +5667,7 @@ mod tests {
         );
 
         let headless_names: Vec<String> = manager
-            .build_tools(&HashMap::new(), &[])
+            .build_tools(&HashMap::new(), &[], &[])
             .into_iter()
             .map(|tool| tool.name)
             .collect();
@@ -5634,7 +5695,7 @@ mod tests {
         let registered = HashMap::from([(wrapper.name.clone(), wrapper)]);
 
         let live_names: Vec<String> = manager
-            .build_tools(&registered, &[])
+            .build_tools(&registered, &[], &[])
             .into_iter()
             .map(|tool| tool.name)
             .collect();
@@ -5644,7 +5705,7 @@ mod tests {
         assert!(!live_names.iter().any(|name| name == "capture_persist"));
 
         let headless_names: Vec<String> = manager
-            .build_tools(&HashMap::new(), &[])
+            .build_tools(&HashMap::new(), &[], &[])
             .into_iter()
             .map(|tool| tool.name)
             .collect();
@@ -5656,7 +5717,7 @@ mod tests {
         let (bus, _) = tokio::sync::broadcast::channel(8);
         let manager = AgentManager::new(bus);
         let names: Vec<String> = manager
-            .build_tools(&HashMap::new(), &[])
+            .build_tools(&HashMap::new(), &[], &[])
             .into_iter()
             .map(|tool| tool.name)
             .collect();
@@ -5683,7 +5744,7 @@ mod tests {
         };
         let registered = HashMap::from([(browser_switch.name.clone(), browser_switch)]);
         let names: Vec<String> = manager
-            .build_tools(&registered, &[])
+            .build_tools(&registered, &[], &[])
             .into_iter()
             .map(|tool| tool.name)
             .collect();
@@ -6069,11 +6130,56 @@ mod tests {
             pattern: "editor_*".into(),
             action: "deny".into(),
         }];
-        let filtered = agents.build_tools(&tools, &rules);
+        let filtered = agents.build_tools(&tools, &rules, &[]);
         assert!(filtered.iter().all(|d| d.name != "editor_echo"));
         assert!(!filtered.is_empty(), "core tools must survive the filter");
-        let unfiltered = agents.build_tools(&tools, &[]);
+        let unfiltered = agents.build_tools(&tools, &[], &[]);
         assert!(unfiltered.iter().any(|d| d.name == "editor_echo"));
+    }
+
+    #[test]
+    fn only_the_top_level_agent_fires_a_stop_hook() {
+        assert!(
+            fires_stop_hook(0, None),
+            "a plain chat turn is the main agent"
+        );
+        // A subagent: its reply is not what a main-turn hook is judging.
+        assert!(!fires_stop_hook(1, None));
+        assert!(!fires_stop_hook(2, None));
+        // A graph node runs at depth 0 too, so depth alone is not the test.
+        assert!(!fires_stop_hook(0, Some("graph-1")));
+    }
+
+    #[test]
+    fn an_agent_allowlist_removes_core_tools_too() {
+        // The bug this pins: `build_tools` starts from `core_tool_defs()` and
+        // only *extends* with the registered map, so filtering that map — the
+        // obvious place — removed nothing at all. An allowlist that silently
+        // enforces nothing is worse than none, because the definition claims
+        // the child cannot write.
+        let agents = AgentManager::new(tokio::sync::broadcast::channel(8).0);
+        let allow = vec!["file_read".to_string(), "file_grep".to_string()];
+        let filtered = agents.build_tools(&HashMap::new(), &[], &allow);
+        let names: Vec<&str> = filtered.iter().map(|def| def.name.as_str()).collect();
+        assert!(names.contains(&"file_read"), "{names:?}");
+        assert!(names.contains(&"file_grep"), "{names:?}");
+        assert!(
+            !names.contains(&"file_write"),
+            "a narrowed agent kept a writer"
+        );
+        assert!(
+            !names.contains(&"subagent_spawn"),
+            "a narrowed agent kept spawning"
+        );
+        assert_eq!(names.len(), 2, "{names:?}");
+    }
+
+    #[test]
+    fn an_empty_allowlist_leaves_every_tool_in_place() {
+        // Which is what a role with no file has always got.
+        let agents = AgentManager::new(tokio::sync::broadcast::channel(8).0);
+        let all = agents.build_tools(&HashMap::new(), &[], &[]);
+        assert!(all.len() > 10, "{}", all.len());
     }
 
     /// First round: the model asks for file_write. In plan mode that must

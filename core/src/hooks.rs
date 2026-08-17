@@ -59,6 +59,11 @@ pub struct HooksConfig {
     pub post_tool_use: Vec<HookEntry>,
     /// Run when a session's system prompt is built. Stdout is appended to it.
     pub session_start: Vec<HookEntry>,
+    /// Run when the **top-level** agent is about to hand control back. May
+    /// block, which feeds its reason in as the next user turn instead of
+    /// returning. Subagents and graph nodes deliberately do not fire it — see
+    /// [`stop`].
+    pub stop: Vec<HookEntry>,
 }
 
 impl HooksConfig {
@@ -66,6 +71,7 @@ impl HooksConfig {
         self.pre_tool_use.is_empty()
             && self.post_tool_use.is_empty()
             && self.session_start.is_empty()
+            && self.stop.is_empty()
     }
 }
 
@@ -178,6 +184,49 @@ pub async fn post_tool_use(
         out.push_str(text);
     }
     out
+}
+
+/// Run every `Stop` hook. `Some(reason)` means "do not stop" — the reason is
+/// fed back as the next user turn.
+///
+/// This is the seam that lets a *loop* be a plugin rather than harness code:
+/// a hook that re-injects the original prompt until some condition holds turns
+/// one shell script into an autonomous loop, with nothing in core aware of it.
+///
+/// `stop_hook_active` tells a hook it is already inside such a re-entry, so it
+/// can decline to block forever. That is a courtesy, not the guard: the turn
+/// budget is, because every re-injection spends a turn and `max_turns` bounds
+/// them. A hook that always blocks therefore ends the turn, not the process.
+///
+/// **Only the top-level agent fires this.** Subagents and graph nodes do not,
+/// and that is not a simplification — it was measured. A hook written for the
+/// main turn ("keep going until you say DONE") does not recognise a child's
+/// reply, so it blocked every one: a single `subagent_spawn` turned into 199
+/// extra model calls as the child was driven to its turn cap. One hook should
+/// not be able to multiply the cost of a run by the number of children it
+/// spawns. A separate `subagent_stop` event can be added when something
+/// actually wants it.
+pub async fn stop(
+    hooks: &HooksConfig,
+    session_id: &str,
+    last_message: &str,
+    stop_hook_active: bool,
+    cwd: Option<&str>,
+) -> Option<String> {
+    for entry in &hooks.stop {
+        let payload = json!({
+            "hook_event_name": "Stop",
+            "session_id": session_id,
+            "cwd": cwd,
+            "stop_hook_active": stop_hook_active,
+            "last_message": last_message,
+        });
+        if let Outcome::Blocked(reason) = run(entry, &payload, cwd).await {
+            tracing::info!(command = %entry.command, "Stop hook kept the turn going");
+            return Some(reason);
+        }
+    }
+    None
 }
 
 /// Concatenated stdout of every `SessionStart` hook, ready to append to the
@@ -573,6 +622,48 @@ mod tests {
             post_tool_use(&hooks, "s", "memory_read", &json!({}), &json!({}), None).await,
             ""
         );
+    }
+
+    #[tokio::test]
+    async fn a_stop_hook_can_keep_the_turn_going() {
+        // The ralph-loop shape: refuse to stop until the model says the magic
+        // word, feeding the original prompt back each time.
+        let hooks = HooksConfig {
+            stop: vec![entry(
+                r#"payload=$(cat); case "$payload" in *'"last_message":"DONE'*) exit 0;; esac; echo '{"decision":"block","reason":"keep going"}'"#,
+                "*",
+            )],
+            ..Default::default()
+        };
+        assert_eq!(
+            stop(&hooks, "s", "still working", false, None).await,
+            Some("keep going".to_string())
+        );
+        // And it lets go when its condition holds.
+        assert_eq!(stop(&hooks, "s", "DONE", false, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn a_stop_hook_is_told_when_it_is_inside_its_own_continuation() {
+        // Without this a hook has no way to decline to block forever.
+        let hooks = HooksConfig {
+            stop: vec![entry(
+                r#"payload=$(cat); case "$payload" in *'"stop_hook_active":true'*) exit 0;; esac; exit 2"#,
+                "*",
+            )],
+            ..Default::default()
+        };
+        assert!(stop(&hooks, "s", "x", false, None).await.is_some());
+        assert!(stop(&hooks, "s", "x", true, None).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_quiet_stop_hook_lets_the_turn_end() {
+        let hooks = HooksConfig {
+            stop: vec![entry("true", "*")],
+            ..Default::default()
+        };
+        assert_eq!(stop(&hooks, "s", "done", false, None).await, None);
     }
 
     #[tokio::test]
