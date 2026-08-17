@@ -28,22 +28,71 @@ export function formatInterval(ms: number): string {
   return `${Math.round(ms / UNIT_MS.s)}s`;
 }
 
+/**
+ * How much process a loop imposes on its goal.
+ *
+ * `standard` replays the goal verbatim and takes the agent's DONE at its word,
+ * which is what every other harness's loop does and what most goals want.
+ * `aaa` is CaliCode's own thing: a mandated task graph — three dependency-free
+ * specialist build roots, an integration build, a terminal judge — plus PIE
+ * captures, persisted frames, and a durable report that must clear a score
+ * threshold before DONE is believed.
+ *
+ * The pipeline is the stronger machine, and it used to be the *only* one, which
+ * is the problem it caused: "fix the typo in the README" was answered with a
+ * three-specialist graph and a demand for three screenshots. A quality bar that
+ * cannot be declined is not a quality bar, it is a tax.
+ */
+export type LoopProfile = "standard" | "aaa";
+
+export const DEFAULT_LOOP_PROFILE: LoopProfile = "standard";
+
+/** `--aaa` / `--standard`, accepted only in leading position. */
+const PROFILE_FLAGS: Record<string, LoopProfile> = {
+  "--aaa": "aaa",
+  "--standard": "standard",
+};
+
 export interface LoopArgs {
   /** Milliseconds between iterations, or null to let the loop run flat out. */
   intervalMs: number | null;
+  profile: LoopProfile;
   goal: string;
 }
 
 /**
- * Split `/loop` arguments into an optional leading interval and the goal.
+ * Split `/loop` arguments into optional leading flags and the goal.
  *
- * The interval only counts in first position, so a goal that happens to
- * contain `30s` keeps it.
+ * Both the profile flag and the interval only count in leading position, in
+ * either order, so a goal that happens to contain `30s` or the word `--aaa`
+ * keeps them.
  */
 export function parseLoopArgs(args: string): LoopArgs {
-  const trimmed = args.trim();
-  const match = /^(\S+)\s+([\s\S]+)$/.exec(trimmed);
-  if (!match) return { intervalMs: null, goal: trimmed };
-  const intervalMs = parseInterval(match[1]);
-  return intervalMs === null ? { intervalMs: null, goal: trimmed } : { intervalMs, goal: match[2].trim() };
+  let rest = args.trim();
+  let intervalMs: number | null = null;
+  let profile: LoopProfile = DEFAULT_LOOP_PROFILE;
+  // Loop rather than a fixed order: `--aaa 15m goal` and `15m --aaa goal` are
+  // the same request, and making one of them silently park the loop on the
+  // goal "--aaa" would be a nasty way to learn the order.
+  for (;;) {
+    const match = /^(\S+)\s+([\s\S]+)$/.exec(rest);
+    if (!match) break;
+    const [, head, tail] = match;
+    const flagged = PROFILE_FLAGS[head.toLowerCase()];
+    if (flagged) {
+      profile = flagged;
+      rest = tail.trim();
+      continue;
+    }
+    if (intervalMs === null) {
+      const parsed = parseInterval(head);
+      if (parsed !== null) {
+        intervalMs = parsed;
+        rest = tail.trim();
+        continue;
+      }
+    }
+    break;
+  }
+  return { intervalMs, profile, goal: rest };
 }

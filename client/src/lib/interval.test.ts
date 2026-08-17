@@ -34,6 +34,7 @@ describe("parseLoopArgs", () => {
   test("takes an interval only in first position", () => {
     expect(parseLoopArgs("15m run the tests and fix what fails")).toEqual({
       intervalMs: 900_000,
+      profile: "standard",
       goal: "run the tests and fix what fails",
     });
   });
@@ -41,6 +42,7 @@ describe("parseLoopArgs", () => {
   test("leaves a plain goal alone", () => {
     expect(parseLoopArgs("add a double jump then playtest")).toEqual({
       intervalMs: null,
+      profile: "standard",
       goal: "add a double jump then playtest",
     });
   });
@@ -48,11 +50,39 @@ describe("parseLoopArgs", () => {
   test("keeps an interval-shaped word that is part of the goal", () => {
     expect(parseLoopArgs("make the dash 30s cooldown")).toEqual({
       intervalMs: null,
+      profile: "standard",
       goal: "make the dash 30s cooldown",
     });
   });
 
   test("an interval with no goal is not a loop", () => {
-    expect(parseLoopArgs("15m")).toEqual({ intervalMs: null, goal: "15m" });
+    expect(parseLoopArgs("15m")).toEqual({ intervalMs: null, profile: "standard", goal: "15m" });
+  });
+
+  test("defaults to the standard profile — the pipeline is opt-in", () => {
+    expect(parseLoopArgs("fix the typo in the README").profile).toBe("standard");
+  });
+
+  test("--aaa opts into the quality pipeline", () => {
+    expect(parseLoopArgs("--aaa make the boss fight feel good")).toEqual({
+      intervalMs: null,
+      profile: "aaa",
+      goal: "make the boss fight feel good",
+    });
+  });
+
+  test("the flag and the interval are order-independent", () => {
+    const flagFirst = parseLoopArgs("--aaa 15m polish the arena");
+    const intervalFirst = parseLoopArgs("15m --aaa polish the arena");
+    expect(flagFirst).toEqual({ intervalMs: 900_000, profile: "aaa", goal: "polish the arena" });
+    expect(intervalFirst).toEqual(flagFirst);
+  });
+
+  test("a flag-shaped word later in the goal is part of the goal", () => {
+    expect(parseLoopArgs("document the --aaa flag")).toEqual({
+      intervalMs: null,
+      profile: "standard",
+      goal: "document the --aaa flag",
+    });
   });
 });

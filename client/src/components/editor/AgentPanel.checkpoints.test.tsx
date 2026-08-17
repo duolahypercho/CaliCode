@@ -138,17 +138,11 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("automatic restore points", () => {
-  it("checkpoints the project before the first loop iteration touches it", async () => {
-    stubLoopRpc(["still working"]);
-    renderPanel();
-    await type("/loop polish the game");
-
-    await waitFor(() => expect(callsTo("agent_chat").length).toBeGreaterThan(0));
-    expect(callsTo("checkpoint_create")).toHaveLength(1);
-    expect(callsTo("checkpoint_create")[0]?.[1]).toEqual({ slug: "demo" });
-    expect(firstCallIndex("checkpoint_create")).toBeLessThan(firstCallIndex("agent_chat"));
-  });
-
+  // Loop checkpointing moved to core with the driver (`loop_run.rs`); it is
+  // covered there by `a_loop_takes_a_restore_point_before_it_edits_anything`
+  // and `a_failing_restore_point_does_not_stop_the_loop`, which exercise the
+  // real thing rather than a mocked RPC. `/goal` still drives client-side, so
+  // the rounds below still test this panel's own checkpointing.
   it("checkpoints before the first goal round", async () => {
     mocks.rpc.mockImplementation(async (method: string) => {
       if (method === "checkpoint_create") return { id: "cp-1700000000001" };
@@ -162,28 +156,6 @@ describe("automatic restore points", () => {
     await waitFor(() => expect(screen.getByText(/goal met/)).toBeTruthy());
     expect(callsTo("checkpoint_create")).toHaveLength(1);
     expect(firstCallIndex("checkpoint_create")).toBeLessThan(firstCallIndex("agent_chat"));
-  });
-
-  it("keeps running when checkpoint_create fails", async () => {
-    let turns = 0;
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "checkpoint_create") throw new Error("No space left on device");
-      if (method === "agent_chat") {
-        turns += 1;
-        if (turns > 2) throw new Error("provider refused the request");
-        return { sessionId: "session-1", reply: "still working", toolCalls: [] };
-      }
-      return {};
-    });
-    renderPanel();
-    await type("/loop polish the game");
-
-    // The turns still happened, and the disk failure never surfaced as a run
-    // error or stopped the loop before its own terminal condition.
-    expect(await screen.findByText(/Loop blocked at iteration 3/)).toBeTruthy();
-    expect(callsTo("agent_chat")).toHaveLength(3);
-    expect(screen.queryByText(/Loop error:/)).toBeNull();
-    expect(screen.queryByText(/No space left on device/)).toBeNull();
   });
 
   it("does not say restore points exist when every checkpoint failed", async () => {
@@ -245,27 +217,25 @@ describe("automatic restore points", () => {
 });
 
 describe("/checkpoints and /restore", () => {
-  it("lists what a blocked loop checkpointed, and closes that run with the restore line", async () => {
-    let turns = 0;
+  it("lists what a blocked run checkpointed, and closes it with the restore line", async () => {
+    // Driven through `/goal`, which still checkpoints client-side. `/loop`
+    // moved its driver to core, so this panel no longer mints those rows.
     mocks.rpc.mockImplementation(async (method: string) => {
       if (method === "checkpoint_create") return { id: "cp-1700000000001" };
-      if (method === "agent_chat") {
-        turns += 1;
-        if (turns > 1) throw new Error("provider refused the request");
-        return { sessionId: "session-1", reply: "still working", toolCalls: [] };
-      }
+      if (method === "agent_chat") return { sessionId: "session-1", reply: "worked on it", toolCalls: [] };
+      if (method === "goal_evaluate") return { met: true, reason: "verified" };
       return {};
     });
     renderPanel();
-    await type("/loop polish the game");
+    await type("/goal polish the game");
 
-    expect(await screen.findByText(/Loop blocked at iteration 2/)).toBeTruthy();
+    expect(await screen.findByText(/goal met/)).toBeTruthy();
     expect(await screen.findByText(/1 restore point saved during this run/)).toBeTruthy();
 
     await type("/checkpoints");
     const listed = await screen.findByText(/Restore points, newest first/);
     expect(listed.textContent).toContain("cp-1700000000001");
-    expect(listed.textContent).toContain("before a /loop turn");
+    expect(listed.textContent).toContain("before a /goal turn");
     expect(listed.textContent).toContain("polish the game");
   });
 

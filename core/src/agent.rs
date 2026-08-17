@@ -2177,6 +2177,38 @@ impl AgentManager {
             Err(error) => json!({ "error": error.to_string() }),
         };
         let activity = take_internal_activity(&mut outcome);
+        // PostToolUse runs here, before the finished event is built, so the
+        // transcript the user reads and the result the model reads carry the
+        // same text. It cannot block — the work already happened, and a
+        // refusal at this point would only misdescribe the disk.
+        {
+            let hooks = { context.state.config.read().await.hooks.clone() };
+            if !hooks.post_tool_use.is_empty() {
+                let appended = crate::hooks::post_tool_use(
+                    &hooks,
+                    context.sid,
+                    &call.name,
+                    &call.arguments,
+                    &outcome,
+                    context.options.workspace_root.as_deref(),
+                )
+                .await;
+                if !appended.is_empty() {
+                    match outcome.as_object_mut() {
+                        Some(object) => {
+                            object.insert("hookOutput".to_string(), json!(appended));
+                        }
+                        // A non-object result (a bare string or array) has
+                        // nowhere to hold a field, so it is wrapped rather
+                        // than dropped — losing a failing typecheck silently
+                        // is the one outcome this hook exists to prevent.
+                        None => {
+                            outcome = json!({ "result": outcome, "hookOutput": appended });
+                        }
+                    }
+                }
+            }
+        }
         let finished_at_ms = unix_time_ms();
         let mut event = json!({
             "type": "agent.tool_finished",
@@ -2378,6 +2410,35 @@ impl AgentManager {
             return self
                 .exit_plan_mode(state, &call.arguments, sid, &root_sid, owner_sid, options)
                 .await;
+        }
+
+        // User-owned policy runs ahead of everything below: ahead of the
+        // `permissions:` rules, ahead of the mode, ahead of the guardian. A
+        // hook is the user's own code and costs no tokens, so a call it
+        // refuses should never reach a model that might be argued into
+        // allowing it — and a block here spends no guardian round trip and
+        // raises no approval card. Hooks can only add a refusal (see
+        // `crate::hooks`), so this cannot widen any mode.
+        {
+            let hooks = { state.config.read().await.hooks.clone() };
+            if !hooks.is_empty() {
+                if let crate::hooks::Decision::Block(reason) = crate::hooks::pre_tool_use(
+                    &hooks,
+                    &root_sid,
+                    &def.name,
+                    &call.arguments,
+                    options.workspace_root.as_deref(),
+                )
+                .await
+                {
+                    anyhow::bail!(
+                        "'{}' was blocked before it ran: {reason} This is a standing rule the \
+                         user configured, not a decision made this turn — do not retry the call \
+                         unchanged.",
+                        def.name
+                    );
+                }
+            }
         }
 
         let mcp_trusted =
@@ -2764,6 +2825,14 @@ const PLAN_MODE_TOOLS: &[&str] = &[
     "file_glob",
     "skill_list",
     "skill_load",
+    // Reading what earlier sessions recorded is the most useful thing a
+    // planning turn can do before proposing anything. Both are local reads;
+    // the global scope reaches `~/.cali/memory` rather than the projects root,
+    // exactly as `skill_load` already reaches `~/.cali/skills`. The two writers
+    // (`memory_write`, `memory_forget`) stay out, and the disjointness test
+    // with `is_destructive` is what keeps them out.
+    "memory_list",
+    "memory_read",
     "model_list",
     "project_list",
     "project_open",
@@ -3714,6 +3783,7 @@ mod tests {
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
             editor_attachment: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             graphs: crate::graph::GraphManager::new(),
+            loops: Default::default(),
             mcp: std::sync::Arc::new(crate::mcp::McpManager::default()),
             asset_catalog: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         }
@@ -4194,6 +4264,7 @@ mod tests {
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
             editor_attachment: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             graphs: crate::graph::GraphManager::new(),
+            loops: Default::default(),
             mcp: std::sync::Arc::new(crate::mcp::McpManager::default()),
             asset_catalog: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         };
@@ -4723,6 +4794,7 @@ mod tests {
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
             editor_attachment: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             graphs: crate::graph::GraphManager::new(),
+            loops: Default::default(),
             mcp: std::sync::Arc::new(crate::mcp::McpManager::default()),
             asset_catalog: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
         };
@@ -5410,6 +5482,12 @@ mod tests {
             "loop_report_iteration",
             "loop_report_start",
             "loop_report_update",
+            // Writes to the user's own disk, outside any project, and outlives
+            // the session that wrote it: a wrong memory is charged to every
+            // future session until someone notices. Reads (`memory_list`,
+            // `memory_read`) stay unguarded.
+            "memory_forget",
+            "memory_write",
             "model_switch",
             "project_revert",
             "subagent_spawn",

@@ -69,6 +69,7 @@ import {
   emptyStore,
   headApproval,
   lapsedExplanation,
+  planFrom,
   reduce,
   visibleApprovals,
   type ApprovalEntry,
@@ -3459,16 +3460,23 @@ export function AgentPanel({
             const lapsed = entry.state.kind === "lapsed";
             const finished = settled || lapsed;
             const target = approvalTarget(entry.arguments);
+            const plan = entry.tool === "exit_plan_mode" ? planFrom(entry.arguments) : null;
             // A finished card keeps its own past tense. Leaving the question
             // form up is the defect that made a transcript of completed work
             // read as a wall of unanswered prompts.
             const title = settled
               ? entry.state.kind === "settled" && entry.state.approved
-                ? `Approved ${entry.tool}`
+                ? plan
+                  ? "Plan approved"
+                  : `Approved ${entry.tool}`
                 : `Denied ${entry.tool}`
               : lapsed
-                ? `Approval for ${entry.tool} lapsed`
-                : `Approve ${entry.tool}?`;
+                ? plan
+                  ? "The plan was never answered"
+                  : `Approval for ${entry.tool} lapsed`
+                : plan
+                  ? "Start work on this plan?"
+                  : `Approve ${entry.tool}?`;
             return (
               <div
                 key={entry.requestId}
@@ -3484,15 +3492,34 @@ export function AgentPanel({
                     <span className="ml-1.5 text-[11px] text-ink-subtle">for run {entry.graphLabel}</span>
                   ) : null}
                 </p>
-                {target ? (
+                {target && !plan ? (
                   <p className="mt-0.5 truncate font-mono text-[11px] text-ink-faint" title={target}>
                     {target}
                   </p>
                 ) : null}
+                {entry.reason && !plan ? (
+                  <p
+                    className="mt-1.5 text-[11.5px] leading-[1.5] text-ink"
+                    data-approval-reason={entry.reasonSource ?? "unattributed"}
+                  >
+                    {entry.reasonSource ? (
+                      <span className="mr-1 text-ink-faint">
+                        {entry.reasonSource === "agent" ? "The agent asks:" : "Flagged for review:"}
+                      </span>
+                    ) : null}
+                    {entry.reason}
+                  </p>
+                ) : null}
+                {plan ? (
+                  <div data-approval-plan className="mt-2 max-h-80 overflow-auto rounded-md border border-line bg-surface-0 px-2.5 py-2">
+                    {plan.heading ? <p className="mb-1.5 text-[13px] font-bold text-ink-strong">{plan.heading}</p> : null}
+                    <AgentText content={plan.body} />
+                  </div>
+                ) : null}
                 {/* Only when there is something the target line did not
                     already say. `null` used to print verbatim, which reads as
                     a bug in the request. */}
-                {!finished && argumentsWorthShowing(entry.arguments, target) ? (
+                {!plan && !finished && argumentsWorthShowing(entry.arguments, target) ? (
                   <pre className="mt-1.5 max-h-24 overflow-auto text-[11px] leading-[1.5] text-ink-subtle">
                     {JSON.stringify(entry.arguments, null, 2)}
                   </pre>

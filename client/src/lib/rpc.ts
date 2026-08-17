@@ -160,6 +160,30 @@ export type AgentEvent = {
   startedAtMs?: number;
   finishedAtMs?: number;
   arguments?: unknown;
+  /**
+   * `agent.approval_request` only: why this call is being shown, when
+   * something decided that per call rather than the mode deciding for
+   * everything. Absent in the modes that ask about every tool.
+   */
+  reason?: string | null;
+  /** `agent.approval_request` only: `"agent"` or `"guardian"`. */
+  reasonSource?: string | null;
+  /** `agent.permission_mode` only: the mode core says the session moved to. */
+  mode?: string;
+  /** `loop.*` only: the core-side run these events belong to. */
+  loopId?: string;
+  /** `loop.iteration` only. */
+  iteration?: number;
+  maxIterations?: number;
+  /** `loop.iteration` only: the prompt core is about to send. */
+  prompt?: string;
+  /** `loop.finished` only: the run's terminal view (see `LoopRun`). */
+  loop?: {
+    loopId: string;
+    status: "running" | "completed" | "stopped" | "failed";
+    iteration: number;
+    detail?: string;
+  };
   requestId?: string;
   result?: unknown;
   /** Sanitised file activity payload emitted by core tool completion. */

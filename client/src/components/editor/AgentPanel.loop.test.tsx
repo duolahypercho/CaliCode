@@ -1,18 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  AgentPanel,
-  fallbackLoopChangedFiles,
-  graphQualityReference,
-  hasRecordedLoopIteration,
-  isTransientRpcError,
-  loopCarryForward,
-  loopIterationPrompt,
-  reportLoopBestEffort,
-  settleRunningToolRows,
-  validateLoopGraphCompletion,
-  validateLoopReportCompletion,
-} from "./AgentPanel";
+import { AgentPanel, settleRunningToolRows } from "./AgentPanel";
 import type { AgentEvent } from "../../lib/rpc";
 import type { TaskGraph } from "../../lib/graph";
 import type { LoopReport, OpenLoopReport } from "../../lib/loopReports";
@@ -34,6 +22,8 @@ const mocks = vi.hoisted(() => ({
   planGraph: vi.fn(),
   runGraph: vi.fn(),
   openLoopReport: vi.fn(),
+  startLoopRun: vi.fn(),
+  stopLoopRun: vi.fn(),
 }));
 
 vi.mock("../../lib/rpc", () => ({
@@ -76,6 +66,8 @@ vi.mock("../../lib/graph", () => ({
 
 vi.mock("../../lib/loopReports", () => ({
   openLoopReport: mocks.openLoopReport,
+  startLoopRun: mocks.startLoopRun,
+  stopLoopRun: mocks.stopLoopRun,
 }));
 
 let emitEvent: ((event: AgentEvent) => void) | null = null;
@@ -377,543 +369,161 @@ describe("session resume", () => {
   });
 });
 
-describe("loop reporting", () => {
-  it("takes the durable quality reference only from a Judge node", () => {
-    expect(graphQualityReference(passingGraph())).toBe("Geometry Wars 3");
-    expect(
-      graphQualityReference({
-        ...passingGraph(),
-        nodes: passingGraph().nodes.map((node) => ({ ...node, reference: node.kind === "build" ? "untrusted" : null })),
-      }),
-    ).toBeNull();
+
+describe("/loop starts a core-side run", () => {
+  const startedRun = (over: Record<string, unknown> = {}) => ({
+    loopId: "loop-1",
+    slug: "demo",
+    goal: "fix the typo",
+    profile: "standard",
+    status: "running",
+    iteration: 0,
+    maxIterations: 100,
+    startedAtMs: 1,
+    ...over,
   });
 
-  it("inlines the previous iteration's carry-forward instead of asking for a fetch", () => {
-    const report = {
-      loopId: "loop-carry",
-      projectSlug: "demo",
-      reference: "Hades arena",
-      status: "running" as const,
-      iterations: [
-        {
-          iteration: 1,
-          outcome: "needs-work" as const,
-          summary: "flat lighting",
-          startedAtMs: 1, completedAtMs: 2,
-          agents: [], checks: [], changedFiles: [], evidence: [], scores: [],
-          punchList: [
-            { priority: "high" as const, item: "Add a rim light", resolved: false },
-            { priority: "low" as const, item: "Already handled", resolved: true },
-          ],
-          nextIterationMemory: {
-            observations: [], decisions: ["Keep three build roots"], risks: [],
-            nextActions: ["Add a rim light"],
-          },
-        },
-      ],
-    } as unknown as LoopReport;
-
-    const carry = loopCarryForward(report);
-    expect(carry).toContain("Add a rim light");
-    expect(carry).toContain("Keep three build roots");
-    // A resolved item is noise in the next pass — it invites redoing work.
-    expect(carry).not.toContain("Already handled");
-
-    const prompt = loopIterationPrompt("polish the game", "loop-carry", 2, carry);
-    expect(prompt).toContain("Add a rim light");
-    expect(prompt).not.toContain("Read loop_report_open first");
-    // Without a carry the prompt must still tell the model where to look.
-    expect(loopIterationPrompt("polish the game", "loop-carry", 2)).toContain("Read loop_report_open first");
-  });
-
-  it("carries nothing forward from a report with no iterations yet", () => {
-    const empty = { loopId: "l", projectSlug: "d", status: "running", iterations: [] } as unknown as LoopReport;
-    expect(loopCarryForward(empty)).toBe("");
-  });
-
-  it("keeps the full completion topology in repair-iteration prompts", () => {
-    const prompt = loopIterationPrompt("polish the game", "loop-proof", 2);
-
-    expect(prompt).toContain("three dependency-free specialist Build roots with distinct roles");
-    expect(prompt).toContain("Integration Build depending on every root");
-    expect(prompt).toContain("terminal Judge depending on Integration");
-    expect(prompt).toContain("Every repair iteration must keep this full topology");
-    expect(prompt).toContain("editor_camera_frame");
-    expect(prompt).toContain("gameplay foreground");
-    expect(prompt).toContain("at least three individual screenshots");
-    expect(prompt).toContain("structured iteration with build/play/test checks");
-  });
-
-  it("binds loop identity and the bounded final-response drain on loop agent calls", async () => {
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") throw new Error("stop after observing request");
-      return {};
-    });
-
+  const fire = async (text: string) => {
     renderPanel();
     const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
+    fireEvent.change(prompt, { target: { value: text } });
     fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-    await screen.findByText(/Loop blocked at iteration 1/);
+    await screen.findByText(/▶ loop started/);
+  };
 
-    const agentCall = mocks.rpc.mock.calls.find(([method]) => method === "agent_chat");
-    expect(agentCall?.[1]).toMatchObject({
-      projectSlug: "demo",
-      loopId: expect.stringMatching(/^loop-/),
-      finalResponseDrain: true,
-      maxTurns: 20,
-    });
+  it("hands the goal, profile and pacing to core rather than driving turns itself", async () => {
+    mocks.startLoopRun.mockResolvedValue(startedRun());
+    await fire("/loop fix the typo");
+    expect(mocks.startLoopRun).toHaveBeenCalledWith(
+      expect.objectContaining({ goal: "fix the typo", profile: "standard", intervalMs: null }),
+    );
+    // The panel must not be running turns of its own any more.
+    const chats = mocks.rpc.mock.calls.filter(([method]) => method === "agent_chat");
+    expect(chats).toHaveLength(0);
   });
 
-  it("fills a missing report reference from the first fresh bound graph", async () => {
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") {
-        emitEvent?.({
-          type: "graph.updated",
-          graphId: "graph-loop",
-          phase: "created",
-          graph: passingGraph(),
-        } as unknown as AgentEvent);
-        return { sessionId: "session-1", reply: "DONE", toolCalls: [] };
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(await screen.findByText("✔ loop complete in 1 iterations")).toBeTruthy();
-    const reportStarts = mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_start");
-    expect(reportStarts).toHaveLength(2);
-    expect(reportStarts[1]?.[1]).toMatchObject({
-      slug: "demo",
-      objective: "polish the game",
-      reference: "Geometry Wars 3",
-    });
-  });
-
-  it("requires a structured two-pass durable report before loop completion", () => {
-    const opened = readyLoopReport();
-    expect(validateLoopReportCompletion(opened.report, "demo", "loop-proof")).toEqual({
-      accepted: true,
-      reason: "durable loop report passed",
-    });
-
-    const genericFallback = readyLoopReport();
-    genericFallback.report.iterations[1] = {
-      ...genericFallback.report.iterations[1],
-      outcome: "needs-work",
-      agents: [],
-      checks: [],
-      evidence: [],
-      scores: [],
-    };
-    expect(validateLoopReportCompletion(genericFallback.report, "demo", "loop-proof")).toMatchObject({
-      accepted: false,
-      reason: "progress report has no passed iteration",
-    });
-  });
-
-  it("recognizes only a successful iteration write for the current loop", () => {
-    expect(
-      hasRecordedLoopIteration(
-        [
-          {
-            name: "loop_report_iteration",
-            status: "done",
-            arguments: { slug: "demo", loopId: "loop-current", iteration: {} },
-          },
-        ],
-        "demo",
-        "loop-current",
-      ),
-    ).toBe(true);
-    expect(
-      hasRecordedLoopIteration(
-        [
-          {
-            name: "loop_report_iteration",
-            status: "done",
-            arguments: { iteration: { outcome: "passed" } },
-          },
-        ],
-        "demo",
-        "loop-current",
-      ),
-    ).toBe(true);
-    expect(
-      hasRecordedLoopIteration(
-        [
-          {
-            name: "loop_report_iteration",
-            status: "error",
-            arguments: { slug: "demo", loopId: "loop-current" },
-          },
-        ],
-        "demo",
-        "loop-current",
-      ),
-    ).toBe(false);
-    expect(
-      hasRecordedLoopIteration(
-        [
-          {
-            name: "loop_report_iteration",
-            status: "done",
-            arguments: { slug: "demo", loopId: "loop-other" },
-          },
-        ],
-        "demo",
-        "loop-current",
-      ),
-    ).toBe(false);
-    expect(
-      hasRecordedLoopIteration(
-        [{ name: "loop_report_iteration", arguments: { slug: "demo", loopId: "loop-current" } }],
-        "demo",
-        "loop-current",
-      ),
-    ).toBe(false);
-  });
-
-  it("falls back exactly once when the agent's iteration write failed", async () => {
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") {
-        const loopPrompt = (params?.messages as Array<{ content?: string }> | undefined)?.at(-1)?.content ?? "";
-        const loopId = /This is \/loop (loop-[a-z0-9]+)/.exec(loopPrompt)?.[1];
-        return {
-          sessionId: "session-1",
-          reply: "DONE",
-          toolCalls: [
-            {
-              name: "loop_report_iteration",
-              status: "error",
-              arguments: { slug: "demo", loopId },
-            },
-          ],
-        };
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(await screen.findByText("✔ loop complete in 1 iterations")).toBeTruthy();
-    expect(mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_iteration")).toHaveLength(1);
-  });
-
-  it("does not duplicate a successful agent-recorded iteration", async () => {
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string, params?: Record<string, unknown>) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") {
-        const loopPrompt = (params?.messages as Array<{ content?: string }> | undefined)?.at(-1)?.content ?? "";
-        const loopId = /This is \/loop (loop-[a-z0-9]+)/.exec(loopPrompt)?.[1];
-        return {
-          sessionId: "session-1",
-          reply: "DONE",
-          toolCalls: [
-            {
-              name: "loop_report_iteration",
-              status: "done",
-              arguments: { slug: "demo", loopId, iteration: { outcome: "passed" } },
-            },
-          ],
-        };
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(await screen.findByText("✔ loop complete in 1 iterations")).toBeTruthy();
-    expect(mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_iteration")).toHaveLength(0);
-  });
-
-  it("keeps the loop running when start, iteration, and terminal report writes fail", async () => {
-    let replies = ["Keep working", "DONE"];
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "loop_report_start" || method === "loop_report_iteration" || method === "loop_report_update") {
-        throw new Error(`${method} offline`);
-      }
-      if (method === "agent_chat") {
-        const [started, finished] = activityEvents();
-        emitEvent?.(started);
-        emitEvent?.(finished);
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        return { sessionId: "session-1", reply: replies.shift() ?? "DONE", toolCalls: [] };
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(await screen.findByText("✔ loop complete in 2 iterations")).toBeTruthy();
-    expect(screen.queryByText(/Loop error:/)).toBeNull();
-    expect(mocks.rpc.mock.calls.filter(([method]) => method === "agent_chat")).toHaveLength(2);
-    expect(mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_start")).toHaveLength(1);
-    expect(mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_iteration")).toHaveLength(2);
-    expect(mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_update")).toHaveLength(1);
-
-    const iterationCall = mocks.rpc.mock.calls.find(([method]) => method === "loop_report_iteration");
-    expect(iterationCall?.[1]).toMatchObject({
-      iteration: {
-        changedFiles: [{ path: "src/game.ts", additions: 2, deletions: 0 }],
-      },
-    });
-  });
-
-  it("ignores bare DONE and records the fallback iteration as needs-work", async () => {
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue({
-      ...passingGraph(),
-      nodes: passingGraph().nodes.map((node) => ({ ...node, status: "running" })),
-      status: "running",
-    });
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") return { sessionId: "session-1", reply: "DONE", toolCalls: [] };
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(await screen.findByText(/DONE ignored:/)).toBeTruthy();
-    expect(screen.queryByText(/✔ loop complete/)).toBeNull();
-    const iterations = mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_iteration");
-    expect(iterations[0]?.[1]).toMatchObject({ iteration: { outcome: "needs-work" } });
-  });
-
-  it("accepts DONE only after a fresh passing graph is fetched authoritatively", async () => {
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") return { sessionId: "session-1", reply: "DONE", toolCalls: [] };
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(await screen.findByText("✔ loop complete in 1 iterations")).toBeTruthy();
-    expect(mocks.graphStatus).toHaveBeenCalledWith("graph-loop");
-    expect(mocks.openLoopReport).toHaveBeenCalledTimes(1);
-    expect(mocks.rpc.mock.calls.filter(([method]) => method === "loop_report_update")).toHaveLength(1);
-  });
-
-  it("keeps watching on an interval instead of finishing when the goal is met", async () => {
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") return { sessionId: "session-1", reply: "DONE", toolCalls: [] };
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop 1s polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    // A paced loop is a watch: an accepted DONE answers this check and the
-    // loop re-arms rather than declaring itself finished.
-    expect(await screen.findByText(/goal met at iteration 1 — watching again in 1s/)).toBeTruthy();
-    expect(await screen.findByText(/next check in 1s/)).toBeTruthy();
-    expect(screen.queryByText(/✔ loop complete/)).toBeNull();
-    // The pill says which kind of run is up there.
-    expect(screen.getByText("every 1s")).toBeTruthy();
-
-    // Stop cuts the wait short rather than sitting it out.
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Stop loop" }));
-    });
-    expect(await screen.findByText(/loop stopped after/)).toBeTruthy();
-  });
-
-  it("reports an iteration failure as blocked without claiming the loop hit its cap", async () => {
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") throw new Error("provider usage limit reached");
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(await screen.findByText("Loop blocked at iteration 1: provider usage limit reached")).toBeTruthy();
-    expect(screen.queryByText(/loop hit the 25-iteration cap/)).toBeNull();
-    expect(mocks.rpc.mock.calls.filter(([method]) => method === "agent_chat")).toHaveLength(1);
-    const terminal = mocks.rpc.mock.calls.find(([method]) => method === "loop_report_update");
-    expect(terminal?.[1]).toMatchObject({
-      update: {
-        status: "blocked",
-        summary: "Loop blocked at iteration 1: provider usage limit reached",
-      },
-    });
-  });
-
-  it("rejects stale or wrong-session graph proof", () => {
-    const startedAt = Date.parse("2026-01-01T00:00:10.000Z");
-    const context = {
-      loopStartedAtMs: startedAt,
-      projectSlug: "demo",
-      sessionId: "session-1",
-      workspaceRoot: "/tmp/game",
-      knownGraphIds: new Set(["graph-stale"]),
-    };
-    expect(validateLoopGraphCompletion(passingGraph({ graphId: "graph-stale" }), context).accepted).toBe(false);
-    expect(
-      validateLoopGraphCompletion(
-        passingGraph({ graphId: "graph-fresh", ownerSession: "session-foreign" }),
-        context,
-      ).accepted,
-    ).toBe(false);
-  });
-
-  it("rejects a shallow graph without three roots, integration, and a terminal judge edge", () => {
-    const context = {
-      loopStartedAtMs: Date.now() - 1_000,
-      projectSlug: "demo",
-      sessionId: "session-1",
-      workspaceRoot: "/tmp/game",
-      knownGraphIds: new Set<string>(),
-      observedGraphIds: new Set(["graph-loop"]),
-    };
-    const shallow = passingGraph({
-      nodes: passingGraph().nodes.filter((node) => node.id !== "tests" && node.id !== "integration").map((node) =>
-        node.id === "judge" ? { ...node, deps: ["gameplay", "visuals"] } : node,
-      ),
-    });
-
-    expect(validateLoopGraphCompletion(shallow, context)).toMatchObject({
-      accepted: false,
-      reason: "graph needs three independent specialist build roots",
-    });
-
-    const noIntegration = passingGraph({
-      nodes: passingGraph().nodes.filter((node) => node.id !== "integration").map((node) =>
-        node.id === "judge" ? { ...node, deps: ["gameplay", "visuals", "tests"] } : node,
-      ),
-    });
-    expect(validateLoopGraphCompletion(noIntegration, context)).toMatchObject({
-      accepted: false,
-      reason: "graph needs a separate integration build depending on every root",
-    });
-  });
-
-  it("persists each synthetic loop user message before agent_chat", async () => {
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") {
-        const saved = mocks.saveSession.mock.calls.at(-1)?.[0] as { messages?: AgentMessage[] } | undefined;
-        expect(saved?.messages?.some((message) => message.role === "user" && message.content.includes("This is /loop"))).toBe(
-          true,
-        );
-        return { sessionId: "session-1", reply: "DONE", toolCalls: [] };
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(await screen.findByText("✔ loop complete in 1 iterations")).toBeTruthy();
-    const saved = mocks.saveSession.mock.calls.map(([input]) => input as { messages?: AgentMessage[] });
-    expect(saved.some((input) => (input.messages ?? []).filter((message) => message.role === "user").length === 1)).toBe(
-      true,
+  it("passes the aaa profile through", async () => {
+    mocks.startLoopRun.mockResolvedValue(startedRun({ profile: "aaa" }));
+    await fire("/loop --aaa make the boss fight feel good");
+    expect(mocks.startLoopRun).toHaveBeenCalledWith(
+      expect.objectContaining({ goal: "make the boss fight feel good", profile: "aaa" }),
     );
   });
 
-  it("extracts fallback files from the selected current activity turn", () => {
-    const messages: AgentMessage[] = [
-      {
-        role: "tool",
-        tool: "file_edit",
-        turnId: "loop-turn",
-        activity: { path: "src/one.ts", operation: "edit", additions: 2, deletions: 1, diff: [] },
-        content: "Edited one",
-      },
-      {
-        role: "tool",
-        tool: "file_edit",
-        turnId: "other-turn",
-        activity: { path: "src/other.ts", operation: "edit", additions: 8, deletions: 0, diff: [] },
-        content: "Edited other",
-      },
-    ];
-
-    expect(fallbackLoopChangedFiles(messages, "loop-turn")).toEqual([
-      { path: "src/one.ts", additions: 2, deletions: 1 },
-    ]);
+  it("passes an interval through as pacing", async () => {
+    mocks.startLoopRun.mockResolvedValue(startedRun());
+    await fire("/loop 15m run the tests");
+    expect(mocks.startLoopRun).toHaveBeenCalledWith(
+      expect.objectContaining({ goal: "run the tests", intervalMs: 900_000 }),
+    );
   });
 
-  it("turns report RPC errors into an undefined result without throwing", async () => {
-    const failure = new Error("report unavailable");
-    mocks.rpc.mockRejectedValueOnce(failure);
-    const onFailure = vi.fn();
+  it("reuses this panel's session, so the run's turns land in this transcript", async () => {
+    mocks.startLoopRun.mockResolvedValue(startedRun());
+    await fire("/loop fix the typo");
+    expect(mocks.startLoopRun).toHaveBeenCalledWith(
+      expect.objectContaining({ sessionId: "session-1", workspaceRoot: "/tmp/game" }),
+    );
+  });
 
-    await expect(reportLoopBestEffort("loop_report_update", {}, onFailure)).resolves.toBeUndefined();
-    expect(onFailure).toHaveBeenCalledWith(failure);
+  it("surfaces a refused start instead of leaving the composer stuck", async () => {
+    mocks.startLoopRun.mockRejectedValue(new Error("core said no"));
+    renderPanel();
+    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
+    fireEvent.change(prompt, { target: { value: "/loop fix the typo" } });
+    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
+    expect(await screen.findByText(/Loop error: core said no/)).toBeTruthy();
+    // Busy must clear, or the panel is wedged with no run behind it.
+    expect(screen.queryByRole("button", { name: "Stop agent loop" })).toBeNull();
   });
 });
 
-describe("isTransientRpcError", () => {
-  it("matches the browser fetch transport failure", () => {
-    expect(isTransientRpcError(new TypeError("Failed to fetch"))).toBe(true);
-    expect(isTransientRpcError(new Error("Load failed"))).toBe(true);
-    expect(isTransientRpcError(new Error("NetworkError when attempting to fetch resource"))).toBe(true);
+describe("/loop renders the run core reports", () => {
+  const startedRun = { loopId: "loop-1", slug: "demo", goal: "fix the typo", profile: "standard", status: "running", iteration: 0, maxIterations: 100, startedAtMs: 1 };
+
+  const startLoop = async () => {
+    mocks.startLoopRun.mockResolvedValue(startedRun);
+    renderPanel();
+    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
+    fireEvent.change(prompt, { target: { value: "/loop fix the typo" } });
+    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
+    await screen.findByText(/▶ loop started/);
+  };
+
+  it("shows each iteration's prompt and counter", async () => {
+    await startLoop();
+    await act(async () => {
+      emitEvent?.({
+        type: "loop.iteration",
+        loopId: "loop-1",
+        iteration: 1,
+        maxIterations: 100,
+        prompt: "fix the typo",
+      } as AgentEvent);
+    });
+    expect(await screen.findByText("loop 1/100")).toBeTruthy();
+    // The prompt lands as a user row, which is what makes a loop's transcript
+    // readable back: you can see what was actually asked each iteration.
+    const userRows = document.querySelectorAll('[data-role="user"]');
+    expect(
+      Array.from(userRows).some((row) => row.textContent?.includes("fix the typo")),
+    ).toBe(true);
   });
 
-  it("matches Vite proxy / HTTP 5xx envelopes", () => {
-    // Explicit 5xx from the Vite proxy is the only RPC failure we treat as
-    // transient. Generic `RPC <method> failed`/JSON-RPC app errors stay
-    // terminal so we never retry out of a real provider/auth failure.
-    expect(isTransientRpcError(new Error("502 Bad Gateway"))).toBe(true);
-    expect(isTransientRpcError(new Error("503 Service Unavailable"))).toBe(true);
-    expect(isTransientRpcError(new Error("504 Gateway Timeout"))).toBe(true);
-    expect(isTransientRpcError(new Error("RPC loop_report_update failed"))).toBe(false);
+  it("shows a refused DONE with core's reason", async () => {
+    await startLoop();
+    await act(async () => {
+      emitEvent?.({
+        type: "loop.done_refused",
+        loopId: "loop-1",
+        iteration: 2,
+        reason: "the report has one iteration, two are required",
+      } as AgentEvent);
+    });
+    expect(await screen.findByText(/DONE ignored: the report has one iteration/)).toBeTruthy();
   });
 
-  it("fails closed on provider/auth/usage errors", () => {
-    expect(isTransientRpcError(new Error("provider usage limit reached"))).toBe(false);
-    expect(isTransientRpcError(new Error("401 Unauthorized"))).toBe(false);
-    expect(isTransientRpcError(new Error("invalid api key"))).toBe(false);
-    expect(isTransientRpcError(new Error(""))).toBe(false);
-    expect(isTransientRpcError(undefined)).toBe(false);
+  it("clears the loop UI when core says the run finished", async () => {
+    await startLoop();
+    expect(screen.getByRole("button", { name: "Stop agent loop" })).toBeTruthy();
+    await act(async () => {
+      emitEvent?.({
+        type: "loop.finished",
+        loop: { loopId: "loop-1", status: "completed", iteration: 2 },
+      } as AgentEvent);
+    });
+    expect(await screen.findByText(/loop 1\/100|▶ loop started/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop agent loop" })).toBeNull();
+  });
+
+  it("reports a failed run rather than silently going idle", async () => {
+    await startLoop();
+    await act(async () => {
+      emitEvent?.({
+        type: "loop.finished",
+        loop: { loopId: "loop-1", status: "failed", iteration: 1, detail: "provider refused" },
+      } as AgentEvent);
+    });
+    expect(await screen.findByText(/Loop failed: provider refused/)).toBeTruthy();
+  });
+
+  it("ignores events belonging to somebody else's run", async () => {
+    await startLoop();
+    await act(async () => {
+      emitEvent?.({
+        type: "loop.done_refused",
+        loopId: "loop-other",
+        reason: "not ours",
+      } as AgentEvent);
+    });
+    expect(screen.queryByText(/not ours/)).toBeNull();
+  });
+
+  it("stops the run in core, not just in this tab", async () => {
+    await startLoop();
+    mocks.stopLoopRun.mockResolvedValue({ ...startedRun, status: "stopped" });
+    fireEvent.click(screen.getByRole("button", { name: "Stop agent loop" }));
+    expect(mocks.stopLoopRun).toHaveBeenCalledWith("loop-1");
   });
 });
 
@@ -966,131 +576,5 @@ describe("settleRunningToolRows", () => {
       { role: "tool", tool: "turn", content: "", turnId: "loop-turn", status: "done", startedAtMs: 1, completedAtMs: 2 },
     ];
     expect(settleRunningToolRows(messages, "loop-turn", 999)).toBe(messages);
-  });
-});
-
-describe("loop recovery from transient fetch loss", () => {
-  it("retries transient agent_chat failures and continues the loop", async () => {
-    let attempts = 0;
-    let replies = ["DONE", "DONE"];
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus.mockResolvedValue(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") {
-        attempts += 1;
-        if (attempts <= 2) throw new TypeError("Failed to fetch");
-        return { sessionId: "session-1", reply: replies.shift() ?? "DONE", toolCalls: [] };
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-    expect(await screen.findByText("✔ loop complete in 1 iterations", {}, { timeout: 3_000 })).toBeTruthy();
-    expect(attempts).toBe(3);
-    expect(screen.queryByText(/Loop blocked/)).toBeNull();
-  });
-
-  it("settles running tool rows and persists the transcript before the terminal report", async () => {
-    let chatCalls = 0;
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") {
-        chatCalls += 1;
-        if (chatCalls === 1) {
-          const [started] = activityEvents();
-          emitEvent?.(started);
-          await new Promise((resolve) => setTimeout(resolve, 0));
-          throw new TypeError("Failed to fetch");
-        }
-        throw new Error("Failed to fetch");
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-
-    expect(
-      await screen.findByText(/Loop blocked at iteration 1: editor disconnected/, {}, { timeout: 3_000 }),
-    ).toBeTruthy();
-    const lastSave = mocks.saveSession.mock.calls.at(-1)?.[0] as { messages: AgentMessage[] };
-    expect(lastSave).toBeDefined();
-    const settledEdit = lastSave.messages.find(
-      (message) => message.role === "tool" && message.tool === "file_edit",
-    );
-    expect(settledEdit).toMatchObject({ status: "error" });
-    const terminal = mocks.rpc.mock.calls.find(([method]) => method === "loop_report_update");
-    expect(terminal?.[1]).toMatchObject({
-      update: {
-        status: "blocked",
-        summary: expect.stringMatching(/Loop blocked at iteration 1: editor disconnected/),
-      },
-    });
-  });
-
-  it("fails closed on a provider usage error and does not retry", async () => {
-    let attempts = 0;
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") {
-        attempts += 1;
-        throw new Error("provider usage limit reached");
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-    expect(await screen.findByText("Loop blocked at iteration 1: provider usage limit reached")).toBeTruthy();
-    expect(attempts).toBe(1);
-    const terminal = mocks.rpc.mock.calls.find(([method]) => method === "loop_report_update");
-    expect(terminal?.[1]).toMatchObject({
-      update: {
-        status: "blocked",
-        summary: "Loop blocked at iteration 1: provider usage limit reached",
-      },
-    });
-  });
-
-  it("continues after a graph-blocked iteration and recovers via a transient fetch blip", async () => {
-    let attempts = 0;
-    let replies = ["DONE", "DONE"];
-    // Iteration 1: agent replies DONE but the graph is still blocked at the
-    // attempt cap (validating graph proof fails). Iteration 2: a transient
-    // fetch error is recovered from and the loop completes successfully.
-    mocks.listGraphs.mockResolvedValueOnce([]).mockResolvedValue([{ graphId: "graph-loop" }]);
-    mocks.graphStatus
-      .mockResolvedValueOnce(
-        passingGraph({
-          status: "running",
-          nodes: passingGraph().nodes.map((node) => ({ ...node, status: "running" })),
-        }),
-      )
-      .mockResolvedValueOnce(passingGraph());
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "editor_attach") return {};
-      if (method === "agent_chat") {
-        attempts += 1;
-        if (attempts === 2) throw new TypeError("Failed to fetch");
-        return { sessionId: "session-1", reply: replies.shift() ?? "DONE", toolCalls: [] };
-      }
-      return {};
-    });
-
-    renderPanel();
-    const prompt = screen.getByRole("textbox", { name: "Agent prompt" });
-    fireEvent.change(prompt, { target: { value: "/loop polish the game" } });
-    fireEvent.keyDown(prompt, { key: "Enter", code: "Enter" });
-    expect(await screen.findByText("✔ loop complete in 2 iterations", {}, { timeout: 3_000 })).toBeTruthy();
-    expect(attempts).toBe(3);
-    expect(screen.queryByText(/Loop blocked/)).toBeNull();
   });
 });

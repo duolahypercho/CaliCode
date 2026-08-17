@@ -30,6 +30,9 @@ export type LapsedReason =
  */
 export type SettledVia = "this-window" | "always-allowed";
 
+/** Which Auto-mode reviewer asked the user to decide this call. */
+export type ReasonSource = "agent" | "guardian";
+
 export type RequestState =
   | { kind: "pending" }
   | { kind: "answering"; approved: boolean; startedAtMs: number }
@@ -364,6 +367,16 @@ export function approvalTarget(args: unknown): string | null {
     if (typeof value === "string" && value.trim()) return value.trim();
   }
   return null;
+}
+
+/** Split an exit_plan_mode document into its heading and markdown body. */
+export function planFrom(args: unknown): { heading: string | null; body: string } | null {
+  if (!args || typeof args !== "object" || Array.isArray(args)) return null;
+  const plan = (args as Record<string, unknown>).plan;
+  if (typeof plan !== "string" || !plan.trim()) return null;
+  const [first, ...rest] = plan.split("\n");
+  const heading = /^#{1,6}\s+\S/.test(first) ? first.replace(/^#{1,6}\s+/, "").trim() : null;
+  return heading ? { heading, body: rest.join("\n").replace(/^\n+/, "") } : { heading: null, body: plan };
 }
 
 /**

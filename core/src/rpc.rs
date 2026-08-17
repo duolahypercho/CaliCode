@@ -682,6 +682,93 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 "skills": crate::skills::list_skills(&state.projects_root, slug, &skills_cfg)
             }))
         }
+        // The loop driver lives in core so a run outlives the tab that
+        // started it (`loop_run.rs`). The prompt-assembly stays here, where
+        // `default_system_prompt` already lives.
+        "loop_start" => {
+            let slug = str_param(&params, "projectSlug")?.to_string();
+            let goal = str_param(&params, "goal")?.to_string();
+            let profile = crate::loop_run::LoopProfile::parse(
+                params.get("profile").and_then(Value::as_str).unwrap_or(""),
+            );
+            let permission_mode = params
+                .get("permissionMode")
+                .and_then(Value::as_str)
+                .unwrap_or(crate::agent::DEFAULT_PERMISSION_MODE)
+                .to_string();
+            let mut registered = state.tools.read().await.clone();
+            registered.extend(state.mcp.tool_defs().await);
+            let (skills_cfg, hooks_cfg) = {
+                let config = state.config.read().await;
+                (config.skills.clone(), config.hooks.clone())
+            };
+            let mut system = default_system_prompt(state, &slug, &skills_cfg, &registered);
+            system.push_str(permission_mode_prompt(&permission_mode));
+            let workspace_root = params
+                .get("workspaceRoot")
+                .and_then(Value::as_str)
+                .map(String::from);
+            if !hooks_cfg.is_empty() {
+                system.push_str(
+                    &crate::hooks::session_start(&hooks_cfg, workspace_root.as_deref()).await,
+                );
+            }
+            let spec = crate::loop_run::LoopSpec {
+                slug,
+                goal,
+                profile,
+                interval_ms: params.get("intervalMs").and_then(Value::as_u64),
+                session_id: params
+                    .get("sessionId")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                workspace_root,
+                permission_mode,
+                system: Some(system),
+                context_length: params
+                    .get("contextLength")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as u32),
+                guardian_model: params
+                    .get("guardianModel")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                max_iterations: params
+                    .get("maxIterations")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(crate::loop_run::MAX_ITERATIONS),
+            };
+            Ok(json!({ "loop": state.loops.start(state, spec).await? }))
+        }
+        "loop_stop" => {
+            let loop_id = str_param(&params, "loopId")?;
+            Ok(json!({ "loop": state.loops.stop(loop_id).await? }))
+        }
+        "loop_status" => {
+            let loop_id = str_param(&params, "loopId")?;
+            Ok(json!({ "loop": state.loops.status(loop_id).await? }))
+        }
+        "loop_runs" => Ok(json!({ "loops": state.loops.list().await })),
+        "command_list" => {
+            let slug = params.get("projectSlug").and_then(Value::as_str);
+            Ok(json!({
+                "commands": crate::commands::list_commands(&state.projects_root, slug)
+            }))
+        }
+        // Expansion is a separate call from listing because the body never
+        // belongs in the menu: the client shows descriptions, and asks for the
+        // prompt only when the user actually fires the command.
+        "command_render" => {
+            let slug = params.get("projectSlug").and_then(Value::as_str);
+            let name = str_param(&params, "name")?;
+            let args = params
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (info, prompt) = crate::commands::render(&state.projects_root, slug, name, args)?;
+            Ok(json!({ "name": info.name, "scope": info.scope, "prompt": prompt }))
+        }
         "skill_read" => {
             // UI preview: a disabled skill is still readable, so the empty
             // disabled slice is deliberate.
@@ -1167,11 +1254,12 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
             registered.extend(state.mcp.tool_defs().await);
             // Clone-then-drop; the config lock must never be held across
             // chat().await (fair RwLock starvation, see agent.rs).
-            let (skills_cfg, permission_rules) = {
+            let (skills_cfg, permission_rules, hooks_cfg) = {
                 let config = state.config.read().await;
                 (
                     config.skills.clone(),
                     agent_permission_rules(&config.permissions),
+                    config.hooks.clone(),
                 )
             };
             let permission_mode = params
@@ -1179,21 +1267,31 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 .and_then(|v| v.as_str())
                 .unwrap_or(crate::agent::DEFAULT_PERMISSION_MODE)
                 .to_string();
-            let system = params
+            let mut system = params
                 .get("system")
                 .and_then(|v| v.as_str())
-                .map(String::from)
-                .or_else(|| {
-                    project_slug.as_deref().map(|slug| {
-                        let mut prompt =
-                            default_system_prompt(state, slug, &skills_cfg, &registered);
-                        // Appended last so the static body stays a shared
-                        // prompt-cache prefix: switching modes mid-session
-                        // invalidates this tail and nothing above it.
-                        prompt.push_str(permission_mode_prompt(&permission_mode));
-                        prompt
-                    })
-                });
+                .map(String::from);
+            // Spelled out rather than `.or_else`, because a SessionStart hook
+            // is a child process and the closure cannot await one.
+            if system.is_none() {
+                if let Some(slug) = project_slug.as_deref() {
+                    let mut prompt = default_system_prompt(state, slug, &skills_cfg, &registered);
+                    // Appended last so the static body stays a shared
+                    // prompt-cache prefix: switching modes mid-session
+                    // invalidates this tail and nothing above it.
+                    prompt.push_str(permission_mode_prompt(&permission_mode));
+                    // Hook output lands after the mode text, still inside that
+                    // volatile tail. A caller supplying its own `system` gets
+                    // exactly what it asked for and no injection.
+                    if !hooks_cfg.is_empty() {
+                        prompt.push_str(
+                            &crate::hooks::session_start(&hooks_cfg, workspace_root.as_deref())
+                                .await,
+                        );
+                    }
+                    system = Some(prompt);
+                }
+            }
             let options = AgentOptions {
                 // Fail closed on an omitted mode. `requires_approval` already
                 // treats an unknown mode as "prompt for everything", so this
@@ -1886,6 +1984,16 @@ Conventions: {skills_block}\n",
         Some(slug),
         skills_cfg,
     ));
+    // Durable memory, same progressive disclosure as skills: descriptions in
+    // the prompt, bodies through memory_read. This is a session-start snapshot
+    // — the system message is only inserted into an empty transcript
+    // (`agent::chat`) — which is the right lifetime: a memory written mid-
+    // session is already in context because this agent just wrote it, and the
+    // index it belongs in is the next session's.
+    prompt.push_str(&crate::memory::prompt_index(
+        &state.projects_root,
+        Some(slug),
+    ));
     prompt
 }
 
@@ -2306,6 +2414,7 @@ mod tests {
             sessions_root,
             agents: crate::agent::AgentManager::new(bus.clone()),
             graphs: crate::graph::GraphManager::new(),
+            loops: Default::default(),
             bus: bus.clone(),
             tools: std::sync::Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             editor_bridge: crate::editor_bridge::EditorBridge::new(bus.clone()),
@@ -3185,6 +3294,56 @@ mod tests {
         assert!(prompt.contains("entity-0-with-a-rather-long-descriptive-name"));
         assert!(prompt.contains("dependency-free Build roots"));
         assert!(prompt.contains("Integration Build depending on every root"));
+    }
+
+    #[test]
+    fn memory_reaches_the_prompt_as_descriptions_only_and_never_the_static_body() {
+        let projects = tempfile::tempdir().unwrap();
+        let sessions = tempfile::tempdir().unwrap();
+        store::create_project(projects.path(), "demo", "Demo").unwrap();
+        // Project scope keeps this hermetic: it resolves under the temp
+        // projects root, so the test never reads the developer's own
+        // ~/.cali/memory the way a global-scope write would.
+        crate::memory::write_memory(
+            projects.path(),
+            Some("demo"),
+            crate::memory::MemoryScope::Project,
+            "port-rule",
+            "core binds a fixed 8765 and the e2e suite refuses to reuse a running one",
+            Some("reference"),
+            "THE-BODY-SENTINEL — everything under the frontmatter.",
+        )
+        .unwrap();
+
+        let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
+        let prompt = default_system_prompt(&state, "demo", &isolated_skills(), &with_editor());
+
+        assert!(
+            prompt.contains("port-rule (reference): core binds a fixed 8765"),
+            "{prompt}"
+        );
+        // Progressive disclosure is the whole point: the body costs nothing
+        // until the agent decides the description is worth following.
+        assert!(
+            !prompt.contains("THE-BODY-SENTINEL"),
+            "memory body leaked into the prompt"
+        );
+        assert!(prompt.contains("memory_read"), "{prompt}");
+
+        // The static body is the shared prompt-cache prefix across every
+        // project and session (see STATIC_SYSTEM_PROMPT). A per-project memory
+        // index interpolated into it would re-bill the whole static block on
+        // every turn — the single most expensive mistake available here.
+        assert!(!STATIC_SYSTEM_PROMPT.contains("port-rule"));
+        assert!(
+            prompt.find("port-rule").unwrap() > STATIC_SYSTEM_PROMPT.len(),
+            "memory index must sit in the volatile tail, after the cached prefix"
+        );
+
+        // A project with no memories pays nothing at all.
+        store::create_project(projects.path(), "bare", "Bare").unwrap();
+        let bare = default_system_prompt(&state, "bare", &isolated_skills(), &with_editor());
+        assert!(!bare.contains("Memory from earlier sessions"), "{bare}");
     }
 
     #[test]

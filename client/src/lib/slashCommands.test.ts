@@ -1,5 +1,5 @@
 import { describe, expect, test, vi } from "vitest";
-import type { SkillInfo } from "./extensions";
+import type { FileCommandInfo, SkillInfo } from "./extensions";
 import {
   completeSlashToken,
   matchCommands,
@@ -7,6 +7,7 @@ import {
   runsBare,
   parseSlashIn,
   parseSlash,
+  fileCommands,
   skillCommands,
   slashTokenAt,
   SLASH_COMMANDS,
@@ -128,6 +129,49 @@ describe("completeSlashToken", () => {
   });
 });
 
+describe("fileCommands", () => {
+  const fileCommand = (over: Partial<FileCommandInfo> = {}): FileCommandInfo => ({
+    name: "review",
+    description: "Review PRs for merge readiness",
+    scope: "global",
+    path: "/home/u/.cali/commands/review.md",
+    ...over,
+  });
+
+  test("offers each usable file command as one that renders and sends it", async () => {
+    const runFileCommand = vi.fn().mockResolvedValue(undefined);
+    const [command] = fileCommands([fileCommand({ argumentHint: "<pr numbers>" })]);
+    expect(command.name).toBe("review");
+    expect(command.summary).toBe("Review PRs for merge readiness");
+    // The hint is the usage string, so the menu shows what to type.
+    expect(command.usage).toBe("<pr numbers>");
+    await command.run("151 152", { runFileCommand } as unknown as SlashContext);
+    expect(runFileCommand).toHaveBeenCalledWith("review", "151 152");
+  });
+
+  test("leaves out broken files — running one would send an empty prompt", () => {
+    const commands = fileCommands([
+      fileCommand({ name: "broken", error: "missing frontmatter" }),
+      fileCommand({ name: "good" }),
+    ]);
+    expect(commands.map((command) => command.name)).toEqual(["good"]);
+  });
+
+  test("never shadows a built-in command", () => {
+    expect(fileCommands([fileCommand({ name: "compact" })])).toHaveLength(0);
+  });
+
+  test("joins the menu beside the built-ins and the skills", () => {
+    const commands = [
+      ...SLASH_COMMANDS,
+      ...skillCommands([skill()]),
+      ...fileCommands([fileCommand()]),
+    ];
+    expect(parseSlashIn("/review 151", commands)?.command?.name).toBe("review");
+    expect(matchCommandsIn("/rev", commands).map((command) => command.name)).toEqual(["review"]);
+  });
+});
+
 describe("skillCommands", () => {
   test("offers each usable skill as a command that runs it", async () => {
     const runSkill = vi.fn().mockResolvedValue(undefined);
@@ -176,13 +220,13 @@ describe("/help", () => {
       name: "playtest",
       usage: "[task]",
       summary: "Drive the game and report what broke",
-      skill: true,
+      kind: "skill",
     });
   });
 
   test("tags skills apart from built-ins, so the panel can group them", () => {
     const { panel } = runHelp();
-    expect(panel.commands.find((c: { name: string }) => c.name === "loop").skill).toBe(false);
+    expect(panel.commands.find((c: { name: string }) => c.name === "loop").kind).toBeUndefined();
   });
 
   test("keeps the plain-text listing as the fallback body", () => {
@@ -223,12 +267,17 @@ describe("/loop", () => {
 
   test("passes a leading interval through as pacing", () => {
     run("/loop 15m run the tests and fix what fails");
-    expect(runLoop).toHaveBeenCalledWith("run the tests and fix what fails", 900_000);
+    expect(runLoop).toHaveBeenCalledWith("run the tests and fix what fails", 900_000, "standard");
   });
 
   test("runs flat out when no interval is given", () => {
     run("/loop add a double jump then playtest");
-    expect(runLoop).toHaveBeenCalledWith("add a double jump then playtest", null);
+    expect(runLoop).toHaveBeenCalledWith("add a double jump then playtest", null, "standard");
+  });
+
+  test("--aaa reaches the driver as the profile", () => {
+    run("/loop --aaa make the boss fight feel good");
+    expect(runLoop).toHaveBeenCalledWith("make the boss fight feel good", null, "aaa");
   });
 
   test("explains itself instead of looping on nothing", () => {

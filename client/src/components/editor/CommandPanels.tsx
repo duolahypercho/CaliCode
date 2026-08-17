@@ -111,11 +111,13 @@ function UsagePanel(panel: Extract<CommandPanel, { kind: "usage" }>) {
 }
 
 function HelpPanel({ commands }: Extract<CommandPanel, { kind: "help" }>) {
-  const builtins = commands.filter((command) => !command.skill);
-  const skills = commands.filter((command) => command.skill);
+  const builtins = commands.filter((command) => !command.kind);
+  const skills = commands.filter((command) => command.kind === "skill");
+  const fileDefined = commands.filter((command) => command.kind === "command");
   const groups: { title: string; rows: typeof commands }[] = [
     { title: "Commands", rows: builtins },
     ...(skills.length > 0 ? [{ title: "Skills", rows: skills }] : []),
+    ...(fileDefined.length > 0 ? [{ title: "Your commands", rows: fileDefined }] : []),
   ];
 
   return (

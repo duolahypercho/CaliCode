@@ -51,9 +51,49 @@ export interface McpServerReport {
   pendingConsent?: boolean;
 }
 
+/** Typed mirror of core/src/commands.rs CommandInfo. */
+export interface FileCommandInfo {
+  name: string;
+  description: string;
+  /** Shown after the name in the menu, e.g. `<pr numbers>`. */
+  argumentHint?: string;
+  scope: SkillScope;
+  path: string;
+  /** Parse problem, if any — a broken file is listed but cannot be run. */
+  error?: string | null;
+}
+
 export async function listSkills(projectSlug?: string): Promise<SkillInfo[]> {
   const result = await rpc<{ skills?: SkillInfo[] }>("skill_list", projectSlug ? { projectSlug } : {});
   return result?.skills ?? [];
+}
+
+export async function listFileCommands(projectSlug?: string): Promise<FileCommandInfo[]> {
+  const result = await rpc<{ commands?: FileCommandInfo[] }>(
+    "command_list",
+    projectSlug ? { projectSlug } : {},
+  );
+  return result?.commands ?? [];
+}
+
+/**
+ * Expand one file command into the prompt it sends.
+ *
+ * Separate from the listing because the body never belongs in the menu: the
+ * menu shows descriptions, and the prompt is fetched only when the user
+ * actually fires the command.
+ */
+export async function renderFileCommand(
+  name: string,
+  args: string,
+  projectSlug?: string,
+): Promise<string> {
+  const result = await rpc<{ prompt?: string }>("command_render", {
+    name,
+    arguments: args,
+    ...(projectSlug ? { projectSlug } : {}),
+  });
+  return result?.prompt ?? "";
 }
 
 export async function setSkillEnabled(scope: SkillScope, name: string, enabled: boolean): Promise<void> {

@@ -4,6 +4,7 @@ import {
   CircleHelp,
   Eraser,
   FileDiff,
+  FileText,
   GaugeCircle,
   GitFork,
   History,
@@ -85,7 +86,9 @@ export function SlashMenu<Command extends NamedCommand>({
     // both. On `raised` the dark selection came out darker than its own card.
     <div className="mb-2 max-h-[320px] overflow-y-auto overscroll-contain rounded-xl border border-line bg-popover p-1.5">
       {commands.map((command, index) => {
-        const Icon = ICONS[command.name] ?? (command.kind === "skill" ? Sparkles : CircleHelp);
+        const Icon =
+          ICONS[command.name] ??
+          (command.kind === "skill" ? Sparkles : command.kind === "command" ? FileText : CircleHelp);
         const active = index === activeIndex;
         return (
           <button

@@ -107,11 +107,18 @@ test.describe("loop completion gate", () => {
     }
   });
 
-  test("visibly ignores bare DONE when no fresh graph proof exists", async ({ page }, testInfo) => {
+  // The DONE gate itself moved to core with the driver, and is covered there
+  // by `loop_run::tests::an_aaa_loop_refuses_done_it_cannot_prove` — a real
+  // run against a scripted provider, rather than this suite stubbing our own
+  // `agent_chat` at the browser boundary, which a core-driven loop never
+  // sends. What is left for the browser to prove is the contract it still
+  // owns: the right run is asked for, and Stop reaches core rather than only
+  // this tab.
+  test("hands /loop to core and stops it there", async ({ page }, testInfo) => {
     test.setTimeout(60_000);
     const suffix = `${testInfo.workerIndex}-${testInfo.repeatEachIndex}-${Date.now().toString(36)}`;
-    let sessionId: string | null = null;
-    let agentChatCalls = 0;
+    const started: Array<Record<string, unknown>> = [];
+    const stopped: Array<Record<string, unknown>> = [];
 
     await page.route("**/rpc", async (route) => {
       const request = route.request();
@@ -120,24 +127,39 @@ test.describe("loop completion gate", () => {
         return;
       }
       const body = request.postDataJSON() as { id?: string; method?: string; params?: Record<string, unknown> };
-      if (body.method === "graph_list") {
-        await route.fulfill({
-          status: 200,
-          contentType: "application/json",
-          body: JSON.stringify({ jsonrpc: "2.0", id: body.id, result: { graphs: [] } }),
-        });
-        return;
-      }
-      if (body.method === "agent_chat") {
-        agentChatCalls += 1;
-        sessionId = String(body.params?.sessionId ?? "");
+      if (body.method === "loop_start") {
+        started.push(body.params ?? {});
         await route.fulfill({
           status: 200,
           contentType: "application/json",
           body: JSON.stringify({
             jsonrpc: "2.0",
             id: body.id,
-            result: { sessionId, reply: "DONE", toolCalls: [] },
+            result: {
+              loop: {
+                loopId: "loop-e2e",
+                slug: String(body.params?.projectSlug ?? ""),
+                goal: String(body.params?.goal ?? ""),
+                profile: String(body.params?.profile ?? "standard"),
+                status: "running",
+                iteration: 0,
+                maxIterations: 100,
+                startedAtMs: Date.now(),
+              },
+            },
+          }),
+        });
+        return;
+      }
+      if (body.method === "loop_stop") {
+        stopped.push(body.params ?? {});
+        await route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: { loop: { loopId: "loop-e2e", status: "stopped", iteration: 1 } },
           }),
         });
         return;
@@ -145,50 +167,27 @@ test.describe("loop completion gate", () => {
       await route.fallback();
     });
 
-    const { slug, title } = await (async () => {
+    const { slug } = await (async () => {
       await page.goto("/");
       return createLoopProject(page, suffix);
     })();
-    const goal = `bare DONE gate ${suffix}`;
+    const goal = `core-driven loop ${suffix}`;
 
     try {
       const prompt = page.getByRole("textbox", { name: "Agent prompt" });
-      await prompt.fill(`/loop ${goal}`);
+      await prompt.fill(`/loop --aaa ${goal}`);
       await prompt.press("Enter");
 
-      // Distinguish "loop never started" from "gate never fired" on failure.
-      await expect(page.getByText(`▶ loop started: ${goal}`)).toBeVisible({ timeout: 10_000 });
-      // 30s: the gate line lands only after session_create/editor_attach/
-      // loop_report_start/session_save round-trips against the real core.
-      await expect(page.getByText(/DONE ignored:/).first()).toBeVisible({ timeout: 30_000 });
-      expect(agentChatCalls).toBeGreaterThan(0);
-      if (!sessionId) throw new Error("agent_chat did not carry a session id");
-
-      const loaded = (await callRpc(page, "session_load", { id: sessionId })) as {
-        messages?: Array<{ role?: string; content?: string }>;
-      };
-      expect(loaded.messages?.some((message) => message.role === "user" && message.content?.includes("This is /loop"))).toBe(
-        true,
-      );
-      expect(page.getByText(/✔ loop complete/)).toHaveCount(0);
+      await expect(page.getByText(`▶ loop started: ${goal}`)).toBeVisible({ timeout: 15_000 });
+      expect(started).toHaveLength(1);
+      expect(started[0]).toMatchObject({ goal, profile: "aaa", projectSlug: slug });
+      // The run carries this panel's session, which is what routes its turns
+      // back into this transcript.
+      expect(typeof started[0].sessionId).toBe("string");
 
       await page.getByRole("button", { name: "Stop agent loop" }).click();
-      await expect(page.getByRole("button", { name: "Stop agent loop" })).toBeHidden({ timeout: 15_000 });
-
-      await page.reload();
-      const sidebar = page.locator("aside").first();
-      const project = sidebar
-        .getByRole("button", { name: new RegExp(`^${escapeRegExp(title)}$`) })
-        .first();
-      await expect(project).toBeVisible({ timeout: 10_000 });
-      await project.click();
-      const session = sidebar
-        .getByRole("button", { name: new RegExp(`^${escapeRegExp(goal)}`) })
-        .first();
-      await expect(session).toBeVisible({ timeout: 10_000 });
-      await session.click();
-      await expect(page.locator('[data-role="user"]').filter({ hasText: /This is \/loop/ }).first()).toBeVisible();
-      await expect(page.locator('[data-role="tool"]').filter({ hasText: /DONE ignored:/ }).first()).toBeVisible();
+      await expect.poll(() => stopped.length, { timeout: 15_000 }).toBe(1);
+      expect(stopped[0]).toMatchObject({ loopId: "loop-e2e" });
     } finally {
       await callRpc(page, "project_delete", { slug }).catch(() => undefined);
     }

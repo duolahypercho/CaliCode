@@ -55,6 +55,12 @@ pub struct AppConfig {
     /// Tuning for `auto` mode's guardian (see `crate::guardian`).
     #[serde(default)]
     pub approvals: ApprovalsConfig,
+    /// User-declared shell commands run at fixed points in a turn. Policy the
+    /// user owns, as against the guardian's judgment — see `crate::hooks` for
+    /// why `PreToolUse` runs ahead of both the rules and the guardian, and why
+    /// a hook can only ever add a block.
+    #[serde(default)]
+    pub hooks: crate::hooks::HooksConfig,
 }
 
 /// `approvals:` — how `auto` mode's second opinion is obtained.
