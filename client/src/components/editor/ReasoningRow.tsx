@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { ChevronRight, Sparkles } from "lucide-react";
+import { ChevronRight } from "lucide-react";
 
-/** How long a finished block stays open before folding itself away. */
+/** How long a finished block remains visible before folding itself away. */
 const AUTO_COLLAPSE_MS = 1000;
 
 export interface ReasoningRowProps {
@@ -27,6 +27,17 @@ function formatDuration(ms: number): string {
   return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
+/** A small, quiet thought-orb inspired by dotted agent status indicators. */
+export function ThinkingOrb({ active }: { active: boolean }) {
+  return (
+    <span aria-hidden className={`thinking-orb ${active ? "thinking-orb-active" : ""}`}>
+      <span className="thinking-orb-dot thinking-orb-dot-a" />
+      <span className="thinking-orb-dot thinking-orb-dot-b" />
+      <span className="thinking-orb-dot thinking-orb-dot-c" />
+    </span>
+  );
+}
+
 /**
  * A turn's reasoning as a collapsible block — shimmering while it streams,
  * then labelled with its settled state, with the text under a left rule (the
@@ -41,6 +52,7 @@ export function ReasoningRow({
   showDuration = true,
 }: ReasoningRowProps) {
   const [open, setOpen] = useState(!defaultCollapsed);
+  const [visible, setVisible] = useState(true);
   const toggled = useRef(false);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const bodyId = useId();
@@ -48,6 +60,16 @@ export function ReasoningRow({
   useEffect(() => {
     if (streaming && !defaultCollapsed && !toggled.current) setOpen(true);
   }, [streaming, defaultCollapsed]);
+
+  useEffect(() => {
+    if (streaming) {
+      setVisible(true);
+      return;
+    }
+    if (toggled.current) return;
+    const timer = window.setTimeout(() => setVisible(false), AUTO_COLLAPSE_MS);
+    return () => window.clearTimeout(timer);
+  }, [streaming]);
 
   useEffect(() => {
     if (streaming || toggled.current) return;
@@ -64,18 +86,25 @@ export function ReasoningRow({
     if (body) body.scrollTop = body.scrollHeight;
   }, [text, streaming, open]);
 
-  if (!text && !streaming) return null;
+  if (!visible || (!text && !streaming)) return null;
 
+  // A zero-second thought is a timestamp race, not useful information. The
+  // stream can settle before its first clock tick, so keep that state readable
+  // instead of exposing a label that looks broken or unfinished.
   const label = streaming
     ? "Thinking…"
     : !showDuration
       ? "Think"
-      : durationMs === undefined
+      : durationMs === undefined || durationMs < 1_000
         ? "Thought"
         : `Thought for ${formatDuration(durationMs)}`;
 
   return (
-    <section aria-label="Model reasoning" data-role="reasoning" className="w-full max-w-[94%] self-start">
+    <section
+      aria-label="Model reasoning"
+      data-role="reasoning"
+      className="w-full max-w-[94%] self-start"
+    >
       <button
         type="button"
         onClick={() => {
@@ -84,13 +113,9 @@ export function ReasoningRow({
         }}
         aria-expanded={open}
         aria-controls={bodyId}
-        className="flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left text-xs transition-colors hover:bg-surface-2 active:bg-surface-3"
+        className="flex w-full items-center gap-2 rounded-md px-0 py-1 text-left text-xs transition-colors hover:text-ink-strong active:text-ink-strong"
       >
-        <Sparkles
-          aria-hidden
-          className={`h-3 w-3 shrink-0 ${streaming ? "text-ink-subtle" : "text-ink-faint"}`}
-          strokeWidth={1.7}
-        />
+        <ThinkingOrb active={streaming} />
         <span
           className={`shrink-0 text-[12px] font-medium ${streaming ? "cb-shimmer" : "text-ink"}`}
         >
@@ -103,7 +128,7 @@ export function ReasoningRow({
         ) : null}
         <ChevronRight
           aria-hidden
-          className={`ml-auto h-3 w-3 shrink-0 text-ink-faint transition-transform ${open ? "rotate-90" : ""}`}
+          className={`h-3 w-3 shrink-0 text-ink-faint transition-transform ${open ? "rotate-90" : ""}`}
           strokeWidth={1.7}
         />
       </button>

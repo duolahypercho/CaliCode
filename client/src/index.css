@@ -337,6 +337,90 @@ select {
   }
 }
 
+/* A restrained dotted orb for live agent work. It gives the thinking state a
+ * visual pulse without turning the transcript into a loading animation wall. */
+.thinking-orb {
+  position: relative;
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  opacity: 0.78;
+}
+
+.thinking-orb::before {
+  position: absolute;
+  inset: 2px;
+  border: 1px dotted var(--ink-faint);
+  border-radius: inherit;
+  content: "";
+}
+
+.thinking-orb-active::before {
+  animation: calicode-orb-spin 2.4s linear infinite;
+}
+
+.thinking-orb-dot {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--ink-subtle);
+}
+
+.thinking-orb-dot-a {
+  top: 1px;
+  left: 5px;
+}
+
+.thinking-orb-dot-b {
+  right: 1px;
+  bottom: 3px;
+}
+
+.thinking-orb-dot-c {
+  bottom: 1px;
+  left: 2px;
+}
+
+.thinking-orb-active .thinking-orb-dot-a {
+  animation: cb-dot 1.6s ease-in-out infinite;
+}
+
+.thinking-orb-active .thinking-orb-dot-b {
+  animation: cb-dot 1.6s ease-in-out 0.28s infinite;
+}
+
+.thinking-orb-active .thinking-orb-dot-c {
+  animation: cb-dot 1.6s ease-in-out 0.56s infinite;
+}
+
+@keyframes calicode-orb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* A single state change is enough motion for the collapsed activity row: the
+ * title settles in when a run starts or resolves, while the orb carries the
+ * ongoing execution signal. */
+.activity-summary-enter {
+  animation: calicode-summary-in 180ms ease-out both;
+}
+
+@keyframes calicode-summary-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
 /* Window dragging in the Electron shell.
  *
  * Electron drags on the CSS

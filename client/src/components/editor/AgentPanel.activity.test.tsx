@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ActivityTurnRow, ToolRow, activityAnchorIndexes, ownsBrowserToolEvent } from "./AgentPanel";
+import { ActivityTurnRow, ToolRow, activityAnchorIndexes, activityTaskSummary, ownsBrowserToolEvent } from "./AgentPanel";
 import { createTurnMarker } from "../../lib/activity";
 import type { TaskGraph } from "../../lib/graph";
 import type { AgentMessage } from "../../lib/types";
@@ -8,7 +8,16 @@ import type { AgentMessage } from "../../lib/types";
 afterEach(cleanup);
 
 describe("ActivityTurnRow", () => {
-  it("uses one elapsed working status while a tool is in flight", () => {
+  it("derives a concise title from the turn narrative before falling back to the prompt", () => {
+    expect(
+      activityTaskSummary([{ role: "assistant", content: "I’ll verify the desktop app color update after install." }]),
+    ).toBe("Verify the desktop app color update after install");
+    expect(activityTaskSummary([], "Rebuild the desktop app and check the installed renderer.")).toBe(
+      "Rebuild the desktop app and check the installed renderer",
+    );
+  });
+
+  it("uses a compact task title while a tool is in flight", () => {
     const startedAtMs = Date.now();
     const marker = createTurnMarker("turn-live", startedAtMs);
     render(
@@ -29,10 +38,34 @@ describe("ActivityTurnRow", () => {
       />,
     );
 
-    expect(screen.getByRole("button", { name: /Expand activity for turn turn-live/ }).textContent).toContain(
-      "Working for <1s",
-    );
+    expect(screen.getByRole("button", { name: /Expand activity for turn turn-live/ }).textContent).toContain("Read files");
+    expect(screen.queryByText(/Working for/)).toBeNull();
     expect(screen.queryByText("Read App.tsx")).toBeNull();
+  });
+
+  it("uses the loop task title while loop work is in flight", () => {
+    const startedAtMs = Date.now();
+    const marker = createTurnMarker("turn-loop", startedAtMs);
+    render(
+      <ActivityTurnRow
+        turnId="turn-loop"
+        taskTitle="Start Loop"
+        messages={[
+          marker,
+          {
+            role: "tool",
+            tool: "skill_load",
+            toolCallId: "call-skill",
+            turnId: "turn-loop",
+            status: "running",
+            startedAtMs,
+            content: "Loaded goal-loop",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /Expand activity for turn turn-loop/ }).textContent).toContain("Start Loop");
   });
 
   it("shows one compact latest summary and expands all actions", () => {
@@ -70,13 +103,16 @@ describe("ActivityTurnRow", () => {
     ];
     render(<ActivityTurnRow turnId="turn-1" messages={messages} />);
 
-    expect(screen.getByRole("button", { name: /Expand activity for turn turn-1/ }).textContent).toContain("Edited App.tsx +2 -1");
+    const activityButton = screen.getByRole("button", { name: /Expand activity for turn turn-1/ });
+    expect(activityButton.textContent).toContain("Worked for 1s");
+    expect(activityButton.textContent).not.toContain("actions");
+    expect(activityButton.textContent).not.toContain("Edited App.tsx +2 -1");
     expect(screen.queryByText("Read App.tsx")).toBeNull();
     expect(screen.getByText("1 file changed").parentElement?.textContent).toContain("+2-1");
 
     fireEvent.click(screen.getByRole("button", { name: /Expand activity for turn turn-1/ }));
     expect(screen.getByText("Read App.tsx")).toBeTruthy();
-    expect(screen.getAllByText("Edited App.tsx +2 -1").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText("Edited App.tsx +2 -1").length).toBeGreaterThanOrEqual(1);
     expect(screen.queryByText("+2 -1", { exact: true })).toBeNull();
     // Each action keeps its own output folded away until that row is clicked.
     expect(screen.queryByText("new line")).toBeNull();
@@ -105,6 +141,9 @@ describe("ActivityTurnRow", () => {
       />,
     );
 
+    const activityButton = screen.getByRole("button", { name: /Expand activity for turn turn-error/ });
+    expect(activityButton.textContent).toContain("Start Loop");
+    expect(activityButton.textContent).toContain("Did not finish after <1s");
     fireEvent.click(screen.getByRole("button", { name: /Expand activity for turn turn-error/ }));
     expect(screen.queryByText(/loop report already exists/)).toBeNull();
     const row = screen.getByRole("button", { name: /Used loop_report_start/ });

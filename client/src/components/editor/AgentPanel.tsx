@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import * as DropdownMenu from "@radix-ui/react-dropdown-menu";
 import {
   ArrowDown,
@@ -28,7 +28,7 @@ import {
 } from "lucide-react";
 import { AgentText } from "./AgentText";
 import { CommandPanelView } from "./CommandPanels";
-import { ReasoningRow } from "./ReasoningRow";
+import { ReasoningRow, ThinkingOrb } from "./ReasoningRow";
 import { ModelPicker, buildModelChoices } from "./ModelPicker";
 import { RunStatusPill, type ActiveLoopRun } from "./RunStatusPill";
 import type { SideChatAnchor } from "./SideChat";
@@ -714,12 +714,16 @@ function AssistantMessageRow({
   return (
     <div
       data-role="assistant"
-      className={`max-w-[94%] self-start ${continuation ? "" : "mt-3"}`}
+      className={`w-full max-w-[94%] self-start pl-1 ${continuation ? "" : "mt-3"}`}
     >
       {continuation ? null : (
-        <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-ink-subtle">CALICODE</div>
+        <div className="mb-1.5 flex items-center gap-2">
+          <span className="text-[9.5px] font-medium tracking-[0.24em] text-ink-subtle">CALICODE</span>
+          <span className="h-px w-8 bg-line-strong" aria-hidden />
+          <span className="text-[10px] text-ink-faint">agent</span>
+        </div>
       )}
-      <div className="text-[13px] leading-[1.6] text-ink">
+      <div className="max-w-[68ch] text-[13px] leading-[1.65] text-ink">
         {message.panel ? <CommandPanelView panel={message.panel} /> : <AgentText content={message.content} />}
       </div>
     </div>
@@ -759,8 +763,8 @@ export function ToolRow({ message, onAsk }: { message: AgentMessage; onAsk?: (me
         disabled={!expandable}
         onClick={() => setOpen((current) => !current)}
         aria-expanded={expandable ? open : undefined}
-        className={`flex min-w-0 flex-1 items-center gap-2 rounded-md px-1 py-0.5 text-left text-xs text-ink-subtle transition-colors ${
-          expandable ? "hover:bg-surface-2 active:bg-surface-3" : "cursor-default"
+        className={`flex min-w-0 items-center gap-2 rounded-md px-0 py-0.5 text-left text-xs text-ink-subtle transition-colors ${
+          expandable ? "hover:text-ink-strong active:text-ink-strong" : "cursor-default"
         }`}
       >
         {/* One stroke weight across the set. The informational row used to
@@ -786,7 +790,7 @@ export function ToolRow({ message, onAsk }: { message: AgentMessage; onAsk?: (me
             {heading}
           </span>
         ) : null}
-        <span className="min-w-0 flex-1 truncate">{message.content}</span>
+        <span className="min-w-0 max-w-[min(58ch,72%)] truncate">{message.content}</span>
         {expandable ? (
           <ChevronRight
             aria-hidden
@@ -801,7 +805,7 @@ export function ToolRow({ message, onAsk }: { message: AgentMessage; onAsk?: (me
           aria-label={`Ask about ${message.tool} in side chat`}
           title="Ask about this step in the side chat"
           onClick={() => onAsk?.(message)}
-          className="shrink-0 rounded p-1 text-ink-faint opacity-0 transition-[opacity,background-color,color] hover:bg-surface-2 hover:text-ink group-hover/tool:opacity-100"
+          className="shrink-0 rounded p-1 text-ink-faint opacity-0 transition-[opacity,color] hover:text-ink group-hover/tool:opacity-100"
         >
           <MessageCircleQuestion aria-hidden className="h-3 w-3" strokeWidth={1.8} />
         </button>
@@ -828,7 +832,7 @@ function ActivityIcon({
   stopped?: boolean;
 }) {
   if (running) {
-    return <Loader2 aria-hidden className="h-3 w-3 shrink-0 animate-spin text-ink-subtle" strokeWidth={1.9} />;
+    return <ThinkingOrb active />;
   }
   if (failed) {
     return <X aria-hidden className="h-3 w-3 shrink-0 text-danger-soft" strokeWidth={1.9} />;
@@ -851,6 +855,78 @@ function ActivityIcon({
     return <BookOpen aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.8} />;
   }
   return <Check aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.9} />;
+}
+
+function taskLabelForOperation(operation: string): string {
+  switch (operation) {
+    case "read":
+      return "Read files";
+    case "search":
+      return "Searched files";
+    case "edit":
+      return "Edited files";
+    case "write":
+      return "Wrote files";
+    case "command":
+      return "Ran a command";
+    default:
+      return "Ran a tool";
+  }
+}
+
+function activityTaskTitle(actions: Array<AgentMessage & { toolCallId: string }>): string {
+  const labels: string[] = [];
+  for (const action of actions) {
+    const label = taskLabelForOperation(classifyActivityOperation(action.tool ?? "tool", action.activity?.operation));
+    if (!labels.includes(label)) labels.push(label);
+  }
+  return labels
+    .map((label, index) => (index === 0 ? label : `${label.slice(0, 1).toLowerCase()}${label.slice(1)}`))
+    .join(", ");
+}
+
+/**
+ * Keep the collapsed row tied to the work the agent actually announced. A
+ * tool taxonomy is a useful fallback, but it is not a task title: "Read
+ * files" tells us what happened, not why the run exists. The first sentence
+ * is intentionally bounded so a pasted prompt cannot turn the activity row
+ * into a second transcript.
+ */
+export function activityTaskSummary(
+  assistantMessages: ReadonlyArray<AgentMessage>,
+  userPrompt?: string,
+): string | undefined {
+  const candidates = [
+    ...assistantMessages.map((message) => message.content),
+    ...(userPrompt ? [userPrompt] : []),
+  ];
+  for (const candidate of candidates) {
+    const withoutCode = candidate.replace(/```[\s\S]*?```/g, " ");
+    const firstLine = withoutCode
+      .split(/\r?\n/)
+      .map((line) => line.replace(/^\s*(?:[-*+]\s+|#{1,6}\s+)/, "").trim())
+      .find(Boolean);
+    if (!firstLine) continue;
+    const sentence = firstLine.match(/^(.+?[.!?])(?:\s|$)/)?.[1] ?? firstLine;
+    const cleaned = sentence
+      .replace(/[\*_`]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .replace(/[.!?]+$/, "");
+    if (cleaned.length < 4) continue;
+    const concise = cleaned.replace(
+      /^(?:i['’]ll|i will|i['’]m going to|i am going to|let me|first,?)\s+/i,
+      "",
+    );
+    if (concise.length < 4) continue;
+    const titled = `${concise.slice(0, 1).toUpperCase()}${concise.slice(1)}`;
+    return titled.length > 88 ? `${titled.slice(0, 85).trimEnd()}…` : titled;
+  }
+  return undefined;
+}
+
+function isLoopActivity(actions: Array<AgentMessage & { toolCallId: string }>): boolean {
+  return actions.some((action) => action.tool?.startsWith("loop_"));
 }
 
 export function ActivityDetailRow({
@@ -879,13 +955,20 @@ export function ActivityDetailRow({
         onClick={() => setOpen((current) => !current)}
         aria-expanded={expandable ? open : undefined}
         className={`flex w-full min-w-0 items-center gap-2 rounded-md py-1 pr-1 text-left text-[11px] text-ink-subtle transition-colors ${
-          expandable ? "hover:bg-surface-2 active:bg-surface-3" : "cursor-default"
+          expandable ? "hover:text-ink-strong active:text-ink-strong" : "cursor-default"
         }`}
       >
         <ActivityIcon operation={file?.operation ?? "tool"} running={action.status === "running"} failed={failed} />
-        <span className={`min-w-0 flex-1 truncate ${failed ? "text-danger-soft" : ""}`}>
+        <span className={`min-w-0 max-w-[min(58ch,72%)] truncate ${failed ? "text-danger-soft" : ""}`}>
           {action.content || `Ran ${action.tool}`}
         </span>
+        {expandable ? (
+          <ChevronRight
+            aria-hidden
+            className={`h-3 w-3 shrink-0 text-ink-faint transition-transform ${open ? "rotate-90" : ""}`}
+            strokeWidth={2}
+          />
+        ) : null}
         {counts && file ? (
           <span className="inline-flex shrink-0 gap-1 font-mono text-[10px]">
             <span className="text-success-soft">{file.truncated ? "≈" : ""}+{file.additions}</span>
@@ -897,13 +980,6 @@ export function ActivityDetailRow({
             {formatDuration(durationForTurn(action.startedAtMs, action.finishedAtMs))}
           </span>
         ) : null}
-        {expandable ? (
-          <ChevronRight
-            aria-hidden
-            className={`h-3 w-3 shrink-0 text-ink-faint transition-transform ${open ? "rotate-90" : ""}`}
-            strokeWidth={2}
-          />
-        ) : null}
       </button>
       {open && fileLabel ? (
         <button
@@ -913,7 +989,7 @@ export function ActivityDetailRow({
             if (file && canOpen) onOpenFile?.(file);
           }}
           className={`mb-1 max-w-full truncate rounded px-1 text-left font-mono text-[10px] text-ink-faint ${
-            canOpen && onOpenFile ? "hover:bg-surface-2 hover:text-ink active:bg-surface-3" : "cursor-default"
+            canOpen && onOpenFile ? "hover:text-ink active:text-ink-strong" : "cursor-default"
           }`}
           aria-label={canOpen ? `Open ${fileLabel}` : fileLabel}
         >
@@ -959,10 +1035,12 @@ export function ActivityTurnRow({
   turnId,
   messages,
   onOpenFile,
+  taskTitle: requestedTaskTitle,
 }: {
   turnId: string;
   messages: AgentMessage[];
   onOpenFile?: (file: ActivityFileChange) => void;
+  taskTitle?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -979,30 +1057,52 @@ export function ActivityTurnRow({
   }, [live]);
   const elapsed = durationForTurn(marker?.startedAtMs, marker?.completedAtMs, nowMs);
   const operation = latest?.activity?.operation ?? classifyActivityOperation(latest?.tool ?? "tool");
-  const summary = latest?.content || (live ? "Working…" : marker?.stopped ? "Stopped" : "Completed");
-  const statusLabel = live ? `Working for ${formatDuration(elapsed)}` : summary;
   const latestFailed = !live && latest?.status === "error";
+  const elapsedLabel = formatDuration(elapsed);
+  const taskTitle = requestedTaskTitle ?? (isLoopActivity(actions) ? "Start Loop" : activityTaskTitle(actions) || "Working");
+  const statusLabel = live
+    ? taskTitle
+    : latestFailed || marker?.stopped
+      ? taskTitle
+      : `Worked for ${elapsedLabel}`;
+  const detailLabel = live || (!latestFailed && !marker?.stopped)
+    ? null
+    : latestFailed
+      ? `Did not finish after ${elapsedLabel}`
+      : `Stopped after ${elapsedLabel}`;
   const changed = summariseChangedFiles(actions.map((action) => action.activity));
   return (
-    <div data-role="activity-turn" data-turn-id={turnId} className="w-full max-w-[94%] self-start">
+    <div
+      data-role="activity-turn"
+      data-turn-id={turnId}
+      className="w-full max-w-[94%] self-start"
+    >
       <button
         type="button"
         onClick={() => setExpanded((current) => !current)}
         aria-expanded={expanded}
         aria-label={`${expanded ? "Collapse" : "Expand"} activity for turn ${turnId}`}
-        className="flex w-full items-center gap-2 rounded-md px-1 py-1 text-left text-xs text-ink-subtle transition-colors hover:bg-surface-2 active:bg-surface-3"
+        className="flex w-full items-center gap-2 rounded-md px-0 py-1.5 text-left text-xs text-ink-subtle transition-colors hover:text-ink-strong active:text-ink-strong"
       >
-        <ActivityIcon operation={operation} running={live} failed={latestFailed} stopped={marker?.stopped} />
-        <span className={`min-w-0 flex-1 truncate ${latestFailed ? "text-danger-soft" : "text-ink"}`}>{statusLabel}</span>
-        {!live && actions.length > 1 ? (
-          <span className="shrink-0 text-[10px] text-ink-faint">{actions.length} actions</span>
-        ) : null}
-        {!live ? <span className="shrink-0 text-[10px] text-ink-faint">{formatDuration(elapsed)}</span> : null}
+        <ActivityIcon
+          operation={!live && !latestFailed && !marker?.stopped ? "done" : operation}
+          running={live}
+          failed={latestFailed}
+          stopped={marker?.stopped}
+        />
+        <span key={statusLabel} className="activity-summary-enter min-w-0 truncate font-medium text-ink">
+          {statusLabel}
+        </span>
         <ChevronRight
           aria-hidden
           className={`h-3 w-3 shrink-0 text-ink-faint transition-transform ${expanded ? "rotate-90" : ""}`}
           strokeWidth={2}
         />
+        {detailLabel ? (
+          <span className={`min-w-0 max-w-[min(52ch,70%)] truncate ${latestFailed ? "text-danger-soft" : "text-ink-subtle"}`}>
+            {detailLabel}
+          </span>
+        ) : null}
       </button>
       {/* Only once the turn is over: a running turn's totals are a moving
           target, and the expanded view already lists every action. */}
@@ -3097,6 +3197,7 @@ export function AgentPanel({
                         (candidate): candidate is AgentMessage & { role: "assistant" } => candidate.role === "assistant",
                       );
               const lastUserIndex = previousUserIndex(messages, index);
+              const userPrompt = lastUserIndex >= 0 ? messages[lastUserIndex]?.content : undefined;
               // Older/resumed transcripts may contain a visible assistant
               // fragment without the client turn id. If it precedes this
               // tagged group, it still belongs to the same user turn and has
@@ -3114,7 +3215,12 @@ export function AgentPanel({
                   />
                 ));
               return (
-                <Fragment key={`turn-${message.turnId}`}>
+                <div
+                  key={`turn-${message.turnId}`}
+                  data-role="turn"
+                  data-turn-id={message.turnId}
+                  className="relative flex w-full flex-col gap-2"
+                >
                   {firstActionIndex >= 0 ? assistantRows(beforeActions, headingOffset) : null}
                   {reasoning ? (
                     <ReasoningRow
@@ -3132,23 +3238,30 @@ export function AgentPanel({
                     <ActivityTurnRow
                       turnId={message.turnId}
                       messages={actions}
+                      taskTitle={
+                        message.turnId === loopActivityTurnRef.current
+                          ? "Start Loop"
+                          : activityTaskSummary(beforeActions, userPrompt)
+                      }
                       onOpenFile={onOpenActivityFile}
                     />
                   ) : null}
                   {firstActionIndex >= 0
                     ? assistantRows(afterActions, headingOffset + beforeActions.length)
                     : assistantRows(afterActions, headingOffset)}
-                </Fragment>
+                </div>
               );
             }
             if (message.role === "user") {
               return (
-                <div
-                  key={index}
-                  data-role="user"
-                  className="mt-4 max-w-[88%] self-end rounded-[9px_9px_2px_9px] bg-surface-3 px-3.5 py-2.5 text-[13px] leading-[1.55] text-ink-strong"
-                >
-                  {message.content}
+                <div key={index} className="mt-5 flex w-full justify-end">
+                  <div
+                    data-role="user"
+                    className="max-w-[78%] rounded-[12px_12px_3px_12px] border border-line bg-surface-2 px-3.5 py-2.5 text-[13px] leading-[1.55] text-ink-strong"
+                  >
+                    <div className="mb-1 text-[9px] font-medium uppercase tracking-[0.18em] text-ink-faint">You</div>
+                    {message.content}
+                  </div>
                 </div>
               );
             }
@@ -3165,7 +3278,8 @@ export function AgentPanel({
 
           {busy && !activeReasoning && !hasLiveActivity && (
             <div className="self-start" aria-label="Agent is thinking">
-              <div className="flex items-baseline gap-2">
+              <div className="flex items-center gap-2">
+                <ThinkingOrb active />
                 <span className="cb-shimmer text-[12.5px] font-medium">
                   {messages.some((message) => message.status === "running") ? "Working…" : "Thinking…"}
                 </span>
