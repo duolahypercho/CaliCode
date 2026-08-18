@@ -1,5 +1,5 @@
 import { useEffect, useId, useRef, useState } from "react";
-import { Brain, ChevronRight } from "lucide-react";
+import { ChevronRight, Sparkles } from "lucide-react";
 
 /** How long a finished block stays open before folding itself away. */
 const AUTO_COLLAPSE_MS = 1000;
@@ -11,8 +11,14 @@ export interface ReasoningRowProps {
   streaming: boolean;
   /** Milliseconds the block took (or has taken so far). */
   durationMs?: number;
-  /** Start collapsed regardless of streaming state (used when replaying a saved transcript). */
+  /** Start collapsed regardless of streaming state so the reader can opt into the detail. */
   defaultCollapsed?: boolean;
+  /**
+   * Show the block duration in the settled label. The conversation panel
+   * keeps elapsed time on the turn/activity row, so it can use the DeepSeek
+   * style `Think` disclosure without putting two clocks beside one stream.
+   */
+  showDuration?: boolean;
 }
 
 function formatDuration(ms: number): string {
@@ -23,11 +29,17 @@ function formatDuration(ms: number): string {
 
 /**
  * A turn's reasoning as a collapsible block — shimmering while it streams,
- * then labelled with how long it took, with the text under a left rule (the
+ * then labelled with its settled state, with the text under a left rule (the
  * opencode idiom). Opens and closes itself around the stream, but a manual
  * toggle wins from then on: the panel must never fight the reader.
  */
-export function ReasoningRow({ text, streaming, durationMs, defaultCollapsed = false }: ReasoningRowProps) {
+export function ReasoningRow({
+  text,
+  streaming,
+  durationMs,
+  defaultCollapsed = false,
+  showDuration = true,
+}: ReasoningRowProps) {
   const [open, setOpen] = useState(!defaultCollapsed);
   const toggled = useRef(false);
   const bodyRef = useRef<HTMLDivElement | null>(null);
@@ -56,9 +68,11 @@ export function ReasoningRow({ text, streaming, durationMs, defaultCollapsed = f
 
   const label = streaming
     ? "Thinking…"
-    : durationMs === undefined
-      ? "Thought"
-      : `Thought for ${formatDuration(durationMs)}`;
+    : !showDuration
+      ? "Think"
+      : durationMs === undefined
+        ? "Thought"
+        : `Thought for ${formatDuration(durationMs)}`;
 
   return (
     <section aria-label="Model reasoning" data-role="reasoning" className="w-full max-w-[94%] self-start">
@@ -72,12 +86,21 @@ export function ReasoningRow({ text, streaming, durationMs, defaultCollapsed = f
         aria-controls={bodyId}
         className="flex w-full items-center gap-2 rounded-md px-1 py-0.5 text-left text-xs transition-colors hover:bg-surface-2 active:bg-surface-3"
       >
-        <Brain aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.7} />
+        <Sparkles
+          aria-hidden
+          className={`h-3 w-3 shrink-0 ${streaming ? "text-ink-subtle" : "text-ink-faint"}`}
+          strokeWidth={1.7}
+        />
         <span
           className={`shrink-0 text-[12px] font-medium ${streaming ? "cb-shimmer" : "text-ink"}`}
         >
           {label}
         </span>
+        {streaming && durationMs !== undefined ? (
+          <span className="shrink-0 tabular-nums text-[10.5px] text-ink-faint">
+            {formatDuration(durationMs)}
+          </span>
+        ) : null}
         <ChevronRight
           aria-hidden
           className={`ml-auto h-3 w-3 shrink-0 text-ink-faint transition-transform ${open ? "rotate-90" : ""}`}

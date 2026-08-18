@@ -1,115 +1,12 @@
-// Restore points for unattended runs.
-//
-// Core gives us exactly two primitives: `project_checkpoint` copies the project
-// directory and returns `{ id }`, and `project_revert` copies one back. There
-// is no RPC that lists checkpoints and none that deletes one, so the ids this
-// panel creates are remembered here — a restore point nobody can name is not a
-// restore point. The same gap means retention below can only bound the *list*;
-// bounding the bytes on disk needs a core method that does not exist yet.
+// Restore-point presentation and confirmation for unattended `/loop` runs.
+// Core owns creation, inventory, pruning, and restoration; keeping inventory
+// server-side means a loop remains recoverable after a reload or in another
+// window.
 
-export type AutoCheckpointReason = "loop" | "goal";
-
-export interface AutoCheckpoint {
-  /** Core's checkpoint id, e.g. `cp-1723600000000`. */
+export interface ListedCheckpoint {
   id: string;
-  takenAtMs: number;
-  reason: AutoCheckpointReason;
-  /** The loop/goal objective this checkpoint was taken in front of. */
-  objective: string;
-}
-
-/**
- * How long an automatic checkpoint stays fresh enough to skip taking another.
- *
- * Each one is a full copy of the project directory, and a three-day `/loop`
- * would otherwise take hundreds. Fifteen minutes bounds the work a single
- * destructive turn can cost to roughly one iteration while keeping a 72-hour
- * run near 288 copies — already more than anyone wants, which is why the
- * interval sits here rather than at one or five minutes.
- */
-export const AUTO_CHECKPOINT_INTERVAL_MS = 15 * 60_000;
-
-/** Automatic restore points remembered per game. Older ids are forgotten. */
-export const AUTO_CHECKPOINT_KEEP = 10;
-
-/** Objective text kept beside an id, so the list stays one line per entry. */
-const OBJECTIVE_CHARS = 60;
-
-const STORAGE_KEY = "calicode-auto-checkpoints";
-
-type Registry = Record<string, AutoCheckpoint[]>;
-
-function isReason(value: unknown): value is AutoCheckpointReason {
-  return value === "loop" || value === "goal";
-}
-
-function toEntry(value: unknown): AutoCheckpoint | null {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
-  if (typeof record.id !== "string" || record.id.length === 0) return null;
-  if (typeof record.takenAtMs !== "number" || !Number.isFinite(record.takenAtMs)) return null;
-  if (!isReason(record.reason)) return null;
-  return {
-    id: record.id,
-    takenAtMs: record.takenAtMs,
-    reason: record.reason,
-    objective: typeof record.objective === "string" ? record.objective : "",
-  };
-}
-
-function readRegistry(): Registry {
-  try {
-    const parsed: unknown = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "{}");
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return {};
-    const registry: Registry = {};
-    for (const [slug, value] of Object.entries(parsed as Record<string, unknown>)) {
-      if (!Array.isArray(value)) continue;
-      registry[slug] = value.flatMap((item) => {
-        const entry = toEntry(item);
-        return entry ? [entry] : [];
-      });
-    }
-    return registry;
-  } catch {
-    return {};
-  }
-}
-
-function writeRegistry(registry: Registry): void {
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(registry));
-  } catch {
-    // A full or disabled localStorage must not break a run: the checkpoint
-    // itself already exists on disk, only the name for it is lost.
-  }
-}
-
-/** Newest first, capped at `AUTO_CHECKPOINT_KEEP`. */
-export function pruneAutoCheckpoints(entries: readonly AutoCheckpoint[]): AutoCheckpoint[] {
-  return [...entries].sort((left, right) => right.takenAtMs - left.takenAtMs).slice(0, AUTO_CHECKPOINT_KEEP);
-}
-
-export function readAutoCheckpoints(slug: string): AutoCheckpoint[] {
-  return pruneAutoCheckpoints(readRegistry()[slug] ?? []);
-}
-
-export function recordAutoCheckpoint(slug: string, entry: AutoCheckpoint): AutoCheckpoint[] {
-  const registry = readRegistry();
-  const kept = pruneAutoCheckpoints([entry, ...(registry[slug] ?? []).filter((item) => item.id !== entry.id)]);
-  registry[slug] = kept;
-  writeRegistry(registry);
-  return kept;
-}
-
-/** Test seam: drops every remembered id for every game. */
-export function clearAutoCheckpoints(): void {
-  writeRegistry({});
-}
-
-/** True when no checkpoint has been taken inside the throttle window. */
-export function dueForCheckpoint(lastAtMs: number | null, nowMs: number): boolean {
-  if (lastAtMs === null) return true;
-  return nowMs - lastAtMs >= AUTO_CHECKPOINT_INTERVAL_MS;
+  kind: "git" | "project";
+  createdAtMs: number;
 }
 
 /**
@@ -120,7 +17,7 @@ export function dueForCheckpoint(lastAtMs: number | null, nowMs: number): boolea
  * still carries an age even though this panel never recorded it.
  */
 export function checkpointTakenAtMs(id: string): number | null {
-  const match = /^cp-(\d+)(?:-\d+)?$/.exec(id);
+  const match = /^(?:cp|git)-(\d+)(?:-\d+)?$/.exec(id);
   if (!match) return null;
   const millis = Number(match[1]);
   return Number.isFinite(millis) && millis > 0 ? millis : null;
@@ -135,23 +32,17 @@ export function formatCheckpointAge(ageMs: number): string {
   return `${Math.floor(hours / 24)}d ago`;
 }
 
-function objectiveOf(entry: AutoCheckpoint): string {
-  const trimmed = entry.objective.trim();
-  if (!trimmed) return "";
-  return trimmed.length > OBJECTIVE_CHARS ? `${trimmed.slice(0, OBJECTIVE_CHARS)}…` : trimmed;
-}
-
-export function formatCheckpointList(entries: readonly AutoCheckpoint[], nowMs: number): string {
+export function formatCheckpointList(entries: readonly ListedCheckpoint[], nowMs: number): string {
   if (entries.length === 0) {
     return [
-      "No restore points recorded yet.",
-      "One is taken automatically before the first /loop iteration and the first /goal round, then at most one every 15 minutes.",
+      "No restore points exist yet.",
+      "A /loop takes one before its first iteration, then at most one every 15 minutes.",
     ].join("\n");
   }
   const lines = entries.map((entry) => {
-    const age = formatCheckpointAge(Math.max(0, nowMs - entry.takenAtMs));
-    const objective = objectiveOf(entry);
-    return `• ${entry.id} — ${age}, before a /${entry.reason} turn${objective ? ` (${objective})` : ""}`;
+    const age = formatCheckpointAge(Math.max(0, nowMs - entry.createdAtMs));
+    const kind = entry.kind === "git" ? "git snapshot" : "project snapshot";
+    return `• ${entry.id} — ${age}, ${kind}`;
   });
   return [
     "Restore points, newest first:",

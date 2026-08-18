@@ -39,11 +39,6 @@ const AUTO_CHECKPOINT_INTERVAL_MS: u64 = 15 * 60_000;
 /// Disambiguates loop ids minted inside one millisecond. See `start`.
 static LOOP_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Runaway backstop, not a product limit. The real exit is the completion
-/// gate; this only bounds a loop that is making no progress at all and would
-/// otherwise bill forever. Mirrors `MAX_LOOP_ITERATIONS` in the client.
-pub const MAX_ITERATIONS: usize = 100;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LoopProfile {
@@ -90,7 +85,6 @@ pub struct LoopSpec {
     pub system: Option<String>,
     pub context_length: Option<u32>,
     pub guardian_model: Option<String>,
-    pub max_iterations: usize,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,7 +96,6 @@ pub struct LoopView {
     pub profile: LoopProfile,
     pub status: RunStatus,
     pub iteration: usize,
-    pub max_iterations: usize,
     pub started_at_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub interval_ms: Option<u64>,
@@ -147,7 +140,6 @@ impl LoopManager {
             profile: spec.profile,
             status: RunStatus::Running,
             iteration: 0,
-            max_iterations: spec.max_iterations.clamp(1, MAX_ITERATIONS),
             started_at_ms,
             interval_ms: spec.interval_ms,
             session_id: spec.session_id.clone(),
@@ -162,10 +154,6 @@ impl LoopManager {
 
         let manager = self.clone();
         let state = state.clone();
-        let spec = LoopSpec {
-            max_iterations: view.max_iterations,
-            ..spec
-        };
         tokio::spawn(async move {
             let outcome = manager
                 .drive(&state, &loop_id, spec, run.clone(), cancel)
@@ -233,7 +221,6 @@ impl LoopManager {
         cancel: CancellationToken,
     ) -> Result<Outcome> {
         let mut session_id = spec.session_id.clone();
-        let mut completed_once = false;
         let mut last_checkpoint_at: Option<u64> = None;
         // Only the pipeline keeps a durable report. A `standard` loop writing
         // one would be filing paperwork nobody asked for and nothing reads.
@@ -253,7 +240,8 @@ impl LoopManager {
             }
         }
 
-        for iteration in 1..=spec.max_iterations {
+        let mut iteration = 0usize;
+        loop {
             if cancel.is_cancelled() {
                 if reports {
                     close_report(
@@ -266,9 +254,12 @@ impl LoopManager {
                 }
                 return Ok(Outcome::Stopped(format!(
                     "stopped after {} iterations",
-                    iteration - 1
+                    iteration
                 )));
             }
+            iteration = iteration
+                .checked_add(1)
+                .context("loop iteration counter overflowed")?;
             {
                 let mut guard = run.write().await;
                 guard.view.iteration = iteration;
@@ -309,7 +300,6 @@ impl LoopManager {
                 "type": "loop.iteration",
                 "loopId": loop_id,
                 "iteration": iteration,
-                "maxIterations": spec.max_iterations,
                 "prompt": prompt,
             }));
 
@@ -339,6 +329,15 @@ impl LoopManager {
             let turn = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => {
+                    if reports {
+                        close_report(
+                            state,
+                            &spec,
+                            loop_id,
+                            crate::loop_report::LoopStatus::Cancelled,
+                            "Loop stopped by the user.",
+                        );
+                    }
                     return Ok(Outcome::Stopped(format!(
                         "stopped during iteration {iteration}"
                     )));
@@ -368,7 +367,6 @@ impl LoopManager {
             if says_done(&reply) {
                 match completion_blocker(state, &spec, loop_id) {
                     None => {
-                        completed_once = true;
                         let _ = state.bus.send(json!({
                             "type": "loop.completed",
                             "loopId": loop_id,
@@ -404,38 +402,26 @@ impl LoopManager {
             }
 
             if let Some(interval) = spec.interval_ms {
-                if iteration < spec.max_iterations {
-                    let wait = std::time::Duration::from_millis(interval);
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            return Ok(Outcome::Stopped(format!(
-                                "watch stopped after {iteration} iterations"
-                            )));
+                let wait = std::time::Duration::from_millis(interval);
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        if reports {
+                            close_report(
+                                state,
+                                &spec,
+                                loop_id,
+                                crate::loop_report::LoopStatus::Cancelled,
+                                "Loop stopped by the user.",
+                            );
                         }
-                        _ = tokio::time::sleep(wait) => {}
+                        return Ok(Outcome::Stopped(format!(
+                            "watch stopped after {iteration} iterations"
+                        )));
                     }
+                    _ = tokio::time::sleep(wait) => {}
                 }
             }
         }
-        if reports && !completed_once {
-            close_report(
-                state,
-                &spec,
-                loop_id,
-                crate::loop_report::LoopStatus::Blocked,
-                "Loop hit its iteration cap before completion could be proven.",
-            );
-        }
-        Ok(if completed_once {
-            // A watch that met its goal and then ran out of iterations is not a
-            // failure; saying "hit the cap" and nothing else would read as one.
-            Outcome::Completed(format!(
-                "watch reached the {}-iteration cap after meeting the goal",
-                spec.max_iterations
-            ))
-        } else {
-            Outcome::Stopped(format!("hit the {}-iteration cap", spec.max_iterations))
-        })
     }
 }
 
@@ -640,7 +626,6 @@ mod tests {
             system: None,
             context_length: None,
             guardian_model: None,
-            max_iterations: 10,
         }
     }
 
@@ -740,6 +725,21 @@ mod tests {
         panic!("loop {loop_id} never reached a terminal status");
     }
 
+    /// Wait for the durable report to contain real completed iterations. The
+    /// run view advances before the provider call, so polling that counter
+    /// would race cancellation against the report write this test proves.
+    async fn wait_for_report_iterations(state: &crate::AppState, loop_id: &str, expected: usize) {
+        for _ in 0..200 {
+            if crate::loop_report::load(&state.projects_root, "demo", loop_id)
+                .is_ok_and(|report| report.iterations.len() >= expected)
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("loop {loop_id} never recorded {expected} iterations");
+    }
+
     #[tokio::test]
     async fn a_standard_loop_runs_until_the_model_says_done() {
         let (state, calls) =
@@ -758,24 +758,25 @@ mod tests {
     #[tokio::test]
     async fn an_aaa_loop_refuses_done_it_cannot_prove() {
         // The model claims completion on every turn; with no passing report on
-        // disk the gate must refuse every one and let the cap end the run.
-        let (state, _) = scripted_state(vec!["DONE".into()]).await;
+        // disk the gate must refuse every one and keep running until Stop.
+        let (state, calls) = scripted_state(vec!["DONE".into()]).await;
         let view = state
             .loops
-            .start(
-                &state,
-                LoopSpec {
-                    profile: LoopProfile::Aaa,
-                    max_iterations: 3,
-                    ..spec(LoopProfile::Aaa)
-                },
-            )
+            .start(&state, spec(LoopProfile::Aaa))
             .await
             .unwrap();
+        wait_for_report_iterations(&state, &view.loop_id, 3).await;
+        assert_eq!(
+            state.loops.status(&view.loop_id).await.unwrap().status,
+            RunStatus::Running,
+            "three refused DONE replies must not impose a hidden cap"
+        );
+        assert!(calls.load(Ordering::SeqCst) >= 3);
+        state.loops.stop(&view.loop_id).await.unwrap();
         let settled = settle(&state, &view.loop_id).await;
         assert_eq!(settled.status, RunStatus::Stopped, "{settled:?}");
-        assert_eq!(
-            settled.iteration, 3,
+        assert!(
+            settled.iteration >= 3,
             "the gate should have refused all three"
         );
     }
@@ -829,24 +830,15 @@ mod tests {
         let (state, _) = scripted_state(vec!["worked on it".into()]).await;
         let view = state
             .loops
-            .start(
-                &state,
-                LoopSpec {
-                    profile: LoopProfile::Aaa,
-                    max_iterations: 2,
-                    ..spec(LoopProfile::Aaa)
-                },
-            )
+            .start(&state, spec(LoopProfile::Aaa))
             .await
             .unwrap();
+        wait_for_report_iterations(&state, &view.loop_id, 2).await;
+        state.loops.stop(&view.loop_id).await.unwrap();
         settle(&state, &view.loop_id).await;
         let report = crate::loop_report::load(&state.projects_root, "demo", &view.loop_id).unwrap();
-        assert_eq!(report.iterations.len(), 2, "{report:?}");
-        assert_ne!(
-            report.status,
-            crate::loop_report::LoopStatus::Running,
-            "a capped loop must close its report"
-        );
+        assert!(report.iterations.len() >= 2, "{report:?}");
+        assert_eq!(report.status, crate::loop_report::LoopStatus::Cancelled);
     }
 
     #[tokio::test]

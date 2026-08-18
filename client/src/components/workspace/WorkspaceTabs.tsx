@@ -15,10 +15,23 @@ import {
   Play,
   Plus,
   SquareTerminal,
+  Workflow,
   X,
 } from "lucide-react";
 
-export const WORKSPACE_TABS = ["play", "code", "art", "build", "scene", "test", "terminal", "browser", "sidechat", "reports"] as const;
+export const WORKSPACE_TABS = [
+  "play",
+  "code",
+  "art",
+  "build",
+  "scene",
+  "test",
+  "terminal",
+  "browser",
+  "sidechat",
+  "graph",
+  "reports",
+] as const;
 
 export type WorkspaceTab = (typeof WORKSPACE_TABS)[number];
 
@@ -53,13 +66,13 @@ export function nextTabId(kind: WorkspaceTab, open: readonly WorkspaceTabId[]): 
 }
 
 interface WorkspaceTabsProps {
-  /** Views open as tabs, in strip order. Never empty. */
+  /** Views open as tabs, in strip order. The strip may be empty on first use. */
   openTabs: readonly WorkspaceTabId[];
-  active: WorkspaceTabId;
+  active: WorkspaceTabId | null;
   onChange: (tab: WorkspaceTabId) => void;
   /** Open a view. Repeatable views open another instance. */
   onAdd: (tab: WorkspaceTab) => void;
-  /** Close a tab. The last remaining tab cannot be closed. */
+  /** Close a tab. Closing the final tab returns the dock to its blank picker. */
   onClose: (tab: WorkspaceTabId) => void;
   badges: Partial<Record<WorkspaceTab, number>>;
   /**
@@ -90,6 +103,7 @@ const TAB_META = {
   terminal: { label: "Terminal", icon: SquareTerminal },
   browser: { label: "Browser", icon: Globe },
   sidechat: { label: "Side chat", icon: MessageCircleQuestion },
+  graph: { label: "Graph", icon: Workflow },
   reports: { label: "Reports", icon: FileChartColumn },
 } satisfies Record<WorkspaceTab, { label: string; icon: typeof Play }>;
 
@@ -122,14 +136,15 @@ export function WorkspaceTabs({
   // view from elsewhere in the app (the header's side-chat button, a badge)
   // is exactly when that happens.
   useEffect(() => {
+    if (!active) return;
     document
       .getElementById(`workspace-tab-${active}`)
       ?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [active]);
 
-  // Closing the last tab would leave the dock with nothing to show, so the
-  // affordance disappears rather than failing on click.
-  const closable = openTabs.length > 1;
+  // A fresh dock starts empty, and closing the final view returns it there so
+  // the chooser remains reachable without a reload or a storage reset.
+  const closable = openTabs.length > 0;
   // Views not currently in the strip. A repeatable view drops out once one is
   // open: "Add view" is for reaching a view you do not have, and stacking a
   // second side chat is a deliberate act — `/side` — not a menu pick that
@@ -145,7 +160,7 @@ export function WorkspaceTabs({
         role="tablist"
         aria-label="Workspace"
         aria-orientation="horizontal"
-        className="scrollbar-none flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [mask-image:linear-gradient(to_right,#000_calc(100%-28px),transparent)]"
+        className="scrollbar-none flex h-8 min-w-0 shrink-0 flex-1 items-center gap-1 overflow-x-auto [mask-image:linear-gradient(to_right,#000_calc(100%-28px),transparent)]"
       >
         {openTabs.map((tab, index) => {
           const selected = tab === active;
@@ -304,6 +319,57 @@ export function WorkspaceTabs({
           <Minus aria-hidden className="h-[15px] w-[15px]" strokeWidth={1.9} />
         </button>
       ) : null}
+    </div>
+  );
+}
+
+interface WorkspaceTabPickerProps {
+  /** Open a view in the dock and make it active. */
+  onSelect: (tab: WorkspaceTab) => void;
+}
+
+/**
+ * First-use state for the tools dock. It is intentionally separate from the
+ * tab strip so an empty dock still has the same chrome and add menu as a dock
+ * with tabs, while the content area answers the obvious next question.
+ */
+export function WorkspaceTabPicker({ onSelect }: WorkspaceTabPickerProps) {
+  const choices = WORKSPACE_TABS.filter((tab) => tab !== "graph");
+
+  return (
+    <div
+      data-empty-workspace
+      className="flex h-full min-h-0 flex-col items-center justify-center overflow-y-auto px-6 py-8 text-center"
+    >
+      <div className="flex h-10 w-10 items-center justify-center rounded-xl border border-line bg-surface-1 text-ink-subtle">
+        <Plus aria-hidden className="h-4 w-4" strokeWidth={1.7} />
+      </div>
+      <h2 className="mt-4 text-[14px] font-semibold text-ink-strong">What do you want to show here?</h2>
+      <p className="mt-1 max-w-[300px] text-[12px] leading-[1.5] text-ink-subtle">
+        Choose a workspace tab to get started.
+      </p>
+      <div
+        className="mt-5 grid w-full max-w-[420px] grid-cols-2 gap-2"
+        role="group"
+        aria-label="Workspace tabs to open"
+      >
+        {choices.map((tab) => {
+          const meta = TAB_META[tab];
+          const Icon = meta.icon;
+          return (
+            <button
+              key={tab}
+              type="button"
+              aria-label={`Show ${meta.label}`}
+              onClick={() => onSelect(tab)}
+              className="flex items-center gap-2 rounded-lg border border-line bg-surface-1 px-3 py-2.5 text-left text-[12px] font-medium text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong"
+            >
+              <Icon aria-hidden className="h-3.5 w-3.5 shrink-0" strokeWidth={1.7} />
+              <span className="truncate">{meta.label}</span>
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }

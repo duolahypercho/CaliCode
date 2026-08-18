@@ -381,7 +381,6 @@ describe("/loop rejoins a run that outlived the tab", () => {
     profile: "standard",
     status: "running",
     iteration: 4,
-    maxIterations: 100,
     startedAtMs: 1,
     sessionId: "session-1",
     ...over,
@@ -406,11 +405,10 @@ describe("/loop rejoins a run that outlived the tab", () => {
         type: "loop.iteration",
         loopId: "loop-live",
         iteration: 5,
-        maxIterations: 100,
         prompt: "keep the tests green",
       } as AgentEvent);
     });
-    expect(await screen.findByText("loop 5/100")).toBeTruthy();
+    expect(await screen.findByText("loop iteration 5")).toBeTruthy();
   });
 
   it("leaves another chat's run alone when a session is already open", async () => {
@@ -450,7 +448,6 @@ describe("/loop starts a core-side run", () => {
     profile: "standard",
     status: "running",
     iteration: 0,
-    maxIterations: 100,
     startedAtMs: 1,
     ...over,
   });
@@ -511,7 +508,7 @@ describe("/loop starts a core-side run", () => {
 });
 
 describe("/loop renders the run core reports", () => {
-  const startedRun = { loopId: "loop-1", slug: "demo", goal: "fix the typo", profile: "standard", status: "running", iteration: 0, maxIterations: 100, startedAtMs: 1 };
+  const startedRun = { loopId: "loop-1", slug: "demo", goal: "fix the typo", profile: "standard", status: "running", iteration: 0, startedAtMs: 1 };
 
   const startLoop = async () => {
     mocks.startLoopRun.mockResolvedValue(startedRun);
@@ -529,11 +526,10 @@ describe("/loop renders the run core reports", () => {
         type: "loop.iteration",
         loopId: "loop-1",
         iteration: 1,
-        maxIterations: 100,
         prompt: "fix the typo",
       } as AgentEvent);
     });
-    expect(await screen.findByText("loop 1/100")).toBeTruthy();
+    expect(await screen.findByText("loop iteration 1")).toBeTruthy();
     // The prompt lands as a user row, which is what makes a loop's transcript
     // readable back: you can see what was actually asked each iteration.
     const userRows = document.querySelectorAll('[data-role="user"]');
@@ -552,7 +548,7 @@ describe("/loop renders the run core reports", () => {
         reason: "the report has one iteration, two are required",
       } as AgentEvent);
     });
-    expect(await screen.findByText(/DONE ignored: the report has one iteration/)).toBeTruthy();
+    expect(await screen.findByText(/DONE refused: the report has one iteration/)).toBeTruthy();
   });
 
   it("clears the loop UI when core says the run finished", async () => {

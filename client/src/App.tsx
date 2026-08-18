@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { Viewport } from "./components/editor/Viewport";
 import { ConsolePanel, type LogEntry } from "./components/editor/ConsolePanel";
 import { AgentPanel } from "./components/editor/AgentPanel";
+import { GraphPanel } from "./components/editor/GraphPanel";
 import {
   ArrowLeft,
   ArrowRight,
@@ -9,6 +10,7 @@ import {
   PanelBottom,
   PanelLeft,
   PanelRight,
+  Workflow,
 } from "lucide-react";
 import blenderLogo from "./assets/blender-logo.svg";
 import { hasOverlayWindowControls } from "./lib/desktop";
@@ -18,6 +20,7 @@ import {
   type SessionMenuAction,
 } from "./components/workspace/GamesSidebar";
 import { AssetsLibraryPage } from "./components/library/AssetsLibraryPage";
+import { ProjectHub } from "./components/workspace/ProjectHub";
 import { SettingsPage } from "./components/settings/SettingsPage";
 import {
   archiveSession,
@@ -31,6 +34,7 @@ import {
   MULTI_INSTANCE_TABS,
   WORKSPACE_TABS,
   WorkspaceTabs,
+  WorkspaceTabPicker,
   nextTabId,
   tabKind,
   type WorkspaceTab,
@@ -92,6 +96,7 @@ import {
 } from "./hooks/useResizablePanels";
 import type { PieRuntime, PieState } from "./lib/pie";
 import type { AgentMessage, Asset, CapturedFrame, Entity, ModelList, Project, TestResult } from "./lib/types";
+import { cancelGraph, runGraph, type TaskGraph } from "./lib/graph";
 import type { ProjectTemplate } from "./lib/projectTemplates";
 import { importMime, isBlenderAsset } from "./lib/blender";
 
@@ -187,8 +192,8 @@ const FILE_TREE_PANEL: ResizablePanelOptions = {
  * lost work even though nothing was lost.
  */
 interface ViewState {
-  tab: WorkspaceTabId;
-  /** Views open as dock tabs. Order is the strip order. */
+  tab: WorkspaceTabId | null;
+  /** Views open as dock tabs. Order is the strip order; empty is first use. */
   openTabs: WorkspaceTabId[];
   /**
    * Views this editor has already offered.
@@ -207,14 +212,23 @@ interface ViewState {
 function readView(): ViewState {
   try {
     const raw = localStorage.getItem(VIEW_KEY);
+    // A missing view record is a first-use dock, not an instruction to fill it
+    // with every available panel. The picker in the dock supplies the first
+    // explicit choice and persistence takes over from there.
+    if (raw === null) {
+      return { tab: null, openTabs: [], seenTabs: [...WORKSPACE_TABS], workspaceFile: null };
+    }
     const parsed = raw ? (JSON.parse(raw) as Partial<ViewState>) : {};
-    const tab = WORKSPACE_TABS.includes(parsed.tab as WorkspaceTab) ? (parsed.tab as WorkspaceTab) : "play";
+    // Graph is contextual: it should appear beside a conversation once a
+    // graph exists, rather than occupying a tab in every empty workspace.
+    const defaultCatalogue = WORKSPACE_TABS.filter((entry) => entry !== "graph");
+    const parsedTab = WORKSPACE_TABS.includes(parsed.tab as WorkspaceTab) ? (parsed.tab as WorkspaceTab) : null;
     // A stored strip is filtered against the current view list, so a released
     // or renamed view cannot restore a tab that no longer has a panel. An
-    // empty result falls back to every view rather than none — a dock with no
-    // tabs has nothing to show and no way back.
+    // explicitly empty strip is a valid persisted first-use state.
     // Bare ids only: a second side chat is a memory-only thread, so restoring
     // its tab would reopen an empty panel the user never asked for again.
+    const hasStoredStrip = Array.isArray(parsed.openTabs);
     const stored = Array.isArray(parsed.openTabs)
       ? parsed.openTabs.filter((entry): entry is WorkspaceTab => WORKSPACE_TABS.includes(entry as WorkspaceTab))
       : [];
@@ -223,8 +237,14 @@ function readView(): ViewState {
     const seen = Array.isArray(parsed.seenTabs)
       ? parsed.seenTabs.filter((entry): entry is WorkspaceTab => WORKSPACE_TABS.includes(entry as WorkspaceTab))
       : stored;
-    const openTabs = withIntroducedTabs(stored, seen, WORKSPACE_TABS);
-    if (!openTabs.includes(tab)) openTabs.unshift(tab);
+    const openTabs = hasStoredStrip
+      ? stored.length === 0
+        ? []
+        : withIntroducedTabs(stored, seen, defaultCatalogue)
+      : parsedTab
+        ? [parsedTab]
+        : [];
+    const tab = parsedTab && openTabs.includes(parsedTab) ? parsedTab : openTabs[0] ?? null;
     return {
       tab,
       openTabs,
@@ -232,7 +252,12 @@ function readView(): ViewState {
       workspaceFile: typeof parsed.workspaceFile === "string" ? parsed.workspaceFile : null,
     };
   } catch {
-    return { tab: "play", openTabs: [...WORKSPACE_TABS], seenTabs: [...WORKSPACE_TABS], workspaceFile: null };
+    return {
+      tab: null,
+      openTabs: [],
+      seenTabs: [...WORKSPACE_TABS],
+      workspaceFile: null,
+    };
   }
 }
 
@@ -262,12 +287,39 @@ export default function App() {
   const [modelList, setModelList] = useState<ModelList | null>(null);
   const [captureEvery, setCaptureEvery] = useState(3);
   const [assetSearch, setAssetSearch] = useState("");
-  const [tab, setTab] = useState<WorkspaceTabId>(() => readView().tab);
+  const [tab, setTab] = useState<WorkspaceTabId | null>(() => readView().tab);
   const [openTabs, setOpenTabs] = useState<WorkspaceTabId[]>(() => readView().openTabs);
   // Render mirror of the strip, so an opener can allocate against the current
   // set without waiting for a re-render.
   const openTabsRef = useRef<WorkspaceTabId[]>(openTabs);
   openTabsRef.current = openTabs;
+
+  /** Open a view as a tab and select it, including from the blank first-use dock. */
+  const addWorkspaceTab = useCallback((kind: WorkspaceTab): WorkspaceTabId => {
+    // Read and write the ref, not just state: `/side` twice in one tick has to
+    // allocate two ids, and the second call runs before React has re-rendered
+    // with the first.
+    const current = openTabsRef.current;
+    const opened = MULTI_INSTANCE_TABS.includes(kind) ? nextTabId(kind, current) : kind;
+    if (!current.includes(opened)) {
+      const next = [...current, opened];
+      openTabsRef.current = next;
+      setOpenTabs(next);
+    }
+    setTab(opened);
+    return opened;
+  }, []);
+
+  /** Select the newest instance of a view, opening one when the strip is blank. */
+  const focusWorkspaceTab = useCallback(
+    (kind: WorkspaceTab): WorkspaceTabId => {
+      const existing = [...openTabsRef.current].reverse().find((id) => tabKind(id) === kind);
+      if (!existing) return addWorkspaceTab(kind);
+      setTab(existing);
+      return existing;
+    },
+    [addWorkspaceTab],
+  );
   /**
    * What the agent browser currently has open, so the BROWSER tab can show the
    * page's own title and favicon the way a browser tab does.
@@ -287,6 +339,11 @@ export default function App() {
   // transcript and talks to a tool-less endpoint, so asking about a run can
   // never alter it.
   const [mainTranscript, setMainTranscript] = useState<AgentMessage[]>([]);
+  // The graph belongs to the active agent session, but the full visualization
+  // lives in the tools dock so it can sit beside the conversation.
+  const [activeGraph, setActiveGraph] = useState<TaskGraph | null>(null);
+  const [graphTickers, setGraphTickers] = useState<Record<string, string>>({});
+  const graphAutoOpenedRef = useRef<string | null>(null);
   // Text `/side <question>` puts in the side chat's composer, unsent. The
   // nonce is what makes a repeat of the same question reach the panel again.
   // Drafts and threads are per side chat, not per project: `/side` twice
@@ -358,8 +415,10 @@ export default function App() {
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
   // From lg up the dock is a real column; the chat header's panel button
   // hides/shows it there, and below lg the same button drives the overlay.
-  // What the main column shows: the agent chat, or the Assets Library page.
-  const [mainView, setMainView] = useState<"chat" | "library">("chat");
+  // What the main column shows: the project hub, agent chat, or Assets Library.
+  // Existing installs open the selected game directly; an empty projects
+  // directory switches to the hub below so there is still a clear first step.
+  const [mainView, setMainView] = useState<"chat" | "library" | "hub">("chat");
   const [toolsVisible, setToolsVisible] = useState<boolean>(
     () => localStorage.getItem("calicode-tools-visible") !== "0",
   );
@@ -398,8 +457,8 @@ export default function App() {
   /**
    * Where the next `/side` goes. Each run gets its own thread, except that an
    * untouched panel — nothing asked, nothing typed — is used before a new one
-   * is opened beside it. Without that, the side chat the dock ships with would
-   * sit empty forever while every question opened another tab next to it.
+   * is opened beside it. This also lets a slash command reuse a side-chat tab
+   * that was chosen from the first-use picker without multiplying empty tabs.
    */
   const openFreshSideChat = (): WorkspaceTabId => {
     const pristine = sideChatIds.find(
@@ -658,15 +717,32 @@ export default function App() {
     void (async () => {
       try {
         if (coreRetry > 0) setCoreStatus("unknown");
-        const loaded = await rpc<Project>("project_open", { slug: projectSlugRef.current || "starter" });
-        if (cancelled) return;
-        setProject(adoptSaved(loaded));
-        coreHydratedRef.current = true;
-        setScriptBaseline(snapshotScripts(loaded));
-        setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
-        const listed = await rpc<Project[]>("project_list", {});
+        const listed = (await rpc<Project[]>("project_list", {})) ?? [];
         if (cancelled) return;
         setProjects(listed);
+        coreHydratedRef.current = true;
+        const preferred = listed.find((item) => item.slug === projectSlugRef.current) ?? listed[0];
+        if (!preferred) {
+          // An intentionally empty projects directory is a valid first-run
+          // state. Keep the local preview object inert while the hub explains
+          // how to create or open the first real game.
+          setActiveSessionId(null);
+          setWorkspace(null);
+          setWorkspaceFile(null);
+          setActivityFile(null);
+          setPendingActivityFile(null);
+          setFrames([]);
+          setTestResults([]);
+          setLoadMs(performance.now() - started);
+          setMainView("hub");
+          return;
+        }
+        const loaded = await rpc<Project>("project_open", { slug: preferred.slug });
+        if (cancelled) return;
+        setProject(adoptSaved(loaded));
+        setMainView("chat");
+        setScriptBaseline(snapshotScripts(loaded));
+        setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
         setLoadMs(performance.now() - started);
       } catch {
         if (cancelled) return;
@@ -777,6 +853,7 @@ export default function App() {
       const existing = projects.find((item) => item.workspaceRoot === info.root);
       if (existing) {
         setNewProjectOpen(false);
+        setMainView("chat");
         setActiveSessionId(null);
         setSessionRevision((current) => current + 1);
         await openProject(existing.slug);
@@ -794,6 +871,7 @@ export default function App() {
       const bound = { ...created, workspaceRoot: info.root };
       setProjects((current) => [...current.filter((item) => item.slug !== slug), bound]);
       setProject(adoptSaved(bound));
+      setMainView("chat");
       setActiveSessionId(null);
       setSessionRevision((current) => current + 1);
       setScriptBaseline(snapshotScripts(bound));
@@ -855,7 +933,7 @@ export default function App() {
 
   const revealActivityEditor = useCallback(() => {
     setMainView("chat");
-    setTab("code");
+    focusWorkspaceTab("code");
     // The dock can be hidden persistently on desktop, or must be opened as an
     // overlay on narrow windows. A file activity click is an explicit request
     // to reveal it in either layout.
@@ -863,7 +941,7 @@ export default function App() {
     localStorage.setItem("calicode-tools-visible", "1");
     if (window.matchMedia?.("(min-width: 1024px)").matches) setToolsOpen(false);
     else setToolsOpen(true);
-  }, []);
+  }, [focusWorkspaceTab]);
 
   const openActivityFile = useCallback(
     (change: ActivityFileChange) => {
@@ -1066,12 +1144,12 @@ export default function App() {
         });
       }
       setBuilderAssetId(assetId);
-      setTab("build");
+      focusWorkspaceTab("build");
     },
-    [project],
+    [focusWorkspaceTab, project],
   );
 
-  const focusBuilderTab = useCallback(() => setTab("build"), []);
+  const focusBuilderTab = useCallback(() => focusWorkspaceTab("build"), [focusWorkspaceTab]);
 
   const browserTools = useBrowserTools({
     project,
@@ -1142,46 +1220,39 @@ export default function App() {
     return () => window.clearTimeout(timer);
   }, [coreStatus, project, persistProjectNow]);
 
-  /**
-   * Open a view as a tab and select it. A repeatable view (the side chat)
-   * opens another instance every time rather than focusing the one already
-   * there — two asks are two threads.
-   */
-  const addWorkspaceTab = useCallback((kind: WorkspaceTab): WorkspaceTabId => {
-    // Read and write the ref, not just state: `/side` twice in one tick has to
-    // allocate two ids, and the second call runs before React has re-rendered
-    // with the first.
-    const current = openTabsRef.current;
-    const opened = MULTI_INSTANCE_TABS.includes(kind) ? nextTabId(kind, current) : kind;
-    if (!current.includes(opened)) {
-      const next = [...current, opened];
-      openTabsRef.current = next;
-      setOpenTabs(next);
-    }
-    setTab(opened);
-    return opened;
-  }, []);
-
-  /** Select the newest instance of a view, opening one only if none is open. */
-  const focusWorkspaceTab = useCallback((kind: WorkspaceTab): WorkspaceTabId => {
-    const existing = [...openTabsRef.current].reverse().find((id) => tabKind(id) === kind);
-    if (!existing) return addWorkspaceTab(kind);
-    setTab(existing);
-    return existing;
-  }, [addWorkspaceTab]);
+  /** Keep the graph beside the chat, opening its dock tab on first use. */
+  const handleGraphChange = useCallback(
+    (graph: TaskGraph | null, tickers: Record<string, string>) => {
+      setActiveGraph(graph);
+      setGraphTickers(tickers);
+      if (!graph) {
+        graphAutoOpenedRef.current = null;
+        return;
+      }
+      if (graphAutoOpenedRef.current === graph.graphId) return;
+      graphAutoOpenedRef.current = graph.graphId;
+      addWorkspaceTab("graph");
+      setToolsVisible(true);
+      localStorage.setItem("calicode-tools-visible", "1");
+      if (viewportWidth < TOOLS_DOCK_BREAKPOINT) setToolsOpen(true);
+    },
+    [addWorkspaceTab, viewportWidth],
+  );
 
   /**
    * Close a tab. Closing the active one selects its neighbour rather than
-   * leaving the dock pointed at a view that is no longer in the strip.
+   * leaving the dock pointed at a view that is no longer in the strip. Closing
+   * the final tab selects the blank picker instead.
    */
   const closeWorkspaceTab = useCallback((target: WorkspaceTabId) => {
     setOpenTabs((current) => {
-      if (current.length <= 1) return current;
       const index = current.indexOf(target);
       if (index < 0) return current;
       const next = current.filter((entry) => entry !== target);
       openTabsRef.current = next;
-      setTab((active) => (active === target ? next[Math.min(index, next.length - 1)] : active));
+      setTab((active) =>
+        active === target ? next[Math.min(index, next.length - 1)] ?? null : active,
+      );
       return next;
     });
     // Closing a side chat ends that thread. Ids are reused once freed, so a
@@ -1297,6 +1368,7 @@ export default function App() {
       const created = await rpc<Project>("project_create", { slug, title, template: templateId });
       setProjects((current) => [...current.filter((item) => item.slug !== slug), created]);
       setProject(adoptSaved(created));
+      setMainView("chat");
       // A task belongs to exactly one game/worktree. Carrying the previously
       // selected task into a newly created game makes AgentPanel attempt to
       // resume it against the wrong project before the user has done anything.
@@ -1371,6 +1443,21 @@ export default function App() {
       const stack = [...current.stack.slice(0, current.index + 1), entry];
       return { stack, index: stack.length - 1 };
     });
+  };
+
+  const openProjectHub = () => {
+    setMainView("hub");
+    setToolsOpen(false);
+    setToolsExpanded(false);
+    setSidebarDrawerOpen(false);
+  };
+
+  const selectProjectFromHub = (slug: string) => {
+    pushNav({ slug, sessionId: null });
+    setActiveSessionId(null);
+    setSessionRevision((current) => current + 1);
+    setSidebarDrawerOpen(false);
+    if (slug !== project.slug) void openProject(slug);
   };
 
   const startSession = async (slug: string) => {
@@ -1478,6 +1565,21 @@ export default function App() {
         if (project.slug === target.slug && remaining[0]) {
           setActiveSessionId(null);
           await openProject(remaining[0].slug);
+        } else if (project.slug === target.slug) {
+          // Removing the final game is the explicit route back to the launch
+          // experience. Drop editor-only state so the empty hub is honest.
+          runtime?.stop();
+          setRuntime(null);
+          setActiveSessionId(null);
+          setSessionRevision((current) => current + 1);
+          setWorkspace(null);
+          setWorkspaceFile(null);
+          setActivityFile(null);
+          setPendingActivityFile(null);
+          setFrames([]);
+          setTestResults([]);
+          setMainView("hub");
+          setNav({ stack: [], index: -1 });
         }
         pushLog(`removed ${target.title}`);
       }
@@ -1767,6 +1869,8 @@ export default function App() {
             void startSession(slug);
           }}
           onNewGame={() => setNewProjectOpen(true)}
+          onOpenProjectHub={openProjectHub}
+          projectHubActive={mainView === "hub"}
           pinnedProjectSlugs={pinnedProjectSlugs}
           onProjectAction={handleProjectAction}
           onSessionAction={handleSessionAction}
@@ -1870,9 +1974,11 @@ export default function App() {
             <span className="ml-2 min-w-0 truncate text-[13px] font-semibold text-ink-strong">
               {mainView === "library"
                 ? "Assets Library"
-                : sessions.find((session) => session.id === activeSessionId)?.title ?? project.title}
+                : mainView === "hub"
+                  ? "Projects"
+                  : sessions.find((session) => session.id === activeSessionId)?.title ?? project.title}
             </span>
-            <SaveIndicator state={saveState} onRetry={() => void persistProjectNow()} />
+            {mainView === "chat" ? <SaveIndicator state={saveState} onRetry={() => void persistProjectNow()} /> : null}
             {mainView === "chat" ? (
               <>
                 <button
@@ -1946,7 +2052,16 @@ export default function App() {
             </div>
           ) : null}
 
-          {mainView === "library" ? (
+          {mainView === "hub" ? (
+            <ProjectHub
+              projects={displayedProjects}
+              sessions={sessionsBySlug}
+              activeSlug={project.slug}
+              coreStatus={coreStatus}
+              onOpenProject={selectProjectFromHub}
+              onNewProject={() => setNewProjectOpen(true)}
+            />
+          ) : mainView === "library" ? (
             <AssetsLibraryPage
               installedRepoIds={Object.keys(attachedRepos(project))}
               onInstall={(repoId) => handleToggleRepo(repoId, true)}
@@ -1963,6 +2078,13 @@ export default function App() {
               initialSessionId={activeSessionId}
               onSessionsChanged={setSessions}
               onTranscriptChange={setMainTranscript}
+              onGraphChange={handleGraphChange}
+              onOpenGraph={() => {
+                focusWorkspaceTab("graph");
+                setToolsVisible(true);
+                localStorage.setItem("calicode-tools-visible", "1");
+                if (viewportWidth < TOOLS_DOCK_BREAKPOINT) setToolsOpen(true);
+              }}
               onOpenSideChat={(draft, anchor, options) => {
                 const id = options?.fresh ? openFreshSideChat() : focusWorkspaceTab("sidechat");
                 if (!toolsVisible) toggleTools();
@@ -2054,6 +2176,8 @@ export default function App() {
           />
 
           <div className="relative min-h-0 flex-1">
+            {openTabs.length === 0 ? <WorkspaceTabPicker onSelect={addWorkspaceTab} /> : null}
+
             {/* A live workspace owns PLAY: its own dev server renders the real
                 game, rather than the scene document the editor manages. */}
             {tab === "play" && workspace ? (
@@ -2241,6 +2365,39 @@ export default function App() {
               </div>
             ) : null}
 
+            {tab === "graph" ? (
+              <div role="tabpanel" id="workspace-panel-graph" aria-labelledby="workspace-tab-graph" className="absolute inset-0">
+                {activeGraph ? (
+                  <GraphPanel
+                    graph={activeGraph}
+                    tickers={graphTickers}
+                    onCancel={(graphId) => void cancelGraph(graphId).catch(() => {})}
+                    onRerun={(graphId) => {
+                      setGraphTickers({});
+                      void runGraph(graphId, {
+                        // Rejoined loops may own a session that the parent
+                        // has not selected yet; the graph snapshot is the
+                        // authoritative owner in that case.
+                        ownerSession: activeGraph.ownerSession ?? activeSessionId,
+                      }).catch((error) =>
+                        pushLog(`Graph re-run failed: ${error instanceof Error ? error.message : String(error)}`),
+                      );
+                    }}
+                  />
+                ) : (
+                  <div className="flex h-full flex-col items-center justify-center px-6 text-center">
+                    <div className="flex h-9 w-9 items-center justify-center rounded-lg border border-line bg-surface-1 text-ink-subtle">
+                      <Workflow aria-hidden className="h-4 w-4" strokeWidth={1.7} />
+                    </div>
+                    <p className="mt-3 text-[13px] font-medium text-ink-strong">No task graph yet</p>
+                    <p className="mt-1 max-w-[260px] text-[11.5px] leading-[1.5] text-ink-subtle">
+                      Ask the agent to plan a graph, or use <span className="font-mono text-ink">/graph</span> in chat.
+                    </p>
+                  </div>
+                )}
+              </div>
+            ) : null}
+
             {/* Kept mounted while the tab is in the strip, unlike the other
                 panels: the side thread lives only in this component's state,
                 so unmounting it on a tab switch would throw the conversation
@@ -2299,7 +2456,7 @@ export default function App() {
                   canRun={Boolean(runtime)}
                   onRun={() => void runTestSuite()}
                   onFixAll={(issues) => {
-                    setTab("play");
+                    focusWorkspaceTab("play");
                     pushLog(`asked the agent to fix ${issues.length} issue${issues.length === 1 ? "" : "s"}`);
                     void rpc("agent_chat", {
                       projectSlug: project.slug,
@@ -2338,7 +2495,7 @@ export default function App() {
                         setActivityFile(null);
                         setPendingActivityFile(null);
                         setWorkspaceFile(path);
-                        setTab("code");
+                        focusWorkspaceTab("code");
                       })
                       .catch((error) => pushLog(`cannot open ${path}: ${reason(error)}`, "error"));
                   }}

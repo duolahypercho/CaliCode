@@ -1,7 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentPanel } from "./AgentPanel";
-import { clearAutoCheckpoints } from "../../lib/checkpoints";
 import type { AgentEvent } from "../../lib/rpc";
 
 const mocks = vi.hoisted(() => ({
@@ -89,39 +88,8 @@ function callsTo(method: string) {
   return mocks.rpc.mock.calls.filter(([name]) => name === method);
 }
 
-/** Index of the first call to `method`, or Infinity when it never happened. */
-function firstCallIndex(method: string): number {
-  const index = mocks.rpc.mock.calls.findIndex(([name]) => name === method);
-  return index === -1 ? Number.POSITIVE_INFINITY : index;
-}
-
-let checkpointSeq = 0;
-
-/**
- * Loop replies that never satisfy the DONE gate. The queue running dry blocks
- * the loop, which is how these tests end a run in a bounded number of turns
- * rather than riding it to the 100-iteration cap.
- */
-function stubLoopRpc(replies: string[]) {
-  const queue = [...replies];
-  mocks.rpc.mockImplementation(async (method: string) => {
-    if (method === "checkpoint_create") {
-      checkpointSeq += 1;
-      return { id: `cp-${1_700_000_000_000 + checkpointSeq}` };
-    }
-    if (method === "agent_chat") {
-      const reply = queue.shift();
-      if (reply === undefined) throw new Error("provider refused the request");
-      return { sessionId: "session-1", reply, toolCalls: [] };
-    }
-    return {};
-  });
-}
-
 beforeEach(() => {
   HTMLElement.prototype.scrollTo = vi.fn();
-  checkpointSeq = 0;
-  clearAutoCheckpoints();
   for (const mock of Object.values(mocks)) mock.mockReset();
   mocks.connectEvents.mockImplementation((_handler: (event: AgentEvent) => void) => () => {});
   mocks.createSession.mockResolvedValue({ id: "session-1", workspaceRoot: "/tmp/game" });
@@ -132,118 +100,34 @@ beforeEach(() => {
   mocks.openLoopReport.mockResolvedValue({ report: null });
   mocks.loadModelDev.mockResolvedValue({ index: null, catalog: {}, contextLimits: {} });
   mocks.readCoreConfig.mockResolvedValue(null);
-  stubLoopRpc([]);
+  mocks.rpc.mockResolvedValue({});
 });
 
 afterEach(cleanup);
 
-describe("automatic restore points", () => {
-  // Loop checkpointing moved to core with the driver (`loop_run.rs`); it is
-  // covered there by `a_loop_takes_a_restore_point_before_it_edits_anything`
-  // and `a_failing_restore_point_does_not_stop_the_loop`, which exercise the
-  // real thing rather than a mocked RPC. `/goal` still drives client-side, so
-  // the rounds below still test this panel's own checkpointing.
-  it("checkpoints before the first goal round", async () => {
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "checkpoint_create") return { id: "cp-1700000000001" };
-      if (method === "agent_chat") return { sessionId: "session-1", reply: "worked on it", toolCalls: [] };
-      if (method === "goal_evaluate") return { met: true, reason: "verified" };
-      return {};
-    });
-    renderPanel();
-    await type("/goal make the starter tests pass");
-
-    await waitFor(() => expect(screen.getByText(/goal met/)).toBeTruthy());
-    expect(callsTo("checkpoint_create")).toHaveLength(1);
-    expect(firstCallIndex("checkpoint_create")).toBeLessThan(firstCallIndex("agent_chat"));
-  });
-
-  it("does not say restore points exist when every checkpoint failed", async () => {
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "checkpoint_create") throw new Error("No space left on device");
-      if (method === "agent_chat") return { sessionId: "session-1", reply: "did a thing", toolCalls: [] };
-      if (method === "goal_evaluate") return { met: true, reason: "verified" };
-      return {};
-    });
-    renderPanel();
-    await type("/goal make the starter tests pass");
-
-    await waitFor(() => expect(screen.getByText(/goal met/)).toBeTruthy());
-    expect(screen.queryByText(/restore point/)).toBeNull();
-  });
-
-  it("throttles rapid iterations to far fewer checkpoints than turns", async () => {
-    // Five back-to-back goal rounds inside one throttle window: only the forced
-    // first-round checkpoint may copy the project.
-    const verdicts = [
-      { met: false, reason: "not yet 1" },
-      { met: false, reason: "not yet 2" },
-      { met: false, reason: "not yet 3" },
-      { met: false, reason: "not yet 4" },
-      { met: true, reason: "verified" },
-    ];
-    const queue = [...verdicts];
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "checkpoint_create") {
-        checkpointSeq += 1;
-        return { id: `cp-${1_700_000_000_000 + checkpointSeq}` };
-      }
-      if (method === "agent_chat") return { sessionId: "session-1", reply: "worked on it", toolCalls: [] };
-      if (method === "goal_evaluate") return queue.shift() ?? { met: true, reason: "verified" };
-      return {};
-    });
-    renderPanel();
-    await type("/goal make the starter tests pass");
-
-    await waitFor(() => expect(screen.getByText(/goal met after 5 checks/)).toBeTruthy());
-    expect(callsTo("agent_chat")).toHaveLength(5);
-    expect(callsTo("checkpoint_create")).toHaveLength(1);
-  });
-
-  it("closes a run by naming the restore points and how to use them", async () => {
-    mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "checkpoint_create") return { id: "cp-1700000000001" };
-      if (method === "agent_chat") return { sessionId: "session-1", reply: "worked on it", toolCalls: [] };
-      if (method === "goal_evaluate") return { met: true, reason: "verified" };
-      return {};
-    });
-    renderPanel();
-    await type("/goal make the starter tests pass");
-
-    const line = await screen.findByText(/1 restore point saved during this run/);
-    expect(line.textContent).toContain("/checkpoints");
-    expect(line.textContent).toContain("/restore <id> confirm");
-  });
-});
-
 describe("/checkpoints and /restore", () => {
-  it("lists what a blocked run checkpointed, and closes it with the restore line", async () => {
-    // Driven through `/goal`, which still checkpoints client-side. `/loop`
-    // moved its driver to core, so this panel no longer mints those rows.
+  it("lists the core-owned restore points that survive reloads", async () => {
     mocks.rpc.mockImplementation(async (method: string) => {
-      if (method === "checkpoint_create") return { id: "cp-1700000000001" };
-      if (method === "agent_chat") return { sessionId: "session-1", reply: "worked on it", toolCalls: [] };
-      if (method === "goal_evaluate") return { met: true, reason: "verified" };
+      if (method === "checkpoint_list") {
+        return {
+          checkpoints: [{ id: "git-1700000000001", kind: "git", createdAtMs: 1_700_000_000_001 }],
+        };
+      }
       return {};
     });
     renderPanel();
-    await type("/goal polish the game");
-
-    expect(await screen.findByText(/goal met/)).toBeTruthy();
-    expect(await screen.findByText(/1 restore point saved during this run/)).toBeTruthy();
-
     await type("/checkpoints");
     const listed = await screen.findByText(/Restore points, newest first/);
-    expect(listed.textContent).toContain("cp-1700000000001");
-    expect(listed.textContent).toContain("before a /goal turn");
-    expect(listed.textContent).toContain("polish the game");
+    expect(listed.textContent).toContain("git-1700000000001");
+    expect(listed.textContent).toContain("git snapshot");
+    expect(callsTo("checkpoint_list")).toHaveLength(1);
   });
 
   it("says so when nothing has been recorded yet", async () => {
     renderPanel();
     await type("/checkpoints");
 
-    expect(await screen.findByText(/No restore points recorded yet/)).toBeTruthy();
+    expect(await screen.findByText(/No restore points exist yet/)).toBeTruthy();
     expect(callsTo("checkpoint_restore")).toHaveLength(0);
   });
 

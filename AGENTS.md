@@ -448,7 +448,7 @@ the run is registered and the driver continues detached, so a loop outlives the
 request — and the tab — that started it:
 
 ```
-loop_start {projectSlug, goal, profile?, intervalMs?, sessionId?, maxIterations?}
+loop_start {projectSlug, goal, profile?, intervalMs?, sessionId?}
 loop_stop {loopId} · loop_status {loopId} · loop_runs {}
 ```
 
@@ -460,9 +460,9 @@ loop_stop {loopId} · loop_status {loopId} · loop_runs {}
 - `Aaa` completion defers entirely to
   `loop_report::validate_completion_readiness` — the same gate a model calling
   `loop_report_update` must clear, so the loop cannot finish itself by a route
-  the report would have rejected. Measured: with no report on disk, three DONEs
-  in a row were refused and the run hit its cap, where `standard` completed in
-  two iterations.
+  the report would have rejected. Measured: with no passing report on disk,
+  three DONEs in a row are refused and the run remains live until Stop, while
+  `standard` completes in two iterations.
 - Progress rides the SSE bus as `loop.iteration`, `loop.done_refused`,
   `loop.completed`, `loop.finished`.
 - **The panel rejoins a run it did not start.** On mount it asks `loop_runs`

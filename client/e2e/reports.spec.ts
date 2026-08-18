@@ -323,6 +323,7 @@ test.describe("Reports workspace", () => {
       await projectButton.click();
 
       const reportsTab = page.getByRole("tab", { name: "reports", exact: true });
+      if ((await reportsTab.count()) === 0) await page.getByRole("button", { name: "Show Reports" }).click();
       await expect(reportsTab).toBeVisible();
       await reportsTab.click();
       await expect(reportsTab).toHaveAttribute("aria-selected", "true");

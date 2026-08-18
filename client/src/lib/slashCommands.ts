@@ -1,7 +1,6 @@
 import { parseRestoreArgs } from "./checkpoints";
 import { parseInterval, parseLoopArgs, type LoopProfile } from "./interval";
 import type { FileCommandInfo, SkillInfo } from "./extensions";
-import { parseGoalCommand, type GoalCommand } from "./goal";
 import type { CommandPanel } from "./types";
 
 // Slash-command registry for the agent panel — the harness surface that codex,
@@ -58,8 +57,6 @@ export interface SlashContext {
   runGraphGoal: (goal: string, template?: string) => Promise<void>;
   /** Cancel the active task graph, if any. */
   stopGraph: () => void | Promise<void>;
-  /** Set, show or clear the session goal (see lib/goal). */
-  runGoalCommand: (command: GoalCommand) => void | Promise<void>;
   /** Print the restore points automatic checkpointing recorded. */
   listCheckpoints: () => void | Promise<void>;
   /**
@@ -113,17 +110,6 @@ export interface SlashCommand extends NamedCommand {
   run: (args: string, ctx: SlashContext) => void | Promise<void>;
 }
 
-/**
- * Iterations `/loop` will run before it stops asking for tools and hands back
- * a summary. This is a runaway backstop, not a product limit: the loop's real
- * exit is its completion gate, and the real runaway guard is `detectStall`
- * in lib/loopGuards — a counter only catches a stuck loop by accident, since
- * twenty iterations of genuine progress and twenty repeats of one failing
- * action look identical to it. Comparable harnesses bear this out: Codex and
- * opencode ship no cap at all, and Hermes — the one that does — sits at 90.
- */
-export const MAX_LOOP_ITERATIONS = 100;
-
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   {
     name: "help",
@@ -157,7 +143,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
       // the loop would spend an hour chasing the goal "15m".
       if (!goal || parseInterval(goal) !== null) {
         ctx.say(
-          "Usage: /loop <goal> — I'll keep working until the goal is met or I hit the iteration cap.\n" +
+          "Usage: /loop <goal> — I'll keep working until the goal is met or you stop the run.\n" +
             "/loop <interval> <goal> — same work, paced: `/loop 15m run the tests and fix what fails` keeps re-checking every 15m until you stop it. Units are s, m, h.\n" +
             "/loop --aaa <goal> — the quality pipeline: a specialist task graph, PIE evidence, and a judge that has to score the result before DONE is believed.",
         );
@@ -230,12 +216,6 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = [
       }
       return ctx.runGraphGoal(match[2].trim(), match[1]);
     },
-  },
-  {
-    name: "goal",
-    summary: "Keep working toward a goal, re-checked after every turn",
-    usage: "[objective | clear]",
-    run: (args, ctx) => ctx.runGoalCommand(parseGoalCommand(args)),
   },
   {
     name: "graph-stop",

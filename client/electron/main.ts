@@ -321,7 +321,9 @@ function registerIpc(panel: BrowserPanel): void {
     });
     return result.canceled ? null : (result.filePaths[0] ?? null);
   });
-  ipcMain.handle(IPC.panelBounds, (_event, bounds: PanelBounds) => {
+  // Bounds are high-frequency, fire-and-forget layout updates from the
+  // renderer (`ipcRenderer.send`), not request/response calls.
+  ipcMain.on(IPC.panelBounds, (_event, bounds: PanelBounds) => {
     panel.setBounds(bounds);
   });
   ipcMain.handle(IPC.panelTarget, () => panel.targetId());

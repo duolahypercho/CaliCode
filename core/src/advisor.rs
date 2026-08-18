@@ -59,6 +59,27 @@ const MAX_TOOL_ROUNDS: usize = 4;
 const EMPTY_REPLY: &str =
     "The advisor returned an empty reply. Ask again, or narrow the question to one part of the run.";
 
+/// Server-side ceiling on the observed transcript excerpt. The client
+/// truncates first; this keeps a buggy or non-browser client from crowding the
+/// operator's actual question out of the context window.
+const MAX_TRANSCRIPT_CHARS: usize = 12_000;
+
+/// Keep the tail of an over-long excerpt: the newest activity is what an
+/// explanation usually turns on. Character indexing keeps the returned slice
+/// on a UTF-8 boundary.
+fn clamp_transcript(transcript: &str) -> (&str, bool) {
+    let total = transcript.chars().count();
+    if total <= MAX_TRANSCRIPT_CHARS {
+        return (transcript, false);
+    }
+    let start = transcript
+        .char_indices()
+        .nth(total - MAX_TRANSCRIPT_CHARS)
+        .map(|(index, _)| index)
+        .unwrap_or(0);
+    (&transcript[start..], true)
+}
+
 /// One question about a run: the thread so far plus everything that scopes it.
 #[derive(Default)]
 pub struct AdvisorRequest<'a> {
@@ -79,9 +100,9 @@ pub struct AdvisorRequest<'a> {
 /// Load config the way the other model-backed RPCs do and ask once.
 pub async fn advise(state: &AppState, request: AdvisorRequest<'_>) -> Result<Value> {
     let mut config = { state.config.read().await.clone() };
-    // Explaining a run is judging one, so it follows the same `judge` role
-    // routing `goal_evaluate` uses: an operator who mapped a cheap model to
-    // that role gets it here too. Unmapped, this is a no-op.
+    // Explaining a run is judging one, so it follows the graph judge's role
+    // routing. An operator who mapped a cheap model to that role gets it here
+    // too. Unmapped, this is a no-op.
     crate::config::apply_role_model(&mut config, &["judge".to_string()]);
     if let Some((provider, model)) = request.model {
         apply_model_choice(&mut config, provider, model)?;
@@ -352,7 +373,7 @@ fn read_history(messages: &[Value]) -> Vec<Value> {
 /// can never be mistaken for the operator speaking, and so the replayed
 /// history keeps strict user/assistant alternation.
 fn build_system(transcript: &str, project_slug: Option<&str>, anchor: Option<&str>) -> String {
-    let (excerpt, truncated) = crate::goal::clamp_transcript(transcript);
+    let (excerpt, truncated) = clamp_transcript(transcript);
     let mut prompt = String::from(SYSTEM_PROMPT);
     prompt.push_str("\n\nOBSERVED SESSION");
     if let Some(slug) = project_slug.map(str::trim).filter(|slug| !slug.is_empty()) {
@@ -394,7 +415,6 @@ fn clamp_anchor(anchor: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::goal::MAX_TRANSCRIPT_CHARS;
     use axum::response::sse::{Event, Sse};
     use axum::routing::post;
     use axum::Router;
@@ -937,6 +957,14 @@ mod tests {
         assert!(sent.contains("TAIL-EVIDENCE"));
         assert!(sent.contains("[earlier transcript omitted]"));
         assert!(longest_run(sent, 'y') < MAX_TRANSCRIPT_CHARS);
+    }
+
+    #[test]
+    fn transcript_clamping_keeps_utf8_intact() {
+        let transcript = "é".repeat(MAX_TRANSCRIPT_CHARS + 500);
+        let (kept, truncated) = clamp_transcript(&transcript);
+        assert!(truncated);
+        assert_eq!(kept.chars().count(), MAX_TRANSCRIPT_CHARS);
     }
 
     #[tokio::test]

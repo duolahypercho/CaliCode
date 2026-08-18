@@ -65,7 +65,7 @@ const modelList = {
 
 let emitEvent: ((event: AgentEvent) => void) | null = null;
 
-function renderPanel() {
+function renderPanel(initialSessionId?: string) {
   return render(
     <AgentPanel
       projectSlug="demo"
@@ -74,6 +74,7 @@ function renderPanel() {
       browserTools={[]}
       onModelChange={() => {}}
       onLog={() => {}}
+      initialSessionId={initialSessionId}
     />,
   );
 }
@@ -111,7 +112,92 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("streamed reasoning", () => {
-  it("shows the model's thinking in the transcript as it streams", async () => {
+  it("does not repeat the speaker label around a legacy untagged fragment", async () => {
+    mocks.loadSession.mockResolvedValue({
+      id: "session-1",
+      workspaceRoot: "/tmp/game",
+      updatedAt: 3,
+      messages: [
+        { role: "user", content: "can you see what is in the browser?" },
+        {
+          role: "tool",
+          tool: "turn",
+          content: "",
+          turnId: "turn-1",
+          status: "done",
+          startedAtMs: 1_000,
+          completedAtMs: 3_000,
+        },
+        { role: "assistant", content: "visible." },
+        {
+          role: "tool",
+          tool: "browser_snapshot",
+          content: "Used browser_snapshot",
+          toolCallId: "snapshot-1",
+          turnId: "turn-1",
+          status: "done",
+          startedAtMs: 1_000,
+          completedAtMs: 3_000,
+        },
+        { role: "assistant", content: "The browser is on GitHub.", turnId: "turn-1" },
+      ],
+    });
+
+    renderPanel("session-1");
+
+    await waitFor(() => expect(screen.getByText("The browser is on GitHub.")).toBeTruthy());
+    expect(screen.getAllByText("CALICODE")).toHaveLength(1);
+  });
+
+  it("keeps pre-tool commentary and the final report in one turn", async () => {
+    let resolveChat: ((value: { sessionId: string; reply: string; toolCalls: unknown[] }) => void) | null = null;
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === "agent_chat") {
+        return new Promise((resolve) => {
+          resolveChat = resolve;
+        });
+      }
+      return {};
+    });
+
+    renderPanel();
+    await startTurn();
+    await waitFor(() => expect(resolveChat).not.toBeNull());
+
+    await act(async () => {
+      emitEvent?.({ type: "agent.delta", sessionId: "session-1", delta: "visible." });
+      emitEvent?.({
+        type: "agent.tool_started",
+        sessionId: "session-1",
+        tool: "browser_snapshot",
+        toolCallId: "snapshot-1",
+        startedAtMs: 1_000,
+      });
+      emitEvent?.({
+        type: "agent.tool_finished",
+        sessionId: "session-1",
+        tool: "browser_snapshot",
+        toolCallId: "snapshot-1",
+        startedAtMs: 1_000,
+        finishedAtMs: 3_000,
+        result: { title: "GitHub" },
+      });
+      resolveChat?.({
+        sessionId: "session-1",
+        reply: "The browser is on GitHub.",
+        toolCalls: [{ name: "browser_snapshot" }],
+      });
+    });
+
+    await waitFor(() => expect(screen.getByText("The browser is on GitHub.")).toBeTruthy());
+    expect(screen.getAllByText("CALICODE")).toHaveLength(1);
+    const assistantRows = [...document.querySelectorAll('[data-role="assistant"]')];
+    expect(assistantRows).toHaveLength(2);
+    expect(assistantRows[0]?.textContent).toContain("visible.");
+    expect(assistantRows[1]?.textContent).toContain("The browser is on GitHub.");
+  });
+
+  it("keeps thinking quiet until clicked, then reveals the streamed reasoning", async () => {
     renderPanel();
     await startTurn();
 
@@ -120,7 +206,46 @@ describe("streamed reasoning", () => {
       emitEvent?.({ type: "agent.reasoning", sessionId: "session-1", delta: "the scene graph." });
     });
 
-    await waitFor(() => expect(screen.getByText(/First I check the scene graph\./)).toBeTruthy());
+    const thinking = await waitFor(() => screen.getByRole("button", { name: /Think/ }));
+    expect(thinking.getAttribute("aria-expanded")).toBe("false");
+    expect(screen.queryByText(/First I check the scene graph\./)).toBeNull();
+
+    fireEvent.click(thinking);
+    expect(screen.getByText(/First I check the scene graph\./)).toBeTruthy();
+  });
+
+  it("does not add a second generic working row while a tool is running", async () => {
+    let resolveChat: ((value: { sessionId: string; reply: string; toolCalls: unknown[] }) => void) | null = null;
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === "agent_chat") {
+        return new Promise((resolve) => {
+          resolveChat = resolve;
+        });
+      }
+      return {};
+    });
+
+    renderPanel();
+    await startTurn();
+    await waitFor(() => expect(resolveChat).not.toBeNull());
+
+    await act(async () => {
+      emitEvent?.({
+        type: "agent.tool_started",
+        sessionId: "session-1",
+        tool: "browser_snapshot",
+        toolCallId: "snapshot-1",
+        startedAtMs: 1_000,
+      });
+    });
+
+    expect(screen.queryByLabelText("Agent is thinking")).toBeNull();
+    const completeChat = resolveChat as
+      | ((value: { sessionId: string; reply: string; toolCalls: unknown[] }) => void)
+      | null;
+    if (completeChat) {
+      completeChat({ sessionId: "session-1", reply: "Done.", toolCalls: [{ name: "browser_snapshot" }] });
+    }
   });
 
   it("keeps reasoning out of the saved transcript", async () => {

@@ -300,6 +300,14 @@ describe("GamesSidebar nav block", () => {
     expect(onOpenAssetsLibrary).toHaveBeenCalledTimes(1);
   });
 
+  it("exposes a Projects row that calls its handler", () => {
+    const onOpenProjectHub = vi.fn();
+    renderSidebar({ onOpenProjectHub });
+
+    fireEvent.click(screen.getByRole("button", { name: "Projects" }));
+    expect(onOpenProjectHub).toHaveBeenCalledTimes(1);
+  });
+
   it("marks the Assets Library row selected when the library view is active", () => {
     renderSidebar({ assetsLibraryActive: true });
 

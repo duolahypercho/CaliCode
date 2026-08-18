@@ -91,8 +91,8 @@ export function GraphPanel({ graph, onCancel, onRerun, onSelectNode, tickers }: 
   const selected = graph.nodes.find((node) => node.id === selectedId) ?? null;
 
   return (
-    <div className="flex min-h-0 flex-col border-b border-line bg-surface-0">
-      <div className="flex items-center gap-2.5 border-b border-line px-3 py-2">
+    <div className="flex h-full min-h-0 flex-col bg-surface-0" data-graph-panel>
+      <div className="flex shrink-0 items-center gap-2.5 border-b border-line px-3 py-2">
         <span className="shrink-0 text-[10px] font-medium uppercase tracking-[0.14em] text-ink-subtle">Graph</span>
         <span className="min-w-0 flex-1 truncate text-xs text-ink" title={graph.goal}>
           {graph.goal}
@@ -122,7 +122,7 @@ export function GraphPanel({ graph, onCancel, onRerun, onSelectNode, tickers }: 
         ) : null}
       </div>
 
-      <div className="relative min-w-0 overflow-x-auto">
+      <div className="relative min-h-0 min-w-0 flex-1 overflow-auto">
         <div
           className="relative bg-[radial-gradient(var(--line-strong)_1px,transparent_1px)] [background-size:22px_22px]"
           style={{ width, height, minWidth: width }}
@@ -135,7 +135,7 @@ export function GraphPanel({ graph, onCancel, onRerun, onSelectNode, tickers }: 
                   key={edge.id}
                   d={`M ${edge.x1} ${edge.y1} C ${mid} ${edge.y1}, ${mid} ${edge.y2}, ${edge.x2} ${edge.y2}`}
                   fill="none"
-                  stroke="#5a5a5a"
+                  stroke="var(--line-strong)"
                   strokeWidth={1.5}
                 />
               );

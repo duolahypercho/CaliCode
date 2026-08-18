@@ -730,8 +730,12 @@ fn git_stdout(directory: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(output.stdout).context("git returned non-UTF-8 output")
 }
 
-/// Permanently remove one explicitly named project. Refuse to remove the last
-/// project so the editor always has a valid project to open.
+/// Marker written when the user intentionally removes the last project. Core
+/// seeds a Starter project for a brand-new install, but must not resurrect it
+/// after the user has deliberately chosen an empty project hub.
+pub const EMPTY_PROJECTS_MARKER: &str = ".empty-projects";
+
+/// Permanently remove one explicitly named project, including the last one.
 pub fn delete_project(root: &Path, slug: &str) -> Result<Value> {
     let clean = sanitize_slug(slug)?;
     let directory = project_dir(root, &clean)?;
@@ -739,14 +743,17 @@ pub fn delete_project(root: &Path, slug: &str) -> Result<Value> {
         anyhow::bail!("project {clean} not found");
     }
     let count = list_projects(root)?.as_array().map(Vec::len).unwrap_or(0);
-    if count <= 1 {
-        anyhow::bail!("cannot remove the last project");
-    }
 
     let root_real = root.canonicalize()?;
     let directory_real = directory.canonicalize()?;
     if directory_real.parent() != Some(root_real.as_path()) {
         anyhow::bail!("refusing to remove a project outside the projects directory");
+    }
+    if count == 1 {
+        // Write the intent before deleting the directory: a marker failure
+        // must leave the project recoverable rather than allowing a later
+        // core restart to recreate Starter behind the user's back.
+        std::fs::write(root.join(EMPTY_PROJECTS_MARKER), b" intentionally empty\n")?;
     }
     std::fs::remove_dir_all(&directory_real)?;
     Ok(json!({ "slug": clean, "deleted": true }))
@@ -1085,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_removes_one_project_but_not_the_last() {
+    fn delete_removes_one_project_and_can_leave_an_empty_hub() {
         let root = tempfile::tempdir().unwrap();
         create_project(root.path(), "one", "One").unwrap();
         create_project(root.path(), "two", "Two").unwrap();
@@ -1093,7 +1100,14 @@ mod tests {
         delete_project(root.path(), "one").unwrap();
         assert!(!root.path().join("one").exists());
         assert!(root.path().join("two/project.json").exists());
-        assert!(delete_project(root.path(), "two").is_err());
+        delete_project(root.path(), "two").unwrap();
+        assert!(!root.path().join("two").exists());
+        assert!(root.path().join(EMPTY_PROJECTS_MARKER).exists());
+        assert!(list_projects(root.path())
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

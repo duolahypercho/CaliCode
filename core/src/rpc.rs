@@ -254,8 +254,9 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
         )?),
         "project_delete" => {
             let slug = str_param(&params, "slug")?;
-            // Delete the project first so a failed "last project" guard or
-            // other store error leaves every session/worktree recoverable.
+            // Delete the project first so a store error leaves every
+            // session/worktree recoverable; deleting the last project is a
+            // supported route to the empty project hub.
             let project = store::delete_project(&state.projects_root, slug)?;
             let sessions = delete_project_sessions(state, slug).await?;
             Ok(json!({ "project": project, "sessions": sessions }))
@@ -761,11 +762,6 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                     .get("guardianModel")
                     .and_then(Value::as_str)
                     .map(String::from),
-                max_iterations: params
-                    .get("maxIterations")
-                    .and_then(Value::as_u64)
-                    .map(|value| value as usize)
-                    .unwrap_or(crate::loop_run::MAX_ITERATIONS),
             };
             Ok(json!({ "loop": state.loops.start(state, spec).await? }))
         }
@@ -1490,18 +1486,6 @@ async fn dispatch(state: &AppState, method: &str, params: Value) -> Result<Value
                 "found": found,
                 "cancelled": newly_cancelled,
             }))
-        }
-        // Tool-less per-turn verifier behind the client's `/goal` command.
-        // The evaluator judges only the evidence already in the transcript,
-        // so it cannot confirm a goal by running something itself.
-        "goal_evaluate" => {
-            crate::goal::evaluate(
-                state,
-                str_param(&params, "goal")?,
-                str_param(&params, "transcript")?,
-                params.get("projectSlug").and_then(Value::as_str),
-            )
-            .await
         }
         // Side conversation *about* a run. Unlike `agent_chat` this registers
         // no tools and touches no session: the advisor can only read the
@@ -2855,25 +2839,6 @@ mod tests {
             size_param(&json!({ "cols": 999_999 }), "cols", 80),
             u16::MAX
         );
-    }
-
-    /// Both strings are required. Reaching the provider without a goal would
-    /// spend a model call to verify nothing.
-    #[tokio::test]
-    async fn goal_evaluate_requires_a_goal_and_a_transcript() {
-        let projects = tempfile::tempdir().unwrap();
-        let sessions = tempfile::tempdir().unwrap();
-        let state = test_state(projects.path().to_path_buf(), sessions.path().to_path_buf());
-
-        let missing_goal = dispatch(&state, "goal_evaluate", json!({ "transcript": "ran it" }))
-            .await
-            .unwrap_err();
-        assert!(missing_goal.to_string().contains("goal"));
-
-        let missing_transcript = dispatch(&state, "goal_evaluate", json!({ "goal": "tests pass" }))
-            .await
-            .unwrap_err();
-        assert!(missing_transcript.to_string().contains("transcript"));
     }
 
     /// `transcript` is optional — an advisor asked before anything happened is

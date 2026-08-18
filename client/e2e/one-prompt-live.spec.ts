@@ -303,6 +303,7 @@ test.describe("one-prompt live production proof @live", () => {
       expect(persisted.tests.length).toBeGreaterThan(baseline.tests.length);
 
       const reportsTab = page.getByRole("tab", { name: "reports", exact: true });
+      if ((await reportsTab.count()) === 0) await page.getByRole("button", { name: "Show Reports" }).click();
       await reportsTab.click();
       const reportsPanel = page.locator("#workspace-panel-reports");
       await expect(reportsPanel.getByText(goal, { exact: true })).toBeVisible({ timeout: 30_000 });

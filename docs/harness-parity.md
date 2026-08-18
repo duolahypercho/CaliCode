@@ -76,9 +76,9 @@ Ranked by value × fit × tractability. Each is one loop iteration.
 ### Tier 1 — command surface (explicitly requested)
 1. **Slash-command system** — registry + `/`-autocomplete menu in the composer.
    Convert the hardcoded `/model` into the first registered command. *client only.*
-2. **`/loop <goal>`** — continuous autonomous execution: re-send the goal each
-   turn until the agent reports done or a max-iteration cap, streaming progress
-   and stoppable. *client only (loops `agent_chat`).*
+2. **`/loop <goal>`** — continuous autonomous execution: the core-owned driver
+   re-sends the goal until the agent reports done or the user stops it,
+   streaming progress and surviving tab reloads. *core + client.*
 3. **`/help`, `/clear`, `/new`** — list commands; reset transcript; new session. *client only.*
 4. **`/compact`** — summarize the transcript to reclaim context. *client + one core RPC.*
 5. **`/diff`** — list files the agent changed this session (reuse checkpoint data). *client + core.*
