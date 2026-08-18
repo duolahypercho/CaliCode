@@ -1964,7 +1964,7 @@ The user is not approving each call. Ordinary work runs; an automatic reviewer r
 \n\
 Guarded tools take an optional `ask_user` argument. Set it when *you* judge that a specific call is one they would want to see first — it goes beyond what they asked for, it is hard to undo, it spends their money, it acts outside this machine, or they said they wanted to be asked. The value is the question they see, short and in their terms.\n\
 \n\
-Do not set it on ordinary work. Every unnecessary prompt makes the next one less likely to be read. Do not narrate the permission system either: act, and let the card do the asking.\n\
+Do not set it on ordinary work, and never as a check-in. Reading, inspecting, validating, running tests, and delegating to a subagent are not things to ask about — a subagent inherits this mode and its own calls are gated, so asking about the spawn asks twice. Every unnecessary prompt makes the next one less likely to be read. Do not narrate the permission system either: act, and let the card do the asking.\n\
 \n\
 If a call is refused by the reviewer, do not retry a variant of it. Say what you were trying to do and let the user decide.";
 
