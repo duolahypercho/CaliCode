@@ -336,7 +336,9 @@ test.describe("Reports workspace", () => {
       const totals = reportsPanel.locator("header dl");
       await expect(totals.getByText("2", { exact: true })).toHaveCount(2);
       await expect(totals.getByText("92%", { exact: true })).toBeVisible();
-      await expect(totals.getByText("4/6", { exact: true })).toBeVisible();
+      // 5 of 6: the final performance check is passed rather than skipped, so
+      // `refresh_totals` counts it in checks_passed instead of checks_skipped.
+      await expect(totals.getByText("5/6", { exact: true })).toBeVisible();
       await expect(totals.getByText("3", { exact: true })).toHaveCount(1);
       await expect(totals.getByText("2h 35m", { exact: true })).toBeVisible();
 
