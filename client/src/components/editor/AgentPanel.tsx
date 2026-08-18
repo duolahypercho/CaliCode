@@ -3349,7 +3349,15 @@ export function AgentPanel({
                       disabled={answering}
                       onClick={() => void respondToApproval(entry, false)}
                     >
-                      <ShieldOff className="mr-1 h-3.5 w-3.5" /> {plan ? "Keep planning" : "Deny"}
+                      {plan ? (
+                        <>
+                          <Eye className="mr-1 h-3.5 w-3.5" /> Keep planning
+                        </>
+                      ) : (
+                        <>
+                          <ShieldOff className="mr-1 h-3.5 w-3.5" /> Deny
+                        </>
+                      )}
                     </Button>
                     {/* Optional, and deliberately not a modal step: a denial
                         must stay one click. Enter denies with what is typed,
