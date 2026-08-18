@@ -174,7 +174,6 @@ export type AgentEvent = {
   loopId?: string;
   /** `loop.iteration` only. */
   iteration?: number;
-  maxIterations?: number;
   /** `loop.iteration` only: the prompt core is about to send. */
   prompt?: string;
   /** `loop.finished` only: the run's terminal view (see `LoopRun`). */

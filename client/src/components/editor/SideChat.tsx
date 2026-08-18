@@ -4,7 +4,7 @@ import { Textarea } from "../ui/textarea";
 import { AgentText } from "./AgentText";
 import { ModelPicker, buildModelChoices } from "./ModelPicker";
 import { SlashMenu } from "./SlashMenu";
-import { buildTranscriptWindow } from "../../lib/goal";
+import { buildTranscriptWindow } from "../../lib/transcript";
 import { completeSlashToken, matchCommandsIn, parseSlashIn, type NamedCommand } from "../../lib/slashCommands";
 import { defaultEffort, effortLevelsFor, loadModelDev, type EffortIndex } from "../../lib/modelMeta";
 import { connectEvents, rpc } from "../../lib/rpc";
@@ -62,7 +62,7 @@ export interface SideMessage {
   failed?: boolean;
 }
 
-/** Matches the evaluator's budget; core prompts the advisor with the same tail. */
+/** Core applies a larger final ceiling; this keeps the normal request cheap. */
 const TRANSCRIPT_CHARS = 8000;
 
 /** The side chat's own model pick, which never moves the run's active model. */

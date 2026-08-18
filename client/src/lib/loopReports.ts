@@ -159,7 +159,6 @@ export interface LoopRun {
   profile: "standard" | "aaa";
   status: "running" | "completed" | "stopped" | "failed";
   iteration: number;
-  maxIterations: number;
   startedAtMs: number;
   intervalMs?: number;
   sessionId?: string;

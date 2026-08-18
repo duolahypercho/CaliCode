@@ -24,10 +24,10 @@ import {
   Terminal,
   TestTube2,
   X,
+  Workflow,
 } from "lucide-react";
 import { AgentText } from "./AgentText";
 import { CommandPanelView } from "./CommandPanels";
-import { GraphPanel } from "./GraphPanel";
 import { ReasoningRow } from "./ReasoningRow";
 import { ModelPicker, buildModelChoices } from "./ModelPicker";
 import { RunStatusPill, type ActiveLoopRun } from "./RunStatusPill";
@@ -35,25 +35,12 @@ import type { SideChatAnchor } from "./SideChat";
 import { SlashMenu } from "./SlashMenu";
 import { TurnFileSummaryCard } from "./TurnFileSummaryCard";
 import {
-  buildEvaluatorTranscript,
-  formatGoalStatus,
-  goalContinuationPrompt,
-  goalIsVerifiable,
-  type GoalCommand,
-  type GoalState,
-} from "../../lib/goal";
-import { budgetNotice, detectStall, exhaustionPrompt, type LoopAction } from "../../lib/loopGuards";
-import {
-  AUTO_CHECKPOINT_KEEP,
   checkpointTakenAtMs,
-  dueForCheckpoint,
   formatCheckpointAge,
   formatCheckpointList,
-  readAutoCheckpoints,
-  recordAutoCheckpoint,
   restoreWarning,
-  type AutoCheckpointReason,
   type CheckpointKind,
+  type ListedCheckpoint,
 } from "../../lib/checkpoints";
 import { SubagentChips, type SubagentChipItem } from "./SubagentChips";
 import { Button } from "../ui/button";
@@ -99,7 +86,6 @@ import {
   type LoopProfile,
 } from "../../lib/interval";
 import {
-  MAX_LOOP_ITERATIONS,
   SLASH_COMMANDS,
   completeSlashToken,
   matchCommandsIn,
@@ -695,6 +681,10 @@ interface AgentPanelProps {
   onSessionActivated?: (session: SessionSummary) => void;
   /** Opens a workspace file when a safe activity path is selected. */
   onOpenActivityFile?: (file: ActivityFileChange) => void;
+  /** Publishes the live graph to the right-side workspace dock. */
+  onGraphChange?: (graph: TaskGraph | null, tickers: Record<string, string>) => void;
+  /** Reveals the graph tab when the in-chat graph summary is selected. */
+  onOpenGraph?: () => void;
   /**
    * Reports the session id this panel currently owns — fires when a new
    * session is created, a saved one is resumed, or a fork re-keys the panel.
@@ -711,6 +701,36 @@ interface AgentPanelProps {
    */
   onSessionRunningChange?: (running: boolean, sessionId: string | null) => void;
   /** Opens the tools dock as a drawer below lg, where it leaves the layout. */
+}
+
+/** One visible assistant block; a turn renderer uses `continuation` to keep one speaker label. */
+function AssistantMessageRow({
+  message,
+  continuation = false,
+}: {
+  message: AgentMessage;
+  continuation?: boolean;
+}) {
+  return (
+    <div
+      data-role="assistant"
+      className={`max-w-[94%] self-start ${continuation ? "" : "mt-3"}`}
+    >
+      {continuation ? null : (
+        <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-ink-subtle">CALICODE</div>
+      )}
+      <div className="text-[13px] leading-[1.6] text-ink">
+        {message.panel ? <CommandPanelView panel={message.panel} /> : <AgentText content={message.content} />}
+      </div>
+    </div>
+  );
+}
+
+function previousUserIndex(messages: AgentMessage[], beforeIndex: number): number {
+  for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") return index;
+  }
+  return -1;
 }
 
 /**
@@ -960,6 +980,7 @@ export function ActivityTurnRow({
   const elapsed = durationForTurn(marker?.startedAtMs, marker?.completedAtMs, nowMs);
   const operation = latest?.activity?.operation ?? classifyActivityOperation(latest?.tool ?? "tool");
   const summary = latest?.content || (live ? "Working…" : marker?.stopped ? "Stopped" : "Completed");
+  const statusLabel = live ? `Working for ${formatDuration(elapsed)}` : summary;
   const latestFailed = !live && latest?.status === "error";
   const changed = summariseChangedFiles(actions.map((action) => action.activity));
   return (
@@ -972,9 +993,11 @@ export function ActivityTurnRow({
         className="flex w-full items-center gap-2 rounded-md px-1 py-1 text-left text-xs text-ink-subtle transition-colors hover:bg-surface-2 active:bg-surface-3"
       >
         <ActivityIcon operation={operation} running={live} failed={latestFailed} stopped={marker?.stopped} />
-        <span className={`min-w-0 flex-1 truncate ${latestFailed ? "text-danger-soft" : "text-ink"}`}>{summary}</span>
-        {actions.length > 1 ? <span className="shrink-0 text-[10px] text-ink-faint">{actions.length} actions</span> : null}
-        <span className="shrink-0 text-[10px] text-ink-faint">{live ? `${formatDuration(elapsed)} · live` : formatDuration(elapsed)}</span>
+        <span className={`min-w-0 flex-1 truncate ${latestFailed ? "text-danger-soft" : "text-ink"}`}>{statusLabel}</span>
+        {!live && actions.length > 1 ? (
+          <span className="shrink-0 text-[10px] text-ink-faint">{actions.length} actions</span>
+        ) : null}
+        {!live ? <span className="shrink-0 text-[10px] text-ink-faint">{formatDuration(elapsed)}</span> : null}
         <ChevronRight
           aria-hidden
           className={`h-3 w-3 shrink-0 text-ink-faint transition-transform ${expanded ? "rotate-90" : ""}`}
@@ -1149,6 +1172,8 @@ export function AgentPanel({
   onOpenActivityFile,
   onActiveSessionChange,
   onSessionRunningChange,
+  onGraphChange,
+  onOpenGraph,
 }: AgentPanelProps) {
   const [messages, setMessages] = useState<AgentMessage[]>([]);
   const messagesRef = useRef<AgentMessage[]>(messages);
@@ -1211,19 +1236,14 @@ export function AgentPanel({
   const [menuIndex, setMenuIndex] = useState(0);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   // Latest task graph snapshot from `graph.updated` events, and a per-node
-  // live output ticker (last ~200 chars of each subagent's stream).
+  // live output ticker (last ~200 chars of each subagent's stream). The
+  // parent mirrors these into the right-side graph workspace.
   const [activeGraph, setActiveGraph] = useState<TaskGraph | null>(null);
   const [graphTickers, setGraphTickers] = useState<Record<string, string>>({});
   // Streamed model reasoning, per activity turn. Deliberately NOT part of
   // `messages`: reasoning is display-only, so keeping it out of the transcript
   // is what stops it being persisted into the saved session or replayed back
   // to the provider as if the model had said it.
-  // Session goal (`/goal`). A ref shadows the state because the pursuit loop
-  // reads it between awaits, where a captured render value would be stale —
-  // and clearing the goal mid-flight has to stop the loop on the next check.
-  const [goal, setGoal] = useState<GoalState | null>(null);
-  const goalRef = useRef<GoalState | null>(null);
-  goalRef.current = goal;
   const [reasoningByTurn, setReasoningByTurn] = useState<
     Record<string, { text: string; startedAtMs: number; endedAtMs?: number }>
   >({});
@@ -1234,12 +1254,6 @@ export function AgentPanel({
   const loopBaselineAvailableRef = useRef(false);
   const loopKnownGraphIdsRef = useRef<Set<string>>(new Set());
   const loopObservedGraphIdsRef = useRef<Set<string>>(new Set());
-  // Automatic restore points. The throttle stamp is panel-wide rather than
-  // per-run so a loop restarted a minute after the last one does not copy the
-  // project again, and the per-run counter decides whether the closing line
-  // about restore points is true enough to print.
-  const lastCheckpointAtRef = useRef<number | null>(null);
-  const runCheckpointsRef = useRef(0);
   // Cumulative session token totals from `agent.usage` events, feeding the
   // context meter beside the composer and the /usage command.
   const [usage, setUsage] = useState<UsageTotals | null>(null);
@@ -1290,10 +1304,23 @@ export function AgentPanel({
   const workspaceRootRef = useRef<string | null>(sessionWorkspaceRoot);
   workspaceRootRef.current = sessionWorkspaceRoot;
   const activeGraphRef = useRef<TaskGraph | null>(activeGraph);
+  const onGraphChangeRef = useRef(onGraphChange);
+  onGraphChangeRef.current = onGraphChange;
   const applyGraphSnapshot = (graph: TaskGraph) => {
     activeGraphRef.current = graph;
     setActiveGraph(graph);
   };
+  useEffect(() => {
+    onGraphChangeRef.current?.(activeGraph, graphTickers);
+  }, [activeGraph, graphTickers]);
+  useEffect(
+    () => () => {
+      // A session switch unmounts this keyed panel. Clear the dock so a graph
+      // from the previous game cannot remain visible beside the new chat.
+      onGraphChangeRef.current?.(null, {});
+    },
+    [],
+  );
   const activeTurnRef = useRef<{ turnId: string; startedAtMs: number } | null>(null);
 
   // The single writer. Everything that touches the approval queue goes through
@@ -1462,11 +1489,11 @@ export function AgentPanel({
     const disconnect = connectEvents((event: AgentEvent) => {
       if (event.type === "loop.iteration" && event.loopId === activeLoopIdRef.current) {
         setMessages((current) => [...current, { role: "user", content: String(event.prompt ?? "") }]);
-        say(`loop ${event.iteration}/${event.maxIterations}`, "tool");
+        say(`loop iteration ${event.iteration}`, "tool");
         return;
       }
       if (event.type === "loop.done_refused" && event.loopId === activeLoopIdRef.current) {
-        say(`DONE ignored: ${event.reason ?? "completion could not be proven"}`, "tool");
+        say(`DONE refused: ${event.reason ?? "completion could not be proven"}`, "tool");
         return;
       }
       if (event.type === "loop.completed" && event.loopId === activeLoopIdRef.current) {
@@ -1494,13 +1521,29 @@ export function AgentPanel({
         }
         const foreign = Boolean(event.sessionId && sessionIdRef.current && event.sessionId !== sessionIdRef.current);
         if (foreign) return;
+        const turnId = turnForEvent(event);
+        const delta = event.delta ?? "";
+        // A late broadcast must not append to the previous turn's answer. The
+        // active turn is the client-side equivalent of DeepSeek's stable
+        // message id: every visible stream fragment belongs to exactly one
+        // assistant block, even when tools interleave several blocks.
+        if (!turnId || !delta) return;
+        // The first visible block follows the reasoning block in providers
+        // that expose both. Mark that disclosure settled without waiting for
+        // the whole tool turn to finish.
+        setReasoningByTurn((current) => {
+          const existing = current[turnId];
+          return existing && existing.endedAtMs === undefined
+            ? { ...current, [turnId]: { ...existing, endedAtMs: Date.now() } }
+            : current;
+        });
         setMessages((current) => {
           const copy = [...current];
           const last = copy[copy.length - 1];
-          if (last && last.role === "assistant") {
-            copy[copy.length - 1] = { ...last, content: last.content + (event.delta ?? "") };
+          if (last?.role === "assistant" && last.turnId === turnId) {
+            copy[copy.length - 1] = { ...last, content: last.content + delta };
           } else {
-            copy.push({ role: "assistant", content: event.delta ?? "" });
+            copy.push({ role: "assistant", content: delta, turnId });
           }
           return copy;
         });
@@ -1679,6 +1722,15 @@ export function AgentPanel({
       if (event.type === "agent.tool_started" && event.tool && eventIsLocalActivity(event)) {
         const turnId = turnForEvent(event);
         if (!turnId) return;
+        // A tool request is emitted after the provider closed its reasoning
+        // block. Keep the reasoning disclosure independent from the longer
+        // tool execution clock, as DeepSeek's block timeline does.
+        setReasoningByTurn((current) => {
+          const existing = current[turnId];
+          return existing && existing.endedAtMs === undefined
+            ? { ...current, [turnId]: { ...existing, endedAtMs: Date.now() } }
+            : current;
+        });
         const toolCallId = event.toolCallId ?? `${event.tool}-${event.startedAtMs ?? Date.now()}`;
         const operation = classifyActivityOperation(event.tool);
         const content = activitySummary(event.tool, operation, event.arguments);
@@ -2153,8 +2205,19 @@ export function AgentPanel({
       const reply = result.reply || "Done.";
       setMessages((current) => {
         const last = current[current.length - 1];
-        if (last?.role === "assistant" && last.content === reply) return current;
-        return [...current, { role: "assistant", content: reply }];
+        const sameTurn = last?.role === "assistant" && last.turnId === turnId;
+        if (sameTurn && last?.content === reply) return current;
+        // A no-tool response is one streamed assistant block. The RPC result
+        // is its settled value, so replace the in-flight text instead of
+        // painting the same answer twice. Once tools ran, the provider may
+        // have emitted commentary before a later assistant block; keep that
+        // ordered block and append the final report to the same turn.
+        if (sameTurn && last && result.toolCalls.length === 0) {
+          const copy = [...current];
+          copy[copy.length - 1] = { ...last, content: reply, turnId };
+          return copy;
+        }
+        return [...current, { role: "assistant", content: reply, turnId }];
       });
       if (result.toolCalls.length > 0) {
         onLog(`agent completed ${result.toolCalls.length} tool calls`);
@@ -2169,7 +2232,7 @@ export function AgentPanel({
         return "";
       }
       const message = error instanceof Error ? error.message : String(error);
-      setMessages((current) => [...current, { role: "assistant", content: `Error: ${message}` }]);
+      setMessages((current) => [...current, { role: "assistant", content: `Error: ${message}`, turnId }]);
       onLog(`agent error: ${message}`);
       return "";
     } finally {
@@ -2179,98 +2242,13 @@ export function AgentPanel({
     }
   };
 
-  /**
-   * Ask the tool-less verifier whether the goal is satisfied. It sees only the
-   * transcript, so it can judge only what the worker demonstrated — it
-   * cannot run a check itself and then call that evidence.
-   */
-  const evaluateGoal = async (
-    objective: string,
-  ): Promise<{ met: boolean; reason: string; unavailable?: true }> => {
-    const transcript = buildEvaluatorTranscript(messagesRef.current);
+  const listCheckpoints = async () => {
     try {
-      return await rpc<{ met: boolean; reason: string }>("goal_evaluate", {
-        goal: objective,
-        transcript,
-        projectSlug,
-      });
+      const listed = await rpc<{ checkpoints?: ListedCheckpoint[] }>("checkpoint_list", { slug: projectSlug });
+      say(formatCheckpointList(listed.checkpoints ?? [], Date.now()), "tool");
     } catch (error) {
-      // An unreachable verifier must never read as success: an unmet goal that
-      // keeps working is recoverable, a false "done" is not. It must not read
-      // as a plain "not met" either — that would spend the whole budget asking
-      // a verifier that is never going to answer, so the caller stops instead.
-      return {
-        met: false,
-        unavailable: true,
-        reason: `verifier unavailable (${error instanceof Error ? error.message : String(error)})`,
-      };
+      say(`Could not list restore points: ${error instanceof Error ? error.message : String(error)}`, "tool");
     }
-  };
-
-  /** Tool rows this turn added, as stall-detector input. */
-  const turnActions = (sinceIndex: number): LoopAction[] =>
-    messagesRef.current.slice(sinceIndex).flatMap((message) =>
-      message.role === "tool" && message.tool
-        ? [{ tool: message.tool, signature: message.content.slice(0, 200), failed: message.status === "error" }]
-        : [],
-    );
-
-  /**
-   * Take a restore point in front of an unattended turn.
-   *
-   * Two rules make this safe to call from inside a run. It happens *before* the
-   * turn, so the state it captures is the last one nobody has broken yet — a
-   * turn that deletes the project must never also be the turn that saves over
-   * the way back. And it can only ever log: a checkpoint is a copy of the whole
-   * project directory, so a full disk fails here first, and a run that dies for
-   * want of a backup is a worse outcome than a run with one backup missing.
-   */
-  const takeAutoCheckpoint = async (reason: AutoCheckpointReason, objective: string, force: boolean) => {
-    const startedAtMs = Date.now();
-    if (!force && !dueForCheckpoint(lastCheckpointAtRef.current, startedAtMs)) return;
-    // Stamped before the RPC, not after: a checkpoint that fails must not leave
-    // every following iteration retrying a copy that is going to fail again.
-    lastCheckpointAtRef.current = startedAtMs;
-    try {
-      // `checkpoint_create`, not `project_checkpoint`: the latter copies
-      // ~/.cali/projects/<slug>/ only, so once a game owns a workspaceRoot —
-      // the normal /loop setup — it captured the scene document and not one
-      // line of the source the agent actually edits. `checkpoint_create` takes
-      // a git snapshot of the attached repo when there is one and falls back to
-      // the same directory copy when there is not, so it is a strict
-      // improvement at every call site.
-      const created = await rpc<{ id?: string }>("checkpoint_create", { slug: projectSlug });
-      const id = created?.id;
-      if (typeof id !== "string" || id.length === 0) throw new Error("core returned no checkpoint id");
-      recordAutoCheckpoint(projectSlug, { id, takenAtMs: Date.now(), reason, objective });
-      runCheckpointsRef.current += 1;
-      onLog(`restore point ${id} taken before this /${reason} turn`);
-      // Bound the bytes, not just the list. Directory-copy checkpoints are the
-      // expensive kind and a 72-hour run took hundreds of them with nothing
-      // ever deleting one; git snapshots share objects and cost almost nothing,
-      // but pruning both keeps one policy rather than two.
-      void rpc("checkpoint_prune", { slug: projectSlug, keep: AUTO_CHECKPOINT_KEEP }).catch(() => {});
-    } catch (error) {
-      onLog(`restore point skipped: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  };
-
-  /**
-   * The closing line of an unattended run. Quiet, and only printed when there
-   * is actually something to restore — claiming a restore point that a failed
-   * `project_checkpoint` never produced is worse than saying nothing.
-   */
-  const announceRestorePoints = () => {
-    const count = runCheckpointsRef.current;
-    if (count === 0) return;
-    say(
-      `${count} restore point${count === 1 ? "" : "s"} saved during this run — /checkpoints lists them, /restore <id> confirm rolls back.`,
-      "tool",
-    );
-  };
-
-  const listCheckpoints = () => {
-    say(formatCheckpointList(readAutoCheckpoints(projectSlug), Date.now()), "tool");
   };
 
   // /restore — the only destructive command in the panel, and the reason it
@@ -2281,35 +2259,31 @@ export function AgentPanel({
       say("stop the current run before restoring — a revert under a live turn would fight it.", "tool");
       return;
     }
-    const recorded = readAutoCheckpoints(projectSlug).find((entry) => entry.id === id);
-    // An id typed from outside this panel — one the agent's own checkpoint tool
-    // made, say — still carries its timestamp, so it can still be dated.
-    const takenAtMs = recorded?.takenAtMs ?? checkpointTakenAtMs(id);
-    const age = takenAtMs === null ? null : formatCheckpointAge(Math.max(0, Date.now() - takenAtMs));
     if (!confirmed) {
-      // Core is asked which mechanism owns this id rather than the local
-      // registry guessing: the two kinds cover opposite halves of the game, so
+      // Core is asked which mechanism owns this id rather than guessing from
+      // its spelling: the two kinds cover opposite halves of the game, so
       // naming the wrong one in a confirmation is how someone approves a
       // rollback that does not do what they just read. An unreachable core
       // falls back to the more conservative project-copy wording.
       let kind: CheckpointKind = "project";
+      let createdAtMs = checkpointTakenAtMs(id);
       try {
-        const listed = await rpc<{ checkpoints?: Array<{ id?: string; kind?: string }> }>("checkpoint_list", {
-          slug: projectSlug,
-        });
+        const listed = await rpc<{ checkpoints?: ListedCheckpoint[] }>("checkpoint_list", { slug: projectSlug });
         const entry = listed?.checkpoints?.find((candidate) => candidate.id === id);
         if (entry?.kind === "git") kind = "git";
+        if (typeof entry?.createdAtMs === "number") createdAtMs = entry.createdAtMs;
       } catch {
         /* fall through to the project-copy wording */
       }
+      const age = createdAtMs === null ? null : formatCheckpointAge(Math.max(0, Date.now() - createdAtMs));
       say(restoreWarning(id, age, Boolean(workspaceRootRef.current), kind), "tool");
       return;
     }
     try {
-      // Paired with `checkpoint_create` above: it dispatches on the id's own
-      // kind, so a git restore point comes back through `git restore` (HEAD and
-      // the branch untouched, every commit since still in the history) and a
-      // copy-kind id through the directory copy.
+      // Paired with the core loop's `checkpoint_create`: restore dispatches on
+      // the id's own kind, so a git snapshot comes back through `git restore`
+      // (HEAD and the branch untouched) and a copy-kind id through the project
+      // directory copy.
       await rpc("checkpoint_restore", { slug: projectSlug, id });
       say(
         `restored ${id}. Reload the window so the editor re-reads the project — the copy still open here would otherwise autosave straight back over it.`,
@@ -2318,99 +2292,6 @@ export function AgentPanel({
     } catch (error) {
       say(`restore failed: ${error instanceof Error ? error.message : String(error)}`, "tool");
     }
-  };
-
-  /**
-   * Work the goal turn by turn until the verifier accepts it. Every exit is
-   * deliberate: verified, cleared by the user, stalled, or out of budget — and
-   * the last one still ends with a summary rather than a bare counter.
-   */
-  const pursueGoalRounds = async () => {
-    const actions: LoopAction[] = [];
-    for (let round = 1; round <= MAX_LOOP_ITERATIONS; round += 1) {
-      const state = goalRef.current;
-      if (!state) return;
-      const directive =
-        round === 1
-          ? `${state.goal}\n\n${budgetNotice(round, MAX_LOOP_ITERATIONS)}`
-          : goalContinuationPrompt(state.goal, state.lastReason ?? "", state.evaluations);
-      await takeAutoCheckpoint("goal", state.goal, round === 1);
-      const before = messagesRef.current.length;
-      const reply = await runTurn(directive);
-      // An empty reply is a cancelled or failed turn; both already spoke.
-      if (!reply) return;
-      if (!goalRef.current) return;
-
-      actions.push(...turnActions(before));
-      const stall = detectStall(actions);
-      if (stall.level === "block") {
-        say(`goal paused — ${stall.reason} Clear it or change the goal.`, "tool");
-        return;
-      }
-      if (stall.level === "warn") say(`heads up — ${stall.reason}`, "tool");
-
-      const verdict = await evaluateGoal(state.goal);
-      if (verdict.unavailable) {
-        say(`goal paused — ${verdict.reason}. The goal is kept; /goal to see it.`, "tool");
-        return;
-      }
-      const evaluated: GoalState = {
-        ...state,
-        evaluations: state.evaluations + 1,
-        lastReason: verdict.reason,
-      };
-      goalRef.current = evaluated;
-      setGoal(evaluated);
-      if (verdict.met) {
-        say(`✔ goal met after ${evaluated.evaluations} check${evaluated.evaluations === 1 ? "" : "s"}: ${verdict.reason}`, "tool");
-        goalRef.current = null;
-        setGoal(null);
-        return;
-      }
-      say(`goal not met yet — ${verdict.reason}`, "tool");
-    }
-    const remaining = goalRef.current;
-    if (!remaining) return;
-    // Out of budget: hand back a summary and keep the goal so it can resume.
-    say(`goal budget spent after ${MAX_LOOP_ITERATIONS} turns — summarizing.`, "tool");
-    await runTurn(exhaustionPrompt(remaining.goal, MAX_LOOP_ITERATIONS));
-  };
-
-  // Every way a goal pursuit ends — met, paused, stalled, out of budget — is a
-  // `return` inside the rounds above, so the closing restore-point line hangs
-  // off the wrapper rather than being repeated at each of them.
-  const pursueGoal = async () => {
-    runCheckpointsRef.current = 0;
-    try {
-      await pursueGoalRounds();
-    } finally {
-      announceRestorePoints();
-    }
-  };
-
-  const runGoalCommand = async (command: GoalCommand) => {
-    if (command.action === "show") {
-      say(formatGoalStatus(goalRef.current), "tool");
-      return;
-    }
-    if (command.action === "clear") {
-      const had = Boolean(goalRef.current);
-      goalRef.current = null;
-      setGoal(null);
-      say(had ? "goal cleared." : "no goal was set.", "tool");
-      return;
-    }
-    if (busy || looping) {
-      say("finish or stop the current run before setting a goal.", "tool");
-      return;
-    }
-    const verifiable = goalIsVerifiable(command.goal);
-    if (!verifiable.ok && verifiable.hint) say(verifiable.hint, "tool");
-    const next: GoalState = { goal: command.goal, startedAtMs: Date.now(), evaluations: 0 };
-    goalRef.current = next;
-    setGoal(next);
-    say(`goal set: ${command.goal}`, "tool");
-    await pursueGoal();
   };
 
   const switchModel = async (raw: string) => {
@@ -2572,7 +2453,6 @@ export function AgentPanel({
     if (activityTurnId) completeActivityTurn(activityTurnId, Date.now(), outcome);
     loopActivityTurnRef.current = null;
     activeLoopIdRef.current = null;
-    announceRestorePoints();
     setActiveLoop(null);
     setLooping(false);
     setBusy(false);
@@ -2899,7 +2779,6 @@ export function AgentPanel({
     },
     runGraphGoal,
     stopGraph,
-    runGoalCommand,
     listCheckpoints,
     restoreCheckpoint,
   };
@@ -3022,6 +2901,22 @@ export function AgentPanel({
   const commandMenu = matchCommandsIn(input, allCommands, caret);
   const menuActive = commandMenu.length > 0;
   const activeMenuIndex = Math.min(menuIndex, commandMenu.length - 1);
+  const activeReasoning = activeTurnRef.current
+    ? reasoningByTurn[activeTurnRef.current.turnId]
+    : undefined;
+  // A live tool turn already carries its own spinner and elapsed time in the
+  // activity row. Rendering the generic busy line as well makes one operation
+  // look like two separate runs, especially when the transcript is short.
+  const activeTurnId = activeTurnRef.current?.turnId;
+  const hasLiveActivity = messages.some(
+    (message) =>
+      Boolean(
+        activeTurnId &&
+          message.turnId === activeTurnId &&
+          message.toolCallId &&
+          message.status === "running",
+      ),
+  );
   const workedMs = sessionWorkedMs(messages, activityClockMs);
   const activityGroups = new Map<string, AgentMessage[]>();
   for (const message of messages) {
@@ -3089,24 +2984,6 @@ export function AgentPanel({
 
   return (
     <div className="relative flex h-full min-h-0 flex-col">
-      {activeGraph ? (
-        <div className="max-h-[45%] shrink-0 overflow-y-auto">
-          <GraphPanel
-            graph={activeGraph}
-            tickers={graphTickers}
-            onCancel={(graphId) => void cancelGraph(graphId).catch(() => {})}
-            onRerun={(graphId) => {
-              setGraphTickers({});
-              // Re-run from this panel: the run, and therefore its prompts,
-              // move onto this window's session.
-              void runGraph(graphId, { ownerSession: sessionIdRef.current }).catch((error) =>
-                say(`Graph re-run failed: ${error instanceof Error ? error.message : String(error)}`),
-              );
-            }}
-          />
-        </div>
-      ) : null}
-
       <div ref={transcriptRef} onScroll={handleTranscriptScroll} className="relative min-h-0 flex-1 overflow-y-auto px-[18px] pb-2 pt-[18px]">
         {messages.length === 0 && (
           <div className="absolute inset-0 flex select-none items-center justify-center px-5">
@@ -3156,27 +3033,111 @@ export function AgentPanel({
             fragments rather than one run. Prose and prompts buy their own air
             back with a top margin. */}
         <div className="mx-auto flex w-full max-w-[760px] flex-col gap-2">
+          {activeGraph ? (
+            <div
+              data-graph-chat-card
+              className="flex items-center gap-2.5 rounded-lg border border-line bg-surface-1 px-3 py-2.5 text-xs"
+            >
+              <Workflow aria-hidden className="h-3.5 w-3.5 shrink-0 text-ink-subtle" strokeWidth={1.8} />
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 items-center gap-2">
+                  <span className="shrink-0 font-medium text-ink-strong">Task graph</span>
+                  <span className="min-w-0 truncate text-ink-subtle" title={activeGraph.goal}>
+                    {activeGraph.goal}
+                  </span>
+                  <span className="shrink-0 rounded border border-line px-1.5 py-[2px] text-[10px] uppercase tracking-[0.08em] text-ink-subtle">
+                    {activeGraph.status}
+                  </span>
+                </div>
+                <div className="mt-1 text-[10.5px] text-ink-faint">
+                  {activeGraph.nodes.filter((node) => node.status === "passed").length}/{activeGraph.nodes.length} nodes passed
+                  {activeGraph.nodes.some((node) => node.status === "running" || node.status === "monitoring")
+                    ? " · workers active"
+                    : ""}
+                </div>
+              </div>
+              {onOpenGraph ? (
+                <button
+                  type="button"
+                  onClick={onOpenGraph}
+                  className="shrink-0 rounded-md px-2 py-1 text-[10px] font-medium uppercase tracking-[0.1em] text-ink-subtle transition-colors hover:bg-surface-2 hover:text-ink-strong"
+                >
+                  Open graph
+                </button>
+              ) : null}
+            </div>
+          ) : null}
+
           {messages.map((message, index) => {
             if (message.turnId) {
               if (activityAnchors.get(message.turnId) !== index) return null;
+              const turnMessages = activityGroups.get(message.turnId) ?? [message];
+              const marker = turnMessages.find((candidate) => isTurnMarker(candidate));
+              const firstActionIndex = turnMessages.findIndex((candidate) => Boolean(candidate.toolCallId));
+              const actions = turnMessages.filter((candidate) => isTurnMarker(candidate) || candidate.toolCallId);
+              const assistantMessages = turnMessages.filter(
+                (candidate): candidate is AgentMessage & { role: "assistant" } => candidate.role === "assistant",
+              );
               const reasoning = reasoningByTurn[message.turnId];
+              const showActivity = actions.some((candidate) => Boolean(candidate.toolCallId)) || marker?.stopped === true;
+              const beforeActions =
+                firstActionIndex < 0
+                  ? []
+                  : turnMessages
+                      .slice(0, firstActionIndex)
+                      .filter(
+                        (candidate): candidate is AgentMessage & { role: "assistant" } => candidate.role === "assistant",
+                      );
+              const afterActions =
+                firstActionIndex < 0
+                  ? assistantMessages
+                  : turnMessages
+                      .slice(firstActionIndex + 1)
+                      .filter(
+                        (candidate): candidate is AgentMessage & { role: "assistant" } => candidate.role === "assistant",
+                      );
+              const lastUserIndex = previousUserIndex(messages, index);
+              // Older/resumed transcripts may contain a visible assistant
+              // fragment without the client turn id. If it precedes this
+              // tagged group, it still belongs to the same user turn and has
+              // already claimed the speaker label.
+              const hasExternalAssistantBefore = messages
+                .slice(lastUserIndex + 1, index)
+                .some((candidate) => candidate.role === "assistant" && candidate.turnId !== message.turnId);
+              const headingOffset = hasExternalAssistantBefore ? 1 : 0;
+              const assistantRows = (items: Array<AgentMessage & { role: "assistant" }>, continuationOffset = 0) =>
+                items.map((assistant, assistantIndex) => (
+                  <AssistantMessageRow
+                    key={`${message.turnId}-assistant-${assistantIndex + continuationOffset}`}
+                    message={assistant}
+                    continuation={assistantIndex + continuationOffset > 0}
+                  />
+                ));
               return (
                 <Fragment key={`turn-${message.turnId}`}>
+                  {firstActionIndex >= 0 ? assistantRows(beforeActions, headingOffset) : null}
                   {reasoning ? (
                     <ReasoningRow
                       text={reasoning.text}
                       streaming={reasoning.endedAtMs === undefined}
                       durationMs={(reasoning.endedAtMs ?? Date.now()) - reasoning.startedAtMs}
+                      defaultCollapsed
+                      showDuration={false}
                     />
                   ) : null}
                   {message.turnId === latestTurnId && subagentChips.length > 0 ? (
                     <SubagentChips items={subagentChips} />
                   ) : null}
-                  <ActivityTurnRow
-                    turnId={message.turnId}
-                    messages={activityGroups.get(message.turnId) ?? [message]}
-                    onOpenFile={onOpenActivityFile}
-                  />
+                  {showActivity ? (
+                    <ActivityTurnRow
+                      turnId={message.turnId}
+                      messages={actions}
+                      onOpenFile={onOpenActivityFile}
+                    />
+                  ) : null}
+                  {firstActionIndex >= 0
+                    ? assistantRows(afterActions, headingOffset + beforeActions.length)
+                    : assistantRows(afterActions, headingOffset)}
                 </Fragment>
               );
             }
@@ -3195,29 +3156,14 @@ export function AgentPanel({
             // The eyebrow names a speaker, and the speaker does not change
             // between two consecutive blocks from the agent. Repeating it
             // splits one answer into two that look like different turns.
-            const previous = messages[index - 1];
-            const continuation = previous?.role === "assistant" && !previous.turnId;
-            return (
-              <div
-                key={index}
-                data-role="assistant"
-                className={`max-w-[94%] self-start ${continuation ? "" : "mt-3"}`}
-              >
-                {continuation ? null : (
-                  <div className="mb-1.5 text-[9.5px] tracking-[0.24em] text-ink-subtle">CALICODE</div>
-                )}
-                <div className="text-[13px] leading-[1.6] text-ink">
-                  {message.panel ? (
-                    <CommandPanelView panel={message.panel} />
-                  ) : (
-                    <AgentText content={message.content} />
-                  )}
-                </div>
-              </div>
-            );
+            const lastUserIndex = previousUserIndex(messages, index);
+            const continuation = messages
+              .slice(lastUserIndex + 1, index)
+              .some((candidate) => candidate.role === "assistant");
+            return <AssistantMessageRow key={index} message={message} continuation={continuation} />;
           })}
 
-          {busy && (
+          {busy && !activeReasoning && !hasLiveActivity && (
             <div className="self-start" aria-label="Agent is thinking">
               <div className="flex items-baseline gap-2">
                 <span className="cb-shimmer text-[12.5px] font-medium">
@@ -3406,14 +3352,7 @@ export function AgentPanel({
 
       <div className="shrink-0 bg-surface-0 px-3.5 pb-3.5 pt-2.5">
         <div className="mx-auto w-full max-w-[760px]">
-        <RunStatusPill
-          goal={goal}
-          loop={activeLoop}
-          onStop={(mode) => {
-            if (mode === "loop") stopAgent();
-            else void runGoalCommand({ action: "clear" });
-          }}
-        />
+        <RunStatusPill loop={activeLoop} onStop={stopAgent} />
         {messages.some((message) => isTurnMarker(message)) ? (
           <div
             data-session-worked-time

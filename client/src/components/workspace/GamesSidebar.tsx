@@ -11,6 +11,7 @@ import {
   FolderOpen,
   GitBranch,
   GitFork,
+  LayoutGrid,
   Library,
   Loader2,
   Moon,
@@ -76,6 +77,10 @@ interface GamesSidebarProps {
   onOpenAssetsLibrary: () => void;
   /** True while the assets library view is the active view. */
   assetsLibraryActive?: boolean;
+  /** Opens the project-first hub in the main workspace. */
+  onOpenProjectHub?: () => void;
+  /** True while the project hub is the active view. */
+  projectHubActive?: boolean;
   /** Open as an overlay when the rail is below its md breakpoint. */
   overlay?: boolean;
   /** Width of the persistent rail at md and above. */
@@ -127,17 +132,20 @@ function NavRow({
   label,
   onClick,
   active = false,
+  disabled = false,
 }: {
   icon: LucideIcon;
   label: string;
   onClick: () => void;
   active?: boolean;
+  disabled?: boolean;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`flex min-h-8 w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors ${
+      disabled={disabled}
+      className={`flex min-h-8 w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-45 ${
         active
           ? "bg-surface-3 text-ink-strong"
           : "text-ink hover:bg-surface-2 hover:text-ink-strong active:bg-surface-3"
@@ -172,6 +180,8 @@ export function GamesSidebar({
   coreStatus = "unknown",
   onOpenAssetsLibrary,
   assetsLibraryActive = false,
+  onOpenProjectHub = () => undefined,
+  projectHubActive = false,
   overlay = false,
   width = 240,
   desktopVisible = true,
@@ -282,7 +292,8 @@ export function GamesSidebar({
 
       {/* Nav block: the studio's primary actions, as quiet rows. */}
       <nav className="mt-1 flex flex-col gap-0.5">
-        <NavRow icon={SquarePen} label="New chat" onClick={() => onNewSession(activeSlug)} />
+        <NavRow icon={LayoutGrid} label="Projects" onClick={onOpenProjectHub} active={projectHubActive} />
+        <NavRow icon={SquarePen} label="New chat" onClick={() => onNewSession(activeSlug)} disabled={projects.length === 0} />
         <NavRow icon={Plus} label="New game" onClick={onNewGame} />
         <NavRow icon={Library} label="Assets Library" onClick={onOpenAssetsLibrary} active={assetsLibraryActive} />
       </nav>

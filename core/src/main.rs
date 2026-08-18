@@ -18,7 +18,6 @@ mod diagnostics;
 mod edit_match;
 mod editor_bridge;
 mod fileread;
-mod goal;
 mod graph;
 mod guardian;
 mod hooks;
@@ -122,7 +121,9 @@ async fn main() -> anyhow::Result<()> {
     sandbox::init(&config.sandbox);
     let projects_root = config::projects_root(&config);
     std::fs::create_dir_all(&projects_root)?;
-    if !projects_root.join("starter").exists() {
+    if !projects_root.join("starter").exists()
+        && !projects_root.join(store::EMPTY_PROJECTS_MARKER).exists()
+    {
         store::create_project(&projects_root, "starter", "Starter")?;
     }
 

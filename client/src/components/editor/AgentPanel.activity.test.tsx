@@ -8,6 +8,33 @@ import type { AgentMessage } from "../../lib/types";
 afterEach(cleanup);
 
 describe("ActivityTurnRow", () => {
+  it("uses one elapsed working status while a tool is in flight", () => {
+    const startedAtMs = Date.now();
+    const marker = createTurnMarker("turn-live", startedAtMs);
+    render(
+      <ActivityTurnRow
+        turnId="turn-live"
+        messages={[
+          marker,
+          {
+            role: "tool",
+            tool: "file_read",
+            toolCallId: "call-read",
+            turnId: "turn-live",
+            status: "running",
+            startedAtMs,
+            content: "Read App.tsx",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: /Expand activity for turn turn-live/ }).textContent).toContain(
+      "Working for <1s",
+    );
+    expect(screen.queryByText("Read App.tsx")).toBeNull();
+  });
+
   it("shows one compact latest summary and expands all actions", () => {
     const marker = createTurnMarker("turn-1", 1_000);
     const messages: AgentMessage[] = [

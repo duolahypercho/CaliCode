@@ -44,6 +44,21 @@ async function settle(page: Page): Promise<void> {
 const MAX_DIFF_PIXELS = 150;
 
 const TABS = ["play", "code", "art", "scene", "test"] as const;
+const TAB_PICKER_LABELS: Record<(typeof TABS)[number], string> = {
+  play: "Play",
+  code: "Code",
+  art: "Assets",
+  scene: "Scene",
+  test: "Test",
+};
+
+async function openWorkspaceTab(page: Page, tab: (typeof TABS)[number]): Promise<void> {
+  const existing = page.getByRole("tab", { name: tab, exact: true });
+  if ((await existing.count()) === 0) {
+    await page.getByRole("button", { name: `Show ${TAB_PICKER_LABELS[tab]}` }).click();
+  }
+  await page.getByRole("tab", { name: tab, exact: true }).click();
+}
 
 test.describe("workspace surfaces @visual", () => {
   for (const tab of TABS) {
@@ -51,7 +66,7 @@ test.describe("workspace surfaces @visual", () => {
       await page.setViewportSize({ width: 1440, height: 900 });
       await page.goto("/");
       await settle(page);
-      await page.getByRole("tab", { name: tab, exact: true }).click();
+      await openWorkspaceTab(page, tab);
       await settle(page);
 
       await expect(page).toHaveScreenshot(`tab-${tab}.png`, {

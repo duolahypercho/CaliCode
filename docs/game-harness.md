@@ -178,8 +178,7 @@ autocomplete.
 | Command | Usage | What it does |
 |---|---|---|
 | `/help` | — | Lists every registered command, skills included |
-| `/loop` | `/loop [interval] <goal>` | Autonomous run: re-sends the goal until the agent replies `DONE` alone on a line and the completion gate accepts it, the cap is hit, or you press STOP. With an interval (`30s`, `15m`, `2h`) it becomes a watch: it waits that long between checks and keeps going after the goal is met, until you stop it |
-| `/goal` | `/goal [objective \| clear]` | Keeps working toward an objective, re-checked by the evaluator after every turn. Bare prints the current goal |
+| `/loop` | `/loop [--aaa] [interval] <goal>` | Autonomous run: keeps working until the agent replies `DONE` alone on a line and the selected completion gate accepts it, or you press STOP. With an interval (`30s`, `15m`, `2h`) it becomes a watch: it waits that long between checks and keeps going after the goal is met, until you stop it |
 | `/graph` | `/graph <goal>` | Plans a task DAG for the goal and runs it node by node |
 | `/graph-template` | `/graph-template <template> <goal>` | Same, from a named template (`aaa-fps`, `polished-asset`, …) |
 | `/graph-stop` | — | Cancels the running graph after the current node |
@@ -208,17 +207,19 @@ meter that drops with no explanation reads as lost work.
 
 Loop mechanics worth knowing before you write one:
 
-- **Cap is 100 iterations** (`MAX_LOOP_ITERATIONS`), each iteration allowing up
-  to **10 tool-calling turns** inside the core agent loop. Budget accordingly:
-  a phase that needs 400 placements will not fit in one loop unless the agent
-  writes a placement routine instead of 400 individual calls.
-- **The continuation prompt is fixed:** *"Continue toward the goal. When it is
-  fully complete, reply with exactly DONE on its own line and nothing else."*
-  Your goal text is only sent on iteration 1 — everything the loop needs to
-  keep itself honest must be in that first message.
-- **Termination is a regex on `DONE`.** A goal with a soft finish line ends
-  early. A goal with a checkable finish line does not.
-- **STOP is cooperative** — it lands between iterations, not mid-turn.
+- **There is no iteration cap.** A run-to-completion loop ends only when its
+  completion gate accepts `DONE` or you press STOP. A paced watch continues
+  after accepted completion and therefore ends only on STOP.
+- **Each iteration still has a turn budget.** That bounds one malformed agent
+  turn; it does not terminate the outer loop, which can continue in the next
+  iteration.
+- **The goal is preserved.** Iteration 1 receives the user's words verbatim;
+  later iterations repeat them with one continuation sentence.
+- **Termination is `DONE` on a line of its own.** A goal with a soft finish
+  line can end prematurely; use `--aaa` when completion needs persisted
+  evidence and a judge rather than the standard profile's self-report.
+- **STOP reaches core** and cancels either the in-flight iteration or the wait
+  between paced checks.
 
 ### Writing a `/loop` that finishes correctly
 
@@ -394,7 +395,7 @@ Practical thresholds for a stylized scene:
 
 | Tell | Cause | Fix |
 |---|---|---|
-| Loop hits the 25-iteration cap | Goal had no checkable DONE | Rewrite DONE as a count `editor_scene_inspect` can verify |
+| Loop keeps working without finishing | Goal had no checkable DONE | Press STOP, then rewrite DONE as a count `editor_scene_inspect` can verify or use `--aaa` |
 | Loop replies `DONE` on iteration 2 | DONE was subjective | Add "before replying DONE, capture a frame and score …" |
 | Everything is at `[0, 0.5, 0]` | `editor_object_add` default position, no explicit placement | Always pass `position`; verify with `scene_inspect` |
 | Objects vanish past a point | Camera far = 100, fog 18–42 | Keep the world inside ~40 units or ask the human to widen the camera |

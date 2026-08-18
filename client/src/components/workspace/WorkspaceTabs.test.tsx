@@ -1,6 +1,13 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { WORKSPACE_TABS, WorkspaceTabs, nextTabId, tabKind, type WorkspaceTabId } from "./WorkspaceTabs";
+import {
+  WORKSPACE_TABS,
+  WorkspaceTabPicker,
+  WorkspaceTabs,
+  nextTabId,
+  tabKind,
+  type WorkspaceTabId,
+} from "./WorkspaceTabs";
 
 afterEach(cleanup);
 
@@ -78,6 +85,13 @@ describe("WorkspaceTabs", () => {
     expect(screen.queryByRole("tab", { name: "scene" })).toBeNull();
   });
 
+  it("supports a fresh dock with no active tab", () => {
+    renderTabs({ openTabs: [], active: null });
+
+    expect(screen.queryAllByRole("tab")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "Add view" }).hasAttribute("disabled")).toBe(false);
+  });
+
   it("closes a tab through its own control", () => {
     const { onClose } = renderTabs({ openTabs: ["play", "code"], active: "play" });
 
@@ -106,10 +120,11 @@ describe("WorkspaceTabs", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("hides the close control when one tab is left, so the dock cannot be emptied", () => {
-    renderTabs({ openTabs: ["play"], active: "play" });
+  it("keeps a close control on the final tab so the dock can return to blank", () => {
+    const { onClose } = renderTabs({ openTabs: ["play"], active: "play" });
 
-    expect(screen.queryByRole("button", { name: /Close .* tab/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Close Play tab" }));
+    expect(onClose).toHaveBeenCalledWith("play");
   });
 
   it("offers only unopened views under the add button", async () => {
@@ -171,6 +186,17 @@ describe("WorkspaceTabs", () => {
     cleanup();
     renderTabs();
     expect(screen.queryByRole("button", { name: "Hide tools panel" })).toBeNull();
+  });
+});
+
+describe("empty workspace picker", () => {
+  it("asks what to show and opens the selected view", () => {
+    const onSelect = vi.fn();
+    render(<WorkspaceTabPicker onSelect={onSelect} />);
+
+    expect(screen.getByRole("heading", { name: "What do you want to show here?" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Show Play" }));
+    expect(onSelect).toHaveBeenCalledWith("play");
   });
 });
 

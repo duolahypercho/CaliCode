@@ -8,7 +8,23 @@ const slugify = (value: string) =>
 const uniqueLabel = (prefix: string, testInfo: TestInfo) =>
   `${prefix} ${testInfo.workerIndex}-${testInfo.repeatEachIndex}-${Math.random().toString(36).slice(2, 8)}`;
 
-const openTab = (page: Page, name: string) => page.getByRole("tab", { name, exact: true }).click();
+const TAB_LABELS: Record<string, string> = {
+  play: "Play",
+  code: "Code",
+  art: "Assets",
+  build: "Build",
+  scene: "Scene",
+  test: "Test",
+  terminal: "Terminal",
+  browser: "Browser",
+  reports: "Reports",
+};
+
+async function openTab(page: Page, name: string): Promise<void> {
+  const tab = page.getByRole("tab", { name, exact: true });
+  if ((await tab.count()) === 0) await page.getByRole("button", { name: `Show ${TAB_LABELS[name]}` }).click();
+  await tab.click();
+}
 
 async function callRpc(page: Page, method: string, params: Record<string, unknown>): Promise<any> {
   return page.evaluate(

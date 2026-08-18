@@ -27,8 +27,9 @@ export function withIntroducedTabs<Tab extends string>(
   seen: readonly Tab[],
   catalogue: readonly Tab[],
 ): Tab[] {
-  // An empty strip means "no preference recorded", not "the user closed
-  // everything" — a dock with no tabs has nothing to show and no way back.
+  // Callers that use this merge helper treat an empty strip as "no preference
+  // recorded". The app's first-use path handles its intentional blank state
+  // before calling here, so a chooser always remains available.
   if (stored.length === 0) return [...catalogue];
   const introduced = catalogue.filter((view) => !seen.includes(view));
   return [...new Set([...stored, ...introduced])];

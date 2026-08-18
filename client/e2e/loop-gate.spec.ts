@@ -143,7 +143,6 @@ test.describe("loop completion gate", () => {
                 profile: String(body.params?.profile ?? "standard"),
                 status: "running",
                 iteration: 0,
-                maxIterations: 100,
                 startedAtMs: Date.now(),
               },
             },

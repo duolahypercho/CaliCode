@@ -52,6 +52,11 @@ describe("parseSlash", () => {
     expect(parsed?.name).toBe("nope");
     expect(parsed?.command).toBeNull();
   });
+
+  test("does not expose the retired /goal command", () => {
+    expect(parseSlash("/goal ship it")?.command).toBeNull();
+    expect(SLASH_COMMANDS.some((command) => command.name === "goal")).toBe(false);
+  });
 });
 
 describe("/side", () => {
@@ -288,7 +293,7 @@ describe("runsBare", () => {
   test("every other built-in completes into the composer instead", () => {
     // Named explicitly because these are the ones that used to fire the moment
     // the word was spelled, before any instructions could be added to them.
-    for (const name of ["compact", "clear", "goal", "usage", "diff", "loop", "model", "restore"]) {
+    for (const name of ["compact", "clear", "usage", "diff", "loop", "model", "restore"]) {
       expect(runsBare(SLASH_COMMANDS.find((command) => command.name === name)!)).toBe(false);
     }
   });
@@ -332,6 +337,12 @@ describe("/loop", () => {
     run("/loop 15m");
     expect(runLoop).not.toHaveBeenCalled();
     expect(say).toHaveBeenCalled();
+  });
+
+  test("documents completion and Stop without promising an iteration cap", () => {
+    run("/loop");
+    expect(say.mock.calls[0][0]).toContain("until the goal is met or you stop the run");
+    expect(say.mock.calls[0][0]).not.toContain("iteration cap");
   });
 });
 
