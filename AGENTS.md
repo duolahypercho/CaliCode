@@ -12,6 +12,7 @@ repo works.
 | Path             | What lives there                                                         |
 | ---------------- | ------------------------------------------------------------------------ |
 | `core/`          | Rust control plane. JSON-RPC over HTTP + SSE. Owns projects, sessions, agent loop, assets, MCP, skills. |
+| `core/starters/` | Compiled-in workspace starters — one directory per starter, `include_str!`d by `starters.rs`. |
 | `client/`        | Vite + React + TypeScript editor. Three.js viewport, agent panel, workspace tabs. |
 | `client/electron/`  | Desktop shell (Electron). Spawns core, hosts the browser panel as a real view. |
 | `shared/schemas/` | `project.schema.json`, `cali-asset.schema.json` — the contracts both sides honour. |
@@ -170,6 +171,33 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
 - The model reads pages as ref-tagged element lists (`browser_snapshot`), not
   HTML or pixels, and clicks refs rather than coordinates. Coordinates exist
   for `<canvas>`, which is the only way to reach a running game.
+- **Playing a game is a different verb from using a page.** `browser_key` takes `holdMs`
+  because movement is a held W, not a tapped one; `browser_mouse_move` takes a *delta* because
+  a camera turns by motion, not by destination; and `browser_play` holds several keys *while*
+  looking, because strafing is two keys at once and aiming while advancing is keys and mouse at
+  once — neither is expressible as a sequence of single actions. It always releases what it
+  held, including when the look fails: separate down/up tools would put a stuck W one error
+  away, and a stuck W is a character running into a wall until somebody notices.
+- **Recording happens during the action, not after it.** `browser_play` takes `recordFrames`
+  and captures them interleaved with the look while the keys are still down, because a
+  screenshot taken once the keys come up is a picture of standing still. The frames go straight
+  into the same contact-sheet path `video_contact_sheet` uses and only a path and motion
+  metrics come back — a dozen base64 JPEGs would cost more context than the rest of the turn,
+  and the model cannot look at them anyway.
+- **Reading a recording back has two halves, and they answer different questions.** The sheet's
+  sibling JSON manifest carries measured motion per frame pair — mean luma delta, mean RGB
+  delta, perceptual-hash Hamming distance — and `file_read` turns that into text, which is the
+  half to trust for *did it move, and how much*. `image_look` sends the sheet itself to a vision
+  model and returns words, which is the half for *what happened*. Neither replaces the other,
+  and a provider without vision still has the numbers.
+- **Key events carry no `nativeVirtualKeyCode`, deliberately.** It used to be sent the Windows
+  VK code, which is a different keycode space on macOS — 87 is keypad-5 — so every held key
+  reached the page as `Numpad5` and auto-repeated about twenty thousand times in 600ms. A game
+  keyed on `e.code === "KeyW"`, which is the usual way, saw nothing. Chrome derives the native
+  code correctly when the field is simply absent. It splits that motion into steps and primes the
+  origin first — Blink measures `movementX` against the previous pointer position, so the first
+  event of a sequence reports 0 and an unprimed turn arrives one step short. Click the canvas
+  once before looking if the game wants a pointer lock.
 - `browser_search` deliberately skips Google, which serves this browser an
   interstitial instead of results.
 - **The Electron shell hands core its own panel** (`browser_attach`), so core
@@ -547,8 +575,8 @@ Rust against a scripted provider rather than through a mocked panel.
 | `<project>/.cali/memory/`     | durable memories about one game           |
 | `client/.e2e-projects/`       | throwaway; wiped by `pretest:e2e`         |
 
-Current baseline: 1070 Rust tests (plus 16 `#[ignore]`d live ones), 937 client
-unit tests across 75 files.
+Current baseline: 1076 Rust tests (plus 17 `#[ignore]`d live ones), plus 2
+shutdown tests; 941 client unit tests across 75 files.
 
 ## Memory
 
