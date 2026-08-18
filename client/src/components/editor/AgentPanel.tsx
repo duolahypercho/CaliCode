@@ -105,6 +105,7 @@ import {
   matchCommandsIn,
   runsBare,
   parseSlashIn,
+  fileCommands,
   skillCommands,
   slashTokenAt,
   type SlashCommand,
@@ -1186,6 +1187,8 @@ export function AgentPanel({
   // full-access default would silently bypass the permission rules and plan
   // mode on a newcomer's very first prompt.
   const [permissionMode, setPermissionMode] = useState("auto");
+  const permissionModeRef = useRef(permissionMode);
+  permissionModeRef.current = permissionMode;
   // Reasoning effort is remembered per model and forwarded on every agent
   // turn; graph/subagent workers inherit the coordinator's selected value.
   const [effortByModel, setEffortByModel] = useState<Record<string, string>>(readStoredEfforts);
@@ -1404,7 +1407,16 @@ export function AgentPanel({
         if (!sessionId && mine.sessionId) {
           // Adopt the run's chat, so its deltas and tool rows have somewhere
           // to land. Silent: `resumeSession` says nothing either.
-          await resumeSession(mine.sessionId).catch(() => {});
+          try {
+            await resumeSession(mine.sessionId);
+          } catch {
+            // A stale session record must not hide a live core run; keep the
+            // stream attached to its owner so Stop can still reach it.
+            setSessionId(mine.sessionId);
+            sessionIdRef.current = mine.sessionId;
+            setSessionWorkspaceRoot(workspaceRoot);
+            workspaceRootRef.current = workspaceRoot;
+          }
           if (cancelled) return;
         }
         activeLoopIdRef.current = mine.loopId;
@@ -1447,6 +1459,25 @@ export function AgentPanel({
       return undefined;
     };
     const disconnect = connectEvents((event: AgentEvent) => {
+      if (event.type === "loop.iteration" && event.loopId === activeLoopIdRef.current) {
+        setMessages((current) => [...current, { role: "user", content: String(event.prompt ?? "") }]);
+        say(`loop ${event.iteration}/${event.maxIterations}`, "tool");
+        return;
+      }
+      if (event.type === "loop.done_refused" && event.loopId === activeLoopIdRef.current) {
+        say(`DONE ignored: ${event.reason ?? "completion could not be proven"}`, "tool");
+        return;
+      }
+      if (event.type === "loop.completed" && event.loopId === activeLoopIdRef.current) {
+        say(`✔ loop complete in ${event.iteration} iterations`, "tool");
+        return;
+      }
+      if (event.type === "loop.finished" && event.loop?.loopId === activeLoopIdRef.current) {
+        if (event.loop.status === "failed") say(`Loop failed: ${event.loop.detail ?? "unknown error"}`);
+        else if (event.loop.status === "stopped") say(`■ ${event.loop.detail ?? "loop stopped"}`, "tool");
+        finishLoopUi(event.loop.status === "stopped" ? "stopped" : "done");
+        return;
+      }
       if (event.type === "agent.delta") {
         // Demux by sessionId: with a graph fanning out subagents, every
         // stream shares this SSE bus. Deltas whose sessionId matches a graph
@@ -1622,6 +1653,8 @@ export function AgentPanel({
           tool: event.tool,
           arguments: event.arguments,
           graphLabel: typeof event.ownerGraph === "string" ? event.ownerGraph : null,
+          reason: typeof event.reason === "string" && event.reason.trim() ? event.reason : null,
+          reasonSource: event.reasonSource === "agent" || event.reasonSource === "guardian" ? event.reasonSource : null,
           raisedAtMs: sanitizeRaisedAt(event.raisedAtMs),
         });
       }
@@ -1635,6 +1668,12 @@ export function AgentPanel({
           requestId: event.requestId,
           outcome: (event.outcome ?? "session-gone") as ResolvedOutcome,
         });
+      }
+      if (event.type === "agent.permission_mode" && event.sessionId === sessionIdRef.current) {
+        const mode = event.mode;
+        if ((mode === "auto" || mode === "supervised" || mode === "full-access" || mode === "plan") && permissionModeRef.current === "plan") {
+          setPermissionMode(mode);
+        }
       }
       if (event.type === "agent.tool_started" && event.tool && eventIsLocalActivity(event)) {
         const turnId = turnForEvent(event);
@@ -2519,423 +2558,57 @@ export function AgentPanel({
     };
   };
 
-  // Autonomous loop: drive the agent toward a goal, feeding a "continue" each
-  // turn, until it replies DONE, the cap is reached, or the user hits Stop.
-  // History is threaded locally because setState lands after the closure reads it.
-  const runLoop = async (goal: string, intervalMs: number | null = null) => {
-    if (busy || looping) return;
-    setLooping(true);
-    setBusy(true);
-    cancelLoopRef.current = false;
-    runCheckpointsRef.current = 0;
-    const controller = new AbortController();
-    turnAbortRef.current = controller;
-    const activityTurnId = beginActivityTurn();
-    let attached: { id: string; workspaceRoot: string };
-    try {
-      attached = await ensureEditorSession();
-    } catch (error) {
-      say(`Loop error: ${error instanceof Error ? error.message : String(error)}`);
-      completeActivityTurn(activityTurnId);
-      if (turnAbortRef.current === controller) turnAbortRef.current = null;
-      setLooping(false);
-      setBusy(false);
-      return;
-    }
-    const loopStartedAtMs = Date.now();
-    setActiveLoop({
-      objective: goal,
-      startedAtMs: loopStartedAtMs,
-      every: intervalMs ? formatInterval(intervalMs) : null,
-    });
-    const loopId = `loop-${loopStartedAtMs.toString(36)}`;
-    const fetchLoopReportProof = async (): Promise<LoopGraphProof> => {
-      try {
-        const opened = await openLoopReport(projectSlug, loopId);
-        return validateLoopReportCompletion(opened.report, projectSlug, loopId);
-      } catch {
-        return { accepted: false, reason: "authoritative progress report is unavailable" };
-      }
-    };
-    loopStartedAtRef.current = loopStartedAtMs;
-    loopObservedGraphIdsRef.current = new Set();
-    try {
-      const summaries = await listGraphs(projectSlug);
-      loopKnownGraphIdsRef.current = new Set(summaries.map((summary) => summary.graphId));
-      loopBaselineAvailableRef.current = true;
-    } catch {
-      // An unavailable baseline is safe: fresh graph snapshots still need
-      // matching creation time and exact session/project/workspace binding.
-      loopKnownGraphIdsRef.current = new Set();
-      loopBaselineAvailableRef.current = false;
-    }
-    let localSession = attached.id;
-    const reportFailure = (error: unknown) => {
-      const message = error instanceof Error ? error.message : String(error);
-      say(`Progress report unavailable: ${message}`, "tool");
-      onLog(`loop report failed: ${message}`);
-    };
-    const report = await reportLoopBestEffort<{ htmlPath?: string }>(
-      "loop_report_start",
-      {
-        slug: projectSlug,
-        loopId,
-        objective: goal,
-        startedAtMs: loopStartedAtMs,
-      },
-      reportFailure,
-    );
-    if (report?.htmlPath) say(`Progress report: ${report.htmlPath}`, "tool");
-    let history = messagesRef.current
-      .filter((message) => message.role === "user" || message.role === "assistant")
-      .map((message) => ({ role: message.role, content: message.content }));
-    say(
-      intervalMs
-        ? `▶ loop started: ${goal} — re-checking every ${formatInterval(intervalMs)} until you stop it`
-        : `▶ loop started: ${goal}`,
-      "tool",
-    );
-    // Stop aborts the controller, so a paced loop wakes immediately rather
-    // than sitting out the rest of its wait.
-    const waitBetweenIterations = (ms: number) =>
-      new Promise<void>((resolve) => {
-        const done = () => {
-          window.clearTimeout(timer);
-          controller.signal.removeEventListener("abort", done);
-          resolve();
-        };
-        const timer = window.setTimeout(done, ms);
-        controller.signal.addEventListener("abort", done);
-      });
-    const persistLoopTranscript = async () => {
-      try {
-        await saveSession({
-          id: localSession,
-          projectSlug,
-          provider: modelList?.active.provider ?? null,
-          model: modelList?.active.model ?? null,
-          workspaceRoot: attached.workspaceRoot,
-          messages: messagesRef.current,
-        });
-      } catch (error) {
-        onLog(`loop transcript save failed: ${error instanceof Error ? error.message : String(error)}`);
-      }
-    };
-    let completed = false;
-    let terminalError: { iteration: number; message: string; transient: boolean } | null = null;
-    // Bounded retry around the agent RPC for transient fetch/network loss.
-    // Provider errors are never retried — they fail closed in the outer catch.
-    const MAX_TRANSIENT_RETRIES = 3;
-    const TRANSIENT_BACKOFF_MS = 250;
-    const runChatWithTransientRetry = async (
-      invocation: () => Promise<{ sessionId: string; reply: string; toolCalls: unknown[] }>,
-    ): Promise<{ sessionId: string; reply: string; toolCalls: unknown[] }> => {
-      let attempt = 0;
-      let lastError: unknown;
-      while (attempt <= MAX_TRANSIENT_RETRIES) {
-        try {
-          return await invocation();
-        } catch (error) {
-          lastError = error;
-          // A user Stop must not be retried back into life.
-          if (controller.signal.aborted) throw error;
-          if (!isTransientRpcError(error) || attempt === MAX_TRANSIENT_RETRIES) throw error;
-          attempt += 1;
-          onLog(`loop retry ${attempt}/${MAX_TRANSIENT_RETRIES} after ${error instanceof Error ? error.message : String(error)}`);
-          await new Promise((resolve) => window.setTimeout(resolve, TRANSIENT_BACKOFF_MS * attempt));
-        }
-      }
-      throw lastError;
-    };
-    for (let iteration = 1; iteration <= MAX_LOOP_ITERATIONS; iteration += 1) {
-      if (cancelLoopRef.current) {
-        say(`■ loop stopped after ${iteration - 1} iterations`, "tool");
-        break;
-      }
-      await takeAutoCheckpoint("loop", goal, iteration === 1);
-      // A failed read must not stall the loop: without a carry the prompt
-      // falls back to telling the model to open the report itself.
-      let carry = "";
-      if (iteration > 1) {
-        try {
-          carry = loopCarryForward((await openLoopReport(projectSlug, loopId)).report);
-        } catch (error) {
-          onLog(`loop carry-forward unavailable: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      }
-      const userMessage: AgentMessage = {
-        role: "user",
-        content: loopIterationPrompt(goal, loopId, iteration, carry),
-      };
-      say(`loop ${iteration}/${MAX_LOOP_ITERATIONS}`, "tool");
-      const iterationStartedAtMs = Date.now();
-      try {
-        const alreadyPersisted = history.some(
-          (message) => message.role === "user" && message.content === userMessage.content,
-        );
-        const historyBeforeMessage = alreadyPersisted
-          ? history.filter((message) => !(message.role === "user" && message.content === userMessage.content))
-          : history;
-        if (!alreadyPersisted) {
-          appendMessage(
-            userMessage,
-            (current) => current.some((message) => message.role === "user" && message.content === userMessage.content),
-          );
-        }
-        history = [...historyBeforeMessage, userMessage];
-        // Save before agent_chat: if the provider or core dies mid-iteration,
-        // resuming the session still shows the exact loop prompt and context.
-        await persistLoopTranscript();
-        // A transient browser/core transport blip should retry, not block the
-        // loop. Provider/auth errors fall through to the outer catch so the
-        // loop still fails closed on those.
-        const result = await runChatWithTransientRetry(
-          () =>
-            agentChat(historyBeforeMessage, userMessage, localSession, attached.workspaceRoot, loopId, controller.signal),
-        );
-        localSession = result.sessionId;
-        setSessionId(result.sessionId);
-
-        // The report exists before the coordinator chooses a quality bar.
-        // Persist the first fresh graph's Judge reference mechanically so a
-        // model that plans correctly but forgets to repeat loop_report_start
-        // cannot leave the durable report anonymous.
-        const latestGraph = activeGraphRef.current;
-        const graphReference = latestGraph ? graphQualityReference(latestGraph) : null;
-        if (
-          latestGraph &&
-          graphReference &&
-          loopObservedGraphIdsRef.current.has(latestGraph.graphId) &&
-          latestGraph.projectSlug === projectSlug &&
-          latestGraph.ownerSession === localSession &&
-          latestGraph.workspaceRoot === attached.workspaceRoot
-        ) {
-          await reportLoopBestEffort(
-            "loop_report_start",
-            {
-              slug: projectSlug,
-              loopId,
-              objective: goal,
-              reference: graphReference,
-              startedAtMs: loopStartedAtMs,
-            },
-            reportFailure,
-          );
-        }
-
-        const reply = result.reply || "Done.";
-        history = [...history, { role: "assistant", content: reply }];
-        appendMessage(
-          { role: "assistant", content: reply },
-          (current) => current.at(-1)?.role === "assistant" && current.at(-1)?.content === reply,
-        );
-        const doneRequested = /(^|\n)\s*DONE\s*($|\n|$)/i.test(reply);
-        let proof: LoopGraphProof = { accepted: false, reason: "agent did not return DONE" };
-        if (doneRequested) {
-          proof = await fetchLoopGraphProof({
-            loopStartedAtMs,
-            projectSlug,
-            sessionId: localSession,
-            workspaceRoot: attached.workspaceRoot,
-            baselineAvailable: loopBaselineAvailableRef.current,
-            knownGraphIds: loopKnownGraphIdsRef.current,
-            observedGraphIds: loopObservedGraphIdsRef.current,
-          });
-          if (proof.accepted) proof = await fetchLoopReportProof();
-        }
-        if (doneRequested && !proof.accepted) {
-          say(
-            `DONE ignored: ${proof.reason}. Continue working and provide three independent specialist build roots, a separate integration build, a fresh terminal judge at or above ${DEFAULT_JUDGE_THRESHOLD}, and at least three persisted visual frames.`,
-            "tool",
-          );
-        }
-        const alreadyRecorded = hasRecordedLoopIteration(result.toolCalls, projectSlug, loopId);
-        if (!alreadyRecorded) {
-          const completedAtMs = Date.now();
-          const outcome = proof.accepted ? "passed" : "needs-work";
-          const changedFiles = fallbackLoopChangedFiles(messagesRef.current, activityTurnId);
-          await reportLoopBestEffort(
-            "loop_report_iteration",
-            {
-              slug: projectSlug,
-              loopId,
-              iteration: {
-                startedAtMs: iterationStartedAtMs,
-                completedAtMs,
-                outcome,
-                summary: reply.slice(0, 12_000) || `Iteration ${iteration} returned no summary.`,
-                agents: [],
-                checks: [],
-                changedFiles,
-                evidence: [],
-                scores: [],
-                punchList: [],
-                nextIterationMemory: {
-                  observations: [],
-                  decisions: [],
-                  risks: outcome === "passed" ? [] : ["No structured judge evidence was recorded by the agent."],
-                  nextActions: outcome === "passed" ? [] : ["Continue from the latest reply and collect primary evidence."],
-                },
-              },
-            },
-            reportFailure,
-          );
-        }
-        if (proof.accepted) {
-          await reportLoopBestEffort(
-            "loop_report_update",
-            {
-              slug: projectSlug,
-              loopId,
-              update: {
-                status: "completed",
-                completedAtMs: Date.now(),
-                recordedAtMs: Date.now(),
-                summary: reply,
-              },
-            },
-            reportFailure,
-          );
-          if (!intervalMs) {
-            say(`✔ loop complete in ${iteration} iterations`, "tool");
-            completed = true;
-            break;
-          }
-          // A paced loop is a watch: the goal being met right now is the
-          // answer to this check, not a reason to stop checking.
-          say(
-            `✔ goal met at iteration ${iteration} — watching again in ${formatInterval(intervalMs)}`,
-            "tool",
-          );
-        }
-        if (intervalMs && !cancelLoopRef.current && iteration < MAX_LOOP_ITERATIONS) {
-          say(`⏸ next check in ${formatInterval(intervalMs)}`, "tool");
-          await waitBetweenIterations(intervalMs);
-        }
-      } catch (error) {
-        // Stop aborts the in-flight iteration: that is a cancellation, not a
-        // blocked loop, so it takes the same terminal path as the pre-iteration
-        // cancel check rather than being reported as a failure.
-        if (controller.signal.aborted) {
-          noteTurnCancelled(activityTurnId);
-          say(`■ loop stopped after ${iteration - 1} iterations`, "tool");
-          break;
-        }
-        const message = error instanceof Error ? error.message : String(error);
-        // Any tool row that started via `agent.tool_started` mid-iteration
-        // would otherwise stay `status: "running"` forever once the iteration
-        // exits. Mark them errored with a synthetic finish before the
-        // terminal report so the transcript reads cleanly on resume.
-        terminalError = { iteration, message, transient: isTransientRpcError(error) };
-        const announce = terminalError.transient
-          ? `Loop blocked at iteration ${iteration}: editor disconnected (${message})`
-          : `Loop blocked at iteration ${iteration}: ${message}`;
-        say(announce, "tool");
-        break;
-      }
-    }
-    if (terminalError) {
-      const settled = Date.now();
-      const settledMessages = settleRunningToolRows(messagesRef.current, activityTurnId, settled);
-      if (settledMessages !== messagesRef.current) {
-        messagesRef.current = settledMessages;
-        setMessages(settledMessages);
-      }
-      await persistLoopTranscript();
-      await reportLoopBestEffort(
-        "loop_report_update",
-        {
-          slug: projectSlug,
-          loopId,
-          update: {
-            status: "blocked",
-            completedAtMs: Date.now(),
-            recordedAtMs: Date.now(),
-            summary: terminalError.transient
-              ? `Loop blocked at iteration ${terminalError.iteration}: editor disconnected (${terminalError.message}) — attempts exhausted`
-              : `Loop blocked at iteration ${terminalError.iteration}: ${terminalError.message}`,
-          },
-        },
-        reportFailure,
-      );
-    } else if (!completed && !cancelLoopRef.current) {
-      say(
-        intervalMs
-          ? `loop hit the ${MAX_LOOP_ITERATIONS}-check cap — the watch stops here`
-          : `loop hit the ${MAX_LOOP_ITERATIONS}-iteration cap`,
-        "tool",
-      );
-      await reportLoopBestEffort(
-        "loop_report_update",
-        {
-          slug: projectSlug,
-          loopId,
-          update: {
-            status: "blocked",
-            completedAtMs: Date.now(),
-            recordedAtMs: Date.now(),
-            summary: `Loop hit the ${MAX_LOOP_ITERATIONS}-iteration cap before passing its judge.`,
-          },
-        },
-        reportFailure,
-      );
-    } else if (cancelLoopRef.current) {
-      await reportLoopBestEffort(
-        "loop_report_update",
-        {
-          slug: projectSlug,
-          loopId,
-          update: {
-            status: "cancelled",
-            completedAtMs: Date.now(),
-            recordedAtMs: Date.now(),
-            summary: "Loop stopped by the user.",
-          },
-        },
-        reportFailure,
-      );
-    }
+  // Core owns the loop driver; this panel only starts and renders it.
+  const finishLoopUi = (outcome: "done" | "stopped" = "done") => {
+    const activityTurnId = loopActivityTurnRef.current;
+    if (activityTurnId) completeActivityTurn(activityTurnId, Date.now(), outcome);
+    loopActivityTurnRef.current = null;
+    activeLoopIdRef.current = null;
     announceRestorePoints();
-    // Every exit path says its terminal lines (gate messages, ✔/■/cap markers)
-    // after the last pre-agent_chat save; only the blocked path re-saved. Persist
-    // once here so completed, capped, and stopped loops keep their tail on reload.
-    await persistLoopTranscript();
-    completeActivityTurn(activityTurnId, Date.now(), controller.signal.aborted ? "stopped" : "done");
-    loopStartedAtRef.current = null;
-    loopBaselineAvailableRef.current = false;
-    loopKnownGraphIdsRef.current = new Set();
-    loopObservedGraphIdsRef.current = new Set();
-    if (turnAbortRef.current === controller) turnAbortRef.current = null;
     setActiveLoop(null);
     setLooping(false);
     setBusy(false);
+    setStopping(false);
   };
 
-  // Stop has to be legible in the frame it is clicked: `stopping` re-renders
-  // the control and the transcript acknowledges the click immediately.
-  //
-  // Two things then happen, and both are needed. `agent_cancel` is the one
-  // that reaches the loop: aborting the request only closes this end of the
-  // socket, and core would otherwise keep spending its remaining turn budget
-  // on tools, writes and tokens with nobody reading the reply. The local abort
-  // is what makes the panel free in the same round-trip rather than waiting
-  // for the cancelled turn to unwind. Cancel is sent first so the abort cannot
-  // race it away.
-  //
-  // A tool already dispatched still finishes — core refuses the *rest* of the
-  // batch but does not kill work in flight — which is what `noteTurnCancelled`
-  // says once the request unwinds.
-  //
-  // What Stop deliberately does NOT do is answer a pending approval. Stopping
-  // a turn is a statement about this panel's waiting, not a decision about a
-  // request core is holding — and an earlier build that denied "on the way
-  // out" is precisely how stopping one turn destroyed a running graph's work.
-  // Core drops a finished run's approvals itself; a live one's wait out its
-  // own timer.
+  // Autonomous loop: register a detached core-side run, then render its SSE events.
+  const runLoop = async (
+    goal: string,
+    intervalMs: number | null = null,
+    profile: LoopProfile = DEFAULT_LOOP_PROFILE,
+  ) => {
+    if (busy || looping) return;
+    setLooping(true);
+    setBusy(true);
+    const activityTurnId = beginActivityTurn();
+    loopActivityTurnRef.current = activityTurnId;
+    try {
+      const attached = await ensureEditorSession();
+      const run = await startLoopRun({
+        projectSlug,
+        goal,
+        profile,
+        intervalMs,
+        sessionId: attached.id,
+        workspaceRoot: attached.workspaceRoot,
+        permissionMode,
+      });
+      activeLoopIdRef.current = run.loopId;
+      setActiveLoop({ objective: goal, startedAtMs: Date.now(), every: intervalMs ? formatInterval(intervalMs) : null });
+      say(`▶ loop started: ${goal}`, "tool");
+    } catch (error) {
+      say(`Loop error: ${error instanceof Error ? error.message : String(error)}`);
+      finishLoopUi();
+    }
+    return;
+  };
+
   const stopAgent = () => {
     if (!busy || stopping) return;
     cancelLoopRef.current = true;
     setStopping(true);
+    const loopId = activeLoopIdRef.current;
+    if (loopId) void stopLoopRun(loopId).catch(() => {});
     // No literal glyph: the tool row draws its own ■, so spelling one here
     // rendered "■ ■ Stopping…".
     say("Stopping — finishing the current step, then halting.", "tool");
@@ -3153,8 +2826,8 @@ export function AgentPanel({
 
   // Built-ins first: a skill cannot take a command name the composer owns.
   const allCommands: readonly SlashCommand[] = useMemo(
-    () => [...SLASH_COMMANDS, ...skillCommands(skills)],
-    [skills],
+    () => [...SLASH_COMMANDS, ...skillCommands(skills), ...fileCommands(fileCommandInfos)],
+    [skills, fileCommandInfos],
   );
 
   // Running a skill is a normal turn with a normal prompt — core's system
@@ -3162,6 +2835,21 @@ export function AgentPanel({
   // the agent to pull its body in with skill_load.
   const runSkill = async (name: string, task: string) => {
     await runTurn(task ? `Use the ${name} skill: ${task}` : `Use the ${name} skill.`);
+  };
+
+  const runFileCommand = async (name: string, args: string) => {
+    let prompt: string;
+    try {
+      prompt = await renderFileCommand(name, args, projectSlug);
+    } catch (error) {
+      say(`/${name} failed: ${error instanceof Error ? error.message : String(error)}`);
+      return;
+    }
+    if (!prompt.trim()) {
+      say(`/${name} expanded to an empty prompt — check its body.`);
+      return;
+    }
+    await runTurn(prompt);
   };
 
   const slashContext: SlashContext = {
@@ -3632,36 +3320,34 @@ export function AgentPanel({
                 ) : (
                   <div className="mt-2.5 flex flex-wrap gap-2">
                     <Button size="sm" disabled={answering} onClick={() => void respondToApproval(entry, true)}>
-                      <ShieldCheck className="mr-1 h-3.5 w-3.5" /> Approve
+                      <ShieldCheck className="mr-1 h-3.5 w-3.5" /> {plan ? "Start work" : "Approve"}
                     </Button>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      disabled={answering}
-                      onClick={() => void respondToApproval(entry, true, true)}
-                      title={`Stop asking about ${entry.tool} for the rest of this chat`}
-                    >
-                      {/* Not ShieldCheck: sharing Approve's icon made two
-                          buttons with very different consequences look alike at
-                          a glance, which is the moment the wrong one gets
-                          clicked. */}
-                      <ShieldPlus className="mr-1 h-3.5 w-3.5" /> Always
-                    </Button>
+                    {!plan ? (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        disabled={answering}
+                        onClick={() => void respondToApproval(entry, true, true)}
+                        title={`Stop asking about ${entry.tool} for the rest of this chat`}
+                      >
+                        <ShieldPlus className="mr-1 h-3.5 w-3.5" /> Always
+                      </Button>
+                    ) : null}
                     <Button
                       size="sm"
                       variant="secondary"
                       disabled={answering}
                       onClick={() => void respondToApproval(entry, false)}
                     >
-                      <ShieldOff className="mr-1 h-3.5 w-3.5" /> Deny
+                      <ShieldOff className="mr-1 h-3.5 w-3.5" /> {plan ? "Keep planning" : "Deny"}
                     </Button>
                     {/* Optional, and deliberately not a modal step: a denial
                         must stay one click. Enter denies with what is typed,
                         so a reason never needs a second reach for the mouse. */}
                     <input
                       type="text"
-                      aria-label={`Reason for denying ${entry.tool}`}
-                      placeholder="Deny with a reason (optional)"
+                      aria-label={plan ? "What to change about the plan" : `Reason for denying ${entry.tool}`}
+                      placeholder={plan ? "What should change? (optional)" : "Deny with a reason (optional)"}
                       disabled={answering}
                       value={denyReasons[entry.requestId] ?? ""}
                       onChange={(event) =>

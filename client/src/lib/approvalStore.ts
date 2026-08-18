@@ -45,6 +45,10 @@ export type ApprovalEntry = {
   arguments: unknown;
   /** `ownerGraph`, for the card's label. Read by nothing that gates an action. */
   graphLabel: string | null;
+  /** Why this call is in front of the user, when decided per call in Auto. */
+  reason: string | null;
+  /** Which Auto reviewer supplied `reason`, if any. */
+  reasonSource: ReasonSource | null;
   /** Core's clock when it raised this, falling back to arrival. */
   arrivedAtMs: number;
   /**
@@ -95,6 +99,8 @@ export type ApprovalEvent =
       tool: string;
       arguments: unknown;
       graphLabel: string | null;
+      reason?: string | null;
+      reasonSource?: ReasonSource | null;
       raisedAtMs: number;
     }
   | { kind: "UserAnswered"; requestId: string; approved: boolean; nowMs: number }
@@ -179,6 +185,8 @@ export function reduce(store: ApprovalStore, event: ApprovalEvent): ApprovalStor
         tool: event.tool,
         arguments: event.arguments,
         graphLabel: event.graphLabel,
+        reason: event.reason ?? null,
+        reasonSource: event.reasonSource ?? null,
         arrivedAtMs: existing?.arrivedAtMs ?? event.raisedAtMs,
         order: existing?.order ?? store.nextOrder,
         state: existing?.state ?? { kind: "pending" },
