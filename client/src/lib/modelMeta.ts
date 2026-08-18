@@ -8,9 +8,8 @@
 import { Models } from "@opencode-ai/models";
 import type { Model, ProviderMap } from "@opencode-ai/models";
 
-// v3 adds context limits; a v2 payload has none and would answer "unknown"
-// for every model until it expired.
-const CACHE_KEY = "calicode-modeldev-v3";
+// v4 adds the per-provider guardian model used by Auto-mode review.
+const CACHE_KEY = "calicode-modeldev-v4";
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** model id (bare or provider-prefixed) → accepted effort values; [] = none. */
@@ -123,6 +122,27 @@ export function reduceCatalog(data: ProviderMap): Record<string, string[]> {
   return catalog;
 }
 
+/** provider id → cheapest usable text model for Auto-mode review. */
+export type GuardianModels = Record<string, string>;
+
+export function reduceGuardianModels(data: ProviderMap): GuardianModels {
+  const cheapest: GuardianModels = {};
+  for (const [providerId, provider] of Object.entries(data)) {
+    let best: { id: string; price: number } | null = null;
+    for (const model of Object.values(provider.models ?? {})) {
+      const price = model.cost?.input;
+      if (typeof price !== "number" || !Number.isFinite(price) || price < 0) continue;
+      if (model.status === "deprecated") continue;
+      if (!model.modalities?.output?.includes("text") || model.modalities.output.includes("audio")) continue;
+      if (!best || price < best.price || (price === best.price && model.id < best.id)) {
+        best = { id: model.id, price };
+      }
+    }
+    if (best) cheapest[providerId] = best.id;
+  }
+  return cheapest;
+}
+
 /** model id (bare and provider-prefixed) → advertised context window in tokens. */
 export type ContextLimits = Record<string, number>;
 
@@ -174,6 +194,7 @@ export interface ModelDevData {
   index: EffortIndex;
   catalog: Record<string, string[]>;
   contextLimits: ContextLimits;
+  guardians: GuardianModels;
 }
 
 interface CachedIndex {
@@ -181,6 +202,7 @@ interface CachedIndex {
   index: EffortIndex;
   catalog: Record<string, string[]>;
   contextLimits: ContextLimits;
+  guardians: GuardianModels;
 }
 
 function readCache(): CachedIndex | null {
@@ -193,6 +215,7 @@ function readCache(): CachedIndex | null {
     // A cache written before context limits existed would answer "unknown" for
     // every model for a full day. The key is versioned, but check anyway.
     if (typeof parsed.contextLimits !== "object" || parsed.contextLimits === null) return null;
+    if (typeof parsed.guardians !== "object" || parsed.guardians === null) return null;
     return parsed;
   } catch {
     return null;
@@ -209,7 +232,7 @@ function readCache(): CachedIndex | null {
 export async function loadModelDev(): Promise<ModelDevData> {
   const cached = readCache();
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
-    return { index: cached.index, catalog: cached.catalog, contextLimits: cached.contextLimits };
+    return { index: cached.index, catalog: cached.catalog, contextLimits: cached.contextLimits, guardians: cached.guardians };
   }
   try {
     const providers = await Models.make().providers();
@@ -217,6 +240,7 @@ export async function loadModelDev(): Promise<ModelDevData> {
       index: reduceRegistry(providers),
       catalog: reduceCatalog(providers),
       contextLimits: reduceContextLimits(providers),
+      guardians: reduceGuardianModels(providers),
     };
     try {
       localStorage.setItem(CACHE_KEY, JSON.stringify({ at: Date.now(), ...data } satisfies CachedIndex));
@@ -227,16 +251,17 @@ export async function loadModelDev(): Promise<ModelDevData> {
   } catch {
     // Offline: a stale answer still beats guessing, and the bundled snapshot
     // (regenerated with every package release) beats an empty index.
-    if (cached) return { index: cached.index, catalog: cached.catalog, contextLimits: cached.contextLimits };
+    if (cached) return { index: cached.index, catalog: cached.catalog, contextLimits: cached.contextLimits, guardians: cached.guardians };
     try {
       const snapshot = await import("@opencode-ai/models/snapshot");
       return {
         index: reduceRegistry(snapshot.providers),
         catalog: reduceCatalog(snapshot.providers),
         contextLimits: reduceContextLimits(snapshot.providers),
+        guardians: reduceGuardianModels(snapshot.providers),
       };
     } catch {
-      return { index: {}, catalog: {}, contextLimits: {} };
+      return { index: {}, catalog: {}, contextLimits: {}, guardians: {} };
     }
   }
 }

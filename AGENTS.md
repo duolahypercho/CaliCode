@@ -12,9 +12,8 @@ repo works.
 | Path             | What lives there                                                         |
 | ---------------- | ------------------------------------------------------------------------ |
 | `core/`          | Rust control plane. JSON-RPC over HTTP + SSE. Owns projects, sessions, agent loop, assets, MCP, skills. |
-| `core/starters/` | Compiled-in workspace starters — one directory per starter, `include_str!`d by `starters.rs`. |
 | `client/`        | Vite + React + TypeScript editor. Three.js viewport, agent panel, workspace tabs. |
-| `client/src-tauri/` | macOS desktop shell. Bundles the core release binary as a sidecar.     |
+| `client/electron/`  | Desktop shell (Electron). Spawns core, hosts the browser panel as a real view. |
 | `shared/schemas/` | `project.schema.json`, `cali-asset.schema.json` — the contracts both sides honour. |
 | `scripts/`       | `dev.sh` (run both halves), `desktop.sh` (package the app), live agent clients. |
 | `docs/`          | `runbook.md` (operations), `verification.md` (what proves each feature works), plans, templates. |
@@ -37,18 +36,18 @@ pnpm desktop:build        # from client/ — packages CaliCode.app (+ .dmg)
 pnpm desktop:dev          # native shell against a live core
 ```
 
-**Two shells exist.** Tauri is the shipping one; an Electron shell is being
-brought up alongside it (`docs/plans/electron-shell.md`) because only a Chromium
-window can host the browser panel as a real view rather than a video stream.
-Nothing has been removed — `src-tauri/` and `desktop:build` are untouched.
+**One shell, and it is Electron.** A Tauri shell shipped first and was removed
+(`docs/plans/electron-shell.md`): its webview is a different engine per platform
+— WKWebView, WebView2, WebKitGTK — and none of them can host a second browser, so
+the BROWSER tab could only ever be a video stream of a Chrome running elsewhere.
+Electron bundles Chromium, so the panel is a `WebContentsView` the window
+composites directly and core drives over CDP.
 
-```bash
-pnpm desktop:electron         # run the Electron shell against a live core
-pnpm desktop:electron:build   # package it (unsigned) to release-electron/
-node scripts/compare-shells.mjs   # prove both shells render the same editor
-```
+The macOS menu bar reads `CFBundleName`, so an unpackaged `pnpm desktop:electron`
+says "Electron" no matter what `app.setName` is; only a packaged build says
+CaliCode. Not a bug to chase.
 
-`CALI_PORT` moves either shell off `:8765` so a second instance can run beside a
+`CALI_PORT` moves the shell off `:8765` so a second instance can run beside a
 live app — attaching two clients to one core is worse than a port collision,
 because `editor_attachment` is one owner per session and the newcomer silently
 steals tool routing.
@@ -163,45 +162,32 @@ the *client webview* tools (`editor_*`) "browser tools" — unrelated.
   Linux (chrome, then chromium, then edge, then a playwright cache);
   `CALI_CHROME` overrides the path, `CALI_BROWSER_HEADED=1` shows the window
   for debugging, `CALI_BROWSER_PROFILE` moves the profile off `~/.cali/browser`.
-- **Why a separate Chrome rather than an embedded webview.** Tauri's webview is
-  a different engine per platform — WKWebView, WebView2, WebKitGTK — and only
-  the Windows one speaks CDP. Embedding would mean three rendering behaviours
-  and an agent that can only drive the browser on one of the three. One found
-  Chrome behaves identically everywhere. The cost is that the tab is a
-  screencast, so it cannot select text or open devtools; the toolbar's
-  open-in-browser button is the way out.
+- **A found Chrome is the fallback, not the panel.** When the shell hands core
+  its `WebContentsView` there is one browser and the user watches the agent work
+  in it. Core still knows how to launch its own Chrome, because the handshake can
+  fail and a headless agent has no panel at all; that path is degraded — the tab
+  shows a screencast of it — but it keeps working rather than failing.
 - The model reads pages as ref-tagged element lists (`browser_snapshot`), not
   HTML or pixels, and clicks refs rather than coordinates. Coordinates exist
   for `<canvas>`, which is the only way to reach a running game.
-- **Playing a game is a different verb from using a page.** `browser_key` takes `holdMs`
-  because movement is a held W, not a tapped one; `browser_mouse_move` takes a *delta* because
-  a camera turns by motion, not by destination; and `browser_play` holds several keys *while*
-  looking, because strafing is two keys at once and aiming while advancing is keys and mouse at
-  once — neither is expressible as a sequence of single actions. It always releases what it
-  held, including when the look fails: separate down/up tools would put a stuck W one error
-  away, and a stuck W is a character running into a wall until somebody notices.
-- **Recording happens during the action, not after it.** `browser_play` takes `recordFrames`
-  and captures them interleaved with the look while the keys are still down, because a
-  screenshot taken once the keys come up is a picture of standing still. The frames go straight
-  into the same contact-sheet path `video_contact_sheet` uses and only a path and motion
-  metrics come back — a dozen base64 JPEGs would cost more context than the rest of the turn,
-  and the model cannot look at them anyway.
-- **Reading a recording back has two halves, and they answer different questions.** The sheet's
-  sibling JSON manifest carries measured motion per frame pair — mean luma delta, mean RGB
-  delta, perceptual-hash Hamming distance — and `file_read` turns that into text, which is the
-  half to trust for *did it move, and how much*. `image_look` sends the sheet itself to a vision
-  model and returns words, which is the half for *what happened*. Neither replaces the other,
-  and a provider without vision still has the numbers.
-- **Key events carry no `nativeVirtualKeyCode`, deliberately.** It used to be sent the Windows
-  VK code, which is a different keycode space on macOS — 87 is keypad-5 — so every held key
-  reached the page as `Numpad5` and auto-repeated about twenty thousand times in 600ms. A game
-  keyed on `e.code === "KeyW"`, which is the usual way, saw nothing. Chrome derives the native
-  code correctly when the field is simply absent. It splits that motion into steps and primes the
-  origin first — Blink measures `movementX` against the previous pointer position, so the first
-  event of a sequence reports 0 and an unprimed turn arrives one step short. Click the canvas
-  once before looking if the game wants a pointer lock.
 - `browser_search` deliberately skips Google, which serves this browser an
   interstitial instead of results.
+- **The Electron shell hands core its own panel** (`browser_attach`), so core
+  drives the `WebContentsView` the user is looking at instead of launching a
+  Chrome of its own. The target id is passed, never discovered: guessing by url
+  or title would eventually pick the editor's own window, and core would start
+  driving the app instead of the page inside it. `browser::tests::live_attach`
+  is the regression check: it asserts core drives a browser it did not launch and
+  leaves it running.
+- **Playing a game is a different verb from using a page.** `browser_key` takes
+  `holdMs` because movement is a held W, not a tapped one; `browser_mouse_move`
+  takes a *delta* because a camera turns by motion, not by destination. It
+  splits that motion into steps and primes the origin first — Blink measures
+  `movementX` against the previous pointer position, so the first event of a
+  sequence reports 0 and an unprimed turn arrives one step short. `browser_play`
+  exists because the other two are strictly sequential: strafing (w+a) or aiming
+  while advancing needs keys held *and* the mouse moving at once. Click the
+  canvas once before looking if the game wants a pointer lock.
 - Files downloaded in the panel land in `~/.cali/downloads`, and
   `browser_downloads` lists them — a download is working material the agent is
   about to pull into a project, not a personal download. A navigation that turns

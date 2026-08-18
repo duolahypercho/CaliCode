@@ -126,6 +126,7 @@ import {
   effortLevelsFor,
   loadModelDev,
   type ContextLimits,
+  type GuardianModels,
   type EffortIndex,
 } from "../../lib/modelMeta";
 import {
@@ -595,7 +596,7 @@ const PERMISSION_OPTIONS = [
   {
     value: "auto",
     label: "Auto",
-    hint: "Writes and the dev server ask first",
+    hint: "Asks when a call warrants it",
     icon: ShieldCheck,
     danger: false,
   },
@@ -616,7 +617,7 @@ const PERMISSION_OPTIONS = [
 const PLAN_OPTION = {
   value: "plan",
   label: "Plan",
-  hint: "Read-only — writes are blocked",
+  hint: "Reads · writes only plan.md",
   icon: Eye,
   danger: false,
 } as const;
@@ -1194,6 +1195,7 @@ export function AgentPanel({
   const [effortByModel, setEffortByModel] = useState<Record<string, string>>(readStoredEfforts);
   const [effortIndex, setEffortIndex] = useState<EffortIndex | null>(null);
   const [contextLimits, setContextLimits] = useState<ContextLimits | null>(null);
+  const [guardianModels, setGuardianModels] = useState<GuardianModels | null>(null);
   // models.dev per-provider catalogs, used to surface current models the
   // hand-maintained config hasn't caught up to yet.
   const [registryCatalog, setRegistryCatalog] = useState<Record<string, string[]> | null>(null);
@@ -1244,7 +1246,6 @@ export function AgentPanel({
   // Core config snapshot: the compaction block sizes the context meter, and
   // /usage reports the auto-compaction threshold from it.
   const [coreConfig, setCoreConfig] = useState<CoreConfig | null>(null);
-  const cancelLoopRef = useRef(false);
   // The in-flight agent_chat for the current turn (plain or loop iteration).
   // Stop aborts it so cancellation costs one round-trip instead of the rest of
   // core's `maxTurns` budget.
@@ -1921,6 +1922,7 @@ export function AgentPanel({
       setEffortIndex(data.index);
       setRegistryCatalog(data.catalog);
       setContextLimits(data.contextLimits);
+      setGuardianModels(data.guardians);
     });
     // Compaction tuning for the context meter; offline core just means the
     // meter measures against the built-in default window.
@@ -1936,6 +1938,11 @@ export function AgentPanel({
    * model — core keeps no catalog of its own on purpose.
    */
   const activeContextLimit = contextLimitFor(contextLimits, activeModelId);
+  const activeProvider = modelList?.active.provider ?? "";
+  const guardianModel = (() => {
+    const cheapest = guardianModels?.[activeProvider];
+    return cheapest && activeProvider ? `${activeProvider}:${cheapest}` : undefined;
+  })();
   /** Effort for a model: the user's saved pick, else the model's default; null when the model has no effort control. */
   const effortFor = (modelId: string): string | null => {
     const levels = effortLevelsFor(effortIndex, modelId);
@@ -2045,6 +2052,7 @@ export function AgentPanel({
       projectSlug,
       permissionMode,
       effort,
+      ...(guardianModel ? { guardianModel } : {}),
       // Tool-heavy build turns routinely need more than ten model/tool
       // round-trips. Keep the request bounded, but leave enough headroom for
       // a complete build before the explicit loop/continue controls take over.
@@ -2592,6 +2600,7 @@ export function AgentPanel({
         sessionId: attached.id,
         workspaceRoot: attached.workspaceRoot,
         permissionMode,
+        ...(guardianModel ? { guardianModel } : {}),
       });
       activeLoopIdRef.current = run.loopId;
       setActiveLoop({ objective: goal, startedAtMs: Date.now(), every: intervalMs ? formatInterval(intervalMs) : null });
@@ -2605,7 +2614,6 @@ export function AgentPanel({
 
   const stopAgent = () => {
     if (!busy || stopping) return;
-    cancelLoopRef.current = true;
     setStopping(true);
     const loopId = activeLoopIdRef.current;
     if (loopId) void stopLoopRun(loopId).catch(() => {});
@@ -3246,7 +3254,9 @@ export function AgentPanel({
                 ? plan
                   ? "Plan approved"
                   : `Approved ${entry.tool}`
-                : `Denied ${entry.tool}`
+                : plan
+                  ? "Still planning"
+                  : `Denied ${entry.tool}`
               : lapsed
                 ? plan
                   ? "The plan was never answered"
