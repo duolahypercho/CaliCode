@@ -7,6 +7,7 @@ import {
   heuristicLevels,
   reduceCatalog,
   reduceContextLimits,
+  reduceGuardianModels,
   reduceRegistry,
 } from "./modelMeta";
 
@@ -36,6 +37,83 @@ describe("reduceRegistry over the models.dev snapshot", () => {
     }
   });
 });
+
+describe("reduceGuardianModels", () => {
+  const guardians = reduceGuardianModels(snapshot.providers);
+
+  it("picks a cheaper model than the provider's flagship", () => {
+    const anthropic = guardians.anthropic;
+    expect(anthropic).toBeTruthy();
+    const models = snapshot.providers.anthropic?.models ?? {};
+    const chosen = Object.values(models).find((model) => model.id === anthropic);
+    const priced = Object.values(models)
+      .map((model) => model.cost?.input)
+      .filter((price): price is number => typeof price === "number");
+    expect(chosen?.cost?.input).toBe(Math.min(...priced));
+  });
+
+  it("never picks a model with no published price", () => {
+    for (const [providerId, modelId] of Object.entries(guardians)) {
+      const model = Object.values(snapshot.providers[providerId]?.models ?? {}).find(
+        (candidate) => candidate.id === modelId,
+      );
+      expect(typeof model?.cost?.input).toBe("number");
+    }
+  });
+
+  it("never picks a deprecated or non-text model", () => {
+    for (const [providerId, modelId] of Object.entries(guardians)) {
+      const model = Object.values(snapshot.providers[providerId]?.models ?? {}).find(
+        (candidate) => candidate.id === modelId,
+      );
+      expect(model?.status).not.toBe("deprecated");
+      expect(model?.modalities?.output).toContain("text");
+      expect(model?.modalities?.output).not.toContain("audio");
+    }
+  });
+
+  it("chooses the cheapest priced text model and stable tie breaks", () => {
+    const providers = {
+      test: {
+        id: "test",
+        models: {
+          zeta: makeModel("zeta", 0.1),
+          alpha: makeModel("alpha", 0.1),
+          old: { ...makeModel("old", 0), status: "deprecated" },
+          audio: { ...makeModel("audio", 0), modalities: { input: ["text"], output: ["audio"] } },
+        },
+      },
+    } as unknown as typeof snapshot.providers;
+    expect(reduceGuardianModels(providers).test).toBe("alpha");
+  });
+
+  it("omits providers whose models have no published price", () => {
+    const providers = {
+      mystery: {
+        id: "mystery",
+        models: { a: { ...makeModel("a", 0), cost: undefined } },
+      },
+    } as unknown as typeof snapshot.providers;
+    expect(reduceGuardianModels(providers).mystery).toBeUndefined();
+  });
+});
+
+function makeModel(id: string, input: number) {
+  return {
+    id,
+    name: id,
+    description: "",
+    attachment: false,
+    reasoning: false,
+    tool_call: true,
+    release_date: "2026-01-01",
+    last_updated: "2026-01-01",
+    modalities: { input: ["text"], output: ["text"] },
+    open_weights: false,
+    limit: { context: 100, output: 100 },
+    cost: { input, output: input },
+  };
+}
 
 describe("effortLevelsFor", () => {
   it("resolves provider-prefixed ids to the bare entry", () => {

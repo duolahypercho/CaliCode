@@ -3014,6 +3014,126 @@ mod tests {
     /// the same final position and a useless snap, so the step count is checked
     /// too: this is a motion, not a teleport.
     ///
+    /// Attach drives a browser core did not start, and leaves it running.
+    ///
+    /// This is the Electron shell's whole contract in one test. The shell owns
+    /// the `WebContentsView`; core adopts it and drives the very page the user
+    /// is looking at, which is the difference between one browser and two.
+    ///
+    /// Both halves are asserted, and the second is the one with teeth: a
+    /// `shutdown` that killed an attached browser would close the user's panel —
+    /// or, in the packaged app, take a window out from under them — every time
+    /// a session ended.
+    ///
+    /// `cargo test browser::tests::live_attach -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore = "needs a real Chrome"]
+    async fn live_attach_drives_a_browser_it_did_not_launch() {
+        let binary = find_chrome().expect("a chrome to stand in for the shell's panel");
+        let profile = tempfile::tempdir().unwrap();
+        let port = {
+            let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+
+        // Chrome the test owns, exactly as the Electron shell would own it.
+        let mut panel = tokio::process::Command::new(&binary)
+            .arg(format!("--remote-debugging-port={port}"))
+            .arg(format!("--user-data-dir={}", profile.path().display()))
+            .arg("--headless=new")
+            .arg("--no-first-run")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("chrome must start");
+
+        let endpoint = format!("http://127.0.0.1:{port}");
+        let targets = async {
+            loop {
+                if let Ok(response) = reqwest::get(format!("{endpoint}/json/list")).await {
+                    if let Ok(list) = response.json::<Vec<Value>>().await {
+                        if list.iter().any(|t| t["type"] == "page") {
+                            return list;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let targets = tokio::time::timeout(Duration::from_secs(20), targets)
+            .await
+            .expect("chrome must expose a devtools page target");
+        let target_id = targets
+            .iter()
+            .find(|t| t["type"] == "page")
+            .and_then(|t| t["id"].as_str())
+            .expect("a page target")
+            .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let served = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            const BODY: &str = "<html><title>attached</title><body>panel</body></html>";
+            while let Ok((mut socket, _)) = listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\n\r\n{}",
+                    BODY.len(),
+                    BODY
+                );
+                socket.write_all(response.as_bytes()).await.ok();
+            }
+        });
+
+        let (bus, _rx) = tokio::sync::broadcast::channel(64);
+        let browsers = Browsers::new();
+        let browser = browsers
+            .attach(&endpoint, &target_id, bus)
+            .await
+            .expect("core must adopt the target the shell handed it");
+
+        browser
+            .navigate(&format!("http://127.0.0.1:{served}/"))
+            .await
+            .expect("navigate");
+
+        // Read the url back over the test's own devtools connection rather than
+        // core's, so this cannot pass on core merely believing it navigated.
+        let seen = reqwest::get(format!("{endpoint}/json/list"))
+            .await
+            .unwrap()
+            .json::<Vec<Value>>()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|t| t["id"] == target_id.as_str())
+            .expect("the adopted target must still exist");
+        assert!(
+            seen["url"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&served.to_string()),
+            "core drove some other page: {seen:?}"
+        );
+
+        // The half that matters: ending the session must not close the panel.
+        browsers.shutdown().await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            reqwest::get(format!("{endpoint}/json/version"))
+                .await
+                .is_ok(),
+            "shutdown killed a browser core did not launch"
+        );
+        assert!(
+            panel.try_wait().expect("wait").is_none(),
+            "shutdown killed the shell's chrome process"
+        );
+
+        panel.kill().await.ok();
+    }
+
     /// `cargo test browser::tests::live_mouse_move -- --ignored --nocapture`
     #[tokio::test]
     #[ignore = "needs a real Chrome"]
