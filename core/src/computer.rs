@@ -1244,6 +1244,7 @@ mod tests {
     /// for a reason that has nothing to do with what they measure.
     /// Set `CALI_BROWSER_HEADED=1`; a headless Chrome has no window and no key
     /// focus, which is the very thing being measured.
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "needs a real headed Chrome"]
     async fn live_typing_reaches_the_agent_browser() {
@@ -1319,6 +1320,7 @@ mod tests {
     /// fix works, and deleting it would erase the only evidence of the gap.
     ///
     /// `CALI_BROWSER_HEADED=1 cargo test computer::tests::live_clicking -- --ignored`
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "known gap: background windows do not receive synthetic clicks"]
     async fn live_clicking_reaches_the_agent_browser() {
@@ -1404,6 +1406,7 @@ mod tests {
     /// Restores whatever was frontmost before, so running it costs a blink.
     ///
     /// `CALI_BROWSER_HEADED=1 cargo test computer::tests::diag_click -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "diagnostic; briefly activates Chrome"]
     async fn diag_click_when_frontmost() {
@@ -1504,6 +1507,7 @@ mod tests {
     /// is worse than not shipping it.
     ///
     /// `CALI_BROWSER_HEADED=1 cargo test computer::tests::diag_scroll -- --ignored --nocapture`
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "diagnostic; needs a real headed Chrome"]
     async fn diag_scroll_delivery() {
@@ -1566,6 +1570,7 @@ mod tests {
     ///   swiftc -O core/tests/helpers/clicktarget.swift -o /tmp/clicktarget
     ///   CALI_CLICK_TARGET=/tmp/clicktarget \
     ///     cargo test computer::tests::diag_appkit -- --ignored --nocapture
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     #[ignore = "diagnostic; needs the clicktarget helper built"]
     async fn diag_appkit_click_delivery() {
