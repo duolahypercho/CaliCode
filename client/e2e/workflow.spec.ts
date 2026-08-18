@@ -1,4 +1,4 @@
-import { expect, test, type Page, type Request, type TestInfo } from "@playwright/test";
+import { expect, test, type APIRequestContext, type Page, type Request, type TestInfo } from "@playwright/test";
 
 const WORKFLOW_VIEWPORT = { width: 1440, height: 900 };
 
@@ -31,6 +31,21 @@ async function callRpc(page: Page, method: string, params: Record<string, unknow
     },
     { rpcMethod: method, rpcParams: params },
   );
+}
+
+async function callRpcFromRunner(
+  request: APIRequestContext,
+  method: string,
+  params: Record<string, unknown>,
+): Promise<any> {
+  const response = await request.post("/rpc", {
+    data: { jsonrpc: "2.0", id: crypto.randomUUID(), method, params },
+  });
+  const envelope = (await response.json()) as { result?: unknown; error?: { message?: string } };
+  if (!response.ok() || envelope.error) {
+    throw new Error(envelope.error?.message ?? `RPC ${method} failed`);
+  }
+  return envelope.result;
 }
 
 async function createStarterGame(page: Page, testInfo: TestInfo) {
@@ -309,7 +324,7 @@ test.describe("end-to-end game workflow", () => {
     }
   });
 
-  test("routes concurrent editor calls to the owning page and session", async ({ browser }, testInfo) => {
+  test("routes concurrent editor calls to the owning page and session", async ({ browser, request }, testInfo) => {
     const context = await browser.newContext({ viewport: WORKFLOW_VIEWPORT });
     const pageA = await context.newPage();
     const pageB = await context.newPage();
@@ -332,8 +347,14 @@ test.describe("end-to-end game workflow", () => {
         // Ignore unrelated non-JSON requests.
       }
     };
-    pageA.on("request", captureAttach(attachA));
-    pageB.on("request", captureAttach(attachB));
+    // `requestfinished`, not `request`: the poll below gates the first
+    // `editor_tool_call` on this list, and a *sent* attach is not an
+    // *applied* one. Core registers the owner while handling the call, so
+    // firing the tool call on the outgoing request raced the registration —
+    // the call arrived with no owner for that session and hung until the
+    // 60s test timeout rather than failing with a reason.
+    pageA.on("requestfinished", captureAttach(attachA));
+    pageB.on("requestfinished", captureAttach(attachB));
 
     try {
       await pageA.goto("/");
@@ -363,12 +384,12 @@ test.describe("end-to-end game workflow", () => {
       ]);
 
       const [snapshotA, snapshotB] = await Promise.all([
-        callRpc(pageA, "editor_tool_call", {
+        callRpcFromRunner(request, "editor_tool_call", {
           sessionId: sessionA,
           tool: "editor_scene_inspect",
           arguments: {},
         }),
-        callRpc(pageB, "editor_tool_call", {
+        callRpcFromRunner(request, "editor_tool_call", {
           sessionId: sessionB,
           tool: "editor_scene_inspect",
           arguments: {},
