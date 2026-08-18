@@ -184,6 +184,7 @@ fn resolve_in(ledger: &SpawnLedger, pid: u32) -> Result<Target> {
 /// editor — and sending that costs tokens for detail no model uses. 1568 is
 /// Anthropic's documented ceiling before an image is downscaled server-side
 /// anyway, so scaling here buys the same picture for fewer bytes.
+#[cfg(target_os = "macos")]
 const MAX_CAPTURE_EDGE: u32 = 1568;
 
 /// Capture one window as PNG bytes, whether or not it is frontmost.
@@ -414,11 +415,6 @@ fn click_via(pid: u32, window_id: u32, screen_x: f64, screen_y: f64, by_psn: boo
     }
 }
 
-#[cfg(all(not(target_os = "macos"), test))]
-fn click_at(_pid: u32, _window_id: u32, _screen_x: f64, _screen_y: f64) -> Result<()> {
-    bail!("computer use input is implemented for macOS only")
-}
-
 /// Pick the window a capture request means.
 ///
 /// With an explicit `windowId` it must belong to the resolved target — a window
@@ -482,6 +478,7 @@ fn note(targets: usize, with_windows: usize) -> &'static str {
 /// string on the event and needs no keycode at all; this table exists only for
 /// the keys that have no character — the ones that mean "submit", "next field",
 /// "cancel".
+#[cfg(target_os = "macos")]
 fn keycode(name: &str) -> Option<u16> {
     Some(match name.to_ascii_lowercase().as_str() {
         "return" | "enter" => 36,
@@ -688,11 +685,6 @@ fn post_to_psn(pid: u32, events: Vec<core_graphics::event::CGEvent>) -> Result<(
         unsafe { CGEventPostToPSN(&psn, event.as_ptr()) };
     }
     Ok(())
-}
-
-#[cfg(not(target_os = "macos"))]
-fn post_to_pid(_pid: u32, _events: Vec<()>) -> Result<()> {
-    bail!("computer use input is implemented for macOS only")
 }
 
 #[cfg(target_os = "macos")]
