@@ -234,12 +234,17 @@ test.describe("Reports workspace", () => {
               details: "PIE completed with persisted visual evidence.",
             },
             {
+              // Passed, not skipped: `validate_completion_readiness` requires a
+              // passing performance check on the last iteration, because a run
+              // that never timed a frame has no evidence for the half of an
+              // `aaa` claim a screenshot cannot carry. A skipped one describes a
+              // report that can no longer reach `completed`.
               kind: "performance",
               name: "Performance sample",
-              command: "pnpm test:e2e --grep reports",
-              status: "skipped",
-              durationMs: 0,
-              details: "Covered by this isolated browser run.",
+              command: "game_perf",
+              status: "passed",
+              durationMs: 12_000,
+              details: "60fps average, 52fps one percent low over a 20s sample.",
             },
           ],
           changedFiles: [{ path: "AGENTS.md", additions: 5, deletions: 2 }],
