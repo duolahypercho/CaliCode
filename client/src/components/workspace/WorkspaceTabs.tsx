@@ -160,7 +160,7 @@ export function WorkspaceTabs({
         role="tablist"
         aria-label="Workspace"
         aria-orientation="horizontal"
-        className="scrollbar-none flex min-w-0 flex-1 items-center gap-1 overflow-x-auto [mask-image:linear-gradient(to_right,#000_calc(100%-28px),transparent)]"
+        className="scrollbar-none flex h-8 min-w-0 shrink-0 flex-1 items-center gap-1 overflow-x-auto [mask-image:linear-gradient(to_right,#000_calc(100%-28px),transparent)]"
       >
         {openTabs.map((tab, index) => {
           const selected = tab === active;

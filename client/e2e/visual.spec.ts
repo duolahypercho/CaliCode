@@ -55,7 +55,13 @@ const TAB_PICKER_LABELS: Record<(typeof TABS)[number], string> = {
 async function openWorkspaceTab(page: Page, tab: (typeof TABS)[number]): Promise<void> {
   const existing = page.getByRole("tab", { name: tab, exact: true });
   if ((await existing.count()) === 0) {
-    await page.getByRole("button", { name: `Show ${TAB_PICKER_LABELS[tab]}` }).click();
+    const picker = page.getByRole("button", { name: `Show ${TAB_PICKER_LABELS[tab]}` });
+    if ((await picker.count()) > 0) {
+      await picker.click();
+    } else {
+      await page.getByRole("button", { name: "Add view" }).click();
+      await page.getByRole("menuitem", { name: TAB_PICKER_LABELS[tab], exact: true }).click();
+    }
   }
   await page.getByRole("tab", { name: tab, exact: true }).click();
 }

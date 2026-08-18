@@ -22,7 +22,15 @@ const TAB_LABELS: Record<string, string> = {
 
 async function openTab(page: Page, name: string): Promise<void> {
   const tab = page.getByRole("tab", { name, exact: true });
-  if ((await tab.count()) === 0) await page.getByRole("button", { name: `Show ${TAB_LABELS[name]}` }).click();
+  if ((await tab.count()) === 0) {
+    const picker = page.getByRole("button", { name: `Show ${TAB_LABELS[name]}` });
+    if ((await picker.count()) > 0) {
+      await picker.click();
+    } else {
+      await page.getByRole("button", { name: "Add view" }).click();
+      await page.getByRole("menuitem", { name: TAB_LABELS[name], exact: true }).click();
+    }
+  }
   await tab.click();
 }
 

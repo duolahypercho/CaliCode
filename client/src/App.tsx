@@ -416,9 +416,9 @@ export default function App() {
   // From lg up the dock is a real column; the chat header's panel button
   // hides/shows it there, and below lg the same button drives the overlay.
   // What the main column shows: the project hub, agent chat, or Assets Library.
-  // Start at the project boundary: the agent only becomes available after a
-  // game is chosen, so its tools inherit an unambiguous project context.
-  const [mainView, setMainView] = useState<"chat" | "library" | "hub">("hub");
+  // Existing installs open the selected game directly; an empty projects
+  // directory switches to the hub below so there is still a clear first step.
+  const [mainView, setMainView] = useState<"chat" | "library" | "hub">("chat");
   const [toolsVisible, setToolsVisible] = useState<boolean>(
     () => localStorage.getItem("calicode-tools-visible") !== "0",
   );
@@ -734,11 +734,13 @@ export default function App() {
           setFrames([]);
           setTestResults([]);
           setLoadMs(performance.now() - started);
+          setMainView("hub");
           return;
         }
         const loaded = await rpc<Project>("project_open", { slug: preferred.slug });
         if (cancelled) return;
         setProject(adoptSaved(loaded));
+        setMainView("chat");
         setScriptBaseline(snapshotScripts(loaded));
         setCaptureEvery((loaded.settings.pie as { captureEvery?: number })?.captureEvery ?? 3);
         setLoadMs(performance.now() - started);
