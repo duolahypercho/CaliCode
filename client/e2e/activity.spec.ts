@@ -162,10 +162,10 @@ test.describe("persisted agent activity", () => {
       await expect(activity).toHaveCount(1, { timeout: 10_000 });
       const compact = activity.getByRole("button", { name: `Expand activity for turn ${turnId}` });
       await expect(compact).toHaveCount(1);
-      await expect(compact).toContainText("Edited README.md +1 -1");
-      await expect(compact).toContainText("2 actions");
+      await expect(compact).toContainText("Worked for 4s");
+      await expect(compact).not.toContainText("actions");
+      await expect(compact).not.toContainText("Edited README.md +1 -1");
       await expect(compact).not.toContainText("Read README.md");
-      await expect(compact).toContainText(/\d+s/);
       await expect(page.locator("[data-session-worked-time]")).toContainText(/Worked [1-9]\d*s this session/);
 
       await compact.click();

@@ -136,7 +136,7 @@ describe("Stop", () => {
     });
   });
 
-  it("labels the stopped turn Stopped, not Completed", async () => {
+  it("labels the stopped turn with its elapsed stop state, not Completed", async () => {
     renderPanel();
     await send("build me a level");
 
@@ -146,7 +146,7 @@ describe("Stop", () => {
 
     // Driving this headlessly is what caught it: the turn summary read
     // "✔ Completed" directly above its own "Turn cancelled" line.
-    await waitFor(() => expect(screen.getByText("Stopped")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/Stopped after/)).toBeTruthy());
     expect(screen.queryByText("Completed")).toBeNull();
   });
 

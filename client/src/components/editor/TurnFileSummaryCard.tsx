@@ -36,7 +36,7 @@ export function TurnFileSummaryCard({
   return (
     <div
       data-activity-change-summary
-      className="mt-1 overflow-hidden rounded-lg border border-line px-2.5 py-1.5 text-[10px] text-ink-subtle"
+      className="mt-1 overflow-hidden py-1 text-[10px] text-ink-subtle"
     >
       <div className="flex items-center gap-2">
         <FilePenLine aria-hidden className="h-3 w-3 shrink-0 text-ink-faint" strokeWidth={1.7} />
@@ -58,7 +58,7 @@ export function TurnFileSummaryCard({
               }}
               aria-label={canOpen ? `Open ${file.path}` : file.path}
               className={`flex w-full min-w-0 items-center gap-2 rounded px-1 py-0.5 text-left transition-colors ${
-                canOpen ? "hover:bg-surface-2 hover:text-ink active:bg-surface-3" : "cursor-default"
+                canOpen ? "hover:text-ink active:text-ink-strong" : "cursor-default"
               }`}
             >
               <span className="min-w-0 flex-1 truncate font-mono text-ink-faint">{file.path}</span>
@@ -72,7 +72,7 @@ export function TurnFileSummaryCard({
           type="button"
           onClick={() => setShowAll((current) => !current)}
           aria-expanded={showAll}
-          className="mt-1 rounded px-1 py-0.5 text-ink-faint transition-colors hover:bg-surface-2 hover:text-ink active:bg-surface-3"
+          className="mt-1 rounded px-1 py-0.5 text-ink-faint transition-colors hover:text-ink active:text-ink-strong"
         >
           {showAll ? "Show fewer files" : `Show ${hidden} more ${hidden === 1 ? "file" : "files"}`}
         </button>
