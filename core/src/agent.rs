@@ -2506,7 +2506,13 @@ impl AgentManager {
         // The escalation is a one-way lever: it can only add a prompt, never
         // remove one, so a model cannot talk its way past a rule or the floor
         // by leaving it out.
-        let mut ask_reason = self_escalation.clone().map(ApprovalReason::agent);
+        let mut ask_reason = self_escalation.clone().map(|question| {
+            ApprovalReason::agent(if question.is_empty() {
+                format!("The agent flagged this {} for your decision.", def.name)
+            } else {
+                question
+            })
+        });
         let needs_approval = match gate {
             Gate::Deny => anyhow::bail!("tool '{}' is denied by permission rules", def.name),
             Gate::Prompt => true,
@@ -3075,18 +3081,15 @@ impl ApprovalReason {
 
 /// Lift the model's own escalation out of a call's arguments.
 ///
-/// Returns the question it wants asked. A present-but-empty or non-string
-/// value still escalates — the model reached for the lever, and reading a
-/// malformed pull as "never mind" is the wrong direction to fail — but it
-/// carries no question, so the card falls back to naming the tool.
+/// Returns the question it wants asked, empty when the model pulled the lever
+/// without supplying one. A present-but-empty or non-string value still
+/// escalates — the model reached for the lever, and reading a malformed pull
+/// as "never mind" is the wrong direction to fail — and the caller names the
+/// tool instead, because a card whose only sentence is "the agent asked" tells
+/// the user nothing the title did not.
 fn take_self_escalation(arguments: &mut Value) -> Option<String> {
     let raw = arguments.as_object_mut()?.remove(SELF_ESCALATION_KEY)?;
-    let question = raw.as_str().unwrap_or("").trim().to_string();
-    Some(if question.is_empty() {
-        "The agent asked for your decision on this call.".into()
-    } else {
-        question
-    })
+    Some(raw.as_str().unwrap_or("").trim().to_string())
 }
 
 /// Add the escalation lever to a tool's schema.
@@ -3100,7 +3103,16 @@ fn take_self_escalation(arguments: &mut Value) -> Option<String> {
 /// third party's schema for.
 fn escalatable_schema(def: &ToolDef, mode: &str) -> Value {
     let mut schema = to_openai_schema(def);
-    if mode != "auto" || def.access != crate::tools::Access::Guarded {
+    // `is_destructive`, not `def.access`. They agree for core tools and
+    // disagree for every client-registered one: `tool_register` sends no
+    // `access`, so serde fills in the fail-closed `Guarded` default, and
+    // reading that as "guarded" advertised the lever on all ~30 `editor_*`
+    // tools — `editor_scene_inspect` and `editor_console_history` included.
+    // Measured against a real editor, the model then asked before all 12 calls
+    // of a routine task, which is Manual with extra words. The gate itself
+    // decides with `is_destructive`, so the lever must too: offering it where
+    // nothing is gated invites an interruption that protects nothing.
+    if mode != "auto" || !is_destructive(&def.name, false) {
         return schema;
     }
     let Some(properties) = schema
@@ -3119,8 +3131,11 @@ fn escalatable_schema(def: &ToolDef, mode: &str) -> Value {
                 they asked for, it is hard to undo, it spends their money, it acts outside this \
                 machine, or they said they wanted to be asked about it. The value is the question \
                 they will see, phrased for them and short: \"Install the 40 dependencies this \
-                template needs?\". Leaving it out is the normal case; it is not a way to hedge, \
-                and setting it on ordinary work trains them to stop reading."
+                template needs?\". Leaving it out is the normal case. It is NOT a check-in and \
+                NOT a way to hedge: do not ask to read, inspect, validate, run tests, or delegate \
+                to a subagent. Delegation especially — the subagent inherits this mode and every \
+                call it makes is gated on its own, so asking about the spawn asks twice. If the \
+                only thing you would say is \"may I proceed\", proceed."
         }),
     );
     schema
@@ -5033,9 +5048,10 @@ mod tests {
         // value loses the question, not the interruption.
         for value in [json!(""), json!("   "), json!(true), json!(null), json!(7)] {
             let mut arguments = json!({ "path": "a.js", "ask_user": value });
-            assert!(
-                take_self_escalation(&mut arguments).is_some(),
-                "{value} must still escalate"
+            assert_eq!(
+                take_self_escalation(&mut arguments),
+                Some(String::new()),
+                "{value} must still escalate, carrying no question"
             );
             assert_eq!(arguments, json!({ "path": "a.js" }));
         }
@@ -5078,6 +5094,45 @@ mod tests {
             assert!(
                 escalatable_schema(&guarded, mode).pointer(&lever).is_none(),
                 "{mode} must not advertise the lever"
+            );
+        }
+    }
+
+    #[test]
+    fn a_client_registered_reader_is_never_offered_the_lever() {
+        // The defect this replaces: `tool_register` sends no `access`, serde
+        // filled in the fail-closed `Guarded` default, and `escalatable_schema`
+        // read that as "guarded" — so all ~30 `editor_*` tools advertised the
+        // lever, readers included. Against a real editor the model then asked
+        // before all 12 calls of a routine task, which is Manual with extra
+        // words. Registered tools are classified by name, and no `editor_*`
+        // name is destructive, so none may carry it.
+        let lever = format!("/function/parameters/properties/{SELF_ESCALATION_KEY}");
+        for name in [
+            "editor_scene_inspect",
+            "editor_console_history",
+            "editor_script_write",
+            "editor_run_tests",
+            "editor_project_save",
+        ] {
+            let registered = ToolDef {
+                name: name.into(),
+                description: "registered by the client".into(),
+                parameters: json!({ "type": "object", "properties": {} }),
+                kind: crate::tools::ToolKind::Browser,
+                // Exactly what serde produces for a `tool_register` payload.
+                access: crate::tools::Access::default(),
+            };
+            assert_eq!(
+                registered.access,
+                crate::tools::Access::Guarded,
+                "the default must stay fail-closed; this test is about not reading it as intent"
+            );
+            assert!(
+                escalatable_schema(&registered, "auto")
+                    .pointer(&lever)
+                    .is_none(),
+                "{name} must not advertise the lever — the gate does not guard it"
             );
         }
     }
